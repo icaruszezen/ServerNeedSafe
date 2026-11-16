@@ -1,0 +1,13 @@
+# Build artifacts & local runtime data
+dist/
+bin/
+web/dist/
+web/node_modules/
+data/
+data-local/
+*.sns
+*.sns.tmp
+*.exe
+*.log
+*.tsbuildinfo
+.DS_Store

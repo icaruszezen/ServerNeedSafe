@@ -1,0 +1,21 @@
+services:
+  serverneedsafe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: serverneedsafe:latest
+    container_name: serverneedsafe
+    restart: unless-stopped
+    ports:
+      - "${SNS_PORT:-8080}:8080"
+    environment:
+      - TZ=Asia/Shanghai
+      - SNS_ADDR=0.0.0.0:8080
+      - SNS_DATA_DIR=/data
+      - SNS_SESSION_TTL=8h
+    volumes:
+      # 持久化存储零知识全量加密数据包 (vault.sns)
+      # 即使该目录或文件外泄，未持有管理员主密码的攻击者无法解密任何应用数据
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true

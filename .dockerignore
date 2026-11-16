@@ -1,0 +1,11 @@
+.git
+.github
+dist
+bin
+data
+data-local
+web/node_modules
+web/dist
+*.sns
+*.exe
+*.md

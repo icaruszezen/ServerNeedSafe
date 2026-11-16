@@ -1,0 +1,51 @@
+name: Build & Verify (Docker + Windows Local App)
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build Frontend Bundle
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run Security & Integration Tests
+        run: go test ./internal/... -v -race
+
+      - name: Build Windows Pure-Local Desktop EXE & Linux Server Binary
+        run: bash ./scripts/build-all.sh
+
+      - name: Upload Ready-to-Run Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerNeedSafe-Binaries
+          path: |
+            dist/ServerNeedSafe-windows-amd64.exe
+            dist/ServerNeedSafe-windows-arm64.exe
+            dist/sns-server-linux-amd64
+
+      - name: Verify Docker Image Build
+        run: docker build -t serverneedsafe:ci .
