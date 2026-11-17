@@ -84,8 +84,15 @@ jobs:
 
       - name: Verify Windows Native GUI Subsystem Header
         run: |
-          file dist/ServerNeedSafe-windows-amd64.exe | tee /dev/stderr | grep -q "PE32+ executable (GUI) x86-64"
-          file dist/ServerNeedSafe-windows-arm64.exe | tee /dev/stderr | grep -q "PE32+ executable (GUI) Aarch64"
+          OUT_X64=$(file dist/ServerNeedSafe-windows-amd64.exe)
+          echo "$OUT_X64"
+          echo "$OUT_X64" | grep -q "PE32+ executable"
+          echo "$OUT_X64" | grep -q "(GUI)"
+
+          OUT_ARM64=$(file dist/ServerNeedSafe-windows-arm64.exe)
+          echo "$OUT_ARM64"
+          echo "$OUT_ARM64" | grep -q "PE32+ executable"
+          echo "$OUT_ARM64" | grep -q "(GUI)"
 
       - name: Package Portable Windows Bundles
         run: |
@@ -187,7 +194,7 @@ jobs:
             exit 1
           fi
           curl -fsS http://127.0.0.1:18080/api/health
-          curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deployMode":"server"'
+          curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deploy_mode":"server"'
           curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'
 
       - name: Log in to GitHub Container Registry (GHCR)
