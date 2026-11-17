@@ -137,6 +137,18 @@ class ZeroKnowledgeWorkerClient {
         return;
       }
 
+      if (msg.kind === 'anchor_updated' && typeof msg.anchorJson === 'string') {
+        try {
+          const anchor = JSON.parse(msg.anchorJson);
+          if (anchor?.vault_id) {
+            saveLocalAnchor(anchor);
+          }
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
       if (msg.kind === 'term_output') {
         const sub = this.termSubs.get(msg.tabId);
         if (sub && msg.bytes instanceof Uint8Array) {

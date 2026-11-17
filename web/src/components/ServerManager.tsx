@@ -35,6 +35,7 @@ interface ServerManagerProps {
   showHiddenFiles?: boolean;
   onRefresh: () => Promise<void>;
   onConnectTerminal: (server: ServerView, openSftp?: boolean) => void;
+  onOpenMonitor?: (serverId: string) => void;
   onNotify: (msg: string) => void;
 }
 
@@ -55,6 +56,10 @@ const emptyForm: ServerMutationPayload = {
   notes: '',
   pinned: false,
   keep_alive_sec: 30,
+  monitor_enabled: true,
+  custom_interval_sec: 0,
+  watched_services: [],
+  watched_ports: [],
 };
 
 export const ServerManager: React.FC<ServerManagerProps> = ({
@@ -65,6 +70,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   showHiddenFiles = true,
   onRefresh,
   onConnectTerminal,
+  onOpenMonitor,
   onNotify,
 }) => {
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
@@ -73,6 +79,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   const [editingServer, setEditingServer] = useState<ServerView | null>(null);
   const [form, setForm] = useState<ServerMutationPayload>(emptyForm);
   const [tagsText, setTagsText] = useState('');
+  const [watchedServicesText, setWatchedServicesText] = useState('');
+  const [watchedPortsText, setWatchedPortsText] = useState('');
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
 
@@ -130,6 +138,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       credential_id: credentials[0]?.id || '',
     });
     setTagsText('');
+    setWatchedServicesText('');
+    setWatchedPortsText('');
     setFormError('');
     setModalOpen(true);
   };
@@ -153,8 +163,14 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       notes: srv.notes || '',
       pinned: srv.pinned,
       keep_alive_sec: srv.keep_alive_sec || 30,
+      monitor_enabled: srv.monitor_enabled !== false,
+      custom_interval_sec: srv.custom_interval_sec || 0,
+      watched_services: srv.watched_services || [],
+      watched_ports: srv.watched_ports || [],
     });
     setTagsText((srv.tags || []).join(', '));
+    setWatchedServicesText((srv.watched_services || []).join(', '));
+    setWatchedPortsText((srv.watched_ports || []).join(', '));
     setFormError('');
     setModalOpen(true);
   };
@@ -164,12 +180,23 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     setFormError('');
     setSaving(true);
     try {
+      const parsedPorts = watchedPortsText
+        .split(/[,，\s]+/)
+        .map((p) => Number(p.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
+      const parsedSvcs = watchedServicesText
+        .split(/[,，\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
       const payload: ServerMutationPayload = {
         ...form,
         tags: tagsText
           .split(/[,，]/)
           .map((t) => t.trim())
           .filter(Boolean),
+        watched_services: parsedSvcs,
+        watched_ports: parsedPorts,
       };
 
       // On update, omit blank secret fields so existing encrypted secrets remain untouched
@@ -472,15 +499,27 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                   )}
 
                   <div className="server-card-footer">
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      disabled={probingId === srv.id}
-                      onClick={() => void handleProbe(srv)}
-                    >
-                      <Activity size={13} />
-                      {probingId === srv.id ? '探测中...' : '连通探测'}
-                    </button>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={probingId === srv.id}
+                        onClick={() => void handleProbe(srv)}
+                      >
+                        <Activity size={13} />
+                        {probingId === srv.id ? '探测中...' : '连通探测'}
+                      </button>
+                      {onOpenMonitor && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => onOpenMonitor(srv.id)}
+                          title="查看全维监控指标与历史趋势曲线"
+                        >
+                          监控详情
+                        </button>
+                      )}
+                    </div>
 
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button
@@ -730,6 +769,91 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     placeholder="用途、内网段或负责人备注"
                     value={form.notes}
                     onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              {/* Per-Server Monitoring Configuration */}
+              <div
+                style={{
+                  background: 'var(--bg-subtle)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '12px 14px',
+                  marginBottom: 14,
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    marginBottom: 10,
+                    flexWrap: 'wrap',
+                    gap: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5, fontWeight: 620 }}>
+                    状态监控与关键业务守护配置
+                  </span>
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      fontSize: 12.5,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.monitor_enabled !== false}
+                      onChange={(e) =>
+                        setForm({ ...form, monitor_enabled: e.target.checked })
+                      }
+                    />
+                    启用后台定时巡检记录
+                  </label>
+                </div>
+
+                <div className="field-row" style={{ marginBottom: 0 }}>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">
+                      <span>独立采集周期 (秒)</span>
+                      <span className="field-hint">0 表示跟随全局</span>
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={86400}
+                      className="input mono"
+                      value={form.custom_interval_sec || 0}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          custom_interval_sec: Math.max(0, Number(e.target.value) || 0),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">必监守护服务 (停止即告警)</label>
+                    <input
+                      className="input mono"
+                      placeholder="例如 nginx, postgresql, docker"
+                      value={watchedServicesText}
+                      onChange={(e) => setWatchedServicesText(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="field" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <label className="field-label">必监监听端口 (未处于 LISTEN 即告警，逗号分隔)</label>
+                  <input
+                    className="input mono"
+                    placeholder="例如 80, 443, 5432, 6379"
+                    value={watchedPortsText}
+                    onChange={(e) => setWatchedPortsText(e.target.value)}
                   />
                 </div>
               </div>

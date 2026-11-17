@@ -24,6 +24,7 @@ declare const self: DedicatedWorkerGlobalScope & {
   };
   __snsOnWasmReady?: () => void;
   __snsOnVaultLocked?: (reason: string) => void;
+  __snsOnAnchorUpdated?: (anchorJson: string) => void;
   __snsOnTermOutput?: (tabId: string, chunk: Uint8Array) => void;
   __snsOnTermExit?: (tabId: string, message: string) => void;
 };
@@ -94,6 +95,10 @@ let bootPromise: Promise<void> | null = null;
 
 self.__snsOnVaultLocked = (reason: string) => {
   self.postMessage({ kind: 'vault_locked', reason });
+};
+
+self.__snsOnAnchorUpdated = (anchorJson: string) => {
+  self.postMessage({ kind: 'anchor_updated', anchorJson });
 };
 
 self.__snsOnTermOutput = (tabId: string, chunk: Uint8Array) => {

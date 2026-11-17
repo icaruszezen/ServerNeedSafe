@@ -39,6 +39,11 @@
    - 客户端 WASM 原生 SFTP 引擎支持目录浏览、流式上传/下载、新建目录/文件、重命名、`chmod` 权限修改与在线文本编辑，文件路径与内容全程端到端加密。
 4. **内置密钥生成器与多机并发巡检**
    - 在客户端 WASM 内存中直接生成 `Ed25519` 或 `RSA-4096` 密钥对并一键部署公钥至目标主机 `~/.ssh/authorized_keys`；支持跨多台主机并发执行巡检指令。
+5. **全维服务器状态监控与端到端零知识时序归档（无 Agent 定时巡检）**
+   - 在客户端 WASM 隔离沙箱内内置后台定时 SSH 巡检调度器与时序引擎，无需在远端服务器安装任何 Agent，全程通过盲 TCP 中继建立端到端 SSH 加密通道完成采集，**部署服务器 `root` 全程零明文可见**：
+   - **12 大全方位监控采集维度**：连通性与系统画像（RTT 延迟、OS/内核/CPU/虚拟化/Uptime/NTP/温度）、250ms 双采样真实 CPU 分解（`User / System / IOWait / Steal`）与归一化负载、物理内存/Swap/文件句柄（`file-nr`）/OOM Kill、全分区容量/Inode 与块设备读写速率/IOPS、多网卡上下行速率/错丢包与内核 TCP/UDP Socket 状态矩阵、进程状态分布与 Top CPU/RSS 排行、监听端口审计与公网暴露端口安全基线、Systemd 故障服务与自定义必监服务、Docker 容器健康、以及主机防火墙/SELinux/特权账号/在线终端/SSH 爆破源 IP 安全态势。
+   - **18 项多维告警规则与防抖自愈**：内置主机离线、CPU/IOWait/负载、内存/Swap/OOM/FD、磁盘空间/Inode、SSH 高延迟、僵尸进程、CLOSE_WAIT 泄漏、Systemd/必监服务故障、Docker 异常容器、新公网暴露端口漂移、必监端口掉线及 SSH 爆破攻击等 18 条可配置规则，支持连续超限次数防抖、自动销警恢复、手动确认与 Webhook 推送。
+   - **100% 客户端零知识加密持久化与报表导出**：所有监控配置、最新快照、环形缓冲历史时序曲线、告警记录与端口基线均在客户端经 `XChaCha20-Poly1305` 封装进 `SNSVAULT v2` 密文容器，锁库时随 Web Worker 立即物理销毁并暂停巡检；支持纯客户端零知识导出 CSV（含 UTF-8 BOM）/ JSON 历史报表。
 
 ---
 
@@ -86,15 +91,16 @@ ServerNeedSafe/
 ├── cmd/
 │   ├── server/          # 零知识盲存储 + 盲 TCP 中继 Web 服务端入口（零明文、零密钥）
 │   ├── desktop/         # Windows 纯本地原生桌面 GUI 应用入口 (WebView2 + 回环守卫)
-│   └── wasm/            # 浏览器独立 Web Worker 零知识密码学与端到端 SSH/SFTP WASM 引擎入口
+│   └── wasm/            # 浏览器独立 Web Worker 零知识密码学、监控引擎与端到端 SSH/SFTP WASM 入口
 ├── internal/
-│   ├── vault/           # SNSVAULT v2 容器 (Argon2id + HKDF + XChaCha20-Poly1305 + BlindStore + ClientVault)
+│   ├── vault/           # SNSVAULT v2 容器 (Argon2id + HKDF + XChaCha20-Poly1305 + 监控时序加密归档)
 │   ├── auth/            # Ed25519 单次随机挑战会话、指数退避防爆破与单次中继票据
 │   ├── relay/           # 零元数据保留的 WebSocket ↔ TCP 盲二进制流中继器
 │   ├── sshmanager/      # 纯客户端端到端 SSHv2 拨号、ProxyJump、PTY 终端、SFTP 与密钥生成
+│   ├── monitor/         # 客户端无 Agent 全维状态采集脚本、解析器、定时巡检调度、18 项告警与报表导出
 │   ├── zkclient/        # 跨原生与 WASM 的零知识客户端引擎、CAS 自动合并与远端密文云同步
 │   └── api/             # 严格拒绝未知字段的零知识 REST/WS 路由与模拟服务器 root 沦陷测试套件
-└── web/                 # React + TypeScript + Dedicated Web Worker + SRI 完整性校验前端
+└── web/                 # React + TypeScript + SVG 时序图表 + Dedicated Web Worker + SRI 完整性校验前端
 ```
 
 ---
@@ -106,6 +112,6 @@ ServerNeedSafe/
 ```bash
 cd web && npm ci && npm run build && cd ..
 go vet ./...
-GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/zkclient
+GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/zkclient
 go test ./... -v -race -count=1
 ```

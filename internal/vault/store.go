@@ -85,17 +85,18 @@ type VaultAnchor struct {
 // ClientVault manages the client-side decrypted VaultState strictly in volatile client memory
 // and persists ONLY authenticated XChaCha20-Poly1305 ciphertext blobs to CiphertextBackend.
 type ClientVault struct {
-	mu           sync.RWMutex
-	backend      CiphertextBackend
-	dek          []byte
-	authPriv     ed25519.PrivateKey
-	header       *EnvelopeHeader
-	state        *VaultState
-	lastBlob     []byte
-	anchor       *VaultAnchor
-	unlockedAt   time.Time
-	lastActivity time.Time
-	onLockHooks  []func()
+	mu            sync.RWMutex
+	backend       CiphertextBackend
+	dek           []byte
+	authPriv      ed25519.PrivateKey
+	header        *EnvelopeHeader
+	state         *VaultState
+	lastBlob      []byte
+	anchor        *VaultAnchor
+	unlockedAt    time.Time
+	lastActivity  time.Time
+	onLockHooks   []func()
+	onUnlockHooks []func()
 
 	kdfTime      uint32
 	kdfMemoryKiB uint32
@@ -189,6 +190,13 @@ func (s *ClientVault) RegisterOnLock(fn func()) {
 	s.onLockHooks = append(s.onLockHooks, fn)
 }
 
+// RegisterOnUnlock registers a callback invoked whenever the client vault transitions to unlocked state.
+func (s *ClientVault) RegisterOnUnlock(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onUnlockHooks = append(s.onUnlockHooks, fn)
+}
+
 // Status returns the current lifecycle status of the client vault.
 func (s *ClientVault) Status() VaultStatus {
 	s.mu.RLock()
@@ -225,31 +233,37 @@ func (s *ClientVault) Setup(password, clientIP string) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if init, err := s.backend.IsInitialized(); err != nil {
+		s.mu.Unlock()
 		return err
 	} else if init {
+		s.mu.Unlock()
 		return ErrVaultAlreadyInit
 	}
 
 	// If an anchor already existed locally, warn about server wipe attack unless anchor was cleared explicitly!
 	if s.anchor != nil && s.anchor.VaultID != "" {
-		return fmt.Errorf("%w: 本地记录该服务端曾初始化保险库 (%s)，但服务端当前为空，疑似遭到重置删除", ErrRollbackDetected, s.anchor.VaultID)
+		vid := s.anchor.VaultID
+		s.mu.Unlock()
+		return fmt.Errorf("%w: 本地记录该服务端曾初始化保险库 (%s)，但服务端当前为空，疑似遭到重置删除", ErrRollbackDetected, vid)
 	}
 
 	salt, err := randomBytes(kdfSaltSize)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	dek, err := randomBytes(dekSize)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 
 	kek, authPriv, authPub, err := DeriveVaultKeys(password, salt, s.kdfTime, s.kdfMemoryKiB, s.kdfThreads, s.minMemoryKiB)
 	if err != nil {
 		zeroBytes(dek)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -269,6 +283,7 @@ func (s *ClientVault) Setup(password, clientIP string) error {
 	if err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -279,6 +294,7 @@ func (s *ClientVault) Setup(password, clientIP string) error {
 	if err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 	sig := SignSetup(authPriv, sealedHdr.VaultID, sealedHdr.Revision, rawBlob)
@@ -286,6 +302,7 @@ func (s *ClientVault) Setup(password, clientIP string) error {
 	if err := s.backend.Initialize(rawBlob, sig); err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -304,6 +321,12 @@ func (s *ClientVault) Setup(password, clientIP string) error {
 	now := time.Now().UTC()
 	s.unlockedAt = now
 	s.lastActivity = now
+	hooks := slices.Clone(s.onUnlockHooks)
+	s.mu.Unlock()
+
+	for _, fn := range hooks {
+		fn()
+	}
 	return nil
 }
 
@@ -336,13 +359,14 @@ func (s *ClientVault) UnlockFromRawBlob(raw []byte, password, clientIP string, r
 		zeroBytes(authPriv)
 		return ErrCorruptedVault
 	}
+	ensureMonitorInitialized(state)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err := s.verifyAndAdvanceAnchorLocked(hdr); err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -367,6 +391,12 @@ func (s *ClientVault) UnlockFromRawBlob(raw []byte, password, clientIP string, r
 			appendAuditLocked(st, "vault.unlock", "client-memory", "客户端零知识验证通过，本地内存解密保险库", clientIP, true)
 			return nil
 		})
+	}
+	hooks := slices.Clone(s.onUnlockHooks)
+	s.mu.Unlock()
+
+	for _, fn := range hooks {
+		fn()
 	}
 	return nil
 }
@@ -406,12 +436,13 @@ func (s *ClientVault) UnlockWithPreDerivedKeys(
 	if err != nil {
 		return err
 	}
+	ensureMonitorInitialized(state)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err := s.verifyAndAdvanceAnchorLocked(hdr); err != nil {
 		zeroBytes(dek)
+		s.mu.Unlock()
 		return err
 	}
 	if len(s.dek) > 0 {
@@ -435,6 +466,12 @@ func (s *ClientVault) UnlockWithPreDerivedKeys(
 			appendAuditLocked(st, "vault.unlock", "client-memory", "客户端零知识验证通过，本地内存解密保险库", clientIP, true)
 			return nil
 		})
+	}
+	hooks := slices.Clone(s.onUnlockHooks)
+	s.mu.Unlock()
+
+	for _, fn := range hooks {
+		fn()
 	}
 	return nil
 }
@@ -486,6 +523,7 @@ func scrubStateSecrets(st *VaultState) {
 		st.Credentials[i].Passphrase = ""
 		st.Credentials[i].Notes = ""
 	}
+	scrubMonitorData(st)
 }
 
 func cloneVaultState(st *VaultState) *VaultState {
@@ -495,6 +533,8 @@ func cloneVaultState(st *VaultState) *VaultState {
 	for i, srv := range st.Servers {
 		srvCp := srv
 		srvCp.Tags = slices.Clone(srv.Tags)
+		srvCp.WatchedServices = slices.Clone(srv.WatchedServices)
+		srvCp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 		if srv.LastConnectedAt != nil {
 			t := *srv.LastConnectedAt
 			srvCp.LastConnectedAt = &t
@@ -505,6 +545,7 @@ func cloneVaultState(st *VaultState) *VaultState {
 	cp.Snippets = slices.Clone(st.Snippets)
 	cp.KnownHosts = slices.Clone(st.KnownHosts)
 	cp.AuditLogs = slices.Clone(st.AuditLogs)
+	cp.Monitor = cloneMonitorVaultData(st.Monitor)
 	return &cp
 }
 
@@ -571,7 +612,8 @@ func (s *ClientVault) TouchActivity() {
 	s.mu.Unlock()
 }
 
-// CheckAutoLock locks the client vault if AutoLockMinutes > 0 and inactivity exceeds threshold.
+// CheckAutoLock locks the client vault if AutoLockMinutes > 0 and inactivity exceeds threshold
+// (unless UnattendedWhileUnlocked monitoring is actively running with configured servers).
 func (s *ClientVault) CheckAutoLock() bool {
 	s.mu.RLock()
 	if len(s.dek) == 0 || s.state == nil {
@@ -580,9 +622,11 @@ func (s *ClientVault) CheckAutoLock() bool {
 	}
 	mins := s.state.Settings.AutoLockMinutes
 	last := s.lastActivity
+	mon := s.state.Monitor
+	unattended := mon != nil && mon.Settings.Enabled && mon.Settings.UnattendedWhileUnlocked && len(s.state.Servers) > 0
 	s.mu.RUnlock()
 
-	if mins <= 0 {
+	if mins <= 0 || unattended {
 		return false
 	}
 	if time.Since(last) >= time.Duration(mins)*time.Minute {
@@ -725,9 +769,9 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 	if err != nil {
 		return err
 	}
+	ensureMonitorInitialized(state)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Upgrade v1 backup or advance revision on v2 backup so ciphertext nonce is fresh
 	var targetHdr EnvelopeHeader
@@ -735,11 +779,13 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 		salt, sErr := randomBytes(kdfSaltSize)
 		if sErr != nil {
 			zeroBytes(dek)
+			s.mu.Unlock()
 			return sErr
 		}
 		kek, derivedPriv, derivedPub, kErr := DeriveVaultKeys(backupPassword, salt, s.kdfTime, s.kdfMemoryKiB, s.kdfThreads, s.minMemoryKiB)
 		if kErr != nil {
 			zeroBytes(dek)
+			s.mu.Unlock()
 			return kErr
 		}
 		targetHdr = EnvelopeHeader{
@@ -758,6 +804,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 		if wErr != nil {
 			zeroBytes(dek)
 			zeroBytes(derivedPriv)
+			s.mu.Unlock()
 			return wErr
 		}
 		authPriv = derivedPriv
@@ -773,6 +820,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 	if err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -784,6 +832,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 		if pErr != nil {
 			zeroBytes(dek)
 			zeroBytes(authPriv)
+			s.mu.Unlock()
 			return pErr
 		}
 		if len(s.authPriv) == ed25519.PrivateKeySize && s.header != nil && s.header.VaultID == params.VaultID {
@@ -797,6 +846,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 			if dErr != nil {
 				zeroBytes(dek)
 				zeroBytes(authPriv)
+				s.mu.Unlock()
 				return dErr
 			}
 			zeroBytes(kekTmp)
@@ -808,6 +858,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 	if err := s.backend.Import(sealedBlob, newSig, overwriteSig); err != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
+		s.mu.Unlock()
 		return err
 	}
 
@@ -830,6 +881,12 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 	now := time.Now().UTC()
 	s.unlockedAt = now
 	s.lastActivity = now
+	hooks := slices.Clone(s.onUnlockHooks)
+	s.mu.Unlock()
+
+	for _, fn := range hooks {
+		fn()
+	}
 	return nil
 }
 
@@ -923,6 +980,8 @@ func (s *ClientVault) GetServerSecret(id string) (*ServerConfig, error) {
 		if srv.ID == id {
 			cp := srv
 			cp.Tags = slices.Clone(srv.Tags)
+			cp.WatchedServices = slices.Clone(srv.WatchedServices)
+			cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 			return &cp, nil
 		}
 	}
@@ -931,22 +990,57 @@ func (s *ClientVault) GetServerSecret(id string) (*ServerConfig, error) {
 
 // ServerMutationInput represents create/update request fields for an SSH server.
 type ServerMutationInput struct {
-	Name         string   `json:"name"`
-	Group        string   `json:"group"`
-	Tags         []string `json:"tags"`
-	Host         string   `json:"host"`
-	Port         int      `json:"port"`
-	Username     string   `json:"username"`
-	AuthType     AuthType `json:"auth_type"`
-	Password     *string  `json:"password,omitempty"`    // nil = keep existing on update
-	PrivateKey   *string  `json:"private_key,omitempty"` // nil = keep existing on update
-	Passphrase   *string  `json:"passphrase,omitempty"`  // nil = keep existing on update
-	CredentialID string   `json:"credential_id"`
-	JumpServerID string   `json:"jump_server_id"`
-	DefaultPath  string   `json:"default_path"`
-	Notes        string   `json:"notes"`
-	Pinned       bool     `json:"pinned"`
-	KeepAliveSec int      `json:"keep_alive_sec"`
+	Name              string   `json:"name"`
+	Group             string   `json:"group"`
+	Tags              []string `json:"tags"`
+	Host              string   `json:"host"`
+	Port              int      `json:"port"`
+	Username          string   `json:"username"`
+	AuthType          AuthType `json:"auth_type"`
+	Password          *string  `json:"password,omitempty"`    // nil = keep existing on update
+	PrivateKey        *string  `json:"private_key,omitempty"` // nil = keep existing on update
+	Passphrase        *string  `json:"passphrase,omitempty"`  // nil = keep existing on update
+	CredentialID      string   `json:"credential_id"`
+	JumpServerID      string   `json:"jump_server_id"`
+	DefaultPath       string   `json:"default_path"`
+	Notes             string   `json:"notes"`
+	Pinned            bool     `json:"pinned"`
+	KeepAliveSec      int      `json:"keep_alive_sec"`
+	MonitorEnabled    *bool    `json:"monitor_enabled,omitempty"`
+	CustomIntervalSec *int     `json:"custom_interval_sec,omitempty"`
+	WatchedServices   []string `json:"watched_services,omitempty"`
+	WatchedPorts      []int    `json:"watched_ports,omitempty"`
+}
+
+func sanitizeServiceNames(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		clean := strings.TrimSpace(item)
+		if clean == "" || len(clean) > 64 {
+			continue
+		}
+		valid := true
+		for _, ch := range clean {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '@') {
+				valid = false
+				break
+			}
+		}
+		if valid && !slices.Contains(out, clean) {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+func sanitizePortList(raw []int) []int {
+	out := make([]int, 0, len(raw))
+	for _, p := range raw {
+		if p > 0 && p <= 65535 && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func sanitizeServerInput(in *ServerMutationInput) error {
@@ -979,6 +1073,23 @@ func sanitizeServerInput(in *ServerMutationInput) error {
 		}
 	}
 	in.Tags = cleanTags
+	if in.CustomIntervalSec != nil {
+		v := *in.CustomIntervalSec
+		if v < 0 {
+			v = 0
+		} else if v > 0 && v < 10 {
+			v = 10
+		} else if v > 86400 {
+			v = 86400
+		}
+		*in.CustomIntervalSec = v
+	}
+	if in.WatchedServices != nil {
+		in.WatchedServices = sanitizeServiceNames(in.WatchedServices)
+	}
+	if in.WatchedPorts != nil {
+		in.WatchedPorts = sanitizePortList(in.WatchedPorts)
+	}
 	return nil
 }
 
@@ -998,22 +1109,30 @@ func (s *ClientVault) CreateServer(in ServerMutationInput, clientIP string) (*Se
 	err := s.mutateLocked(func(st *VaultState) error {
 		now := time.Now().UTC()
 		srv := ServerConfig{
-			ID:           newID,
-			Name:         in.Name,
-			Group:        in.Group,
-			Tags:         slices.Clone(in.Tags),
-			Host:         in.Host,
-			Port:         in.Port,
-			Username:     in.Username,
-			AuthType:     in.AuthType,
-			CredentialID: in.CredentialID,
-			JumpServerID: in.JumpServerID,
-			DefaultPath:  strings.TrimSpace(in.DefaultPath),
-			Notes:        strings.TrimSpace(in.Notes),
-			Pinned:       in.Pinned,
-			KeepAliveSec: in.KeepAliveSec,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			ID:              newID,
+			Name:            in.Name,
+			Group:           in.Group,
+			Tags:            slices.Clone(in.Tags),
+			Host:            in.Host,
+			Port:            in.Port,
+			Username:        in.Username,
+			AuthType:        in.AuthType,
+			CredentialID:    in.CredentialID,
+			JumpServerID:    in.JumpServerID,
+			DefaultPath:     strings.TrimSpace(in.DefaultPath),
+			Notes:           strings.TrimSpace(in.Notes),
+			Pinned:          in.Pinned,
+			KeepAliveSec:    in.KeepAliveSec,
+			WatchedServices: slices.Clone(in.WatchedServices),
+			WatchedPorts:    slices.Clone(in.WatchedPorts),
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		if in.MonitorEnabled != nil {
+			srv.MonitorDisabled = !(*in.MonitorEnabled)
+		}
+		if in.CustomIntervalSec != nil {
+			srv.CustomIntervalSec = *in.CustomIntervalSec
 		}
 		if in.Password != nil {
 			srv.Password = *in.Password
@@ -1079,6 +1198,18 @@ func (s *ClientVault) UpdateServer(id string, in ServerMutationInput, clientIP s
 		srv.Notes = strings.TrimSpace(in.Notes)
 		srv.Pinned = in.Pinned
 		srv.KeepAliveSec = in.KeepAliveSec
+		if in.MonitorEnabled != nil {
+			srv.MonitorDisabled = !(*in.MonitorEnabled)
+		}
+		if in.CustomIntervalSec != nil {
+			srv.CustomIntervalSec = *in.CustomIntervalSec
+		}
+		if in.WatchedServices != nil {
+			srv.WatchedServices = slices.Clone(in.WatchedServices)
+		}
+		if in.WatchedPorts != nil {
+			srv.WatchedPorts = slices.Clone(in.WatchedPorts)
+		}
 		srv.UpdatedAt = time.Now().UTC()
 
 		if in.Password != nil {
@@ -1118,6 +1249,21 @@ func (s *ClientVault) DeleteServer(id, clientIP string) error {
 					if st.Servers[j].JumpServerID == id {
 						st.Servers[j].JumpServerID = ""
 					}
+				}
+				// Purge monitoring state associated with deleted server
+				if st.Monitor != nil {
+					delete(st.Monitor.LatestSnapshots, id)
+					delete(st.Monitor.HistoryByServer, id)
+					delete(st.Monitor.PortBaselines, id)
+					prefix := id + "|"
+					for k := range st.Monitor.BreachStreaks {
+						if strings.HasPrefix(k, prefix) {
+							delete(st.Monitor.BreachStreaks, k)
+						}
+					}
+					st.Monitor.Alerts = slices.DeleteFunc(st.Monitor.Alerts, func(a MonitorAlert) bool {
+						return a.ServerID == id
+					})
 				}
 				appendAuditLocked(st, "server.delete", fmt.Sprintf("%s (%s:%d)", srv.Name, srv.Host, srv.Port), "删除服务器配置", clientIP, true)
 				return nil

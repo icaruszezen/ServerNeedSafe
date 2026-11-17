@@ -46,40 +46,48 @@ type ServerConfig struct {
 	JumpServerID       string    `json:"jump_server_id,omitempty"` // Optional SSH Bastion / ProxyJump server ID
 	DefaultPath        string    `json:"default_path,omitempty"`   // Default initial SFTP / shell directory
 	Notes              string    `json:"notes,omitempty"`
-	Pinned             bool      `json:"pinned"`
-	KeepAliveSec       int       `json:"keep_alive_sec"`
+	Pinned             bool       `json:"pinned"`
+	KeepAliveSec       int        `json:"keep_alive_sec"`
+	MonitorDisabled    bool       `json:"monitor_disabled,omitempty"`
+	CustomIntervalSec  int        `json:"custom_interval_sec,omitempty"`
+	WatchedServices    []string   `json:"watched_services,omitempty"`
+	WatchedPorts       []int      `json:"watched_ports,omitempty"`
 	LastConnectedAt    *time.Time `json:"last_connected_at,omitempty"`
-	LastLatencyMs      int64     `json:"last_latency_ms,omitempty"`
-	LastOSInfo         string    `json:"last_os_info,omitempty"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	LastLatencyMs      int64      `json:"last_latency_ms,omitempty"`
+	LastOSInfo         string     `json:"last_os_info,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // ServerView is a redacted representation returned to list views so raw secrets
 // are never unnecessarily transmitted over HTTP JSON responses unless explicitly needed internally.
 type ServerView struct {
-	ID              string     `json:"id"`
-	Name            string     `json:"name"`
-	Group           string     `json:"group"`
-	Tags            []string   `json:"tags"`
-	Host            string     `json:"host"`
-	Port            int        `json:"port"`
-	Username        string     `json:"username"`
-	AuthType        AuthType   `json:"auth_type"`
-	HasPassword     bool       `json:"has_password"`
-	HasPrivateKey   bool       `json:"has_private_key"`
-	HasPassphrase   bool       `json:"has_passphrase"`
-	CredentialID    string     `json:"credential_id,omitempty"`
-	JumpServerID    string     `json:"jump_server_id,omitempty"`
-	DefaultPath     string     `json:"default_path,omitempty"`
-	Notes           string     `json:"notes,omitempty"`
-	Pinned          bool       `json:"pinned"`
-	KeepAliveSec    int        `json:"keep_alive_sec"`
-	LastConnectedAt *time.Time `json:"last_connected_at,omitempty"`
-	LastLatencyMs   int64      `json:"last_latency_ms,omitempty"`
-	LastOSInfo      string     `json:"last_os_info,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	Group             string     `json:"group"`
+	Tags              []string   `json:"tags"`
+	Host              string     `json:"host"`
+	Port              int        `json:"port"`
+	Username          string     `json:"username"`
+	AuthType          AuthType   `json:"auth_type"`
+	HasPassword       bool       `json:"has_password"`
+	HasPrivateKey     bool       `json:"has_private_key"`
+	HasPassphrase     bool       `json:"has_passphrase"`
+	CredentialID      string     `json:"credential_id,omitempty"`
+	JumpServerID      string     `json:"jump_server_id,omitempty"`
+	DefaultPath       string     `json:"default_path,omitempty"`
+	Notes             string     `json:"notes,omitempty"`
+	Pinned            bool       `json:"pinned"`
+	KeepAliveSec      int        `json:"keep_alive_sec"`
+	MonitorEnabled    bool       `json:"monitor_enabled"`
+	CustomIntervalSec int        `json:"custom_interval_sec,omitempty"`
+	WatchedServices   []string   `json:"watched_services"`
+	WatchedPorts      []int      `json:"watched_ports"`
+	LastConnectedAt   *time.Time `json:"last_connected_at,omitempty"`
+	LastLatencyMs     int64      `json:"last_latency_ms,omitempty"`
+	LastOSInfo        string     `json:"last_os_info,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 func (s ServerConfig) ToView() ServerView {
@@ -87,29 +95,41 @@ func (s ServerConfig) ToView() ServerView {
 	if tags == nil {
 		tags = []string{}
 	}
+	watchedSvcs := s.WatchedServices
+	if watchedSvcs == nil {
+		watchedSvcs = []string{}
+	}
+	watchedPorts := s.WatchedPorts
+	if watchedPorts == nil {
+		watchedPorts = []int{}
+	}
 	return ServerView{
-		ID:              s.ID,
-		Name:            s.Name,
-		Group:           s.Group,
-		Tags:            tags,
-		Host:            s.Host,
-		Port:            s.Port,
-		Username:        s.Username,
-		AuthType:        s.AuthType,
-		HasPassword:     s.Password != "",
-		HasPrivateKey:   s.PrivateKey != "",
-		HasPassphrase:   s.Passphrase != "",
-		CredentialID:    s.CredentialID,
-		JumpServerID:    s.JumpServerID,
-		DefaultPath:     s.DefaultPath,
-		Notes:           s.Notes,
-		Pinned:          s.Pinned,
-		KeepAliveSec:    s.KeepAliveSec,
-		LastConnectedAt: s.LastConnectedAt,
-		LastLatencyMs:   s.LastLatencyMs,
-		LastOSInfo:      s.LastOSInfo,
-		CreatedAt:       s.CreatedAt,
-		UpdatedAt:       s.UpdatedAt,
+		ID:                s.ID,
+		Name:              s.Name,
+		Group:             s.Group,
+		Tags:              tags,
+		Host:              s.Host,
+		Port:              s.Port,
+		Username:          s.Username,
+		AuthType:          s.AuthType,
+		HasPassword:       s.Password != "",
+		HasPrivateKey:     s.PrivateKey != "",
+		HasPassphrase:     s.Passphrase != "",
+		CredentialID:      s.CredentialID,
+		JumpServerID:      s.JumpServerID,
+		DefaultPath:       s.DefaultPath,
+		Notes:             s.Notes,
+		Pinned:            s.Pinned,
+		KeepAliveSec:      s.KeepAliveSec,
+		MonitorEnabled:    !s.MonitorDisabled,
+		CustomIntervalSec: s.CustomIntervalSec,
+		WatchedServices:   watchedSvcs,
+		WatchedPorts:      watchedPorts,
+		LastConnectedAt:   s.LastConnectedAt,
+		LastLatencyMs:     s.LastLatencyMs,
+		LastOSInfo:        s.LastOSInfo,
+		CreatedAt:         s.CreatedAt,
+		UpdatedAt:         s.UpdatedAt,
 	}
 }
 
@@ -211,18 +231,19 @@ type AppSettings struct {
 // VaultState is the root plaintext structure serialized, compressed, padded,
 // and encrypted via XChaCha20-Poly1305 into vault.sns exclusively on the client.
 type VaultState struct {
-	SchemaVersion int            `json:"schema_version"`
-	VaultID       string         `json:"vault_id,omitempty"`
-	Revision      uint64         `json:"revision,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	Groups        []string       `json:"groups"`
-	Servers       []ServerConfig `json:"servers"`
-	Credentials   []Credential   `json:"credentials"`
-	Snippets      []Snippet      `json:"snippets"`
-	KnownHosts    []KnownHost    `json:"known_hosts"`
-	AuditLogs     []AuditEntry   `json:"audit_logs"`
-	Settings      AppSettings    `json:"settings"`
+	SchemaVersion int               `json:"schema_version"`
+	VaultID       string            `json:"vault_id,omitempty"`
+	Revision      uint64            `json:"revision,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	Groups        []string          `json:"groups"`
+	Servers       []ServerConfig    `json:"servers"`
+	Credentials   []Credential      `json:"credentials"`
+	Snippets      []Snippet         `json:"snippets"`
+	KnownHosts    []KnownHost       `json:"known_hosts"`
+	AuditLogs     []AuditEntry      `json:"audit_logs"`
+	Settings      AppSettings       `json:"settings"`
+	Monitor       *MonitorVaultData `json:"monitor,omitempty"`
 }
 
 // DefaultVaultState initializes a clean vault with practical default groups and security inspection snippets.
@@ -288,5 +309,6 @@ func DefaultVaultState() *VaultState {
 			TerminalScrollback: 5000,
 			ShowHiddenFiles:    true,
 		},
+		Monitor: DefaultMonitorVaultData(),
 	}
 }

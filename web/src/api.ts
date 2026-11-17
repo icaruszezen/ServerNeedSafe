@@ -4,6 +4,14 @@ import type {
   BatchExecResult,
   CredentialView,
   HostKeyUntrustedInfo,
+  MonitorAlert,
+  MonitorAlertRule,
+  MonitorOverviewResponse,
+  MonitorPolicyResponse,
+  MonitorRuntimeStatus,
+  MonitorSettings,
+  ServerMonitorDetailResponse,
+  ServerMonitorSnapshot,
   ServerMutationPayload,
   ServerProbeResult,
   ServerView,
@@ -365,4 +373,64 @@ export const api = {
 
   sftpChmod: (serverId: string, path: string, mode: string) =>
     zkCall<{ ok: boolean }>('sftpChmod', { server_id: serverId, path, mode }),
+
+  // Client-side E2EE Server Status Monitoring & Time-Series Telemetry (zero server plaintext)
+  getMonitorOverview: () => zkCall<MonitorOverviewResponse>('getMonitorOverview'),
+
+  getServerMonitorDetail: (id: string, range = '1h') =>
+    zkCall<ServerMonitorDetailResponse>('getServerMonitorDetail', { id, range }),
+
+  collectAllMonitor: (server_ids: string[] = []) =>
+    zkCall<{
+      ok: boolean;
+      count: number;
+      snapshots: ServerMonitorSnapshot[];
+      runtime: MonitorRuntimeStatus;
+    }>('collectAllMonitor', { server_ids }),
+
+  collectServerMonitor: (id: string, trust_fingerprint = '') =>
+    zkCall<{
+      ok: boolean;
+      snapshot: ServerMonitorSnapshot;
+      runtime: MonitorRuntimeStatus;
+    }>('collectServerMonitor', { id, trust_fingerprint }),
+
+  acceptPortBaseline: (id: string) =>
+    zkCall<{ ok: boolean; port_baseline: string[] }>('acceptPortBaseline', { id }),
+
+  listMonitorAlerts: (status = '', server_id = '', limit = 300) =>
+    zkCall<{ alerts: MonitorAlert[] }>('listMonitorAlerts', { status, server_id, limit }),
+
+  ackMonitorAlert: (id: string) =>
+    zkCall<{ ok: boolean; alert: MonitorAlert }>('ackMonitorAlert', { id }),
+
+  clearResolvedMonitorAlerts: () =>
+    zkCall<{ ok: boolean; removed: number }>('clearResolvedMonitorAlerts'),
+
+  getMonitorPolicy: () => zkCall<MonitorPolicyResponse>('getMonitorPolicy'),
+
+  updateMonitorPolicy: (settings: MonitorSettings, rules: MonitorAlertRule[]) =>
+    zkCall<MonitorPolicyResponse & { ok: boolean }>('updateMonitorPolicy', { settings, rules }),
+
+  clearMonitorHistory: (server_id = '') =>
+    zkCall<{ ok: boolean }>('clearMonitorHistory', { server_id }),
+
+  exportMonitorBlob: async (
+    format: 'csv' | 'json',
+    server_id = '',
+    range = 'all'
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const { data, bytes } = await zkCallWithBytes<{
+      filename: string;
+      content_type: string;
+    }>('exportMonitorHistory', { format, server_id, range });
+    const raw = bytes ? new Uint8Array(bytes) : new Uint8Array(0);
+    const copy = new Uint8Array(raw.byteLength);
+    copy.set(raw);
+    const mime =
+      data.content_type ||
+      (format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8');
+    const blob = new Blob([copy.buffer], { type: mime });
+    return { blob, filename: data.filename || `ServerNeedSafe-monitor.${format}` };
+  },
 };

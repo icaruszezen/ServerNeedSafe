@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
+	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
@@ -461,16 +463,17 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 	_ = targetHost
 	internalTargetHost := "localhost"
 	targetSrv, err := client.Vault().CreateServer(vault.ServerMutationInput{
-		Name:         "CoreDB-Master-Secret-Vault",
-		Group:        "核心涉密数据库组",
-		Tags:         []string{"zero-trust-db"},
-		Host:         internalTargetHost,
-		Port:         targetPort,
-		Username:     "coredb_secret_admin",
-		AuthType:     vault.AuthCredential,
-		CredentialID: cred.ID,
-		JumpServerID: bastionSrv.ID,
-		Notes:        "COREDB_PRIVATE_NOTE_6633",
+		Name:            "CoreDB-Master-Secret-Vault",
+		Group:           "核心涉密数据库组",
+		Tags:            []string{"zero-trust-db"},
+		Host:            internalTargetHost,
+		Port:            targetPort,
+		Username:        "coredb_secret_admin",
+		AuthType:        vault.AuthCredential,
+		CredentialID:    cred.ID,
+		JumpServerID:    bastionSrv.ID,
+		Notes:           "COREDB_PRIVATE_NOTE_6633",
+		WatchedServices: []string{"secret-watched-daemon-canary"},
 	}, "client-zk")
 	if err != nil {
 		t.Fatalf("CreateServer target: %v", err)
@@ -568,6 +571,25 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 		t.Fatalf("SFTPDownloadBytes mismatch: name=%q bytes=%q err=%v", dlName, string(dlBytes), err)
 	}
 
+	// Full-Spectrum Server Status Monitoring over blind TCP relay + ProxyJump
+	monSettings, monRules, err := client.Vault().GetMonitorPolicy()
+	if err != nil {
+		t.Fatalf("GetMonitorPolicy: %v", err)
+	}
+	secretWebhookCanary := "http://127.0.0.1:9/secret-monitor-webhook-canary-9944"
+	monSettings.WebhookURL = secretWebhookCanary
+	if _, _, err := client.Vault().UpdateMonitorPolicy(monSettings, monRules, "client-zk"); err != nil {
+		t.Fatalf("UpdateMonitorPolicy: %v", err)
+	}
+	monSnap, err := client.Monitor().CollectServerNow(context.Background(), targetSrv.ID, "", "client-zk")
+	if err != nil || monSnap == nil || !monSnap.Reachable || monSnap.CPUCores < 1 {
+		t.Fatalf("Monitor.CollectServerNow over blind relay + ProxyJump failed: snap=%+v err=%v", monSnap, err)
+	}
+	csvExportBytes, csvName, _, err := monitor.ExportHistory(client.Vault(), "csv", targetSrv.ID, "all", "client-zk")
+	if err != nil || !strings.HasSuffix(csvName, ".csv") || !bytes.Contains(csvExportBytes, []byte("CoreDB-Master-Secret-Vault")) {
+		t.Fatalf("monitor.ExportHistory failed: name=%q err=%v", csvName, err)
+	}
+
 	// Rotate Master Password (rotates Argon2id salt, DEK, and Ed25519 AuthKeyPair)
 	if err := client.ChangePassword(adminPass1, adminPass2); err != nil {
 		t.Fatalf("ChangePassword: %v", err)
@@ -588,6 +610,10 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 	pulledServers, err := desktopPullClient.Vault().ListServers()
 	if err != nil || len(pulledServers) != 2 {
 		t.Fatalf("expected 2 synced servers on secondary server, got %d (err=%v)", len(pulledServers), err)
+	}
+	pulledMonDetail, err := desktopPullClient.Vault().GetServerMonitorDetail(targetSrv.ID, time.Hour)
+	if err != nil || pulledMonDetail.Snapshot == nil || !pulledMonDetail.Snapshot.Reachable || len(pulledMonDetail.Series) != 1 {
+		t.Fatalf("expected synced E2EE monitoring snapshot & series on secondary server, got %+v (err=%v)", pulledMonDetail, err)
 	}
 	_ = desktopPullClient.Lock()
 
@@ -633,6 +659,9 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 		"zero-trust-db",
 		"coredb_secret_admin",
 		"COREDB_PRIVATE_NOTE_6633",
+		"secret-watched-daemon-canary",
+		secretWebhookCanary,
+		"SNS_MON_BEGIN_V1",
 		fmt.Sprintf("localhost:%d", targetPort), // inner ProxyJump target never even touches sns-server relay!
 		"Secret-DB-Audit-Snippet",
 		"SUPER_SECRET_BATCH_TOKEN_7749",

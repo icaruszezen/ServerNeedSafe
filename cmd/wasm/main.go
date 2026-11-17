@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"syscall/js"
 	"time"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/internal/zkclient"
@@ -262,9 +264,26 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		if req.Anchor != nil && req.Anchor.VaultID != "" {
 			eng.Vault().SetAnchor(req.Anchor)
 		}
+		eng.Monitor().SetOnPersist(func() {
+			anchor := eng.Vault().GetAnchor()
+			if anchor == nil || anchor.VaultID == "" {
+				return
+			}
+			fn := js.Global().Get("__snsOnAnchorUpdated")
+			if fn.Type() == js.TypeFunction {
+				if raw, mErr := json.Marshal(anchor); mErr == nil {
+					fn.Invoke(string(raw))
+				}
+			}
+		})
 		rt.mu.Lock()
+		prevEng := rt.engine
 		rt.engine = eng
 		rt.mu.Unlock()
+		if prevEng != nil {
+			prevEng.Close()
+		}
+		eng.Monitor().Start()
 		return makeSuccessEnvelope(map[string]any{"ok": true}, nil)
 	}
 
@@ -467,6 +486,7 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		if err != nil {
 			return makeErrorEnvelope(err)
 		}
+		eng.Monitor().Wake()
 		return makeSuccessEnvelope(map[string]any{
 			"server": srv,
 			"anchor": eng.Vault().GetAnchor(),
@@ -484,6 +504,7 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		if err != nil {
 			return makeErrorEnvelope(err)
 		}
+		eng.Monitor().Wake()
 		return makeSuccessEnvelope(map[string]any{
 			"server": srv,
 			"anchor": eng.Vault().GetAnchor(),
@@ -499,6 +520,7 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		if err := eng.Vault().DeleteServer(req.ID, "client-zk"); err != nil {
 			return makeErrorEnvelope(err)
 		}
+		eng.Monitor().Wake()
 		return makeSuccessEnvelope(map[string]any{
 			"ok":     true,
 			"anchor": eng.Vault().GetAnchor(),
@@ -963,6 +985,211 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 			"summary": sum,
 			"anchor":  eng.Vault().GetAnchor(),
 		}, nil)
+
+	case "getMonitorOverview":
+		ov, err := eng.Vault().GetMonitorOverview()
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"settings": ov.Settings,
+			"kpi":      ov.KPI,
+			"nodes":    ov.Nodes,
+			"alerts":   ov.Alerts,
+			"runtime":  eng.Monitor().Status(),
+		}, nil)
+
+	case "getServerMonitorDetail":
+		var req struct {
+			ID    string `json:"id"`
+			Range string `json:"range"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		detail, err := eng.Vault().GetServerMonitorDetail(req.ID, monitor.ParseHistoryRange(req.Range))
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"detail":  detail,
+			"runtime": eng.Monitor().Status(),
+		}, nil)
+
+	case "collectAllMonitor":
+		var req struct {
+			ServerIDs []string `json:"server_ids"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		snaps, err := eng.Monitor().CollectAllNow(context.Background(), req.ServerIDs, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":        true,
+			"count":     len(snaps),
+			"snapshots": snaps,
+			"runtime":   eng.Monitor().Status(),
+			"anchor":    eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "collectServerMonitor":
+		var req struct {
+			ID               string `json:"id"`
+			TrustFingerprint string `json:"trust_fingerprint"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		snap, err := eng.Monitor().CollectServerNow(context.Background(), req.ID, req.TrustFingerprint, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":       true,
+			"snapshot": snap,
+			"runtime":  eng.Monitor().Status(),
+			"anchor":   eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "acceptPortBaseline":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		base, err := eng.Vault().AcceptServerPortBaseline(req.ID, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":            true,
+			"port_baseline": base,
+			"anchor":        eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "listMonitorAlerts":
+		var req struct {
+			Status   string `json:"status"`
+			ServerID string `json:"server_id"`
+			Limit    int    `json:"limit"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		if req.Limit <= 0 {
+			req.Limit = 300
+		}
+		alerts, err := eng.Vault().ListMonitorAlerts(req.Status, req.ServerID, req.Limit)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{"alerts": alerts}, nil)
+
+	case "ackMonitorAlert":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		al, err := eng.Vault().AcknowledgeMonitorAlert(req.ID, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"alert":  al,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "clearResolvedMonitorAlerts":
+		eng.Vault().TouchActivity()
+		removed, err := eng.Vault().ClearResolvedMonitorAlerts("client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":      true,
+			"removed": removed,
+			"anchor":  eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "getMonitorPolicy":
+		settings, rules, err := eng.Vault().GetMonitorPolicy()
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"settings": settings,
+			"rules":    rules,
+			"runtime":  eng.Monitor().Status(),
+		}, nil)
+
+	case "updateMonitorPolicy":
+		var req struct {
+			Settings vault.MonitorSettings    `json:"settings"`
+			Rules    []vault.MonitorAlertRule `json:"rules"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		settings, rules, err := eng.Vault().UpdateMonitorPolicy(req.Settings, req.Rules, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Monitor().Wake()
+		return makeSuccessEnvelope(map[string]any{
+			"ok":       true,
+			"settings": settings,
+			"rules":    rules,
+			"runtime":  eng.Monitor().Status(),
+			"anchor":   eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "clearMonitorHistory":
+		var req struct {
+			ServerID string `json:"server_id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		if err := eng.Vault().ClearMonitorHistory(req.ServerID, "client-zk"); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "exportMonitorHistory":
+		var req struct {
+			Format   string `json:"format"`
+			ServerID string `json:"server_id"`
+			Range    string `json:"range"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		raw, filename, contentType, err := monitor.ExportHistory(eng.Vault(), req.Format, req.ServerID, req.Range, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"filename":     filename,
+			"content_type": contentType,
+			"anchor":       eng.Vault().GetAnchor(),
+		}, raw)
 
 	default:
 		return makeErrorEnvelope(fmt.Errorf("unknown WASM RPC action %q", action))

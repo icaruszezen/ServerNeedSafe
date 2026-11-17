@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ShieldCheck,
   Server,
+  Activity,
   Terminal,
   KeyRound,
   Zap,
@@ -22,12 +23,13 @@ import type {
 } from './types';
 import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
+import { MonitorCenter } from './components/MonitorCenter';
 import { TerminalWorkspace } from './components/TerminalWorkspace';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
 import { VaultSecurity } from './components/VaultSecurity';
 
-type NavKey = 'servers' | 'terminals' | 'keychain' | 'snippets' | 'vault';
+type NavKey = 'servers' | 'monitor' | 'terminals' | 'keychain' | 'snippets' | 'vault';
 
 export const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -39,6 +41,8 @@ export const App: React.FC = () => {
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [settings, setSettings] = useState<AppSettings | undefined>(undefined);
   const [activeNav, setActiveNav] = useState<NavKey>('servers');
+  const [monitorTargetId, setMonitorTargetId] = useState<string>('');
+  const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
 
   // Decrypted Workspace State (exists strictly in memory while unlocked)
   const [servers, setServers] = useState<ServerView[]>([]);
@@ -75,6 +79,8 @@ export const App: React.FC = () => {
     setSnippets([]);
     setTerminalTabs([]);
     setActiveTabId('');
+    setMonitorTargetId('');
+    setFiringAlertsCount(0);
     setActiveNav('servers');
   }, []);
 
@@ -95,16 +101,20 @@ export const App: React.FC = () => {
 
   const loadWorkspaceData = useCallback(async () => {
     try {
-      const [srvRes, credRes, snipRes] = await Promise.all([
+      const [srvRes, credRes, snipRes, monRes] = await Promise.all([
         api.listServers(),
         api.listCredentials(),
         api.listSnippets(),
+        api.getMonitorOverview().catch(() => null),
       ]);
       setServers(srvRes.servers || []);
       setGroups(srvRes.groups || []);
       setBackendActiveServerIds((srvRes.active_sessions || []).map((s) => s.server_id));
       setCredentials(credRes.credentials || []);
       setSnippets(snipRes.snippets || []);
+      if (monRes) {
+        setFiringAlertsCount(monRes.kpi.firing_alerts || 0);
+      }
     } catch {
       // Handled by global 401 listener if session expired
     }
@@ -163,6 +173,11 @@ export const App: React.FC = () => {
     setActiveTabId(tabId);
     if (openSftp) setOpenSftpOnNextTab(true);
     setActiveNav('terminals');
+  };
+
+  const handleOpenMonitor = (serverId: string) => {
+    setMonitorTargetId(serverId);
+    setActiveNav('monitor');
   };
 
   const handleCloseTab = (tabId: string) => {
@@ -226,7 +241,7 @@ export const App: React.FC = () => {
         </div>
 
         <nav className="sidebar-nav" aria-label="主导航">
-          <div className="nav-section-label">SSH 运维管理</div>
+          <div className="nav-section-label">SSH 运维与可观测</div>
           <button
             type="button"
             id="nav-servers-btn"
@@ -237,6 +252,24 @@ export const App: React.FC = () => {
               <Server size={16} /> 主机资产
             </span>
             <span className="nav-badge">{servers.length}</span>
+          </button>
+
+          <button
+            type="button"
+            id="nav-monitor-btn"
+            className={`nav-item ${activeNav === 'monitor' ? 'active' : ''}`}
+            onClick={() => setActiveNav('monitor')}
+          >
+            <span className="nav-item-left">
+              <Activity size={16} /> 状态监控
+            </span>
+            {firingAlertsCount > 0 ? (
+              <span className="nav-badge danger">{firingAlertsCount}</span>
+            ) : servers.length > 0 ? (
+              <span className="nav-badge live">
+                {servers.filter((s) => s.monitor_enabled !== false).length}
+              </span>
+            ) : null}
           </button>
 
           <button
@@ -334,6 +367,19 @@ export const App: React.FC = () => {
             showHiddenFiles={settings?.show_hidden_files}
             onRefresh={loadWorkspaceData}
             onConnectTerminal={handleConnectTerminal}
+            onOpenMonitor={handleOpenMonitor}
+            onNotify={notify}
+          />
+        )}
+
+        {activeNav === 'monitor' && (
+          <MonitorCenter
+            servers={servers}
+            initialServerId={monitorTargetId}
+            onClearInitialServer={() => setMonitorTargetId('')}
+            onConnectTerminal={handleConnectTerminal}
+            onNavigateServers={() => setActiveNav('servers')}
+            onFiringCountChange={setFiringAlertsCount}
             onNotify={notify}
           />
         )}

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -334,13 +335,14 @@ func (b *httpBlindBackend) dialRelayTCP(ctx context.Context, addr string, timeou
 }
 
 // Engine unifies the client-side Zero-Knowledge Vault, Ed25519 Challenge-Response Auth,
-// End-to-End SSHv2/SFTP Manager over Blind TCP Relay, and Remote Zero-Knowledge Sync.
+// End-to-End SSHv2/SFTP/Monitoring Manager over Blind TCP Relay, and Remote Zero-Knowledge Sync.
 type Engine struct {
 	baseURL string
 	doer    HTTPJSONDoer
 	backend *httpBlindBackend
 	cv      *vault.ClientVault
 	sshMgr  *sshmanager.Manager
+	mon     *monitor.Engine
 }
 
 func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
@@ -348,6 +350,7 @@ func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
 	cv := vault.NewClientVault(backend)
 	sshMgr := sshmanager.NewManager(cv)
 	sshMgr.SetDialTCPFunc(backend.dialRelayTCP)
+	mon := monitor.NewEngine(cv, sshMgr)
 
 	return &Engine{
 		baseURL: backend.baseURL,
@@ -355,6 +358,7 @@ func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
 		backend: backend,
 		cv:      cv,
 		sshMgr:  sshMgr,
+		mon:     mon,
 	}
 }
 
@@ -364,6 +368,19 @@ func (e *Engine) Vault() *vault.ClientVault {
 
 func (e *Engine) SSH() *sshmanager.Manager {
 	return e.sshMgr
+}
+
+func (e *Engine) Monitor() *monitor.Engine {
+	return e.mon
+}
+
+func (e *Engine) Close() {
+	if e.mon != nil {
+		e.mon.Close()
+	}
+	if e.sshMgr != nil {
+		e.sshMgr.CloseAllSessions()
+	}
 }
 
 func (e *Engine) Token() string {
