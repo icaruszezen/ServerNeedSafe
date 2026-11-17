@@ -200,17 +200,20 @@ type AuditEntry struct {
 
 // AppSettings stores all user preferences inside the encrypted vault.
 type AppSettings struct {
-	AutoLockMinutes   int           `json:"auto_lock_minutes"`    // 0 = disabled, default 30
-	HostKeyPolicy     HostKeyPolicy `json:"host_key_policy"`      // "tofu" or "ask_new"
-	TerminalFontSize  int           `json:"terminal_font_size"`   // default 14
-	TerminalScrollback int          `json:"terminal_scrollback"`  // default 5000
-	ShowHiddenFiles   bool          `json:"show_hidden_files"`    // SFTP hidden files
+	AutoLockMinutes    int           `json:"auto_lock_minutes"`             // 0 = disabled, default 30
+	HostKeyPolicy      HostKeyPolicy `json:"host_key_policy"`               // "tofu" or "ask_new"
+	TerminalFontSize   int           `json:"terminal_font_size"`            // default 14
+	TerminalScrollback int           `json:"terminal_scrollback"`           // default 5000
+	ShowHiddenFiles    bool          `json:"show_hidden_files"`             // SFTP hidden files
+	RemoteSyncURL      string        `json:"remote_sync_url,omitempty"`     // Optional remote zero-knowledge server URL
 }
 
 // VaultState is the root plaintext structure serialized, compressed, padded,
-// and encrypted via XChaCha20-Poly1305 into vault.sns.
+// and encrypted via XChaCha20-Poly1305 into vault.sns exclusively on the client.
 type VaultState struct {
 	SchemaVersion int            `json:"schema_version"`
+	VaultID       string         `json:"vault_id,omitempty"`
+	Revision      uint64         `json:"revision,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	Groups        []string       `json:"groups"`
@@ -226,7 +229,8 @@ type VaultState struct {
 func DefaultVaultState() *VaultState {
 	now := time.Now().UTC()
 	return &VaultState{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
+		Revision:      1,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 		Groups: []string{

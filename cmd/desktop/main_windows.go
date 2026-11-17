@@ -16,7 +16,7 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
+	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 	"github.com/jchv/go-webview2"
@@ -24,17 +24,17 @@ import (
 )
 
 const (
-	windowTitle     = "ServerNeedSafe — 多服务器安全管理与加密终端"
+	windowTitle     = "ServerNeedSafe — 多服务器安全管理与零知识加密终端"
 	singleMutexName = "Local\\ServerNeedSafe_Desktop_Singleton_v1"
 )
 
 var (
-	user32                           = windows.NewLazySystemDLL("user32.dll")
-	procSetProcessDpiAwarenessCtx    = user32.NewProc("SetProcessDpiAwarenessContext")
-	procFindWindowW                  = user32.NewProc("FindWindowW")
-	procShowWindow                   = user32.NewProc("ShowWindow")
-	procSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
-	procMessageBoxW                  = user32.NewProc("MessageBoxW")
+	user32                        = windows.NewLazySystemDLL("user32.dll")
+	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
+	procFindWindowW               = user32.NewProc("FindWindowW")
+	procShowWindow                = user32.NewProc("ShowWindow")
+	procSetForegroundWindow       = user32.NewProc("SetForegroundWindow")
+	procMessageBoxW               = user32.NewProc("MessageBoxW")
 )
 
 func enableHighDPI() {
@@ -124,9 +124,9 @@ func main() {
 	}
 
 	vaultPath := filepath.Join(dataDir, "vault.sns")
-	store, err := vault.NewStore(vaultPath)
+	blindStore, err := vault.NewBlindStore(vaultPath)
 	if err != nil {
-		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("初始化加密保险库失败:\n%v", err), 0x10)
+		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("初始化本地零知识加密保险库失败:\n%v", err), 0x10)
 		return
 	}
 
@@ -137,10 +137,9 @@ func main() {
 		return
 	}
 
-	sshMgr := sshmanager.NewManager(store)
 	staticFS, err := web.DistFS()
 	if err != nil {
-		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("加载内置前端界面资源失败:\n%v", err), 0x10)
+		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("加载内置前端与 WASM 资源失败:\n%v", err), 0x10)
 		return
 	}
 
@@ -151,11 +150,12 @@ func main() {
 		return
 	}
 
+	relayMgr := relay.NewManager(ln.Addr().String())
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
-		Store:      store,
+		BlindStore: blindStore,
 		Auth:       authMgr,
-		SSH:        sshMgr,
+		Relay:      relayMgr,
 		StaticFS:   staticFS,
 	})
 
@@ -195,15 +195,15 @@ func main() {
 		showMessageBox(
 			windowTitle,
 			fmt.Sprintf(
-				"未检测到 Microsoft Edge WebView2 运行时，已在系统默认浏览器中打开纯本地安全控制台。\n\n加密保险库路径：\n%s\n\n点击【确定】将立即锁定保险库并退出 ServerNeedSafe 本地进程。",
+				"未检测到 Microsoft Edge WebView2 运行时，已在系统默认浏览器中打开纯本地零知识安全控制台。\n\n加密保险库路径：\n%s\n\n点击【确定】将立即注销会话并退出 ServerNeedSafe 本地进程。",
 				vaultPath,
 			),
 			0x40,
 		)
 	}
 
-	// Wipe keys in memory & shut down loopback engine immediately on window close
-	store.Lock("关闭 Windows 本地应用自动擦除内存密钥并锁定", "local")
+	// Revoke sessions & shut down loopback engine immediately on window close
+	authMgr.RevokeAll()
 	apiServer.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

@@ -1,6 +1,7 @@
 package sshmanager
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -18,6 +19,10 @@ const (
 	defaultDialTimeout = 12 * time.Second
 	maxJumpHops        = 5
 )
+
+// DialTCPFunc abstracts raw TCP transport creation (e.g. blind WebSocket TCP relay in WASM/client mode,
+// or direct OS TCP socket in native tests).
+type DialTCPFunc func(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error)
 
 // HostKeyUntrustedError is returned when connecting to a host whose SSH host key
 // is either unknown (under strict ask_new policy) or has changed (MITM protection).
@@ -67,9 +72,10 @@ func (m *ManagedSSHClient) Close() error {
 	return firstErr
 }
 
-// Manager coordinates SSH dialing, active interactive terminals, SFTP operations, and probes.
+// Manager coordinates end-to-end client-side SSH dialing, interactive PTY sessions, SFTP operations, and probes.
 type Manager struct {
 	store          *vault.Store
+	dialTCP        DialTCPFunc
 	mu             sync.Mutex
 	activeSessions map[string]*TerminalSession
 }
@@ -79,11 +85,31 @@ func NewManager(store *vault.Store) *Manager {
 		store:          store,
 		activeSessions: make(map[string]*TerminalSession),
 	}
-	// Automatically terminate all active SSH terminals if the vault is locked!
+	// Automatically terminate all active SSH terminals if the client vault is locked!
 	store.RegisterOnLock(func() {
 		m.CloseAllSessions()
 	})
 	return m
+}
+
+// SetDialTCPFunc configures a custom raw TCP transport (such as the zero-knowledge WebSocket TCP relay).
+func (m *Manager) SetDialTCPFunc(fn DialTCPFunc) {
+	m.mu.Lock()
+	m.dialTCP = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) openRawTCP(addr string, timeout time.Duration) (net.Conn, error) {
+	m.mu.Lock()
+	fn := m.dialTCP
+	m.mu.Unlock()
+
+	if fn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return fn(ctx, addr, timeout)
+	}
+	return net.DialTimeout("tcp", addr, timeout)
 }
 
 // DialOptions customizes dial behavior (e.g. trusting a presented host key fingerprint).
@@ -93,7 +119,7 @@ type DialOptions struct {
 	Timeout          time.Duration
 }
 
-// Dial connects to the target server (through any configured JumpHost chain) and verifies host keys.
+// Dial connects to the target server (through any configured JumpHost chain) and verifies host keys end-to-end.
 func (m *Manager) Dial(serverID string, opts DialOptions) (*ManagedSSHClient, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaultDialTimeout
@@ -209,9 +235,9 @@ func (m *Manager) dialChain(serverID string, opts DialOptions, visited map[strin
 		Timeout:         opts.Timeout,
 	}
 
-	// Direct TCP dial if no JumpServerID configured
+	// Direct TCP (or blind WS-TCP relay) dial if no JumpServerID configured
 	if strings.TrimSpace(srv.JumpServerID) == "" {
-		rawConn, err := net.DialTimeout("tcp", targetAddr, opts.Timeout)
+		rawConn, err := m.openRawTCP(targetAddr, opts.Timeout)
 		if err != nil {
 			return nil, fmt.Errorf("无法连接到主机 %s: %w", targetAddr, err)
 		}
@@ -232,9 +258,8 @@ func (m *Manager) dialChain(serverID string, opts DialOptions, visited map[strin
 		}, nil
 	}
 
-	// Dial via Bastion / Jump Host chain
+	// Dial via Bastion / Jump Host chain (SSH direct-tcpip inside E2EE tunnel!)
 	jumpOpts := opts
-	// Only apply explicit fingerprint override to the leaf server unless jump is also trusted
 	jumpOpts.TrustFingerprint = ""
 	jumpClient, err := m.dialChain(srv.JumpServerID, jumpOpts, visited, depth+1)
 	if err != nil {
@@ -323,8 +348,11 @@ func passwordAuthMethods(secret string) []ssh.AuthMethod {
 
 func parsePrivateKeySigner(pemStr, passphrase string) (ssh.Signer, error) {
 	pemBytes := []byte(strings.TrimSpace(pemStr))
+	defer vault.ZeroBytes(pemBytes)
 	if passphrase != "" {
-		signer, err := ssh.ParsePrivateKeyWithPassphrase(pemBytes, []byte(passphrase))
+		passBytes := []byte(passphrase)
+		defer vault.ZeroBytes(passBytes)
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(pemBytes, passBytes)
 		if err != nil {
 			return nil, fmt.Errorf("解析加密 SSH 私钥失败（请检查私钥格式或私钥口令）: %w", err)
 		}

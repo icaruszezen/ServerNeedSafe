@@ -137,6 +137,21 @@ func handleTestSSHConn(netConn net.Conn, cfg *ssh.ServerConfig) {
 						_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: exitStatus}))
 						_ = ch.Close()
 						return
+					case "shell":
+						if req.WantReply {
+							_ = req.Reply(true, nil)
+						}
+						cmd := exec.Command("/bin/sh")
+						cmd.Stdin = ch
+						cmd.Stdout = ch
+						cmd.Stderr = ch.Stderr()
+						exitStatus := uint32(0)
+						if err := cmd.Run(); err != nil {
+							exitStatus = 1
+						}
+						_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: exitStatus}))
+						_ = ch.Close()
+						return
 					case "subsystem":
 						var sub struct{ Name string }
 						_ = ssh.Unmarshal(req.Payload, &sub)

@@ -25,6 +25,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Setup Go Toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Setup Node.js 24 LTS
         uses: actions/setup-node@v4
         with:
@@ -32,22 +38,17 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Install & Build Frontend Bundle
+      - name: Install & Build WASM + Frontend Bundle (with SRI)
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
           npm run build
 
-      - name: Setup Go Toolchain
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Static Vet & Race-Enabled Security Suite
+      - name: Static Vet & Race-Enabled Root-Breach Security Suite
         run: |
           go vet ./...
-          go test ./internal/... -v -race -count=1
+          GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/zkclient
+          go test ./... -v -race -count=1
 
   # ============================================================================
   # 2. 自动构建纯本地 Windows 桌面应用 (.exe + 便携压缩包) 与 Linux 独立二进制
@@ -193,9 +194,9 @@ jobs:
             echo "Container failed healthcheck within 25s"
             exit 1
           fi
-          curl -fsS http://127.0.0.1:18080/api/health
+          curl -fsS http://127.0.0.1:18080/api/health | grep -q '"zero_knowledge":true'
           curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deploy_mode":"server"'
-          curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'
+          curl -fsS http://127.0.0.1:18080/ | grep -q 'integrity="sha384-'
 
       - name: Log in to GitHub Container Registry (GHCR)
         if: github.event_name != 'pull_request'

@@ -16,7 +16,7 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
+	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 )
@@ -27,9 +27,9 @@ func main() {
 		dataDir = "./data-local"
 	}
 	vaultPath := filepath.Join(dataDir, "vault.sns")
-	store, err := vault.NewStore(vaultPath)
+	blindStore, err := vault.NewBlindStore(vaultPath)
 	if err != nil {
-		log.Fatalf("init vault: %v", err)
+		log.Fatalf("init blind vault: %v", err)
 	}
 
 	authMgr, err := auth.NewManager(12*time.Hour, true)
@@ -37,7 +37,6 @@ func main() {
 		log.Fatalf("init auth: %v", err)
 	}
 
-	sshMgr := sshmanager.NewManager(store)
 	staticFS, err := web.DistFS()
 	if err != nil {
 		log.Fatalf("load dist: %v", err)
@@ -52,11 +51,12 @@ func main() {
 		log.Fatalf("listen loopback: %v", err)
 	}
 
+	relayMgr := relay.NewManager(ln.Addr().String())
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
-		Store:      store,
+		BlindStore: blindStore,
 		Auth:       authMgr,
-		SSH:        sshMgr,
+		Relay:      relayMgr,
 		StaticFS:   staticFS,
 	})
 
@@ -67,7 +67,7 @@ func main() {
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	bootURL := fmt.Sprintf("http://127.0.0.1:%d/__desktop_boot?boot=%s", port, authMgr.DesktopBootCode())
-	fmt.Printf("[ServerNeedSafe Local Mode] Loopback URL: %s\n", bootURL)
+	fmt.Printf("[ServerNeedSafe Zero-Knowledge Local Mode] Loopback URL: %s\n", bootURL)
 
 	go func() {
 		_ = httpServer.Serve(ln)
@@ -77,7 +77,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	store.Lock("本地桌面进程退出自动锁定", "local")
+	authMgr.RevokeAll()
 	apiServer.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

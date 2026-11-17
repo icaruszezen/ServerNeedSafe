@@ -9,10 +9,14 @@ import type {
   ServerView,
   SFTPListResponse,
   Snippet,
+  SyncSummary,
+  TerminalReadyInfo,
+  VaultAnchor,
   VaultSecurityOverview,
 } from './types';
+import { clearLocalAnchorStorage, zkClient, ZkRpcError } from './zk/zkClient';
 
-const SESSION_KEY = 'sns_session_token';
+const LEGACY_SESSION_KEY = 'sns_session_token';
 
 export class ApiError extends Error {
   status: number;
@@ -35,15 +39,22 @@ export class ApiError extends Error {
   }
 }
 
+// In Zero-Knowledge E2EE mode, session tokens live exclusively inside the isolated
+// Dedicated Web Worker WASM heap and are NEVER persisted to sessionStorage/localStorage.
 export function getSessionToken(): string {
-  return sessionStorage.getItem(SESSION_KEY) || '';
+  try {
+    sessionStorage.removeItem(LEGACY_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+  return '';
 }
 
-export function setSessionToken(token: string): void {
-  if (token) {
-    sessionStorage.setItem(SESSION_KEY, token);
-  } else {
-    sessionStorage.removeItem(SESSION_KEY);
+export function setSessionToken(_token: string): void {
+  try {
+    sessionStorage.removeItem(LEGACY_SESSION_KEY);
+  } catch {
+    // ignore
   }
 }
 
@@ -53,167 +64,207 @@ export function registerOnUnauthorized(fn: () => void): void {
   onUnauthorizedCallback = fn;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers || {});
-  const token = getSessionToken();
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
-  }
-  if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json');
-  }
-
-  const res = await fetch(path, { ...init, headers });
-  let data: any = null;
-  const contentType = res.headers.get('content-type') || '';
-  if (contentType.includes('application/json')) {
-    data = await res.json().catch(() => null);
-  }
-
-  if (!res.ok) {
-    const code = data?.code || 'HTTP_ERROR';
-    if (res.status === 401 && !path.startsWith('/api/auth/')) {
-      setSessionToken('');
-      if (onUnauthorizedCallback) onUnauthorizedCallback();
+function mapZkError(err: unknown): never {
+  if (err instanceof ZkRpcError) {
+    if (err.code === 'VAULT_LOCKED' || err.code === 'UNAUTHORIZED') {
+      onUnauthorizedCallback?.();
     }
     throw new ApiError(
-      data?.error || `请求失败 (${res.status})`,
-      res.status,
-      code,
-      data?.host_key_info,
-      data?.retry_after_sec
+      err.message,
+      err.status,
+      err.code,
+      err.hostKeyInfo,
+      err.retryAfterSec
     );
   }
-  return data as T;
+  if (err instanceof ApiError) {
+    throw err;
+  }
+  throw new ApiError((err as Error)?.message || '零知识引擎调用失败', 500, 'WASM_CALL_ERROR');
+}
+
+async function zkCall<T>(action: string, payload?: unknown, binary?: Uint8Array): Promise<T> {
+  try {
+    return await zkClient.call<T>(action, payload, binary);
+  } catch (err) {
+    mapZkError(err);
+  }
+}
+
+async function zkCallWithBytes<T>(
+  action: string,
+  payload?: unknown,
+  binary?: Uint8Array
+): Promise<{ data: T; bytes?: Uint8Array }> {
+  try {
+    return await zkClient.callWithBytes<T>(action, payload, binary);
+  } catch (err) {
+    mapZkError(err);
+  }
 }
 
 export const api = {
-  getAuthStatus: () => request<AuthStatusResponse>('/api/auth/status'),
+  getAuthStatus: () => zkCall<AuthStatusResponse>('getAuthStatus'),
 
-  setupVault: (password: string) =>
-    request<{ token: string; settings: AppSettings }>('/api/auth/setup', {
-      method: 'POST',
-      body: JSON.stringify({ password }),
-    }),
+  setupVault: async (password: string) => {
+    const res = await zkCall<{
+      status: AuthStatusResponse;
+      settings: AppSettings;
+      anchor?: VaultAnchor;
+    }>('setupVault', { password });
+    return { token: '', settings: res.settings, status: res.status, anchor: res.anchor };
+  },
 
-  unlockVault: (password: string) =>
-    request<{ token: string; settings: AppSettings }>('/api/auth/unlock', {
-      method: 'POST',
-      body: JSON.stringify({ password }),
-    }),
+  unlockVault: async (password: string) => {
+    const res = await zkCall<{
+      status: AuthStatusResponse;
+      settings: AppSettings;
+      anchor?: VaultAnchor;
+    }>('unlockVault', { password });
+    return { token: '', settings: res.settings, status: res.status, anchor: res.anchor };
+  },
 
-  lockVault: () =>
-    request<{ ok: boolean }>('/api/auth/lock', { method: 'POST' }),
+  lockVault: async (): Promise<{ ok: boolean }> => {
+    try {
+      await zkClient.call('lockVault');
+    } catch {
+      // ignore if already locked
+    } finally {
+      zkClient.destroyWorkerMemory();
+    }
+    return { ok: true };
+  },
 
-  logoutSession: () =>
-    request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  logoutSession: async (): Promise<{ ok: boolean }> => {
+    try {
+      await zkClient.call('logoutSession');
+    } catch {
+      // ignore
+    } finally {
+      zkClient.destroyWorkerMemory();
+    }
+    return { ok: true };
+  },
 
-  changePassword: (old_password: string, new_password: string) =>
-    request<{ ok: boolean; token: string }>('/api/auth/password', {
-      method: 'POST',
-      body: JSON.stringify({ old_password, new_password }),
-    }),
+  clearLocalAnchor: async (): Promise<void> => {
+    clearLocalAnchorStorage();
+    try {
+      await zkClient.call('clearAnchor');
+    } catch {
+      // ignore
+    }
+  },
+
+  changePassword: async (old_password: string, new_password: string) => {
+    const res = await zkCall<{ ok: boolean; anchor?: VaultAnchor }>('changePassword', {
+      old_password,
+      new_password,
+    });
+    return { ok: res.ok, token: '' };
+  },
 
   exportVaultBlob: async (): Promise<{ blob: Blob; filename: string }> => {
-    const token = getSessionToken();
-    const res = await fetch('/api/vault/export', {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!res.ok) {
-      throw new ApiError('导出加密数据包失败', res.status);
+    const { data, bytes } = await zkCallWithBytes<{ filename: string }>('exportVault');
+    if (!bytes || bytes.byteLength === 0) {
+      throw new ApiError('导出加密数据包为空', 500, 'EMPTY_EXPORT');
     }
-    const disp = res.headers.get('Content-Disposition') || '';
-    const match = disp.match(/filename="?([^"]+)"?/i);
-    const filename = match?.[1] || 'ServerNeedSafe-backup.sns';
-    const blob = await res.blob();
-    return { blob, filename };
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const blob = new Blob([copy.buffer], { type: 'application/octet-stream' });
+    return { blob, filename: data.filename || 'ServerNeedSafe-backup.sns' };
   },
 
-  importVault: (file: File, password: string) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('password', password);
-    return request<{ ok: boolean; token: string; settings: AppSettings }>('/api/vault/import', {
-      method: 'POST',
-      body: fd,
-    });
+  importVault: async (
+    file: File,
+    password: string,
+    opts?: { currentAdminPassword?: string; clearAnchor?: boolean }
+  ) => {
+    const buf = await file.arrayBuffer();
+    const u8 = new Uint8Array(buf);
+    try {
+      const res = await zkCall<{
+        ok: boolean;
+        status: AuthStatusResponse;
+        settings: AppSettings;
+        anchor?: VaultAnchor;
+      }>(
+        'importVault',
+        {
+          password,
+          current_admin_password: opts?.currentAdminPassword || '',
+          clear_anchor: Boolean(opts?.clearAnchor),
+        },
+        u8
+      );
+      return { ok: res.ok, token: '', settings: res.settings, status: res.status };
+    } finally {
+      u8.fill(0);
+    }
   },
 
-  getVaultSecurity: () => request<VaultSecurityOverview>('/api/vault/security'),
+  getVaultSecurity: () => zkCall<VaultSecurityOverview>('getVaultSecurity'),
 
   updateSettings: (settings: AppSettings) =>
-    request<{ settings: AppSettings }>('/api/vault/settings', {
-      method: 'PUT',
-      body: JSON.stringify(settings),
-    }),
+    zkCall<{ settings: AppSettings }>('updateSettings', settings),
 
   deleteKnownHost: (address: string) =>
-    request<{ ok: boolean }>(`/api/vault/known-hosts?address=${encodeURIComponent(address)}`, {
-      method: 'DELETE',
+    zkCall<{ ok: boolean }>('deleteKnownHost', { address }),
+
+  // Remote Zero-Knowledge Vault Sync (server <-> desktop or server <-> server)
+  syncPush: (remote_url: string, remote_password = '') =>
+    zkCall<{ summary: SyncSummary; anchor?: VaultAnchor }>('syncPush', {
+      remote_url,
+      remote_password,
+    }),
+
+  syncPull: (remote_url: string, remote_password = '', current_local_password = '') =>
+    zkCall<{ summary: SyncSummary; anchor?: VaultAnchor }>('syncPull', {
+      remote_url,
+      remote_password,
+      current_local_password,
     }),
 
   // Servers & Groups
   listServers: () =>
-    request<{
+    zkCall<{
       servers: ServerView[];
       groups: string[];
       active_sessions: { id: string; server_id: string; server_name: string; started_at: string }[];
-    }>('/api/servers'),
+    }>('listServers'),
 
   createServer: (payload: ServerMutationPayload) =>
-    request<{ server: ServerView }>('/api/servers', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    zkCall<{ server: ServerView }>('createServer', payload),
 
   updateServer: (id: string, payload: ServerMutationPayload) =>
-    request<{ server: ServerView }>(`/api/servers/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    zkCall<{ server: ServerView }>('updateServer', { id, payload }),
 
   deleteServer: (id: string) =>
-    request<{ ok: boolean }>(`/api/servers/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
+    zkCall<{ ok: boolean }>('deleteServer', { id }),
 
   probeServer: (id: string, trustFingerprint = '') =>
-    request<{ probe: ServerProbeResult }>(`/api/servers/${encodeURIComponent(id)}/probe`, {
-      method: 'POST',
-      body: JSON.stringify({ trust_fingerprint: trustFingerprint }),
+    zkCall<{ probe: ServerProbeResult }>('probeServer', {
+      id,
+      trust_fingerprint: trustFingerprint,
     }),
 
   addGroup: (name: string) =>
-    request<{ groups: string[] }>('/api/groups', {
-      method: 'POST',
-      body: JSON.stringify({ name }),
-    }),
+    zkCall<{ groups: string[] }>('addGroup', { name }),
 
   deleteGroup: (name: string) =>
-    request<{ groups: string[] }>(`/api/groups?name=${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    }),
+    zkCall<{ groups: string[] }>('deleteGroup', { name }),
 
   // Credentials & SSH Keys
   listCredentials: () =>
-    request<{ credentials: CredentialView[] }>('/api/credentials'),
+    zkCall<{ credentials: CredentialView[] }>('listCredentials'),
 
   createCredential: (payload: Record<string, any>) =>
-    request<{ credential: CredentialView }>('/api/credentials', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    zkCall<{ credential: CredentialView }>('createCredential', payload),
 
   updateCredential: (id: string, payload: Record<string, any>) =>
-    request<{ credential: CredentialView }>(`/api/credentials/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
+    zkCall<{ credential: CredentialView }>('updateCredential', { id, payload }),
 
   deleteCredential: (id: string) =>
-    request<{ ok: boolean }>(`/api/credentials/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
+    zkCall<{ ok: boolean }>('deleteCredential', { id }),
 
   generateKeyPair: (payload: {
     algorithm: string;
@@ -223,116 +274,95 @@ export const api = {
     username_hint: string;
     notes: string;
   }) =>
-    request<{
+    zkCall<{
       algorithm: string;
       public_key: string;
       private_key?: string;
       fingerprint: string;
       credential?: CredentialView;
-    }>('/api/keys/generate', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    }>('generateKeyPair', payload),
 
   deployPublicKey: (payload: { server_id: string; credential_id?: string; public_key?: string }) =>
-    request<{ ok: boolean }>('/api/keys/deploy', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    zkCall<{ ok: boolean }>('deployPublicKey', payload),
 
   // Snippets & Batch Execution
-  listSnippets: () => request<{ snippets: Snippet[] }>('/api/snippets'),
+  listSnippets: () => zkCall<{ snippets: Snippet[] }>('listSnippets'),
 
   upsertSnippet: (snippet: Partial<Snippet>) =>
-    request<{ snippet: Snippet }>('/api/snippets', {
-      method: 'POST',
-      body: JSON.stringify(snippet),
-    }),
+    zkCall<{ snippet: Snippet }>('upsertSnippet', snippet),
 
   deleteSnippet: (id: string) =>
-    request<{ ok: boolean }>(`/api/snippets/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
+    zkCall<{ ok: boolean }>('deleteSnippet', { id }),
 
   batchExec: (server_ids: string[], command: string, timeout_sec = 25) =>
-    request<{ results: BatchExecResult[] }>('/api/snippets/batch-exec', {
-      method: 'POST',
-      body: JSON.stringify({ server_ids, command, timeout_sec }),
+    zkCall<{ results: BatchExecResult[] }>('batchExec', {
+      server_ids,
+      command,
+      timeout_sec,
     }),
 
-  // Tickets & SFTP
-  issueTicket: (purpose: 'ws_ssh' | 'sftp_download', server_id: string, path = '') =>
-    request<{ ticket: string }>('/api/ws/ticket', {
-      method: 'POST',
-      body: JSON.stringify({ purpose, server_id, path }),
-    }),
+  // Client-side E2EE SSH Terminal inside Dedicated WASM Worker over blind TCP relay
+  openTerminalSession: (payload: {
+    tab_id: string;
+    server_id: string;
+    cols: number;
+    rows: number;
+    trust_fingerprint?: string;
+  }) => zkCall<{ ready: TerminalReadyInfo }>('openTerminal', payload),
 
+  // Client-side E2EE SFTP over blind TCP relay (server never sees filenames, paths, or bytes)
   sftpList: (serverId: string, dirPath = '') =>
-    request<SFTPListResponse>(
-      `/api/sftp/${encodeURIComponent(serverId)}/list?path=${encodeURIComponent(dirPath)}`
-    ),
+    zkCall<SFTPListResponse>('sftpList', { server_id: serverId, path: dirPath }),
 
   sftpRead: (serverId: string, filePath: string) =>
-    request<{ path: string; content: string }>(
-      `/api/sftp/${encodeURIComponent(serverId)}/read?path=${encodeURIComponent(filePath)}`
-    ),
-
-  sftpWrite: (serverId: string, filePath: string, content: string) =>
-    request<{ ok: boolean }>(`/api/sftp/${encodeURIComponent(serverId)}/write`, {
-      method: 'POST',
-      body: JSON.stringify({ path: filePath, content }),
+    zkCall<{ path: string; content: string }>('sftpRead', {
+      server_id: serverId,
+      path: filePath,
     }),
 
-  sftpUpload: (serverId: string, dir: string, file: File) => {
-    const fd = new FormData();
-    fd.append('dir', dir);
-    fd.append('file', file);
-    return request<{ ok: boolean; path: string; bytes: number }>(
-      `/api/sftp/${encodeURIComponent(serverId)}/upload`,
-      { method: 'POST', body: fd }
-    );
+  sftpWrite: (serverId: string, filePath: string, content: string) =>
+    zkCall<{ ok: boolean }>('sftpWrite', {
+      server_id: serverId,
+      path: filePath,
+      content,
+    }),
+
+  sftpUpload: async (serverId: string, dir: string, file: File) => {
+    const buf = await file.arrayBuffer();
+    const u8 = new Uint8Array(buf);
+    try {
+      return await zkCall<{ ok: boolean; path: string; bytes: number }>(
+        'sftpUpload',
+        { server_id: serverId, dir, filename: file.name },
+        u8
+      );
+    } finally {
+      u8.fill(0);
+    }
+  },
+
+  sftpDownloadBlob: async (
+    serverId: string,
+    filePath: string
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const { data, bytes } = await zkCallWithBytes<{ filename: string }>('sftpDownload', {
+      server_id: serverId,
+      path: filePath,
+    });
+    const raw = bytes ? new Uint8Array(bytes) : new Uint8Array(0);
+    const blob = new Blob([raw.buffer], { type: 'application/octet-stream' });
+    return { blob, filename: data.filename || 'download.bin' };
   },
 
   sftpMkdir: (serverId: string, path: string) =>
-    request<{ ok: boolean }>(`/api/sftp/${encodeURIComponent(serverId)}/mkdir`, {
-      method: 'POST',
-      body: JSON.stringify({ path }),
-    }),
+    zkCall<{ ok: boolean }>('sftpMkdir', { server_id: serverId, path }),
 
   sftpRename: (serverId: string, old_path: string, new_path: string) =>
-    request<{ ok: boolean }>(`/api/sftp/${encodeURIComponent(serverId)}/rename`, {
-      method: 'POST',
-      body: JSON.stringify({ old_path, new_path }),
-    }),
+    zkCall<{ ok: boolean }>('sftpRename', { server_id: serverId, old_path, new_path }),
 
   sftpDelete: (serverId: string, path: string) =>
-    request<{ ok: boolean }>(`/api/sftp/${encodeURIComponent(serverId)}/delete`, {
-      method: 'POST',
-      body: JSON.stringify({ path }),
-    }),
+    zkCall<{ ok: boolean }>('sftpDelete', { server_id: serverId, path }),
 
   sftpChmod: (serverId: string, path: string, mode: string) =>
-    request<{ ok: boolean }>(`/api/sftp/${encodeURIComponent(serverId)}/chmod`, {
-      method: 'POST',
-      body: JSON.stringify({ path, mode }),
-    }),
+    zkCall<{ ok: boolean }>('sftpChmod', { server_id: serverId, path, mode }),
 };
-
-export function buildSSHWebSocketURL(
-  serverId: string,
-  ticket: string,
-  cols: number,
-  rows: number,
-  trustFingerprint = ''
-): string {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const params = new URLSearchParams({
-    ticket,
-    cols: String(cols),
-    rows: String(rows),
-  });
-  if (trustFingerprint) {
-    params.set('trust_fingerprint', trustFingerprint);
-  }
-  return `${proto}//${window.location.host}/api/ws/ssh/${encodeURIComponent(serverId)}?${params.toString()}`;
-}

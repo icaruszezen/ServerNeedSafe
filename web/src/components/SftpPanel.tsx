@@ -116,19 +116,20 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
   };
 
   const handleDownload = async (entry: SFTPFileEntry) => {
+    setError('');
     try {
-      const { ticket } = await api.issueTicket('sftp_download', serverId, entry.path);
-      const url = `/api/sftp/${encodeURIComponent(serverId)}/download?ticket=${encodeURIComponent(
-        ticket
-      )}`;
+      const { blob, filename } = await api.sftpDownloadBlob(serverId, entry.path);
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = entry.name;
+      a.download = filename || entry.name;
       document.body.appendChild(a);
       a.click();
       a.remove();
+      URL.revokeObjectURL(url);
+      onNotify(`已通过端到端加密隧道下载 ${entry.name}`);
     } catch (err: any) {
-      setError(err?.message || '生成下载票据失败');
+      setError(err?.message || '端到端加密下载文件失败');
     }
   };
 

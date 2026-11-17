@@ -1,10 +1,9 @@
 package api
 
 import (
+	"encoding/base64"
 	"fmt"
-	"io"
 	"net/http"
-	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -27,56 +26,103 @@ func (s *Server) handleDesktopBoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	vStatus := s.cfg.Store.Status()
+	initialized := s.cfg.BlindStore.IsInitialized()
 	authenticated := false
-	var settings *vault.AppSettings
+	vStatus := vault.StatusUninitialized
 
-	if vStatus == vault.StatusUnlocked {
+	if initialized {
+		vStatus = vault.StatusLocked
 		tok := extractBearerToken(r)
-		if _, err := s.cfg.Auth.ValidateSession(tok); err == nil {
+		pubFP := s.currentAuthPubFingerprint()
+		if _, err := s.cfg.Auth.ValidateSession(tok, pubFP); err == nil {
 			authenticated = true
-			settings, _ = s.cfg.Store.GetSettings()
+			vStatus = vault.StatusUnlocked
 		}
 	}
 
-	encInfo, _ := s.cfg.Store.EncryptionInfo()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"vault_status":  vStatus,
-		"authenticated": authenticated,
-		"deploy_mode":   s.cfg.DeployMode,
-		"vault_path":    s.cfg.Store.FilePath(),
-		"encryption":    encInfo,
-		"settings":      settings,
-	})
+	resp := map[string]any{
+		"initialized":    initialized,
+		"vault_status":   vStatus,
+		"authenticated":  authenticated,
+		"deploy_mode":    s.cfg.DeployMode,
+		"zero_knowledge": true,
+		"vault_path":     s.cfg.BlindStore.FilePath(),
+		"encryption":     s.cfg.BlindStore.EncryptionInfo(authenticated),
+	}
+	if authenticated {
+		resp["active_sessions"] = s.cfg.Auth.ActiveSessionCount()
+		resp["active_relays"] = s.cfg.Relay.ActiveCount()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Password string `json:"password"`
+		BlobB64      string `json:"blob_b64"`
+		SignatureB64 string `json:"signature_b64"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_JSON", "请求数据格式错误")
+	if err := decodeStrictJSON(r, &body, 0); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "零知识初始化请求格式错误（严禁传输明文密码）")
 		return
 	}
-	clientIP := extractClientIP(r)
-	if err := s.cfg.Store.Setup(body.Password, clientIP); err != nil {
+	rawBlob, err := base64.StdEncoding.DecodeString(body.BlobB64)
+	if err != nil || len(rawBlob) == 0 {
+		writeError(w, http.StatusBadRequest, "BAD_BLOB", "无效的加密容器编码")
+		return
+	}
+	sig, err := base64.StdEncoding.DecodeString(body.SignatureB64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_SIGNATURE", "无效的零知识签名编码")
+		return
+	}
+
+	pubFP, encInfo, err := s.cfg.BlindStore.InitializeBlob(rawBlob, sig)
+	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
+
 	s.cfg.Auth.ResetAuthFailures()
-	sess, err := s.cfg.Auth.CreateSession(clientIP, r.UserAgent())
+	sess, err := s.cfg.Auth.CreateSession(pubFP, extractClientIP(r), r.UserAgent())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SESSION_ERROR", err.Error())
 		return
 	}
-	settings, _ := s.cfg.Store.GetSettings()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"token":    sess.Token,
-		"settings": settings,
+		"ok":         true,
+		"token":      sess.Token,
+		"encryption": encInfo,
 	})
 }
 
-func (s *Server) handleAuthUnlock(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAuthChallenge(w http.ResponseWriter, r *http.Request) {
+	if retrySec, err := s.cfg.Auth.CheckRateLimit(); err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error":           err.Error(),
+			"code":            "RATE_LIMITED",
+			"retry_after_sec": retrySec,
+		})
+		return
+	}
+
+	params, err := s.cfg.BlindStore.PublicChallengeParams()
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	ch, err := s.cfg.Auth.IssueChallenge()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "CHALLENGE_ERROR", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"challenge_id": ch.ID,
+		"nonce":        ch.Nonce,
+		"kdf":          params,
+	})
+}
+
+func (s *Server) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
 	if retrySec, err := s.cfg.Auth.CheckRateLimit(); err != nil {
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
 			"error":           err.Error(),
@@ -87,15 +133,33 @@ func (s *Server) handleAuthUnlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Password string `json:"password"`
+		ChallengeID  string `json:"challenge_id"`
+		SignatureB64 string `json:"signature_b64"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_JSON", "请求数据格式错误")
+	if err := decodeStrictJSON(r, &body, 64*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "零知识挑战响应格式无效（严禁传输明文密码）")
+		return
+	}
+	sig, err := base64.StdEncoding.DecodeString(body.SignatureB64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_SIGNATURE", "签名编码无效")
 		return
 	}
 
-	clientIP := extractClientIP(r)
-	if err := s.cfg.Store.UnlockOrVerify(body.Password, clientIP); err != nil {
+	nonce, err := s.cfg.Auth.ConsumeChallenge(body.ChallengeID)
+	if err != nil {
+		failCnt, lockedSec := s.cfg.Auth.RecordAuthFailure()
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"error":           "认证挑战已失效或已被使用，请重试",
+			"code":            "CHALLENGE_EXPIRED",
+			"failed_attempts": failCnt,
+			"retry_after_sec": lockedSec,
+		})
+		return
+	}
+
+	pubFP, err := s.cfg.BlindStore.VerifyClientChallenge(body.ChallengeID, nonce, sig)
+	if err != nil {
 		failCnt, lockedSec := s.cfg.Auth.RecordAuthFailure()
 		msg := err.Error()
 		if lockedSec > 0 {
@@ -111,161 +175,71 @@ func (s *Server) handleAuthUnlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.cfg.Auth.ResetAuthFailures()
-	sess, err := s.cfg.Auth.CreateSession(clientIP, r.UserAgent())
+	sess, err := s.cfg.Auth.CreateSession(pubFP, extractClientIP(r), r.UserAgent())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SESSION_ERROR", err.Error())
 		return
 	}
-	settings, _ := s.cfg.Store.GetSettings()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"token":    sess.Token,
-		"settings": settings,
+		"ok":         true,
+		"token":      sess.Token,
+		"encryption": s.cfg.BlindStore.EncryptionInfo(true),
 	})
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	tok := extractBearerToken(r)
 	s.cfg.Auth.RevokeSession(tok)
+	if s.cfg.Auth.ActiveSessionCount() == 0 {
+		s.cfg.Relay.CloseAll()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleAuthLock(w http.ResponseWriter, r *http.Request) {
-	clientIP := extractClientIP(r)
-	s.cfg.Store.Lock("管理员手动锁定保险库", clientIP)
+	s.cfg.Auth.RevokeAll()
+	s.cfg.Relay.CloseAll()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		OldPassword string `json:"old_password"`
-		NewPassword string `json:"new_password"`
+		ExpectedPrevRevision uint64 `json:"expected_prev_revision"`
+		BlobB64              string `json:"blob_b64"`
+		OldSignatureB64      string `json:"old_signature_b64"`
+		NewSignatureB64      string `json:"new_signature_b64"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_JSON", "请求数据格式错误")
+	if err := decodeStrictJSON(r, &body, 0); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "密钥轮换数据包格式无效（严禁传输明文密码）")
 		return
 	}
-	clientIP := extractClientIP(r)
-	if err := s.cfg.Store.ChangePassword(body.OldPassword, body.NewPassword, clientIP); err != nil {
+	rawBlob, err := base64.StdEncoding.DecodeString(body.BlobB64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_BLOB", "无效的加密容器编码")
+		return
+	}
+	oldSig, err1 := base64.StdEncoding.DecodeString(body.OldSignatureB64)
+	newSig, err2 := base64.StdEncoding.DecodeString(body.NewSignatureB64)
+	if err1 != nil || err2 != nil {
+		writeError(w, http.StatusBadRequest, "BAD_SIGNATURE", "无效的双重轮换签名编码")
+		return
+	}
+
+	newPubFP, encInfo, err := s.cfg.BlindStore.RotatePasswordBlob(rawBlob, body.ExpectedPrevRevision, oldSig, newSig)
+	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	// Rotate all active sessions and issue a fresh token for the caller
+
 	s.cfg.Auth.RevokeAll()
-	sess, err := s.cfg.Auth.CreateSession(clientIP, r.UserAgent())
+	sess, err := s.cfg.Auth.CreateSession(newPubFP, extractClientIP(r), r.UserAgent())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SESSION_ERROR", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":    true,
-		"token": sess.Token,
+		"ok":         true,
+		"token":      sess.Token,
+		"encryption": encInfo,
 	})
-}
-
-func (s *Server) handleVaultExport(w http.ResponseWriter, r *http.Request) {
-	raw, err := s.cfg.Store.ExportEncryptedBytes(extractClientIP(r))
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	filename := fmt.Sprintf("ServerNeedSafe-vault-%s.sns", time.Now().Format("20060102-150405"))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(raw)
-}
-
-func (s *Server) handleVaultImport(w http.ResponseWriter, r *http.Request) {
-	if retrySec, err := s.cfg.Auth.CheckRateLimit(); err != nil {
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{
-			"error":           err.Error(),
-			"code":            "RATE_LIMITED",
-			"retry_after_sec": retrySec,
-		})
-		return
-	}
-
-	if err := r.ParseMultipartForm(64 * 1024 * 1024); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_MULTIPART", "解析上传的加密备份包失败")
-		return
-	}
-	password := r.FormValue("password")
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "MISSING_FILE", "请选择要恢复的 .sns 加密备份文件")
-		return
-	}
-	defer file.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(file, 64*1024*1024))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "READ_FAILED", "读取备份文件失败")
-		return
-	}
-
-	clientIP := extractClientIP(r)
-	if err := s.cfg.Store.ImportEncryptedVault(raw, password, clientIP); err != nil {
-		s.cfg.Auth.RecordAuthFailure()
-		writeDomainError(w, err)
-		return
-	}
-
-	s.cfg.Auth.ResetAuthFailures()
-	s.cfg.Auth.RevokeAll()
-	sess, err := s.cfg.Auth.CreateSession(clientIP, r.UserAgent())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "SESSION_ERROR", err.Error())
-		return
-	}
-	settings, _ := s.cfg.Store.GetSettings()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"token":    sess.Token,
-		"settings": settings,
-	})
-}
-
-func (s *Server) handleVaultSecurity(w http.ResponseWriter, r *http.Request) {
-	encInfo, _ := s.cfg.Store.EncryptionInfo()
-	settings, err := s.cfg.Store.GetSettings()
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	knownHosts, _ := s.cfg.Store.ListKnownHosts()
-	auditLogs, _ := s.cfg.Store.ListAuditLogs(200)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"deploy_mode":     s.cfg.DeployMode,
-		"vault_path":      s.cfg.Store.FilePath(),
-		"encryption":      encInfo,
-		"settings":        settings,
-		"known_hosts":     knownHosts,
-		"audit_logs":      auditLogs,
-		"active_sessions": s.cfg.Auth.ActiveSessionCount(),
-		"active_ssh_tabs": len(s.cfg.SSH.ListActiveSessions()),
-	})
-}
-
-func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
-	var in vault.AppSettings
-	if err := decodeJSON(r, &in); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_JSON", "设置参数格式无效")
-		return
-	}
-	updated, err := s.cfg.Store.UpdateSettings(in, extractClientIP(r))
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"settings": updated})
-}
-
-func (s *Server) handleDeleteKnownHost(w http.ResponseWriter, r *http.Request) {
-	addr := r.URL.Query().Get("address")
-	if err := s.cfg.Store.DeleteKnownHost(addr, extractClientIP(r)); err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

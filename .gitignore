@@ -11,3 +11,6 @@ data-local/
 *.log
 *.tsbuildinfo
 .DS_Store
+web/public/sns-zk.wasm.gz
+web/src/zk/wasm_exec.js
+web/src/zk/wasmIntegrity.json

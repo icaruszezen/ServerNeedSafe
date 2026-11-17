@@ -10,8 +10,13 @@ import {
   FileClock,
   Trash2,
   RefreshCw,
+  Cloud,
+  ArrowUpRight,
+  ArrowDownLeft,
+  Cpu,
 } from 'lucide-react';
-import { api, setSessionToken } from '../api';
+import { api } from '../api';
+import { zkClient, type WasmIntegrityState } from '../zk/zkClient';
 import type { AppSettings, VaultSecurityOverview } from '../types';
 
 interface VaultSecurityProps {
@@ -27,12 +32,16 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
 }) => {
   const [data, setData] = useState<VaultSecurityOverview | null>(null);
   const [loading, setLoading] = useState(true);
+  const [wasmIntegrity, setWasmIntegrity] = useState<WasmIntegrityState>(() =>
+    zkClient.getIntegrityState()
+  );
   const [settingsForm, setSettingsForm] = useState<AppSettings>({
     auto_lock_minutes: 30,
     host_key_policy: 'tofu',
     terminal_font_size: 14,
     terminal_scrollback: 5000,
     show_hidden_files: true,
+    remote_sync_url: '',
   });
 
   // Password Rotation
@@ -44,7 +53,18 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   // Import Backup
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPass, setImportPass] = useState('');
+  const [importCurrentPass, setImportCurrentPass] = useState('');
   const [importing, setImporting] = useState(false);
+
+  // Remote Zero-Knowledge Cloud Sync
+  const [syncUrl, setSyncUrl] = useState('');
+  const [syncRemotePass, setSyncRemotePass] = useState('');
+  const [syncLocalPass, setSyncLocalPass] = useState('');
+  const [syncing, setSyncing] = useState<'push' | 'pull' | null>(null);
+
+  useEffect(() => {
+    return zkClient.subscribeIntegrity(setWasmIntegrity);
+  }, []);
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
@@ -52,6 +72,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       const res = await api.getVaultSecurity();
       setData(res);
       setSettingsForm(res.settings);
+      setSyncUrl((prev) => prev || res.settings.remote_sync_url || '');
     } catch (err: any) {
       onNotify(err?.message || '读取安全中心状态失败');
     } finally {
@@ -66,9 +87,13 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await api.updateSettings(settingsForm);
+      const nextSettings: AppSettings = {
+        ...settingsForm,
+        remote_sync_url: syncUrl.trim() || settingsForm.remote_sync_url || '',
+      };
+      const res = await api.updateSettings(nextSettings);
       onSettingsChanged(res.settings);
-      onNotify('安全策略与偏好设置已加密保存');
+      onNotify('安全策略与偏好设置已在客户端加密并同步');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '保存设置失败');
@@ -87,12 +112,11 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     }
     setRotating(true);
     try {
-      const res = await api.changePassword(oldPass, newPass);
-      setSessionToken(res.token);
+      await api.changePassword(oldPass, newPass);
       setOldPass('');
       setNewPass('');
       setConfirmPass('');
-      onNotify('管理员密码已更新，主密钥已完成轮换重加密');
+      onNotify('管理员密码已在客户端完成重派生，DEK 与 Ed25519 密钥对已原子轮换');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '修改管理员密码失败');
@@ -112,7 +136,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      onNotify('已导出全量加密备份包 (.sns)');
+      onNotify('已导出零知识加密数据包 (.sns)');
     } catch (err: any) {
       onNotify(err?.message || '导出失败');
     }
@@ -126,17 +150,57 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     }
     setImporting(true);
     try {
-      const res = await api.importVault(importFile, importPass);
-      setSessionToken(res.token);
+      const res = await api.importVault(importFile, importPass, {
+        currentAdminPassword: importCurrentPass || undefined,
+        clearAnchor: true,
+      });
       onSettingsChanged(res.settings);
       setImportFile(null);
       setImportPass('');
-      onNotify('加密备份已成功校验并恢复');
+      setImportCurrentPass('');
+      onNotify('加密备份已在客户端校验并恢复');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '恢复备份失败');
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleSyncPush = async () => {
+    if (!syncUrl.trim()) {
+      onNotify('请输入远端零知识同步服务地址 (例如 https://vault.example.com)');
+      return;
+    }
+    setSyncing('push');
+    try {
+      const { summary } = await api.syncPush(syncUrl.trim(), syncRemotePass);
+      setSyncRemotePass('');
+      onNotify(`已零知识推送密文至远端 (Rev #${summary.revision}, ${(summary.bytes / 1024).toFixed(1)} KB)`);
+      await loadOverview();
+    } catch (err: any) {
+      onNotify(err?.message || '推送密文同步失败');
+    } finally {
+      setSyncing(null);
+    }
+  };
+
+  const handleSyncPull = async () => {
+    if (!syncUrl.trim()) {
+      onNotify('请输入远端零知识同步服务地址');
+      return;
+    }
+    setSyncing('pull');
+    try {
+      const { summary } = await api.syncPull(syncUrl.trim(), syncRemotePass, syncLocalPass);
+      setSyncRemotePass('');
+      setSyncLocalPass('');
+      onNotify(`已从远端拉取并在本地解密合并 (Rev #${summary.revision})`);
+      await loadOverview();
+    } catch (err: any) {
+      onNotify(err?.message || '从远端拉取密文失败');
+    } finally {
+      setSyncing(null);
     }
   };
 
@@ -154,8 +218,10 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     <div className="workspace-surface" id="vault-security-view">
       <div className="page-header">
         <div className="page-header-title">
-          <h2>安全保险库与加密审计中心</h2>
-          <p>零知识全量加密存储架构 · 密钥仅驻留内存并在锁定时立即清零擦除</p>
+          <h2>零知识安全保险库与隔离审计中心</h2>
+          <p>
+            客户端 Web Worker WASM 端到端加密 · 即使部署服务器 root 权限沦陷亦无法获取任何应用数据
+          </p>
         </div>
         <div className="page-header-actions">
           <button type="button" className="btn" onClick={() => void loadOverview()}>
@@ -165,60 +231,147 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
             <Download size={14} /> 导出加密数据包 (.sns)
           </button>
           <button type="button" className="btn btn-danger" onClick={() => void onLockVault()}>
-            <Lock size={14} /> 立即锁定保险库
+            <Lock size={14} /> 立即销毁内存并锁定
           </button>
         </div>
       </div>
 
       <div className="page-body">
         {loading && !data ? (
-          <div className="empty-state">正在加载加密保险库安全元数据...</div>
+          <div className="empty-state">正在从客户端 WASM 加密区读取安全元数据...</div>
         ) : (
           <>
-            <div className="security-grid">
-              {/* Cryptographic Engine Spec */}
-              <section className="sec-panel">
-                <h3>
-                  <ShieldCheck size={16} style={{ color: 'var(--accent-teal)' }} />
-                  加密存储引擎状态
+            {/* Zero-Knowledge Root-Breach Isolation Proof Banner */}
+            <section className="sec-panel" style={{ marginBottom: 18 }} id="zk-isolation-proof-panel">
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: 8,
+                  marginBottom: 6,
+                }}
+              >
+                <h3 style={{ margin: 0 }}>
+                  <Cpu size={16} style={{ color: 'var(--accent-teal)' }} />
+                  零知识抗服务器 Root 泄露隔离证明 (SNSVAULT v{data?.encryption.format_version || 2})
                 </h3>
-                <p className="sec-panel-desc">
-                  所有服务器 IP、账号、SSH 私钥、快捷指令与审计日志均封装在单一 AEAD 认证加密容器中。
-                </p>
+                <span className="tag-chip teal">
+                  服务端零明文 · 服务端零密钥 · 端到端 SSHv2/SFTP
+                </span>
+              </div>
+              <p className="sec-panel-desc" style={{ marginBottom: 12 }}>
+                所有密码派生 (Argon2id)、载荷加解密 (XChaCha20-Poly1305) 与 SSH/SFTP 协议栈均在浏览器独立进程沙箱中执行；服务端仅存储盲密文并转发加密字节流。
+              </p>
+              <div className="security-grid" style={{ marginBottom: 0 }}>
                 <div className="kv-list">
                   <div className="kv-row">
-                    <span className="kv-key">运行模式</span>
+                    <span className="kv-key">保险库唯一标识 (Vault ID)</span>
+                    <span className="kv-val mono" style={{ fontSize: 12 }}>
+                      {data?.encryption.vault_id || '—'}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">单调递增防回滚版本号</span>
+                    <span className="kv-val mono" style={{ color: 'var(--accent-teal)' }}>
+                      Revision #{data?.encryption.revision ?? 1}（本地锚点 #{data?.anchor?.min_revision ?? 1}）
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">Ed25519 零知识认证公钥指纹</span>
+                    <span className="kv-val mono" style={{ fontSize: 11.5 }}>
+                      {data?.encryption.auth_pubkey_sha256
+                        ? `${data.encryption.auth_pubkey_sha256.slice(0, 24)}…`
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+                <div className="kv-list">
+                  <div className="kv-row">
+                    <span className="kv-key">客户端 WASM 引擎自校验</span>
+                    <span className="kv-val mono" style={{ fontSize: 11.5, color: 'var(--accent-teal)' }}>
+                      {wasmIntegrity.verified
+                        ? `SHA-256 已验证 (${wasmIntegrity.sha256.slice(0, 16)}…)`
+                        : '运行中'}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">密码学套件 (KDF / AEAD)</span>
                     <span className="kv-val">
-                      {data?.deploy_mode === 'desktop' ? 'Windows 本地独立桌面应用' : 'Docker / Web 服务端部署'}
+                      Argon2id ({Math.round((data?.encryption.kdf_memory_kib || 65536) / 1024)} MiB) · XChaCha20 + 4KiB 填充
                     </span>
                   </div>
                   <div className="kv-row">
-                    <span className="kv-key">密钥派生算法 (KDF)</span>
+                    <span className="kv-key">盲存储体积 / 活跃盲 TCP 隧道</span>
                     <span className="kv-val">
-                      Argon2id ({Math.round((data?.encryption.kdf_memory_kib || 65536) / 1024)} MiB, t=
-                      {data?.encryption.kdf_time}, p={data?.encryption.kdf_threads})
+                      {((data?.encryption.vault_size_bytes || 0) / 1024).toFixed(1)} KB · {data?.active_relays ?? 0} 条加密流
                     </span>
                   </div>
-                  <div className="kv-row">
-                    <span className="kv-key">主密钥信封封装</span>
-                    <span className="kv-val">AES-256-GCM (256-bit DEK)</span>
+                </div>
+              </div>
+            </section>
+
+            <div className="security-grid">
+              {/* Remote Zero-Knowledge Vault Sync */}
+              <section className="sec-panel" id="zk-remote-sync-panel">
+                <h3>
+                  <Cloud size={16} style={{ color: 'var(--accent-teal)' }} />
+                  跨端零知识密文云同步
+                </h3>
+                <p className="sec-panel-desc">
+                  在本地桌面端与远端 <code className="mono">sns-server</code> 之间同步盲密文容器；远端服务器全程无密钥，仅做签名核验与密文托管。
+                </p>
+                <div className="field">
+                  <label className="field-label">远端 ServerNeedSafe 服务地址</label>
+                  <input
+                    className="input mono"
+                    placeholder="https://sns.example.com"
+                    value={syncUrl}
+                    onChange={(e) => setSyncUrl(e.target.value)}
+                  />
+                </div>
+                <div className="field-row">
+                  <div className="field">
+                    <label className="field-label">远端保险库密码（推送同源库可留空，拉取必填）</label>
+                    <input
+                      type="password"
+                      className="input"
+                      placeholder="输入远端加密保险库密码"
+                      value={syncRemotePass}
+                      onChange={(e) => setSyncRemotePass(e.target.value)}
+                    />
                   </div>
-                  <div className="kv-row">
-                    <span className="kv-key">全量载荷加密算法</span>
-                    <span className="kv-val">XChaCha20-Poly1305 + 4KiB 随机填充</span>
+                  <div className="field">
+                    <label className="field-label">本地原密码（仅拉取覆盖不同密码库时填）</label>
+                    <input
+                      type="password"
+                      className="input"
+                      placeholder="可选覆盖授权密码"
+                      value={syncLocalPass}
+                      onChange={(e) => setSyncLocalPass(e.target.value)}
+                    />
                   </div>
-                  <div className="kv-row">
-                    <span className="kv-key">加密容器体积</span>
-                    <span className="kv-val">
-                      {((data?.encryption.vault_size_bytes || 0) / 1024).toFixed(1)} KB
-                    </span>
-                  </div>
-                  <div className="kv-row">
-                    <span className="kv-key">加密文件路径</span>
-                    <span className="kv-val" style={{ fontSize: 11.5 }}>
-                      {data?.vault_path}
-                    </span>
-                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={syncing !== null}
+                    onClick={() => void handleSyncPush()}
+                  >
+                    <ArrowUpRight size={14} />
+                    {syncing === 'push' ? '正在推送盲密文...' : '推送密文至远端'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={syncing !== null}
+                    onClick={() => void handleSyncPull()}
+                  >
+                    <ArrowDownLeft size={14} />
+                    {syncing === 'pull' ? '正在拉取并本地合并...' : '从远端拉取合并'}
+                  </button>
                 </div>
               </section>
 
@@ -228,11 +381,13 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                   <Settings size={16} />
                   安全策略与终端偏好
                 </h3>
-                <p className="sec-panel-desc">配置空闲自动锁定内存擦除策略与 SSH 主机密钥校验级别。</p>
+                <p className="sec-panel-desc">
+                  配置客户端空闲自动销毁 Web Worker 内存策略与 SSH 主机密钥校验级别。
+                </p>
                 <form onSubmit={handleSaveSettings}>
                   <div className="field-row">
                     <div className="field">
-                      <label className="field-label">无操作自动锁定 (分钟)</label>
+                      <label className="field-label">无操作自动销毁内存并锁定 (分钟)</label>
                       <select
                         className="select"
                         value={settingsForm.auto_lock_minutes}
@@ -288,7 +443,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     </select>
                   </div>
                   <button type="submit" className="btn btn-primary">
-                    保存策略设置
+                    加密保存策略设置
                   </button>
                 </form>
               </section>
@@ -297,10 +452,10 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
               <section className="sec-panel">
                 <h3>
                   <KeyRound size={16} />
-                  轮换管理员主密码
+                  轮换管理员主密码与认证密钥对
                 </h3>
                 <p className="sec-panel-desc">
-                  修改密码将重新生成随机盐与全新 256 位数据主密钥 (DEK)，并对整个数据包原子重加密。
+                  在客户端重新生成 256 位随机盐、全新 DEK 与全新 Ed25519 认证密钥对，并使用新旧双签名完成服务端原子切换。
                 </p>
                 <form onSubmit={handleRotatePassword}>
                   <div className="field">
@@ -337,7 +492,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     </div>
                   </div>
                   <button type="submit" className="btn btn-primary" disabled={rotating}>
-                    {rotating ? '正在重加密整个保险库...' : '更新密码并轮换密钥'}
+                    {rotating ? '正在客户端重加密整个保险库...' : '更新密码并轮换全部密钥'}
                   </button>
                 </form>
               </section>
@@ -346,10 +501,10 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
               <section className="sec-panel">
                 <h3>
                   <Upload size={16} />
-                  恢复 / 迁移加密备份包
+                  恢复 / 迁移加密备份包 (.sns)
                 </h3>
                 <p className="sec-panel-desc">
-                  支持在 Docker 服务端与 Windows 本地桌面应用之间无缝迁移 <code className="mono">.sns</code> 加密数据包。
+                  支持在 Docker 服务端与 Windows 纯本地桌面端之间无缝迁移，自动将旧版 v1 备份升级为 v2 零知识容器。
                 </p>
                 <form onSubmit={handleImport}>
                   <div className="field">
@@ -362,19 +517,31 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                       onChange={(e) => setImportFile(e.target.files?.[0] || null)}
                     />
                   </div>
-                  <div className="field">
-                    <label className="field-label">备份包对应的管理员密码</label>
-                    <input
-                      type="password"
-                      className="input"
-                      value={importPass}
-                      onChange={(e) => setImportPass(e.target.value)}
-                      placeholder="输入备份创建时的管理员密码"
-                    />
+                  <div className="field-row">
+                    <div className="field">
+                      <label className="field-label">备份包对应的管理员密码</label>
+                      <input
+                        type="password"
+                        className="input"
+                        value={importPass}
+                        onChange={(e) => setImportPass(e.target.value)}
+                        placeholder="备份创建时的管理员密码"
+                      />
+                    </div>
+                    <div className="field">
+                      <label className="field-label">当前库原密码（密码相同时留空）</label>
+                      <input
+                        type="password"
+                        className="input"
+                        value={importCurrentPass}
+                        onChange={(e) => setImportCurrentPass(e.target.value)}
+                        placeholder="跨密码覆盖时授权签名"
+                      />
+                    </div>
                   </div>
                   <button type="submit" className="btn" disabled={importing}>
                     <Upload size={14} />
-                    {importing ? '正在解密校验并导入...' : '验证并导入覆盖'}
+                    {importing ? '正在客户端解密校验并导入...' : '本地验证并导入覆盖'}
                   </button>
                 </form>
               </section>
@@ -387,7 +554,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                 已信任固定的 SSH 主机指纹 ({data?.known_hosts?.length || 0})
               </h3>
               <p className="sec-panel-desc">
-                用于防范 SSH 中间人劫持攻击。若远程服务器重装系统导致公钥变更，可在此移除旧指纹记录。
+                主机公钥指纹加密保存在零知识保险库内，由客户端 WASM 在每次 SSH 握手时直接校验，彻底杜绝服务端或网络中间人劫持。
               </p>
               <div style={{ overflowX: 'auto' }}>
                 <table className="data-table">
@@ -405,7 +572,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     {!data?.known_hosts?.length ? (
                       <tr>
                         <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
-                          暂无固定的主机指纹记录，首次连接服务器时将自动记录
+                          暂无固定的主机指纹记录，首次端到端连接服务器时将自动记录
                         </td>
                       </tr>
                     ) : (
@@ -443,10 +610,10 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
             <section className="sec-panel">
               <h3>
                 <FileClock size={16} />
-                加密安全审计日志 (最近 {data?.audit_logs?.length || 0} 条)
+                零知识加密安全审计日志 (最近 {data?.audit_logs?.length || 0} 条)
               </h3>
               <p className="sec-panel-desc">
-                所有审计轨迹均加密保存在保险库内部，外部系统日志不记录敏感主机 IP 或账号信息。
+                审计日志在客户端生成并随整个保险库使用 XChaCha20-Poly1305 全量加密，部署服务器磁盘与 stdout 日志中不留任何主机 IP、用户名或操作痕迹。
               </p>
               <div style={{ maxHeight: 320, overflowY: 'auto' }}>
                 <table className="data-table">
@@ -456,7 +623,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                       <th>事件类型</th>
                       <th>操作对象</th>
                       <th>详情说明</th>
-                      <th>来源 IP</th>
+                      <th>执行上下文</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -475,7 +642,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                         </td>
                         <td style={{ fontSize: 12.5 }}>{log.detail}</td>
                         <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                          {log.client_ip || 'local'}
+                          {log.client_ip || 'client-zk'}
                         </td>
                       </tr>
                     ))}

@@ -1,82 +1,57 @@
 package api
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
+	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
 const desktopGuardCookieName = "sns_desktop_guard"
 
-// Config holds dependencies and runtime flags for the HTTP/WS API server.
+// Config holds zero-knowledge dependencies for the HTTP/WS API server.
+// Notice that neither vault.ClientVault nor sshmanager.Manager is referenced here:
+// the server physically cannot hold admin passwords, DEKs, SSH keys, or VaultState.
 type Config struct {
 	DeployMode string // "server" or "desktop"
-	Store      *vault.Store
+	BlindStore *vault.BlindStore
 	Auth       *auth.Manager
-	SSH        *sshmanager.Manager
+	Relay      *relay.Manager
 	StaticFS   fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
 }
 
 type Server struct {
-	cfg      Config
-	mux      *http.ServeMux
-	upgrader websocket.Upgrader
-	stopCh   chan struct{}
+	cfg Config
+	mux *http.ServeMux
 }
 
 func NewServer(cfg Config) *Server {
 	if cfg.DeployMode == "" {
 		cfg.DeployMode = "server"
 	}
+	if cfg.Relay == nil {
+		cfg.Relay = relay.NewManager("")
+	}
 	s := &Server{
-		cfg:    cfg,
-		mux:    http.NewServeMux(),
-		stopCh: make(chan struct{}),
+		cfg: cfg,
+		mux: http.NewServeMux(),
 	}
-	s.upgrader = websocket.Upgrader{
-		ReadBufferSize:  16 * 1024,
-		WriteBufferSize: 16 * 1024,
-		CheckOrigin:     s.checkWebSocketOrigin,
-	}
-
-	// Ensure locking the vault immediately revokes all active bearer sessions
-	cfg.Store.RegisterOnLock(func() {
-		cfg.Auth.RevokeAll()
-	})
-
 	s.registerRoutes()
-	go s.autoLockLoop()
 	return s
 }
 
 func (s *Server) Close() {
-	select {
-	case <-s.stopCh:
-	default:
-		close(s.stopCh)
-	}
-}
-
-func (s *Server) autoLockLoop() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		case <-ticker.C:
-			s.cfg.Store.CheckAutoLock()
-		}
+	if s.cfg.Relay != nil {
+		s.cfg.Relay.CloseAll()
 	}
 }
 
@@ -89,6 +64,8 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http: https: ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 			if s.cfg.Auth.DesktopGuardEnabled() {
@@ -97,22 +74,20 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 					writeError(w, http.StatusForbidden, "FORBIDDEN_ORIGIN", "本地桌面安全隔离策略已拦截外部未授权进程访问")
 					return
 				}
+			} else if origin := r.Header.Get("Origin"); origin != "" {
+				// Allow token/signature-based Remote Zero-Knowledge Vault Sync preflights in server mode (never with credentials/cookies)
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(u.Host, r.Host)
 }
 
 func (s *Server) registerRoutes() {
@@ -122,80 +97,49 @@ func (s *Server) registerRoutes() {
 	// Public healthcheck
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":   true,
-			"mode": s.cfg.DeployMode,
+			"ok":             true,
+			"mode":           s.cfg.DeployMode,
+			"zero_knowledge": true,
 		})
 	})
 
-	// Auth & Vault Lifecycle
+	// Zero-Knowledge Authentication & Lifecycle
 	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
-	s.mux.HandleFunc("POST /api/auth/unlock", s.handleAuthUnlock)
+	s.mux.HandleFunc("POST /api/auth/challenge", s.handleAuthChallenge)
+	s.mux.HandleFunc("POST /api/auth/verify", s.handleAuthVerify)
 	s.mux.HandleFunc("POST /api/auth/logout", s.requireAuth(s.handleAuthLogout))
 	s.mux.HandleFunc("POST /api/auth/lock", s.requireAuth(s.handleAuthLock))
 	s.mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
 
-	// Encrypted Vault Backup Export & Import
-	s.mux.HandleFunc("GET /api/vault/export", s.requireAuth(s.handleVaultExport))
-	s.mux.HandleFunc("POST /api/vault/import", s.handleVaultImport)
+	// Zero-Knowledge Opaque Ciphertext Blob Transport & Backup Import/Export
+	s.mux.HandleFunc("GET /api/vault/blob", s.requireAuth(s.handleGetVaultBlob))
+	s.mux.HandleFunc("PUT /api/vault/blob", s.requireAuth(s.handlePutVaultBlob))
+	s.mux.HandleFunc("GET /api/vault/export", s.requireAuth(s.handleExportVaultBlob))
+	s.mux.HandleFunc("POST /api/vault/import", s.handleImportVaultBlob)
 
-	// Vault Security Center, Settings, KnownHosts, Audit
-	s.mux.HandleFunc("GET /api/vault/security", s.requireAuth(s.handleVaultSecurity))
-	s.mux.HandleFunc("PUT /api/vault/settings", s.requireAuth(s.handleUpdateSettings))
-	s.mux.HandleFunc("DELETE /api/vault/known-hosts", s.requireAuth(s.handleDeleteKnownHost))
+	// Zero-Knowledge Blind TCP Relay over WebSocket (carries end-to-end encrypted SSHv2 frames)
+	s.mux.HandleFunc("POST /api/ws/ticket", s.requireAuth(s.handleIssueRelayTicket))
+	s.mux.HandleFunc("GET /api/ws/tcp-relay", s.handleWebSocketTCPRelay)
 
-	// Servers & Groups
-	s.mux.HandleFunc("GET /api/servers", s.requireAuth(s.handleListServers))
-	s.mux.HandleFunc("POST /api/servers", s.requireAuth(s.handleCreateServer))
-	s.mux.HandleFunc("PUT /api/servers/{id}", s.requireAuth(s.handleUpdateServer))
-	s.mux.HandleFunc("DELETE /api/servers/{id}", s.requireAuth(s.handleDeleteServer))
-	s.mux.HandleFunc("POST /api/servers/{id}/probe", s.requireAuth(s.handleProbeServer))
-	s.mux.HandleFunc("POST /api/groups", s.requireAuth(s.handleAddGroup))
-	s.mux.HandleFunc("DELETE /api/groups", s.requireAuth(s.handleDeleteGroup))
-
-	// Credentials & SSH Key Generator / Deployer
-	s.mux.HandleFunc("GET /api/credentials", s.requireAuth(s.handleListCredentials))
-	s.mux.HandleFunc("POST /api/credentials", s.requireAuth(s.handleCreateCredential))
-	s.mux.HandleFunc("PUT /api/credentials/{id}", s.requireAuth(s.handleUpdateCredential))
-	s.mux.HandleFunc("DELETE /api/credentials/{id}", s.requireAuth(s.handleDeleteCredential))
-	s.mux.HandleFunc("POST /api/keys/generate", s.requireAuth(s.handleGenerateKeyPair))
-	s.mux.HandleFunc("POST /api/keys/deploy", s.requireAuth(s.handleDeployPublicKey))
-
-	// Quick Snippets & Multi-Server Batch Exec
-	s.mux.HandleFunc("GET /api/snippets", s.requireAuth(s.handleListSnippets))
-	s.mux.HandleFunc("POST /api/snippets", s.requireAuth(s.handleUpsertSnippet))
-	s.mux.HandleFunc("DELETE /api/snippets/{id}", s.requireAuth(s.handleDeleteSnippet))
-	s.mux.HandleFunc("POST /api/snippets/batch-exec", s.requireAuth(s.handleBatchExec))
-
-	// One-time Tickets & Interactive SSH WebSocket
-	s.mux.HandleFunc("POST /api/ws/ticket", s.requireAuth(s.handleIssueTicket))
-	s.mux.HandleFunc("GET /api/ws/ssh/{id}", s.handleWebSocketSSH)
-
-	// SFTP File Manager
-	s.mux.HandleFunc("GET /api/sftp/{id}/list", s.requireAuth(s.handleSFTPList))
-	s.mux.HandleFunc("GET /api/sftp/{id}/read", s.requireAuth(s.handleSFTPRead))
-	s.mux.HandleFunc("POST /api/sftp/{id}/write", s.requireAuth(s.handleSFTPWrite))
-	s.mux.HandleFunc("POST /api/sftp/{id}/upload", s.requireAuth(s.handleSFTPUpload))
-	s.mux.HandleFunc("GET /api/sftp/{id}/download", s.handleSFTPDownload)
-	s.mux.HandleFunc("POST /api/sftp/{id}/mkdir", s.requireAuth(s.handleSFTPMkdir))
-	s.mux.HandleFunc("POST /api/sftp/{id}/rename", s.requireAuth(s.handleSFTPRename))
-	s.mux.HandleFunc("POST /api/sftp/{id}/delete", s.requireAuth(s.handleSFTPDelete))
-	s.mux.HandleFunc("POST /api/sftp/{id}/chmod", s.requireAuth(s.handleSFTPChmod))
-
-	// Embedded Single-Page Web Application fallback
+	// Embedded Single-Page Web Application + Pre-Compressed Go WASM Engine
 	if s.cfg.StaticFS != nil {
 		fileServer := http.FileServer(http.FS(s.cfg.StaticFS))
 		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/api/") {
-				writeError(w, http.StatusNotFound, "NOT_FOUND", "API 路径不存在")
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "零知识 API 路径不存在")
 				return
 			}
 			cleanPath := strings.TrimPrefix(r.URL.Path, "/")
+			if cleanPath == "sns-zk.wasm" {
+				if s.servePrecompressedWASM(w, r) {
+					return
+				}
+			}
 			if cleanPath == "" {
 				cleanPath = "index.html"
 			}
 			if _, err := fs.Stat(s.cfg.StaticFS, cleanPath); err != nil {
-				// SPA client-side fallback -> index.html
 				r2 := new(http.Request)
 				*r2 = *r
 				r2.URL = new(url.URL)
@@ -207,6 +151,34 @@ func (s *Server) registerRoutes() {
 			fileServer.ServeHTTP(w, r)
 		})
 	}
+}
+
+func (s *Server) servePrecompressedWASM(w http.ResponseWriter, r *http.Request) bool {
+	gzFile, err := s.cfg.StaticFS.Open("sns-zk.wasm.gz")
+	if err != nil {
+		return false
+	}
+	defer gzFile.Close()
+
+	w.Header().Set("Content-Type", "application/wasm")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Vary", "Accept-Encoding")
+
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(w, gzFile)
+		return true
+	}
+
+	gzReader, err := gzip.NewReader(gzFile)
+	if err != nil {
+		return false
+	}
+	defer gzReader.Close()
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, gzReader)
+	return true
 }
 
 func extractBearerToken(r *http.Request) string {
@@ -225,24 +197,38 @@ func extractClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+func (s *Server) currentAuthPubFingerprint() string {
+	if !s.cfg.BlindStore.IsInitialized() {
+		return ""
+	}
+	info := s.cfg.BlindStore.EncryptionInfo(true)
+	return info.AuthPubKeySHA256
+}
+
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Store.Status() != vault.StatusUnlocked {
-			writeError(w, http.StatusUnauthorized, "VAULT_LOCKED", "加密保险库已锁定，请先验证管理员密码")
+		if !s.cfg.BlindStore.IsInitialized() {
+			writeError(w, http.StatusUnauthorized, "VAULT_NOT_INIT", vault.ErrVaultNotInit.Error())
 			return
 		}
 		tok := extractBearerToken(r)
-		if _, err := s.cfg.Auth.ValidateSession(tok); err != nil {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "尚未通过管理员密码验证或会话已失效")
+		pubFP := s.currentAuthPubFingerprint()
+		if _, err := s.cfg.Auth.ValidateSession(tok, pubFP); err != nil {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "尚未通过零知识管理员验证或会话已失效")
 			return
 		}
-		s.cfg.Store.TouchActivity()
 		next(w, r)
 	}
 }
 
-func decodeJSON(r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 8*1024*1024))
+// decodeStrictJSON decodes JSON with DisallowUnknownFields so any accidental or legacy
+// plaintext field (such as "password") is strictly rejected at the wire boundary.
+func decodeStrictJSON(r *http.Request, dst any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		maxBytes = 72 * 1024 * 1024 // accommodates base64 of 64 MiB max vault container
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBytes))
+	dec.DisallowUnknownFields()
 	return dec.Decode(dst)
 }
 
@@ -260,24 +246,17 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func writeDomainError(w http.ResponseWriter, err error) {
-	var hkErr *sshmanager.HostKeyUntrustedError
-	if errors.As(err, &hkErr) {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":         hkErr.Error(),
-			"code":          "HOST_KEY_UNTRUSTED",
-			"host_key_info": hkErr,
-		})
-		return
-	}
 	switch {
-	case errors.Is(err, vault.ErrVaultLocked):
-		writeError(w, http.StatusUnauthorized, "VAULT_LOCKED", err.Error())
-	case errors.Is(err, vault.ErrInvalidPassword):
+	case errors.Is(err, vault.ErrVaultNotInit):
+		writeError(w, http.StatusBadRequest, "VAULT_NOT_INIT", err.Error())
+	case errors.Is(err, vault.ErrVaultAlreadyInit):
+		writeError(w, http.StatusConflict, "VAULT_ALREADY_INIT", err.Error())
+	case errors.Is(err, vault.ErrRevisionConflict):
+		writeError(w, http.StatusConflict, "REVISION_CONFLICT", err.Error())
+	case errors.Is(err, vault.ErrInvalidPassword), errors.Is(err, vault.ErrInvalidSignature):
 		writeError(w, http.StatusUnauthorized, "INVALID_PASSWORD", err.Error())
-	case errors.Is(err, vault.ErrWeakPassword), errors.Is(err, vault.ErrInvalidInput):
-		writeError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())
-	case errors.Is(err, vault.ErrNotFound):
-		writeError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+	case errors.Is(err, vault.ErrCorruptedVault):
+		writeError(w, http.StatusBadRequest, "CORRUPTED_VAULT", err.Error())
 	default:
 		writeError(w, http.StatusBadRequest, "OPERATION_FAILED", err.Error())
 	}

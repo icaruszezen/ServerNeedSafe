@@ -275,6 +275,27 @@ func (m *Manager) SFTPDownloadStream(serverID, remotePath, clientIP string) (io.
 	return f, stat, cleanup, nil
 }
 
+// SFTPDownloadBytes downloads a remote file directly into client memory (up to maxBytes) for browser Blob saving.
+func (m *Manager) SFTPDownloadBytes(serverID, remotePath string, maxBytes int64, clientIP string) ([]byte, string, error) {
+	if maxBytes <= 0 {
+		maxBytes = 128 * 1024 * 1024 // 128 MiB default client WASM cap
+	}
+	rc, stat, cleanup, err := m.SFTPDownloadStream(serverID, remotePath, clientIP)
+	if err != nil {
+		return nil, "", err
+	}
+	defer cleanup()
+
+	if stat.Size() > maxBytes {
+		return nil, "", fmt.Errorf("文件大小 (%d MB) 超过浏览器端内存下载上限 (%d MB)", stat.Size()/(1024*1024), maxBytes/(1024*1024))
+	}
+	data, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	return data, stat.Name(), nil
+}
+
 // SFTPMkdir creates a directory (including parents) over SFTP.
 func (m *Manager) SFTPMkdir(serverID, remotePath, clientIP string) error {
 	return m.withSFTP(serverID, clientIP, func(sc *sftp.Client, srvName string) error {

@@ -15,7 +15,8 @@ import {
   Search,
   Server,
 } from 'lucide-react';
-import { api, buildSSHWebSocketURL } from '../api';
+import { api, ApiError } from '../api';
+import { zkClient } from '../zk/zkClient';
 import type {
   AppSettings,
   HostKeyUntrustedInfo,
@@ -80,16 +81,13 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const connectedRef = useRef(false);
   const connectSeqRef = useRef(0);
 
-  const connectSocket = useCallback(
+  const connectSession = useCallback(
     async (trustFp = '') => {
       const seq = ++connectSeqRef.current;
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      connectedRef.current = false;
 
       const term = termRef.current;
       const fit = fitRef.current;
@@ -103,78 +101,40 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
       onStatusChange(tab.tabId, 'connecting');
       term.writeln(
-        `\x1b[38;5;245m[ServerNeedSafe] 正在建立加密 SSH 隧道 → ${tab.server.username}@${tab.server.host}:${tab.server.port} ...\x1b[0m`
+        `\x1b[38;5;245m[ServerNeedSafe 零知识终端] 正在客户端 WASM 发起端到端 SSHv2 握手 → ${tab.server.username}@${tab.server.host}:${tab.server.port} ...\x1b[0m`
       );
 
       try {
-        const { ticket } = await api.issueTicket('ws_ssh', tab.server.id);
-        if (seq !== connectSeqRef.current) return;
-
         const cols = term.cols || 120;
         const rows = term.rows || 34;
-        const url = buildSSHWebSocketURL(
-          tab.server.id,
-          ticket,
+        const { ready } = await api.openTerminalSession({
+          tab_id: tab.tabId,
+          server_id: tab.server.id,
           cols,
           rows,
-          trustFp || tab.trustFingerprint || ''
-        );
+          trust_fingerprint: trustFp || tab.trustFingerprint || '',
+        });
+        if (seq !== connectSeqRef.current) return;
 
-        const ws = new WebSocket(url);
-        wsRef.current = ws;
-
-        ws.onmessage = (ev) => {
-          if (seq !== connectSeqRef.current) return;
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.type === 'ready') {
-              onStatusChange(tab.tabId, 'connected', msg.fingerprint, msg.latency_ms);
-              fit.fit();
-              ws.send(
-                JSON.stringify({
-                  type: 'resize',
-                  cols: term.cols,
-                  rows: term.rows,
-                })
-              );
-              term.focus();
-            } else if (msg.type === 'output' && msg.data_b64) {
-              const binary = atob(msg.data_b64);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                bytes[i] = binary.charCodeAt(i);
-              }
-              term.write(bytes);
-            } else if (msg.type === 'error') {
-              if (msg.code === 'HOST_KEY_UNTRUSTED' && msg.host_key_info) {
-                onStatusChange(tab.tabId, 'error');
-                onHostKeyChallenge(tab.tabId, msg.host_key_info);
-              } else {
-                onStatusChange(tab.tabId, 'error');
-                term.writeln(`\r\n\x1b[31m[连接错误] ${msg.message}\x1b[0m`);
-              }
-            } else if (msg.type === 'exit') {
-              onStatusChange(tab.tabId, 'closed');
-              term.writeln(`\r\n\x1b[33m[${msg.message || '会话已结束'}]\x1b[0m`);
-            }
-          } catch {
-            // Ignore malformed frame
-          }
-        };
-
-        ws.onclose = () => {
-          if (seq !== connectSeqRef.current) return;
-          onStatusChange(tab.tabId, 'closed');
-        };
-
-        ws.onerror = () => {
-          if (seq !== connectSeqRef.current) return;
-          onStatusChange(tab.tabId, 'error');
-        };
+        connectedRef.current = true;
+        onStatusChange(tab.tabId, 'connected', ready.fingerprint, ready.latency_ms);
+        try {
+          fit.fit();
+          zkClient.resizeTerminal(tab.tabId, term.cols, term.rows);
+        } catch {
+          // ignore
+        }
+        term.focus();
       } catch (err: any) {
         if (seq !== connectSeqRef.current) return;
+        connectedRef.current = false;
+        if (err instanceof ApiError && err.code === 'HOST_KEY_UNTRUSTED' && err.hostKeyInfo) {
+          onStatusChange(tab.tabId, 'error');
+          onHostKeyChallenge(tab.tabId, err.hostKeyInfo);
+          return;
+        }
         onStatusChange(tab.tabId, 'error');
-        term.writeln(`\r\n\x1b[31m[无法获取安全终端票据] ${err?.message || '请求失败'}\x1b[0m`);
+        term.writeln(`\r\n\x1b[31m[端到端 SSH 连接失败] ${err?.message || '请求失败'}\x1b[0m`);
       }
     },
     [tab, onStatusChange, onHostKeyChallenge]
@@ -226,10 +186,20 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     fitRef.current = fitAddon;
     searchRef.current = searchAddon;
 
+    const unsubWorker = zkClient.subscribeTerminal(tab.tabId, {
+      onOutput: (chunk) => {
+        term.write(chunk);
+      },
+      onExit: (message) => {
+        connectedRef.current = false;
+        onStatusChange(tab.tabId, 'closed');
+        term.writeln(`\r\n\x1b[33m[${message || '会话已结束'}]\x1b[0m`);
+      },
+    });
+
     const dataSub = term.onData((data) => {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', data }));
+      if (connectedRef.current) {
+        zkClient.sendTerminalInput(tab.tabId, data);
       }
     });
 
@@ -237,15 +207,8 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       if (!container.offsetWidth || !container.offsetHeight) return;
       try {
         fitAddon.fit();
-        const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: 'resize',
-              cols: term.cols,
-              rows: term.rows,
-            })
-          );
+        if (connectedRef.current) {
+          zkClient.resizeTerminal(tab.tabId, term.cols, term.rows);
         }
       } catch {
         // Ignore transient resize errors
@@ -255,15 +218,14 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
     registerHandle(tab.tabId, {
       sendCommand: (cmd: string) => {
-        const ws = wsRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'input', data: cmd.endsWith('\n') ? cmd : `${cmd}\n` }));
+        if (connectedRef.current) {
+          zkClient.sendTerminalInput(tab.tabId, cmd.endsWith('\n') ? cmd : `${cmd}\n`);
           term.focus();
         }
       },
       reconnect: (trustFp?: string) => {
         term.clear();
-        void connectSocket(trustFp);
+        void connectSession(trustFp);
       },
       searchNext: (query: string) => {
         if (query) searchAddon.findNext(query);
@@ -277,17 +239,16 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       },
     });
 
-    void connectSocket();
+    void connectSession();
 
     return () => {
       connectSeqRef.current++;
+      connectedRef.current = false;
       registerHandle(tab.tabId, null);
       ro.disconnect();
       dataSub.dispose();
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      unsubWorker();
+      zkClient.closeTerminal(tab.tabId);
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

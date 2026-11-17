@@ -2,46 +2,49 @@
 
 [![CI & Auto Build (Docker + Windows App)](https://github.com/icaruszezen/ServerNeedSafe/actions/workflows/build-release.yml/badge.svg)](https://github.com/icaruszezen/ServerNeedSafe/actions/workflows/build-release.yml)
 
-**面向 Vibe Coding 时代的多服务器安全管理与零知识全量加密 SSH 终端系统**
+**面向 Vibe Coding 时代的多服务器安全管理与客户端零知识端到端加密 (E2EE) SSH 终端系统**
 
-随着快速迭代开发时代的到来，多云与混合内网服务器暴露面持续扩大。`ServerNeedSafe` 旨在打造一套安全优先的多服务器运维基座，支持 **Docker 服务端网页部署** 与 **Windows 纯本地独立桌面应用** 两种形态，从底层实现全量应用数据的零知识认证加密存储。
+随着快速迭代开发时代的到来，多云与混合内网服务器暴露面持续扩大。`ServerNeedSafe` 旨在打造一套**抗部署服务器 `root` 泄露**的多服务器运维安全基座，同时支持 **Docker 服务端网页部署** 与 **Windows 纯本地独立桌面应用** 两种形态：**在不知道管理员密码的前提下，即使部署本应用的服务器 `root` 权限完全沦陷（包括磁盘窃取、进程内存 `gcore` 转储、网卡 `tcpdump` 抓包），攻击者也无法获取任何一台受管服务器的配置、密钥或终端/SFTP 数据**。
 
 ---
 
-## 核心特性（当前阶段已实现）
+## 零知识抗服务器 Root 泄露威胁模型与密码学架构
 
-### 1. 双模式无缝部署
-- **服务器 Docker 部署（Web 应用界面）**：多阶段构建极简非 Root 容器镜像（自动发布 `linux/amd64` 与 `linux/arm64` 双架构镜像至 GHCR），内置前端静态资源，一条 `docker compose up -d` 命令即可提供完整的 Web 管理控制台。
-- **Windows 纯本地桌面应用（直接双击运行）**：基于纯 Go 交叉编译为单一独立无黑框原生 GUI 程序（`ServerNeedSafe-windows-amd64.exe`），内嵌前端、SSH/SFTP 协议栈与加密引擎，仅监听本地回环 `127.0.0.1` 随机端口并启用进程级实例隔离令牌，无需安装任何外部依赖即可离线运行，默认采用便携式 `./data/vault.sns` 存储。
+| 攻击者掌握的服务器 `root` 能力 | 传统服务端加密架构风险 | ServerNeedSafe v2 客户端零知识架构防护结果 |
+| :--- | :--- | :--- |
+| **窃取 `/data/vault.sns` 磁盘文件** | 离线撞库弱口令或读取未加密元数据 | `SNSVAULT v2` 容器采用 `Argon2id (64 MiB, t=3, p=4)` + `XChaCha20-Poly1305` + `4 KiB` 随机块对齐填充，**零明文、零大小侧信道** |
+| **服务器 `root` 实时 Dump 进程内存 (`/proc/<pid>/mem`)** | 解锁期间服务端内存驻留主密钥 `DEK` 与解密后的主机私钥 | **服务端物理不持有任何解密代码、密码或 `DEK`**（`sns-server` 甚至不导入 `ClientVault` 或 `sshmanager`），内存中仅有盲密文与公开 `Ed25519` 公钥 |
+| **服务器 `root` 抓包 HTTP / WebSocket 流量** | 捕获登录请求中的明文密码、API 返回的服务器列表与 WebSocket 终端明文 | 管理员密码**永不离开客户端**（通过 `Ed25519` 零知识随机挑战签名登录）；SSHv2 与 SFTP 握手在浏览器独立 **Web Worker WASM** 中端到端完成，服务端仅盲转发已加密的 SSH 二进制帧 |
+| **篡改或回滚服务器磁盘密文 / 降级 KDF 参数** | 诱导客户端使用弱 KDF 派生密钥或回退至旧配置 | 客户端强制校验 `KDF ≥ 16 MiB` 下限、`HTML SHA-384 SRI` + `WASM SHA-256` 自校验，并在本地持久化 `VaultAnchor` 追踪单调递增 `Revision #` 拦截任何回滚、抹除或替换攻击 |
 
-### 2. 强制管理员密码验证与内存自动擦除
-- 首次启动强制引导创建管理员主密码（至少 8 位）。
-- 每次启动 Windows 桌面应用或新开浏览器进入 Web 端时，**必须通过管理员密码密码学校验**才可进入系统。
-- 内置连续输错密码指数退避防爆破锁定保护、无操作空闲自动锁定、`Ctrl + Shift + L` 一键紧急锁定，锁定时立即清零内存中的主密钥（`DEK`）并断开所有活跃 SSH 会话。
+### 核心密码学流水线 (`SNSVAULT v2`)
+1. **双域隔离密钥派生**：在客户端独立 Web Worker 的 Go WASM 线性内存中，由管理员密码经 `Argon2id (64 MiB)` 生成主种子，再通过 `HKDF-SHA256` 严格域分离派生：
+   - `KEK`（`sns-v2-vault-kek`）：通过 `AES-256-GCM` 封装随机 256 位数据加密主密钥 `DEK`。
+   - `Ed25519` 认证密钥对（`sns-v2-auth-ed25519`）：公钥随容器头部公开，私钥仅在客户端内存对服务端单次随机挑战（`ChallengeID + Nonce + VaultID`）与每次密文提交（`Revision + SHA256(Blob)`）进行数字签名。
+2. **全量 AEAD 认证加密**：所有服务器名称、IP、端口、用户名、SSH 密码、PEM/OpenSSH 私钥、口令、分组、快捷指令、`KnownHosts` 主机指纹、偏好设置与安全审计日志压缩并随机填充对齐 `4 KiB` 后，使用 `XChaCha20-Poly1305` 全量加密，并将完整头部（含 `VaultID`、单调递增 `Revision`、KDF 参数、`AuthPublicKey`）绑定为 `AAD`。
+3. **锁定时物理销毁内存**：点击「立即锁定」、空闲超时或按下 `Ctrl + Shift + L` 时，客户端立即调用 `worker.terminate()` 彻底卸载销毁整个 Web Worker 与 WASM 线性内存空间，同步吊销服务端会话并切断所有盲 TCP 隧道。
 
-### 3. 零知识全量数据加密存储（抗数据包泄露）
-所有服务器配置（IP、端口、账号、备注、分组）、SSH 密码、SSH 私钥与口令、可复用凭据库、信任的主机公钥指纹（`KnownHosts`）、快捷指令、系统设置与安全审计日志**100% 封装在单一认证加密容器 `vault.sns` 中**：
-- **密钥派生（KDF）**：`Argon2id`（默认 `64 MiB` 内存硬成本，`time=3`，`threads=4`，32 字节 CSPRNG 随机盐），磁盘不保存任何密码哈希或明文主密钥。
-- **信封加密（Envelope Encryption）**：使用 `Argon2id` 派生的 `KEK` 通过 `AES-256-GCM` 封装 256 位随机数据主密钥 `DEK`，支持在不暴露明文落盘的前提下安全轮换管理员密码与主密钥。
-- **全量载荷认证加密**：业务状态经压缩并按 `4 KiB` 随机字节块对齐填充（消除精确文件大小侧信道）后，使用 `XChaCha20-Poly1305`（每次写入生成全新 24 字节随机 Nonce）加密，并将文件头作为 `AAD` 绑定认证。
-- **安全保证**：即使整个 `data/` 目录或导出的 `.sns` 备份包被攻击者窃取，在不知道管理员密码的情况下无法查看任何一台服务器的 IP、用户名或密钥信息；任何单比特篡改均会被 AEAD 校验直接拦截。
+---
 
-### 4. 完备的多服务器 SSH 与 SFTP 管理
-- **主机资产与分组管理**：支持分组筛选、星标置顶、多维搜索、连通性延迟探测与无 Agent 实时指标采集（系统版本、CPU 负载、内存、磁盘）。
-- **多种认证与多级跳板机（ProxyJump）**：支持密码认证（兼容 `keyboard-interactive`）、独立 PEM/OpenSSH 私钥（含口令）、引用保险库凭据，以及通过任意受管堡垒机/跳板机建立多级加密隧道直达内网节点。
-- **SSH 主机指纹核验（防中间人攻击）**：支持 TOFU 首次信任固定或严格手动确认策略；一旦远程服务器公钥指纹发生变更，立即阻断连接并弹出高危中间人告警。
-- **多标签 Web 终端工作台**：基于 `@xterm/xterm` 的多标签并发 PTY 终端，支持窗口自适应缩放、全文检索、实时负载状态栏、快捷指令一键注入。
-- **可视化 SFTP 文件管理与在线编辑**：支持目录浏览、流式上传/下载、新建目录/文件、重命名、`chmod` 八进制权限修改及远程配置文件（如 `sshd_config`、`nginx.conf`）在线安全编辑。
-- **内置密钥生成器与公钥一键下发**：支持在内存中生成高强度 `Ed25519` 或 `RSA-4096` 密钥对直接存入加密保险库，并一键安全部署公钥至目标服务器 `~/.ssh/authorized_keys`。
-- **快捷指令与多机并发执行**：内置安全巡检指令模板，支持跨多台选定服务器并发执行命令并汇总退出码与输出。
+## 核心功能特性
+
+1. **双模式无缝部署 + 跨端零知识云同步**
+   - **Docker / Linux Web 服务端**：多阶段极简非 Root 容器镜像，仅需挂载 `/data` 即可提供盲密文存储与加密流量中继。
+   - **Windows 纯本地独立桌面应用 (`ServerNeedSafe-windows-amd64.exe`)**：单一无黑框原生 GUI 可执行文件，仅绑定 `127.0.0.1` 随机回环端口并启用进程级 Cookie 隔离守卫，完全离线可用；内置**跨端零知识密文云同步**，可随时将本地密文安全推送/拉取至远端 `sns-server`。
+2. **多服务器资产、多级跳板机 (`ProxyJump`) 与实时探测**
+   - 支持分组管理、星标置顶、多维检索、密码/私钥/凭据库三种认证方式。
+   - 支持通过任意受管堡垒机建立客户端端到端多级 `direct-tcpip` 隧道直达内网主机（连内网目标主机地址都包裹在外层 SSH 加密隧道内，部署服务器 `root` 甚至无法获知第二跳内网 IP）。
+3. **多标签 Web 终端工作台 + 同屏 SFTP 安全文件管理**
+   - 基于 `@xterm/xterm` 的多标签并发 PTY 终端，支持自适应缩放、全文检索、快捷指令一键注入、TOFU / 严格手动主机公钥指纹防中间人核验。
+   - 客户端 WASM 原生 SFTP 引擎支持目录浏览、流式上传/下载、新建目录/文件、重命名、`chmod` 权限修改与在线文本编辑，文件路径与内容全程端到端加密。
+4. **内置密钥生成器与多机并发巡检**
+   - 在客户端 WASM 内存中直接生成 `Ed25519` 或 `RSA-4096` 密钥对并一键部署公钥至目标主机 `~/.ssh/authorized_keys`；支持跨多台主机并发执行巡检指令。
 
 ---
 
 ## 部署与运行指南
 
-### 方式一：服务器 Docker 部署（Web 界面）
-
-**1. 直接使用 GitHub Actions 自动构建的多架构镜像（无需本地编译）：**
+### 方式一：服务器 Docker 部署（零知识 Web 服务端）
 
 ```bash
 docker run -d \
@@ -52,88 +55,57 @@ docker run -d \
   ghcr.io/icaruszezen/serverneedsafe:latest
 ```
 
-**2. 使用 Docker Compose 部署（或本地源码构建）：**
+或使用 Docker Compose 从源码构建启动：
 
 ```bash
 git clone https://github.com/icaruszezen/ServerNeedSafe.git
 cd ServerNeedSafe
-
-# 拉取预构建镜像直接启动
-docker compose up -d
-
-# 或从本地源码重新构建启动
 docker compose up -d --build
 ```
 
-启动后使用浏览器访问 `http://<服务器IP>:8080`，首次进入设置管理员密码即可使用。可通过环境变量自定义端口：
+> **安全建议**：公网部署时建议配合反向代理开启 HTTPS（TLS），结合内置的 HTML `SHA-384 SRI` 与 Worker `WASM SHA-256` 完整性校验，确保首次加载的前端静态代码不被网络链路篡改。
 
-```bash
-SNS_PORT=9443 docker compose up -d
-```
+### 方式二：Windows 纯本地桌面应用（直接双击运行）
 
-### 方式二：Windows 纯本地应用程序（直接运行）
-
-1. **直接获取 GitHub CI 自动构建产物**：
-   - 前往本仓库 **GitHub Releases** 或 **Actions → CI & Auto Build → Artifacts (`ServerNeedSafe-Windows-App`)** 下载：
-     - `ServerNeedSafe-windows-amd64.exe` / `ServerNeedSafe-Windows-x64-Portable.zip`（Windows 10/11 64 位）
-     - `ServerNeedSafe-windows-arm64.exe` / `ServerNeedSafe-Windows-arm64-Portable.zip`（Windows ARM64）
-   - 复制到任意目录直接双击运行即可打开原生桌面窗口。
-   - 程序默认在同级目录自动创建 `data\vault.sns` 存储全量加密数据（便携模式，整个文件夹拷走即可迁移）；若放置在只读目录（如 `C:\Program Files`），则自动回退至 `%LOCALAPPDATA%\ServerNeedSafe\data\vault.sns`。
-
-2. **从源码自行编译（支持在 Linux / macOS / Windows 下编译）**：
-
-   - **Linux / macOS 一键交叉编译全平台产物**：
-     ```bash
-     bash ./scripts/build-all.sh
-     ```
-     产物输出至 `dist/` 目录：
-     - `dist/ServerNeedSafe-windows-amd64.exe`（Windows 10/11 64 位纯本地桌面端）
-     - `dist/ServerNeedSafe-windows-arm64.exe`（Windows ARM64 纯本地桌面端）
-     - `dist/sns-server-linux-amd64` / `dist/sns-server-linux-arm64`（Linux 独立 Web 服务端单文件）
-
-   - **Windows PowerShell 本地编译**：
-     ```powershell
-     .\scripts\build-windows.ps1
-     ```
-
-### CI / CD 自动化流水线说明
-
-仓库内置 [`.github/workflows/build-release.yml`](.github/workflows/build-release.yml) 持续集成流水线：
-- **每次推送 `main` 或发起 PR**：自动执行前端打包、Go 竞态与加密安全测试套件、编译 Windows 本地应用与 Linux 二进制（上传至 Actions Artifacts），并对 Docker 容器执行真实启动与 `/api/health` 冒烟检测。
-- **合入 `main` 分支**：自动推送 `linux/amd64` + `linux/arm64` 多架构 Docker 镜像至 `ghcr.io/icaruszezen/serverneedsafe:latest`。
-- **推送 `v*` 版本标签**（例如 `git tag v0.1.0 && git push origin v0.1.0`）：自动创建 GitHub Release 并附带 Windows `.exe`、便携 `.zip`、Linux 二进制及 `SHA256SUMS.txt` 校验清单。
+1. 前往本仓库 **GitHub Releases** 或 **Actions Artifacts (`ServerNeedSafe-Windows-App`)** 下载 `ServerNeedSafe-windows-amd64.exe`（或 `arm64` 版本）直接双击运行。
+2. 从源码一键交叉编译全平台产物（Linux / macOS）：
+   ```bash
+   bash ./scripts/build-all.sh
+   ```
+   输出产物位于 `dist/`：
+   - `dist/ServerNeedSafe-windows-amd64.exe` / `dist/ServerNeedSafe-windows-arm64.exe`
+   - `dist/sns-server-linux-amd64` / `dist/sns-server-linux-arm64`
+   - `dist/SHA256SUMS.txt`
 
 ---
 
-## 目录架构与后续演进规划
+## 目录架构
 
 ```text
 ServerNeedSafe/
 ├── cmd/
-│   ├── server/          # Docker / Linux Web 服务端入口
-│   └── desktop/         # Windows 纯本地原生桌面 GUI 应用入口 (WebView2 + 回环隔离)
+│   ├── server/          # 零知识盲存储 + 盲 TCP 中继 Web 服务端入口（零明文、零密钥）
+│   ├── desktop/         # Windows 纯本地原生桌面 GUI 应用入口 (WebView2 + 回环守卫)
+│   └── wasm/            # 浏览器独立 Web Worker 零知识密码学与端到端 SSH/SFTP WASM 引擎入口
 ├── internal/
-│   ├── vault/           # Argon2id + AES-256-GCM + XChaCha20-Poly1305 零知识加密存储引擎
-│   ├── auth/            # 会话认证、防爆破限流、单次票据与本地桌面隔离守卫
-│   ├── sshmanager/      # SSH 拨号、跳板机隧道、PTY 终端桥接、SFTP、密钥生成与并发探测
-│   └── api/             # REST + WebSocket 路由与内嵌静态前端服务
-├── web/                 # React + TypeScript + Vanilla CSS + Xterm.js 现代前端界面
-├── Dockerfile           # 多阶段非 Root 容器构建文件
-└── docker-compose.yml   # 一键容器编排配置
+│   ├── vault/           # SNSVAULT v2 容器 (Argon2id + HKDF + XChaCha20-Poly1305 + BlindStore + ClientVault)
+│   ├── auth/            # Ed25519 单次随机挑战会话、指数退避防爆破与单次中继票据
+│   ├── relay/           # 零元数据保留的 WebSocket ↔ TCP 盲二进制流中继器
+│   ├── sshmanager/      # 纯客户端端到端 SSHv2 拨号、ProxyJump、PTY 终端、SFTP 与密钥生成
+│   ├── zkclient/        # 跨原生与 WASM 的零知识客户端引擎、CAS 自动合并与远端密文云同步
+│   └── api/             # 严格拒绝未知字段的零知识 REST/WS 路由与模拟服务器 root 沦陷测试套件
+└── web/                 # React + TypeScript + Dedicated Web Worker + SRI 完整性校验前端
 ```
-
-**后续开发规划（模块化预留）**：
-- 接入大语言模型（LLM）辅助服务器安全诊断与自然语言运维
-- 自动同步最新 CVE 安全漏洞情报库并与受管服务器版本比对
-- 一键快速安全补丁修复与回滚编排
-- 定时后台巡检服务器异常进程、异常网络连接与登录告警
 
 ---
 
-## 安全测试验证
+## 安全测试验证（含模拟服务器 Root 沦陷全链路取证测试）
 
-运行完整加密防泄漏、篡改检测、跳板机隧道、MITM 主机指纹拦截与会话鉴权测试套件：
+运行静态分析（含原生与 `js/wasm` 目标）及竞态安全测试套件（含 [`root_breach_test.go`](internal/api/root_breach_test.go) 对磁盘、全量 TCP/WS 抓包字节流、服务端 Go 堆内存结构体的零泄漏断言及主动回滚/篡改/降级/覆盖攻击拦截验证）：
 
 ```bash
-go test ./internal/... -v -race
+cd web && npm ci && npm run build && cd ..
+go vet ./...
+GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/zkclient
+go test ./... -v -race -count=1
 ```

@@ -14,11 +14,13 @@ windows: web
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui" -o dist/ServerNeedSafe-windows-amd64.exe ./cmd/desktop
 	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags="-s -w -H windowsgui" -o dist/ServerNeedSafe-windows-arm64.exe ./cmd/desktop
 
-test:
-	go test ./internal/... -v -race
+test: web
+	go vet ./...
+	GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/zkclient
+	go test ./... -v -race -count=1
 
 docker:
 	docker compose up -d --build
 
 clean:
-	rm -rf dist web/dist
+	rm -rf dist web/dist web/public/sns-zk.wasm.gz web/src/zk/wasm_exec.js web/src/zk/wasmIntegrity.json

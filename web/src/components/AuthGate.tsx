@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ShieldCheck,
   Lock,
@@ -9,13 +9,17 @@ import {
   Monitor,
   AlertCircle,
   KeyRound,
+  Cpu,
+  AlertTriangle,
 } from 'lucide-react';
-import { api, ApiError, setSessionToken } from '../api';
+import { api, ApiError } from '../api';
+import { zkClient, type WasmIntegrityState } from '../zk/zkClient';
 import type { AppSettings, AuthStatusResponse } from '../types';
 
 interface AuthGateProps {
   status: AuthStatusResponse;
-  onAuthenticated: (settings?: AppSettings) => void;
+  onAuthenticated: (settings?: AppSettings, updatedStatus?: AuthStatusResponse) => void;
+  onRefreshStatus?: () => Promise<void>;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
 }
@@ -34,18 +38,30 @@ function calcPasswordStrength(pw: string): { level: number; label: string } {
 export const AuthGate: React.FC<AuthGateProps> = ({
   status,
   onAuthenticated,
+  onRefreshStatus,
   theme,
   onToggleTheme,
 }) => {
   const isSetup = status.vault_status === 'uninitialized';
+  const serverHasVault = Boolean(status.initialized) || status.vault_status === 'locked';
+
   const [tab, setTab] = useState<'primary' | 'restore'>('primary');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [currentAdminPassword, setCurrentAdminPassword] = useState('');
+  const [clearAnchorOnRestore, setClearAnchorOnRestore] = useState(false);
   const [showPass, setShowPass] = useState(false);
   const [capsLock, setCapsLock] = useState(false);
   const [restoreFile, setRestoreFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [wasmIntegrity, setWasmIntegrity] = useState<WasmIntegrityState>(() =>
+    zkClient.getIntegrityState()
+  );
+
+  useEffect(() => {
+    return zkClient.subscribeIntegrity(setWasmIntegrity);
+  }, []);
 
   const strength = calcPasswordStrength(password);
 
@@ -53,6 +69,12 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     if (e.getModifierState) {
       setCapsLock(e.getModifierState('CapsLock'));
     }
+  };
+
+  const handleClearAnchor = async () => {
+    setError('');
+    await api.clearLocalAnchor();
+    await onRefreshStatus?.();
   };
 
   const handleSubmitPrimary = async (e: React.FormEvent) => {
@@ -78,15 +100,14 @@ export const AuthGate: React.FC<AuthGateProps> = ({
       const res = isSetup
         ? await api.setupVault(password)
         : await api.unlockVault(password);
-      setSessionToken(res.token);
       setPassword('');
       setConfirmPassword('');
-      onAuthenticated(res.settings);
+      onAuthenticated(res.settings, res.status);
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err.message);
       } else {
-        setError('验证失败，请检查服务连接状态');
+        setError('客户端零知识验证失败，请检查管理员密码或服务状态');
       }
     } finally {
       setLoading(false);
@@ -106,10 +127,13 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     }
     setLoading(true);
     try {
-      const res = await api.importVault(restoreFile, password);
-      setSessionToken(res.token);
+      const res = await api.importVault(restoreFile, password, {
+        currentAdminPassword: currentAdminPassword || undefined,
+        clearAnchor: clearAnchorOnRestore,
+      });
       setPassword('');
-      onAuthenticated(res.settings);
+      setCurrentAdminPassword('');
+      onAuthenticated(res.settings, res.status);
     } catch (err: any) {
       setError(err?.message || '解密恢复失败，请确认管理员密码是否正确');
     } finally {
@@ -118,6 +142,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
   };
 
   const memMiB = Math.round((status.encryption?.kdf_memory_kib || 65536) / 1024);
+  const unexpectedWipeDetected = isSetup && Boolean(status.anchor?.vault_id);
 
   return (
     <main className="auth-viewport">
@@ -128,7 +153,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           </div>
           <div className="auth-brand-text" style={{ flex: 1 }}>
             <h1>ServerNeedSafe</h1>
-            <span>多服务器安全管理与零知识加密保险库</span>
+            <span>客户端零知识端到端加密 (E2EE) · 抗服务器 Root 泄露架构</span>
           </div>
           <button
             type="button"
@@ -141,10 +166,29 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           </button>
         </div>
 
-        <div className="auth-spec-strip">
+        <div className="auth-spec-strip" style={{ flexWrap: 'wrap', gap: 6 }}>
           <span className="auth-spec-badge">
             <Lock size={13} />
-            Argon2id ({memMiB} MiB) · XChaCha20-Poly1305
+            Argon2id ({memMiB} MiB) · XChaCha20-Poly1305 · Ed25519
+          </span>
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              color: wasmIntegrity.verified ? 'var(--accent-teal)' : 'var(--text-muted)',
+              fontSize: 11.5,
+            }}
+            title={
+              wasmIntegrity.sha256
+                ? `WASM SHA-256: ${wasmIntegrity.sha256}`
+                : '客户端密码学 WASM 模块自检'
+            }
+          >
+            <Cpu size={13} />
+            {wasmIntegrity.verified
+              ? `WASM 哈希已自检 (${wasmIntegrity.sha256.slice(0, 8)}…)`
+              : 'WASM 零知识引擎就绪'}
           </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             {status.deploy_mode === 'desktop' ? (
@@ -153,11 +197,35 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               </>
             ) : (
               <>
-                <Server size={13} /> Web 服务端
+                <Server size={13} /> 零知识服务端
               </>
             )}
           </span>
         </div>
+
+        {unexpectedWipeDetected && (
+          <div
+            className="alert alert-error"
+            role="alert"
+            style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 8 }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
+              <AlertTriangle size={15} />
+              <span>防抹除 / 防回滚安全锚点告警</span>
+            </div>
+            <div style={{ fontSize: 12.5, lineHeight: 1.5 }}>
+              当前浏览器曾锚定加密库 <code className="mono">{status.anchor?.vault_id}</code>（版本{' '}
+              <code className="mono">#{status.anchor?.min_revision}</code>），但服务端目前处于未初始化状态。为防止被入侵的服务器诱导您重新输入密码，客户端已自动拦截。若这是您主动重置环境，请先确认清除本地锚点。
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => void handleClearAnchor()}
+            >
+              确认系本人重置服务，清除本地防回滚锚点
+            </button>
+          </div>
+        )}
 
         <div className="auth-mode-switch">
           <button
@@ -169,7 +237,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               setError('');
             }}
           >
-            {isSetup ? '初始化管理员密码' : '验证管理员密码'}
+            {isSetup ? '初始化零知识保险库' : '客户端解密并解锁'}
           </button>
           <button
             type="button"
@@ -195,7 +263,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           <form onSubmit={handleSubmitPrimary} id="auth-primary-form">
             <div className="field">
               <label className="field-label" htmlFor="admin-password-input">
-                <span>{isSetup ? '设置管理员主密码' : '输入管理员密码'}</span>
+                <span>{isSetup ? '设置管理员主密码（仅在本地派生，绝不上传）' : '输入管理员密码（仅在本地 WASM 解密）'}</span>
                 {capsLock && (
                   <span style={{ color: 'var(--amber-text)', fontSize: 11.5 }}>
                     大写锁定已开启
@@ -210,7 +278,11 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                   id="admin-password-input"
                   className="input"
                   type={showPass ? 'text' : 'password'}
-                  placeholder={isSetup ? '至少 8 位字符，建议包含大小写、数字与符号' : '请输入管理员密码以解锁加密数据'}
+                  placeholder={
+                    isSetup
+                      ? '至少 8 位字符，建议包含大小写、数字与符号'
+                      : '在本地派生 KEK 解密保险库并完成零知识挑战签名'
+                  }
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   onKeyUp={handleKeyEvent}
@@ -275,21 +347,21 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               type="submit"
               id="auth-submit-btn"
               className="btn btn-primary btn-block"
-              disabled={loading}
+              disabled={loading || unexpectedWipeDetected}
               style={{ marginTop: 6 }}
             >
               {loading
-                ? '正在派生密钥并校验加密容器...'
+                ? '正在客户端 WASM 派生密钥并验证签名...'
                 : isSetup
-                ? '创建加密保险库并进入系统'
-                : '验证密码并解锁进入'}
+                ? '在本地生成加密容器并初始化系统'
+                : '零知识挑战签名并本地解密进入'}
             </button>
           </form>
         ) : (
           <form onSubmit={handleSubmitRestore} id="auth-restore-form">
             <div className="field">
               <label className="field-label" htmlFor="restore-file-input">
-                选择加密数据包 (.sns)
+                选择加密数据包 (.sns，自动兼容 v1 / v2 格式)
               </label>
               <input
                 id="restore-file-input"
@@ -309,11 +381,48 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                 id="restore-password-input"
                 type="password"
                 className="input"
-                placeholder="输入备份创建时的管理员密码"
+                placeholder="输入备份创建时的管理员密码（本地解密校验）"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
             </div>
+
+            {serverHasVault && (
+              <div className="field">
+                <label className="field-label" htmlFor="restore-current-password-input">
+                  当前服务器原管理员密码（若与备份密码一致可留空）
+                </label>
+                <input
+                  id="restore-current-password-input"
+                  type="password"
+                  className="input"
+                  placeholder="用于生成 Ed25519 覆盖授权签名，防止未授权篡改"
+                  value={currentAdminPassword}
+                  onChange={(e) => setCurrentAdminPassword(e.target.value)}
+                />
+              </div>
+            )}
+
+            {status.anchor?.vault_id && (
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  fontSize: 12.5,
+                  color: 'var(--text-muted)',
+                  marginBottom: 12,
+                  cursor: 'pointer',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={clearAnchorOnRestore}
+                  onChange={(e) => setClearAnchorOnRestore(e.target.checked)}
+                />
+                允许替换为全新 Vault ID（重置本地防回滚锚点）
+              </label>
+            )}
 
             <button
               type="submit"
@@ -322,22 +431,15 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               disabled={loading}
             >
               <Upload size={15} />
-              {loading ? '正在验证并解密恢复...' : '验证并恢复保险库'}
+              {loading ? '正在客户端本地解密升级并签名上传...' : '本地解密校验并恢复保险库'}
             </button>
           </form>
         )}
 
         <div className="auth-footer-note">
-          {isSetup ? (
-            <>
-              <strong>零知识安全声明：</strong>
-              主密钥由管理员密码实时通过 Argon2id 派生，磁盘不存储任何密码哈希或明文密钥。请务必牢记管理员密码，遗忘后任何人都无法恢复加密数据。
-            </>
-          ) : (
-            <>
-              所有服务器地址、SSH 私钥、口令与操作记录均使用全量认证加密存储。即使数据包文件泄露，未持有管理员密码的攻击者也无法读取任何应用数据。
-            </>
-          )}
+          <strong>零知识抗服务器 Root 泄露保证：</strong>
+          管理员密码、主密钥 (DEK/KEK)、SSH 私钥与终端/SFTP 明文<strong>绝不离开浏览器独立 Web Worker WASM 内存</strong>。服务端仅存储盲密文容器并验证 Ed25519 零知识挑战签名——即使部署服务器的{' '}
+          <code className="mono">root</code> 权限完全沦陷，攻击者在不知道管理员密码的情况下也无法获取任何应用数据。
         </div>
       </div>
     </main>

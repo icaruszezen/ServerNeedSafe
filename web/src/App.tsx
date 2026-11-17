@@ -11,6 +11,7 @@ import {
   Moon,
 } from 'lucide-react';
 import { api, registerOnUnauthorized, setSessionToken } from './api';
+import { zkClient } from './zk/zkClient';
 import type {
   AppSettings,
   AuthStatusResponse,
@@ -114,8 +115,16 @@ export const App: React.FC = () => {
       clearUnlockedMemory();
       void checkStatus();
     });
+    zkClient.setOnAutoLocked(() => {
+      clearUnlockedMemory();
+      notify('因无操作超时，客户端零知识加密内存已自动销毁锁定');
+      void checkStatus();
+    });
     void checkStatus();
-  }, [checkStatus, clearUnlockedMemory]);
+    return () => {
+      zkClient.setOnAutoLocked(null);
+    };
+  }, [checkStatus, clearUnlockedMemory, notify]);
 
   useEffect(() => {
     if (authStatus?.authenticated) {
@@ -157,6 +166,7 @@ export const App: React.FC = () => {
   };
 
   const handleCloseTab = (tabId: string) => {
+    zkClient.closeTerminal(tabId);
     setTerminalTabs((prev) => {
       const next = prev.filter((t) => t.tabId !== tabId);
       if (activeTabId === tabId) {
@@ -176,7 +186,7 @@ export const App: React.FC = () => {
     return (
       <div className="auth-viewport">
         <div style={{ color: 'var(--text-muted)', fontSize: 13.5 }}>
-          正在加载安全加密环境...
+          正在启动客户端零知识密码学隔离环境 (WASM)...
         </div>
       </div>
     );
@@ -188,9 +198,12 @@ export const App: React.FC = () => {
         status={authStatus}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-        onAuthenticated={(s) => {
+        onRefreshStatus={checkStatus}
+        onAuthenticated={(s, updatedStatus) => {
           if (s) setSettings(s);
-          setAuthStatus({ ...authStatus, vault_status: 'unlocked', authenticated: true });
+          setAuthStatus(
+            updatedStatus || { ...authStatus, vault_status: 'unlocked', authenticated: true }
+          );
         }}
       />
     );
@@ -278,10 +291,10 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="sidebar-vault-pill">
-            <span>全量加密存储</span>
+          <div className="sidebar-vault-pill" title="客户端 WASM 零知识隔离 · 服务端零明文零密钥">
+            <span>零知识 E2EE</span>
             <span className="mono" style={{ fontSize: 10.5 }}>
-              XChaCha20
+              WASM · XChaCha20
             </span>
           </div>
           <div className="sidebar-actions">

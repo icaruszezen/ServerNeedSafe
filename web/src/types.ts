@@ -2,14 +2,36 @@ export type VaultStatus = 'uninitialized' | 'locked' | 'unlocked';
 export type AuthType = 'password' | 'private_key' | 'credential';
 export type HostKeyPolicy = 'tofu' | 'ask_new';
 
+export interface VaultAnchor {
+  vault_id: string;
+  min_revision: number;
+  auth_pubkey_sha256: string;
+  min_kdf_memory_kib: number;
+  min_kdf_time: number;
+  updated_at: string;
+}
+
+export interface SyncSummary {
+  direction: 'push' | 'pull';
+  remote_url: string;
+  vault_id: string;
+  revision: number;
+  bytes: number;
+}
+
 export interface EncryptionInfo {
   format_version: number;
+  vault_id?: string;
+  revision?: number;
   kdf_algo: string;
   kdf_time: number;
   kdf_memory_kib: number;
   kdf_threads: number;
   wrap_algo: string;
   cipher_algo: string;
+  auth_algo?: string;
+  auth_pubkey_sha256?: string;
+  zero_knowledge?: boolean;
   vault_size_bytes: number;
 }
 
@@ -19,15 +41,21 @@ export interface AppSettings {
   terminal_font_size: number;
   terminal_scrollback: number;
   show_hidden_files: boolean;
+  remote_sync_url?: string;
 }
 
 export interface AuthStatusResponse {
+  initialized?: boolean;
   vault_status: VaultStatus;
   authenticated: boolean;
   deploy_mode: 'server' | 'desktop';
+  zero_knowledge?: boolean;
   vault_path: string;
   encryption: EncryptionInfo;
   settings?: AppSettings;
+  anchor?: VaultAnchor;
+  active_sessions?: number;
+  active_relays?: number;
 }
 
 export interface ServerView {
@@ -183,12 +211,23 @@ export interface AuditEntry {
 export interface VaultSecurityOverview {
   deploy_mode: string;
   vault_path: string;
+  zero_knowledge?: boolean;
   encryption: EncryptionInfo;
   settings: AppSettings;
   known_hosts: KnownHost[];
   audit_logs: AuditEntry[];
   active_sessions: number;
+  active_relays?: number;
   active_ssh_tabs: number;
+  anchor?: VaultAnchor;
+}
+
+export interface TerminalReadyInfo {
+  session_id: string;
+  server_id: string;
+  server_name: string;
+  fingerprint: string;
+  latency_ms: number;
 }
 
 export interface OpenTerminalTab {
