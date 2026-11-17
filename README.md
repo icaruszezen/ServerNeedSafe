@@ -1,5 +1,7 @@
 # ServerNeedSafe
 
+[![CI & Auto Build (Docker + Windows App)](https://github.com/icaruszezen/ServerNeedSafe/actions/workflows/build-release.yml/badge.svg)](https://github.com/icaruszezen/ServerNeedSafe/actions/workflows/build-release.yml)
+
 **面向 Vibe Coding 时代的多服务器安全管理与零知识全量加密 SSH 终端系统**
 
 随着快速迭代开发时代的到来，多云与混合内网服务器暴露面持续扩大。`ServerNeedSafe` 旨在打造一套安全优先的多服务器运维基座，支持 **Docker 服务端网页部署** 与 **Windows 纯本地独立桌面应用** 两种形态，从底层实现全量应用数据的零知识认证加密存储。
@@ -9,7 +11,7 @@
 ## 核心特性（当前阶段已实现）
 
 ### 1. 双模式无缝部署
-- **服务器 Docker 部署（Web 应用界面）**：多阶段构建极简非 Root 容器镜像，内置前端静态资源，一条 `docker compose up -d` 命令即可提供完整的 Web 管理控制台。
+- **服务器 Docker 部署（Web 应用界面）**：多阶段构建极简非 Root 容器镜像（自动发布 `linux/amd64` 与 `linux/arm64` 双架构镜像至 GHCR），内置前端静态资源，一条 `docker compose up -d` 命令即可提供完整的 Web 管理控制台。
 - **Windows 纯本地桌面应用（直接双击运行）**：基于纯 Go 交叉编译为单一独立无黑框原生 GUI 程序（`ServerNeedSafe-windows-amd64.exe`），内嵌前端、SSH/SFTP 协议栈与加密引擎，仅监听本地回环 `127.0.0.1` 随机端口并启用进程级实例隔离令牌，无需安装任何外部依赖即可离线运行，默认采用便携式 `./data/vault.sns` 存储。
 
 ### 2. 强制管理员密码验证与内存自动擦除
@@ -39,11 +41,27 @@
 
 ### 方式一：服务器 Docker 部署（Web 界面）
 
+**1. 直接使用 GitHub Actions 自动构建的多架构镜像（无需本地编译）：**
+
+```bash
+docker run -d \
+  --name serverneedsafe \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v $(pwd)/data:/data \
+  ghcr.io/icaruszezen/serverneedsafe:latest
+```
+
+**2. 使用 Docker Compose 部署（或本地源码构建）：**
+
 ```bash
 git clone https://github.com/icaruszezen/ServerNeedSafe.git
 cd ServerNeedSafe
 
-# 构建并后台启动容器（默认映射 8080 端口，加密数据持久化在 ./data/vault.sns）
+# 拉取预构建镜像直接启动
+docker compose up -d
+
+# 或从本地源码重新构建启动
 docker compose up -d --build
 ```
 
@@ -55,8 +73,11 @@ SNS_PORT=9443 docker compose up -d
 
 ### 方式二：Windows 纯本地应用程序（直接运行）
 
-1. **直接运行编译产物**：
-   下载或编译得到单文件程序 `ServerNeedSafe-windows-amd64.exe`（x64）或 `ServerNeedSafe-windows-arm64.exe`（ARM64），复制到任意目录直接双击运行即可打开原生桌面窗口。
+1. **直接获取 GitHub CI 自动构建产物**：
+   - 前往本仓库 **GitHub Releases** 或 **Actions → CI & Auto Build → Artifacts (`ServerNeedSafe-Windows-App`)** 下载：
+     - `ServerNeedSafe-windows-amd64.exe` / `ServerNeedSafe-Windows-x64-Portable.zip`（Windows 10/11 64 位）
+     - `ServerNeedSafe-windows-arm64.exe` / `ServerNeedSafe-Windows-arm64-Portable.zip`（Windows ARM64）
+   - 复制到任意目录直接双击运行即可打开原生桌面窗口。
    - 程序默认在同级目录自动创建 `data\vault.sns` 存储全量加密数据（便携模式，整个文件夹拷走即可迁移）；若放置在只读目录（如 `C:\Program Files`），则自动回退至 `%LOCALAPPDATA%\ServerNeedSafe\data\vault.sns`。
 
 2. **从源码自行编译（支持在 Linux / macOS / Windows 下编译）**：
@@ -68,12 +89,19 @@ SNS_PORT=9443 docker compose up -d
      产物输出至 `dist/` 目录：
      - `dist/ServerNeedSafe-windows-amd64.exe`（Windows 10/11 64 位纯本地桌面端）
      - `dist/ServerNeedSafe-windows-arm64.exe`（Windows ARM64 纯本地桌面端）
-     - `dist/sns-server-linux-amd64`（Linux 独立 Web 服务端单文件）
+     - `dist/sns-server-linux-amd64` / `dist/sns-server-linux-arm64`（Linux 独立 Web 服务端单文件）
 
    - **Windows PowerShell 本地编译**：
      ```powershell
      .\scripts\build-windows.ps1
      ```
+
+### CI / CD 自动化流水线说明
+
+仓库内置 [`.github/workflows/build-release.yml`](.github/workflows/build-release.yml) 持续集成流水线：
+- **每次推送 `main` 或发起 PR**：自动执行前端打包、Go 竞态与加密安全测试套件、编译 Windows 本地应用与 Linux 二进制（上传至 Actions Artifacts），并对 Docker 容器执行真实启动与 `/api/health` 冒烟检测。
+- **合入 `main` 分支**：自动推送 `linux/amd64` + `linux/arm64` 多架构 Docker 镜像至 `ghcr.io/icaruszezen/serverneedsafe:latest`。
+- **推送 `v*` 版本标签**（例如 `git tag v0.1.0 && git push origin v0.1.0`）：自动创建 GitHub Release 并附带 Windows `.exe`、便携 `.zip`、Linux 二进制及 `SHA256SUMS.txt` 校验清单。
 
 ---
 

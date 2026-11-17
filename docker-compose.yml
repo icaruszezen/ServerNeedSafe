@@ -1,9 +1,9 @@
 services:
   serverneedsafe:
+    image: ghcr.io/icaruszezen/serverneedsafe:latest
     build:
       context: .
       dockerfile: Dockerfile
-    image: serverneedsafe:latest
     container_name: serverneedsafe
     restart: unless-stopped
     ports:

@@ -1,51 +1,267 @@
-name: Build & Verify (Docker + Windows Local App)
+name: CI & Auto Build (Docker + Windows App)
 
 on:
   push:
     branches: ["main", "master"]
     tags: ["v*"]
   pull_request:
+    branches: ["main", "master"]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build-and-test:
+  # ============================================================================
+  # 1. 前端构建检查 + Go 零知识加密与 SSH/SFTP 安全集成测试
+  # ============================================================================
+  test:
+    name: Security & Integration Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 24 LTS
         uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Build Frontend Bundle
+      - name: Install & Build Frontend Bundle
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
           npm run build
 
-      - name: Setup Go
+      - name: Setup Go Toolchain
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
-      - name: Run Security & Integration Tests
-        run: go test ./internal/... -v -race
+      - name: Static Vet & Race-Enabled Security Suite
+        run: |
+          go vet ./...
+          go test ./internal/... -v -race -count=1
 
-      - name: Build Windows Pure-Local Desktop EXE & Linux Server Binary
+  # ============================================================================
+  # 2. 自动构建纯本地 Windows 桌面应用 (.exe + 便携压缩包) 与 Linux 独立二进制
+  # ============================================================================
+  build-windows-app:
+    name: Build Windows Local App & Server Binaries
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Frontend Dependencies
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: Setup Go Toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build Windows GUI EXEs & Linux Server Binaries
         run: bash ./scripts/build-all.sh
 
-      - name: Upload Ready-to-Run Binaries
+      - name: Verify Windows Native GUI Subsystem Header
+        run: |
+          file dist/ServerNeedSafe-windows-amd64.exe | tee /dev/stderr | grep -q "PE32+ executable (GUI) x86-64"
+          file dist/ServerNeedSafe-windows-arm64.exe | tee /dev/stderr | grep -q "PE32+ executable (GUI) Aarch64"
+
+      - name: Package Portable Windows Bundles
+        run: |
+          mkdir -p pkg/win-x64 pkg/win-arm64
+          cp dist/ServerNeedSafe-windows-amd64.exe pkg/win-x64/ServerNeedSafe.exe
+          cp README.md pkg/win-x64/README.md
+          (cd pkg/win-x64 && zip -9 -r ../../dist/ServerNeedSafe-Windows-x64-Portable.zip .)
+
+          cp dist/ServerNeedSafe-windows-arm64.exe pkg/win-arm64/ServerNeedSafe.exe
+          cp README.md pkg/win-arm64/README.md
+          (cd pkg/win-arm64 && zip -9 -r ../../dist/ServerNeedSafe-Windows-arm64-Portable.zip .)
+
+          (
+            cd dist
+            sha256sum \
+              ServerNeedSafe-windows-amd64.exe \
+              ServerNeedSafe-windows-arm64.exe \
+              ServerNeedSafe-Windows-x64-Portable.zip \
+              ServerNeedSafe-Windows-arm64-Portable.zip \
+              sns-server-linux-amd64 \
+              sns-server-linux-arm64 > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
+
+      - name: Upload Windows Local Desktop Application Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ServerNeedSafe-Binaries
+          name: ServerNeedSafe-Windows-App
+          retention-days: 30
+          if-no-files-found: error
           path: |
             dist/ServerNeedSafe-windows-amd64.exe
             dist/ServerNeedSafe-windows-arm64.exe
-            dist/sns-server-linux-amd64
+            dist/ServerNeedSafe-Windows-x64-Portable.zip
+            dist/ServerNeedSafe-Windows-arm64-Portable.zip
+            dist/SHA256SUMS.txt
 
-      - name: Verify Docker Image Build
-        run: docker build -t serverneedsafe:ci .
+      - name: Upload Linux Standalone Server Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerNeedSafe-Linux-Server
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            dist/sns-server-linux-amd64
+            dist/sns-server-linux-arm64
+            dist/SHA256SUMS.txt
+
+  # ============================================================================
+  # 3. 自动构建多架构 Docker 镜像、运行容器健康探针并推送至 GHCR
+  # ============================================================================
+  build-docker:
+    name: Build & Publish Multi-Arch Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Normalize Image Reference to Lowercase
+        id: img
+        run: |
+          IMAGE_GHCR=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "ghcr=${IMAGE_GHCR}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU Multi-Arch Support
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Local amd64 Image for Container Smoke Test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: serverneedsafe:ci-smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Live Container Health & Web UI Smoke Check
+        run: |
+          docker run -d --name sns-smoke -p 18080:8080 serverneedsafe:ci-smoke
+          trap "docker logs sns-smoke || true; docker rm -f sns-smoke >/dev/null 2>&1 || true" EXIT
+          READY=0
+          for i in $(seq 1 25); do
+            if curl -fsS http://127.0.0.1:18080/api/health 2>/dev/null | grep -q '"ok":true'; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "Container failed healthcheck within 25s"
+            exit 1
+          fi
+          curl -fsS http://127.0.0.1:18080/api/health
+          curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deployMode":"server"'
+          curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata (Tags & Labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.ghcr }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build & Push Multi-Platform Image (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # 4. 推送 v* 版本标签时自动创建 GitHub Release 并附带 Windows/Linux 安装包
+  # ============================================================================
+  publish-release:
+    name: Publish GitHub Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows-app, build-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ServerNeedSafe-Windows-App
+          path: release-assets
+
+      - name: Download Linux Server Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ServerNeedSafe-Linux-Server
+          path: release-assets
+
+      - name: Generate Final Checksums & Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          (
+            cd release-assets
+            sha256sum \
+              ServerNeedSafe-windows-amd64.exe \
+              ServerNeedSafe-windows-arm64.exe \
+              ServerNeedSafe-Windows-x64-Portable.zip \
+              ServerNeedSafe-Windows-arm64-Portable.zip \
+              sns-server-linux-amd64 \
+              sns-server-linux-arm64 > SHA256SUMS.txt
+          )
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" release-assets/* --clobber
+          else
+            gh release create "${{ github.ref_name }}" release-assets/* \
+              --title "ServerNeedSafe ${{ github.ref_name }}" \
+              --generate-notes
+          fi
