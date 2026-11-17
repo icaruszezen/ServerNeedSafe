@@ -14,6 +14,7 @@ import {
   Activity,
   Search,
   Server,
+  Bot,
 } from 'lucide-react';
 import { api, ApiError } from '../api';
 import { zkClient } from '../zk/zkClient';
@@ -26,7 +27,14 @@ import type {
   Snippet,
 } from '../types';
 import { SftpPanel } from './SftpPanel';
+import { TerminalCopilotPanel } from './TerminalCopilotPanel';
 import { HostKeyModal } from './HostKeyModal';
+
+// Strip ANSI escape codes from rolling terminal text buffer before attaching as AI context
+function stripAnsi(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
 
 interface TerminalWorkspaceProps {
   tabs: OpenTerminalTab[];
@@ -41,6 +49,7 @@ interface TerminalWorkspaceProps {
   onCloseTab: (tabId: string) => void;
   onOpenServerTab: (server: ServerView) => void;
   onNavigateServers: () => void;
+  onNavigateAICenter?: () => void;
   onNotify: (msg: string) => void;
 }
 
@@ -49,6 +58,7 @@ interface SinglePaneHandle {
   reconnect: (trustFp?: string) => void;
   searchNext: (query: string) => void;
   fit: () => void;
+  getRecentOutput: () => string;
 }
 
 interface SinglePaneProps {
@@ -83,6 +93,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   const searchRef = useRef<SearchAddon | null>(null);
   const connectedRef = useRef(false);
   const connectSeqRef = useRef(0);
+  const recentOutputRef = useRef<string>('');
 
   const connectSession = useCallback(
     async (trustFp = '') => {
@@ -186,9 +197,21 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     fitRef.current = fitAddon;
     searchRef.current = searchAddon;
 
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+
     const unsubWorker = zkClient.subscribeTerminal(tab.tabId, {
       onOutput: (chunk) => {
         term.write(chunk);
+        try {
+          const decoded = stripAnsi(decoder.decode(chunk, { stream: true }));
+          if (decoded) {
+            const combined = recentOutputRef.current + decoded;
+            recentOutputRef.current =
+              combined.length > 7000 ? combined.slice(combined.length - 7000) : combined;
+          }
+        } catch {
+          // ignore decode edge cases
+        }
       },
       onExit: (message) => {
         connectedRef.current = false;
@@ -225,6 +248,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       },
       reconnect: (trustFp?: string) => {
         term.clear();
+        recentOutputRef.current = '';
         void connectSession(trustFp);
       },
       searchNext: (query: string) => {
@@ -237,6 +261,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
           // ignore
         }
       },
+      getRecentOutput: () => recentOutputRef.current,
     });
 
     void connectSession();
@@ -244,6 +269,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     return () => {
       connectSeqRef.current++;
       connectedRef.current = false;
+      recentOutputRef.current = '';
       registerHandle(tab.tabId, null);
       ro.disconnect();
       dataSub.dispose();
@@ -299,6 +325,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   onCloseTab,
   onOpenServerTab,
   onNavigateServers,
+  onNavigateAICenter,
   onNotify,
 }) => {
   const handlesRef = useRef<Record<string, SinglePaneHandle | null>>({});
@@ -313,7 +340,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     >
   >({});
   const [telemetryByServer, setTelemetryByServer] = useState<Record<string, ServerProbeResult>>({});
-  const [showSftp, setShowSftp] = useState(false);
+  const [sideDrawer, setSideDrawer] = useState<'none' | 'sftp' | 'ai'>('none');
   const [showQuickMenu, setShowQuickMenu] = useState(false);
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -325,7 +352,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
 
   useEffect(() => {
     if (defaultOpenSftp) {
-      setShowSftp(true);
+      setSideDrawer('sftp');
       onConsumeDefaultSftp?.();
     }
   }, [defaultOpenSftp, onConsumeDefaultSftp]);
@@ -373,7 +400,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
       }, 60);
       return () => clearTimeout(id);
     }
-  }, [showSftp, activeTab]);
+  }, [sideDrawer, activeTab]);
 
   if (tabs.length === 0) {
     return (
@@ -381,7 +408,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
         <div className="page-header">
           <div className="page-header-title">
             <h2>SSH 加密终端工作台</h2>
-            <p>支持多标签并发 PTY 终端会话、实时负载遥测与同屏 SFTP 文件传输</p>
+            <p>支持多标签并发 PTY 终端会话、实时负载遥测、同屏 SFTP 文件传输与 AI 副驾驶</p>
           </div>
         </div>
         <div className="page-body" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -630,10 +657,20 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
             <button
               type="button"
               id="term-toggle-sftp-btn"
-              className={`term-tool-btn ${showSftp ? 'active' : ''}`}
-              onClick={() => setShowSftp(!showSftp)}
+              className={`term-tool-btn ${sideDrawer === 'sftp' ? 'active' : ''}`}
+              onClick={() => setSideDrawer(sideDrawer === 'sftp' ? 'none' : 'sftp')}
             >
               <FolderOpen size={13} /> SFTP 文件
+            </button>
+
+            <button
+              type="button"
+              id="term-toggle-copilot-btn"
+              className={`term-tool-btn ${sideDrawer === 'ai' ? 'active' : ''}`}
+              onClick={() => setSideDrawer(sideDrawer === 'ai' ? 'none' : 'ai')}
+              title="开启同屏 AI 终端副驾驶（读取终端报错、主机记忆与变更审批）"
+            >
+              <Bot size={13} /> AI 副驾驶
             </button>
           </div>
         </div>
@@ -685,7 +722,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
           </div>
         )}
 
-        {/* Terminal PTY Canvas + Optional Side-by-Side SFTP Explorer */}
+        {/* Terminal PTY Canvas + Optional Side-by-Side SFTP Explorer or AI Co-pilot */}
         <div className="terminal-split-body">
           <div className="terminal-panes-stack">
             {tabs.map((tab) => (
@@ -705,14 +742,34 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
             ))}
           </div>
 
-          {showSftp && activeTab && (
+          {sideDrawer === 'sftp' && activeTab && (
             <aside className="terminal-side-drawer">
               <SftpPanel
                 serverId={activeTab.server.id}
                 serverName={activeTab.server.name}
                 showHiddenDefault={settings?.show_hidden_files ?? true}
                 onNotify={onNotify}
-                onClose={() => setShowSftp(false)}
+                onClose={() => setSideDrawer('none')}
+              />
+            </aside>
+          )}
+
+          {sideDrawer === 'ai' && activeTab && (
+            <aside className="terminal-side-drawer">
+              <TerminalCopilotPanel
+                serverId={activeTab.server.id}
+                serverName={activeTab.server.name}
+                getTerminalContext={() =>
+                  handlesRef.current[activeTab.tabId]?.getRecentOutput() || ''
+                }
+                onInjectCommand={(cmd) => {
+                  handlesRef.current[activeTab.tabId]?.sendCommand(cmd);
+                }}
+                onNavigateAIConfig={() => {
+                  onNavigateAICenter?.();
+                }}
+                onNotify={onNotify}
+                onClose={() => setSideDrawer('none')}
               />
             </aside>
           )}

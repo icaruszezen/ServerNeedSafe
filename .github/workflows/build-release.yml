@@ -47,7 +47,7 @@ jobs:
       - name: Static Vet & Race-Enabled Root-Breach Security Suite
         run: |
           go vet ./...
-          GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/zkclient
+          GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/aiops ./internal/zkclient
           go test ./... -v -race -count=1
 
   # ============================================================================

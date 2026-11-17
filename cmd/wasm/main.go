@@ -13,6 +13,7 @@ import (
 	"syscall/js"
 	"time"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
@@ -264,7 +265,7 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		if req.Anchor != nil && req.Anchor.VaultID != "" {
 			eng.Vault().SetAnchor(req.Anchor)
 		}
-		eng.Monitor().SetOnPersist(func() {
+		notifyAnchor := func() {
 			anchor := eng.Vault().GetAnchor()
 			if anchor == nil || anchor.VaultID == "" {
 				return
@@ -275,7 +276,9 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 					fn.Invoke(string(raw))
 				}
 			}
-		})
+		}
+		eng.Monitor().SetOnPersist(notifyAnchor)
+		eng.AI().SetOnPersist(notifyAnchor)
 		rt.mu.Lock()
 		prevEng := rt.engine
 		rt.engine = eng
@@ -327,6 +330,28 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 		}
 		st, err := eng.Unlock(req.Password)
 		req.Password = ""
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"status":   st,
+			"settings": st.Settings,
+			"anchor":   eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "verifyUnlockPassword":
+		var req struct {
+			Password string `json:"password"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		err := eng.Vault().VerifyPassword(req.Password)
+		req.Password = ""
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		st, err := eng.Status()
 		if err != nil {
 			return makeErrorEnvelope(err)
 		}
@@ -1190,6 +1215,518 @@ func (rt *wasmRuntime) dispatch(action, payloadJSON string, binData []byte) js.V
 			"content_type": contentType,
 			"anchor":       eng.Vault().GetAnchor(),
 		}, raw)
+
+	case "getAIOverview":
+		var req struct {
+			Scope string `json:"scope"`
+		}
+		_ = json.Unmarshal([]byte(payloadJSON), &req)
+		activeID, defaultMode, providers, patrolCfg, err := eng.Vault().GetAISettingsView()
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		memories, err := eng.Vault().ListHostMemories()
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		runbooks, err := eng.Vault().ListRunbooks()
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		sessions, err := eng.Vault().ListAISessions(req.Scope)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		records, unread, _ := eng.Vault().ListPatrolRecords(20, false)
+		patrolStatus := eng.AI().GetPatrolStatus()
+		patrolStatus.UnreadAlerts = unread
+		return makeSuccessEnvelope(map[string]any{
+			"active_provider_id": activeID,
+			"default_mode":       defaultMode,
+			"providers":          providers,
+			"presets":            aiops.BuiltinProviderPresets(),
+			"patrol_config":      patrolCfg,
+			"patrol_status":      patrolStatus,
+			"patrol_records":     records,
+			"host_memories":      memories,
+			"runbooks":           runbooks,
+			"sessions":           sessions,
+		}, nil)
+
+	case "upsertAIProvider":
+		var in vault.AIProviderMutationInput
+		if err := json.Unmarshal([]byte(payloadJSON), &in); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		provView, activeID, err := eng.Vault().UpsertAIProvider(in, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"provider":           provView,
+			"active_provider_id": activeID,
+			"anchor":             eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "setActiveAIProvider":
+		var req struct {
+			ProviderID  string                `json:"provider_id"`
+			DefaultMode vault.AIExecutionMode `json:"default_mode"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		if err := eng.Vault().SetActiveAIProvider(req.ProviderID, req.DefaultMode, "client-zk"); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		activeID, defMode, _, _, _ := eng.Vault().GetAISettingsView()
+		return makeSuccessEnvelope(map[string]any{
+			"ok":                 true,
+			"active_provider_id": activeID,
+			"default_mode":       defMode,
+			"anchor":             eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "deleteAIProvider":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		activeID, err := eng.Vault().DeleteAIProvider(req.ID, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":                 true,
+			"active_provider_id": activeID,
+			"anchor":             eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "testAIProvider":
+		var req struct {
+			ID       string           `json:"id"`
+			Protocol vault.AIProtocol `json:"protocol"`
+			BaseURL  string           `json:"base_url"`
+			APIKey   string           `json:"api_key"`
+			Model    string           `json:"model"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		var cfg vault.AIProviderConfig
+		if req.ID != "" {
+			if stored, sErr := eng.Vault().GetAIProviderSecret(req.ID); sErr == nil && stored != nil {
+				cfg = *stored
+			}
+		}
+		if req.Protocol != "" {
+			cfg.Protocol = req.Protocol
+		}
+		if cfg.Protocol == "" {
+			cfg.Protocol = vault.AIProtocolOpenAI
+		}
+		if strings.TrimSpace(req.BaseURL) != "" {
+			cfg.BaseURL = strings.TrimSpace(req.BaseURL)
+		}
+		if strings.TrimSpace(req.Model) != "" {
+			cfg.Model = strings.TrimSpace(req.Model)
+		}
+		if strings.TrimSpace(req.APIKey) != "" {
+			cfg.APIKey = strings.TrimSpace(req.APIKey)
+		}
+		req.APIKey = ""
+		if cfg.BaseURL == "" || cfg.Model == "" {
+			return makeErrorEnvelope(fmt.Errorf("%w: 请填写接口地址与模型名称", vault.ErrInvalidInput))
+		}
+		latencyMs, reply, err := eng.AI().LLM().TestConnection(context.Background(), cfg)
+		cfg.APIKey = ""
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":         true,
+			"latency_ms": latencyMs,
+			"reply":      reply,
+		}, nil)
+
+	case "listAISessions":
+		var req struct {
+			Scope string `json:"scope"`
+		}
+		_ = json.Unmarshal([]byte(payloadJSON), &req)
+		sessions, err := eng.Vault().ListAISessions(req.Scope)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{"sessions": sessions}, nil)
+
+	case "createAISession":
+		var req struct {
+			Title     string                `json:"title"`
+			Scope     string                `json:"scope"`
+			ServerIDs []string              `json:"server_ids"`
+			Mode      vault.AIExecutionMode `json:"mode"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		sess, err := eng.Vault().CreateAISession(req.Title, req.Scope, req.ServerIDs, req.Mode)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"session": sess,
+			"anchor":  eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "getAISession":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		sess, err := eng.Vault().GetAISession(req.ID)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{"session": sess}, nil)
+
+	case "updateAISessionMode":
+		var req struct {
+			ID        string                `json:"id"`
+			Mode      vault.AIExecutionMode `json:"mode,omitempty"`
+			ServerIDs *[]string             `json:"server_ids,omitempty"`
+			Title     *string               `json:"title,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		sess, err := eng.Vault().GetAISession(req.ID)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		if req.Mode == vault.AIModeSuggest || req.Mode == vault.AIModeStandard || req.Mode == vault.AIModeAutonomous {
+			sess.Mode = req.Mode
+		}
+		if req.ServerIDs != nil {
+			sess.ServerIDs = *req.ServerIDs
+		}
+		if req.Title != nil && strings.TrimSpace(*req.Title) != "" {
+			sess.Title = strings.TrimSpace(*req.Title)
+		}
+		if err := eng.Vault().SaveAISession(*sess); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"session": sess,
+			"anchor":  eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "deleteAISession":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		if err := eng.Vault().DeleteAISession(req.ID, "client-zk"); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "streamAIChat":
+		var req struct {
+			StreamID        string                `json:"stream_id"`
+			SessionID       string                `json:"session_id"`
+			Message         string                `json:"message"`
+			ServerIDs       []string              `json:"server_ids,omitempty"`
+			Mode            vault.AIExecutionMode `json:"mode,omitempty"`
+			TerminalContext string                `json:"terminal_context,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		emit := func(ev aiops.StreamEvent) {
+			fn := js.Global().Get("__snsOnAIStreamEvent")
+			if fn.Type() == js.TypeFunction {
+				if raw, mErr := json.Marshal(ev); mErr == nil {
+					fn.Invoke(req.StreamID, string(raw))
+				}
+			}
+		}
+		if err := eng.AI().RunChatStream(context.Background(), aiops.ChatRequest{
+			SessionID:       req.SessionID,
+			Message:         req.Message,
+			ServerIDs:       req.ServerIDs,
+			Mode:            req.Mode,
+			TerminalContext: req.TerminalContext,
+			ClientIP:        "client-zk",
+		}, emit); err != nil {
+			emit(aiops.StreamEvent{Type: "error", Error: err.Error()})
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "streamAIApproval":
+		var req struct {
+			StreamID   string `json:"stream_id"`
+			SessionID  string `json:"session_id"`
+			ApprovalID string `json:"approval_id"`
+			Approve    bool   `json:"approve"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		emit := func(ev aiops.StreamEvent) {
+			fn := js.Global().Get("__snsOnAIStreamEvent")
+			if fn.Type() == js.TypeFunction {
+				if raw, mErr := json.Marshal(ev); mErr == nil {
+					fn.Invoke(req.StreamID, string(raw))
+				}
+			}
+		}
+		if err := eng.AI().ResolveApprovalStream(context.Background(), req.SessionID, req.ApprovalID, req.Approve, "client-zk", emit); err != nil {
+			emit(aiops.StreamEvent{Type: "error", Error: err.Error()})
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "upsertHostMemory":
+		var in vault.HostMemory
+		if err := json.Unmarshal([]byte(payloadJSON), &in); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		mem, err := eng.Vault().UpsertHostMemory(in, false, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"memory": mem,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "deleteHostMemory":
+		var req struct {
+			ServerID string `json:"server_id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		if err := eng.Vault().DeleteHostMemory(req.ServerID, "client-zk"); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "resolveRunbookProposal":
+		var req struct {
+			ProposalID  string `json:"proposal_id"`
+			Accept      bool   `json:"accept"`
+			SyncSnippet bool   `json:"sync_snippet"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		rb, err := eng.Vault().ResolveRunbookProposal(req.ProposalID, req.Accept, req.SyncSnippet, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":      true,
+			"runbook": rb,
+			"anchor":  eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "upsertRunbook":
+		var req struct {
+			vault.AIRunbook
+			SyncSnippet bool `json:"sync_snippet"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		rb, err := eng.Vault().UpsertRunbook(req.AIRunbook, req.SyncSnippet, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"runbook": rb,
+			"anchor":  eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "deleteRunbook":
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		if err := eng.Vault().DeleteRunbook(req.ID, "client-zk"); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"ok":     true,
+			"anchor": eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "updatePatrolConfig":
+		var in vault.PatrolConfigMutationInput
+		if err := json.Unmarshal([]byte(payloadJSON), &in); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		view, err := eng.Vault().UpdatePatrolConfig(in, "client-zk")
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.AI().NotifyPatrolConfigUpdated()
+		return makeSuccessEnvelope(map[string]any{
+			"patrol_config": view,
+			"patrol_status": eng.AI().GetPatrolStatus(),
+			"anchor":        eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "listPatrolRecords":
+		var req struct {
+			Limit    int  `json:"limit"`
+			MarkRead bool `json:"mark_read"`
+		}
+		_ = json.Unmarshal([]byte(payloadJSON), &req)
+		if req.Limit <= 0 || req.Limit > 100 {
+			req.Limit = 30
+		}
+		records, unread, err := eng.Vault().ListPatrolRecords(req.Limit, req.MarkRead)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		st := eng.AI().GetPatrolStatus()
+		if req.MarkRead {
+			st.UnreadAlerts = 0
+		} else {
+			st.UnreadAlerts = unread
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"records":       records,
+			"unread_alerts": unread,
+			"patrol_status": st,
+			"anchor":        eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "runPatrolNow":
+		var req struct {
+			ForceAI bool `json:"force_ai"`
+		}
+		_ = json.Unmarshal([]byte(payloadJSON), &req)
+		eng.Vault().TouchActivity()
+		rec, err := eng.AI().RunPatrolNow(context.Background(), "manual", req.ForceAI)
+		if err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{
+			"record":        rec,
+			"patrol_status": eng.AI().GetPatrolStatus(),
+			"anchor":        eng.Vault().GetAnchor(),
+		}, nil)
+
+	case "testAIWebhook":
+		var req struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Kind   string `json:"kind"`
+			URL    string `json:"url"`
+			Secret string `json:"secret"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &req); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		eng.Vault().TouchActivity()
+		ch := vault.WebhookChannel{
+			ID:      req.ID,
+			Name:    strings.TrimSpace(req.Name),
+			Kind:    strings.TrimSpace(req.Kind),
+			URL:     strings.TrimSpace(req.URL),
+			Secret:  strings.TrimSpace(req.Secret),
+			Enabled: true,
+		}
+		if req.ID != "" && (ch.URL == "" || ch.Secret == "") {
+			if cfg, cErr := eng.Vault().GetPatrolConfigSecret(); cErr == nil && cfg != nil {
+				for _, wch := range cfg.Webhooks {
+					if wch.ID == req.ID {
+						if ch.URL == "" {
+							ch.URL = wch.URL
+						}
+						if ch.Secret == "" {
+							ch.Secret = wch.Secret
+						}
+						if ch.Kind == "" {
+							ch.Kind = wch.Kind
+						}
+						if ch.Name == "" {
+							ch.Name = wch.Name
+						}
+						break
+					}
+				}
+			}
+		}
+		req.Secret = ""
+		if ch.URL == "" {
+			return makeErrorEnvelope(fmt.Errorf("%w: 请填写完整的 Webhook URL", vault.ErrInvalidInput))
+		}
+		now := time.Now().UTC()
+		sampleRec := vault.PatrolRecord{
+			ID:            "test-webhook",
+			Trigger:       "manual",
+			StartedAt:     now,
+			CompletedAt:   now,
+			Status:        "warning",
+			TotalServers:  2,
+			HealthyCount:  1,
+			WarningCount:  1,
+			CriticalCount: 0,
+			Findings: []vault.PatrolFinding{
+				{
+					ServerName: "示例业务节点 (连通性测试)",
+					Host:       "10.0.0.10",
+					Reachable:  true,
+					Anomalies:  []string{"这是一条由 ServerNeedSafe 零知识客户端发出的巡检告警通道连通性测试消息"},
+				},
+			},
+			AISummary:         "Webhook 通道签名与网络投递验证正常，当后台定时巡检发现真实异常时将自动推送至该群组。",
+			AIRecommendations: []string{"无需人工处理，您已完成告警通知配置"},
+		}
+		if err := aiops.SendPatrolAlertWebhook(context.Background(), eng.AI().LLM().Transport(), ch, sampleRec); err != nil {
+			return makeErrorEnvelope(err)
+		}
+		return makeSuccessEnvelope(map[string]any{"ok": true}, nil)
 
 	default:
 		return makeErrorEnvelope(fmt.Errorf("unknown WASM RPC action %q", action))

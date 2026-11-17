@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
@@ -74,6 +75,7 @@ type ServerStatusResponse struct {
 	Encryption     *vault.EncryptionInfo `json:"encryption"`
 	Settings       *vault.AppSettings    `json:"settings,omitempty"`
 	Anchor         *vault.VaultAnchor    `json:"anchor,omitempty"`
+	PatrolEnabled  bool                  `json:"patrol_enabled,omitempty"`
 	ActiveSessions int                   `json:"active_sessions,omitempty"`
 	ActiveRelays   int                   `json:"active_relays,omitempty"`
 }
@@ -335,7 +337,7 @@ func (b *httpBlindBackend) dialRelayTCP(ctx context.Context, addr string, timeou
 }
 
 // Engine unifies the client-side Zero-Knowledge Vault, Ed25519 Challenge-Response Auth,
-// End-to-End SSHv2/SFTP/Monitoring Manager over Blind TCP Relay, and Remote Zero-Knowledge Sync.
+// End-to-End SSHv2/SFTP/Monitoring/AI Ops Manager over Blind TCP Relay, and Remote Zero-Knowledge Sync.
 type Engine struct {
 	baseURL string
 	doer    HTTPJSONDoer
@@ -343,6 +345,7 @@ type Engine struct {
 	cv      *vault.ClientVault
 	sshMgr  *sshmanager.Manager
 	mon     *monitor.Engine
+	ai      *aiops.Service
 }
 
 func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
@@ -351,6 +354,7 @@ func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
 	sshMgr := sshmanager.NewManager(cv)
 	sshMgr.SetDialTCPFunc(backend.dialRelayTCP)
 	mon := monitor.NewEngine(cv, sshMgr)
+	ai := aiops.NewService(cv, sshMgr)
 
 	return &Engine{
 		baseURL: backend.baseURL,
@@ -359,6 +363,7 @@ func newEngineWithDoer(baseURL string, doer HTTPJSONDoer) *Engine {
 		cv:      cv,
 		sshMgr:  sshMgr,
 		mon:     mon,
+		ai:      ai,
 	}
 }
 
@@ -374,7 +379,14 @@ func (e *Engine) Monitor() *monitor.Engine {
 	return e.mon
 }
 
+func (e *Engine) AI() *aiops.Service {
+	return e.ai
+}
+
 func (e *Engine) Close() {
+	if e.ai != nil {
+		e.ai.Close()
+	}
 	if e.mon != nil {
 		e.mon.Close()
 	}
@@ -408,6 +420,9 @@ func (e *Engine) Status() (*ServerStatusResponse, error) {
 		srvSt.Settings, _ = e.cv.GetSettings()
 		if enc, encErr := e.cv.EncryptionInfo(); encErr == nil {
 			srvSt.Encryption = enc
+		}
+		if _, _, _, pCfg, pErr := e.cv.GetAISettingsView(); pErr == nil {
+			srvSt.PatrolEnabled = pCfg.Enabled
 		}
 	} else {
 		srvSt.VaultStatus = vault.StatusLocked

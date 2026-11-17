@@ -1,15 +1,27 @@
 import type {
+  AIChatSession,
+  AIChatSessionSummary,
+  AIExecutionMode,
+  AIOverviewResponse,
+  AIProtocol,
+  AIProviderView,
+  AIRunbook,
+  AIStreamEvent,
   AppSettings,
   AuthStatusResponse,
   BatchExecResult,
   CredentialView,
   HostKeyUntrustedInfo,
+  HostMemory,
   MonitorAlert,
   MonitorAlertRule,
   MonitorOverviewResponse,
   MonitorPolicyResponse,
   MonitorRuntimeStatus,
   MonitorSettings,
+  PatrolConfigView,
+  PatrolRecord,
+  PatrolStatusView,
   ServerMonitorDetailResponse,
   ServerMonitorSnapshot,
   ServerMutationPayload,
@@ -111,6 +123,19 @@ async function zkCallWithBytes<T>(
   }
 }
 
+async function zkCallAIStream(
+  action: 'streamAIChat' | 'streamAIApproval',
+  payload: Record<string, unknown>,
+  onEvent: (ev: AIStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  try {
+    await zkClient.callAIStream<AIStreamEvent>(action, payload, onEvent, signal);
+  } catch (err) {
+    mapZkError(err);
+  }
+}
+
 export const api = {
   getAuthStatus: () => zkCall<AuthStatusResponse>('getAuthStatus'),
 
@@ -129,6 +154,15 @@ export const api = {
       settings: AppSettings;
       anchor?: VaultAnchor;
     }>('unlockVault', { password });
+    return { token: '', settings: res.settings, status: res.status, anchor: res.anchor };
+  },
+
+  verifyUnlockPassword: async (password: string) => {
+    const res = await zkCall<{
+      status: AuthStatusResponse;
+      settings: AppSettings;
+      anchor?: VaultAnchor;
+    }>('verifyUnlockPassword', { password });
     return { token: '', settings: res.settings, status: res.status, anchor: res.anchor };
   },
 
@@ -433,4 +467,140 @@ export const api = {
     const blob = new Blob([copy.buffer], { type: mime });
     return { blob, filename: data.filename || `ServerNeedSafe-monitor.${format}` };
   },
+
+  // Client-side Zero-Knowledge AI Ops, Hybrid Memory, Runbooks & Scheduled Patrol
+  getAIOverview: (scope = '') =>
+    zkCall<AIOverviewResponse>('getAIOverview', { scope }),
+
+  upsertAIProvider: (payload: {
+    id?: string;
+    name: string;
+    protocol: AIProtocol;
+    base_url: string;
+    api_key?: string;
+    model: string;
+    max_tokens?: number;
+    set_active?: boolean;
+  }) =>
+    zkCall<{ provider: AIProviderView; active_provider_id: string }>('upsertAIProvider', payload),
+
+  setActiveAIProvider: (provider_id: string, default_mode?: AIExecutionMode) =>
+    zkCall<{ ok: boolean; active_provider_id: string; default_mode: AIExecutionMode }>(
+      'setActiveAIProvider',
+      { provider_id, default_mode }
+    ),
+
+  deleteAIProvider: (id: string) =>
+    zkCall<{ ok: boolean; active_provider_id: string }>('deleteAIProvider', { id }),
+
+  testAIProvider: (payload: {
+    id?: string;
+    protocol: AIProtocol;
+    base_url: string;
+    api_key?: string;
+    model: string;
+  }) => zkCall<{ ok: boolean; latency_ms: number; reply: string }>('testAIProvider', payload),
+
+  listAISessions: (scope = '') =>
+    zkCall<{ sessions: AIChatSessionSummary[] }>('listAISessions', { scope }),
+
+  createAISession: (payload: {
+    title?: string;
+    scope?: 'center' | 'terminal';
+    server_ids?: string[];
+    mode?: AIExecutionMode;
+  }) => zkCall<{ session: AIChatSession }>('createAISession', payload),
+
+  getAISession: (id: string) =>
+    zkCall<{ session: AIChatSession }>('getAISession', { id }),
+
+  updateAISessionMode: (
+    id: string,
+    payload: { mode?: AIExecutionMode; server_ids?: string[]; title?: string }
+  ) => zkCall<{ session: AIChatSession }>('updateAISessionMode', { id, ...payload }),
+
+  deleteAISession: (id: string) =>
+    zkCall<{ ok: boolean }>('deleteAISession', { id }),
+
+  streamAIChat: (
+    sessionId: string,
+    payload: {
+      message: string;
+      server_ids?: string[];
+      mode?: AIExecutionMode;
+      terminal_context?: string;
+    },
+    onEvent: (ev: AIStreamEvent) => void,
+    signal?: AbortSignal
+  ) =>
+    zkCallAIStream(
+      'streamAIChat',
+      {
+        session_id: sessionId,
+        ...payload,
+      },
+      onEvent,
+      signal
+    ),
+
+  streamAIApproval: (
+    sessionId: string,
+    approvalId: string,
+    approve: boolean,
+    onEvent: (ev: AIStreamEvent) => void,
+    signal?: AbortSignal
+  ) =>
+    zkCallAIStream(
+      'streamAIApproval',
+      {
+        session_id: sessionId,
+        approval_id: approvalId,
+        approve,
+      },
+      onEvent,
+      signal
+    ),
+
+  upsertHostMemory: (serverId: string, payload: Partial<HostMemory>) =>
+    zkCall<{ memory: HostMemory }>('upsertHostMemory', { ...payload, server_id: serverId }),
+
+  deleteHostMemory: (serverId: string) =>
+    zkCall<{ ok: boolean }>('deleteHostMemory', { server_id: serverId }),
+
+  resolveRunbookProposal: (proposalId: string, accept: boolean, sync_snippet = false) =>
+    zkCall<{ ok: boolean; runbook?: AIRunbook }>('resolveRunbookProposal', {
+      proposal_id: proposalId,
+      accept,
+      sync_snippet,
+    }),
+
+  upsertRunbook: (payload: Partial<AIRunbook> & { sync_snippet?: boolean }) =>
+    zkCall<{ runbook: AIRunbook }>('upsertRunbook', payload),
+
+  deleteRunbook: (id: string) =>
+    zkCall<{ ok: boolean }>('deleteRunbook', { id }),
+
+  updatePatrolConfig: (payload: Record<string, any>) =>
+    zkCall<{ patrol_config: PatrolConfigView; patrol_status: PatrolStatusView }>(
+      'updatePatrolConfig',
+      payload
+    ),
+
+  listPatrolRecords: (limit = 30, markRead = false) =>
+    zkCall<{
+      records: PatrolRecord[];
+      unread_alerts: number;
+      patrol_status: PatrolStatusView;
+    }>('listPatrolRecords', { limit, mark_read: markRead }),
+
+  runPatrolNow: (force_ai = true) =>
+    zkCall<{ record: PatrolRecord; patrol_status: PatrolStatusView }>('runPatrolNow', { force_ai }),
+
+  testWebhook: (payload: {
+    id?: string;
+    name?: string;
+    kind: string;
+    url?: string;
+    secret?: string;
+  }) => zkCall<{ ok: boolean }>('testAIWebhook', payload),
 };

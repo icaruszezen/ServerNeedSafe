@@ -79,8 +79,10 @@ export function clearLocalAnchorStorage(): void {
 class ZeroKnowledgeWorkerClient {
   private worker: Worker | null = null;
   private nextId = 1;
+  private nextStreamId = 1;
   private pending = new Map<number, PendingCall>();
   private termSubs = new Map<string, TermSubscription>();
+  private aiStreamSubs = new Map<string, (ev: any) => void>();
   private onAutoLocked: (() => void) | null = null;
   private integrity: WasmIntegrityState = {
     verified: false,
@@ -161,6 +163,18 @@ class ZeroKnowledgeWorkerClient {
         const sub = this.termSubs.get(msg.tabId);
         if (sub) {
           sub.onExit(msg.message || '会话已结束');
+        }
+        return;
+      }
+
+      if (msg.kind === 'ai_stream_event' && typeof msg.streamId === 'string') {
+        const sub = this.aiStreamSubs.get(msg.streamId);
+        if (sub && typeof msg.eventJson === 'string') {
+          try {
+            sub(JSON.parse(msg.eventJson));
+          } catch {
+            // ignore malformed frame
+          }
         }
         return;
       }
@@ -262,6 +276,32 @@ class ZeroKnowledgeWorkerClient {
     });
   }
 
+  async callAIStream<E = any>(
+    action: 'streamAIChat' | 'streamAIApproval',
+    payload: Record<string, unknown>,
+    onEvent: (ev: E) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const streamId = `ais_${Date.now()}_${this.nextStreamId++}`;
+    let aborted = Boolean(signal?.aborted);
+    const onAbort = () => {
+      aborted = true;
+      this.aiStreamSubs.delete(streamId);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    this.aiStreamSubs.set(streamId, (ev: E) => {
+      if (!aborted) {
+        onEvent(ev);
+      }
+    });
+    try {
+      await this.call(action, { ...payload, stream_id: streamId });
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      this.aiStreamSubs.delete(streamId);
+    }
+  }
+
   subscribeTerminal(tabId: string, sub: TermSubscription): () => void {
     this.termSubs.set(tabId, sub);
     return () => {
@@ -297,6 +337,7 @@ class ZeroKnowledgeWorkerClient {
       sub.onExit('保险库已锁定，安全终端内存已销毁');
     }
     this.termSubs.clear();
+    this.aiStreamSubs.clear();
     for (const [, p] of this.pending) {
       p.reject(new ZkRpcError('保险库已锁定', 401, 'VAULT_LOCKED'));
     }

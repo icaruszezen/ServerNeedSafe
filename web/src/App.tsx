@@ -4,6 +4,7 @@ import {
   Server,
   Activity,
   Terminal,
+  Bot,
   KeyRound,
   Zap,
   Shield,
@@ -25,11 +26,12 @@ import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
 import { MonitorCenter } from './components/MonitorCenter';
 import { TerminalWorkspace } from './components/TerminalWorkspace';
+import { AIOpsCenter } from './components/AIOpsCenter';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
 import { VaultSecurity } from './components/VaultSecurity';
 
-type NavKey = 'servers' | 'monitor' | 'terminals' | 'keychain' | 'snippets' | 'vault';
+type NavKey = 'servers' | 'monitor' | 'terminals' | 'ai' | 'keychain' | 'snippets' | 'vault';
 
 export const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -39,10 +41,12 @@ export const App: React.FC = () => {
 
   const [bootLoading, setBootLoading] = useState(true);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [uiLocked, setUiLocked] = useState(false);
   const [settings, setSettings] = useState<AppSettings | undefined>(undefined);
   const [activeNav, setActiveNav] = useState<NavKey>('servers');
   const [monitorTargetId, setMonitorTargetId] = useState<string>('');
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
+  const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
 
   // Decrypted Workspace State (exists strictly in memory while unlocked)
   const [servers, setServers] = useState<ServerView[]>([]);
@@ -73,6 +77,7 @@ export const App: React.FC = () => {
   }, []);
 
   const clearUnlockedMemory = useCallback(() => {
+    setUiLocked(false);
     setServers([]);
     setGroups([]);
     setCredentials([]);
@@ -81,6 +86,7 @@ export const App: React.FC = () => {
     setActiveTabId('');
     setMonitorTargetId('');
     setFiringAlertsCount(0);
+    setPatrolUnreadCount(0);
     setActiveNav('servers');
   }, []);
 
@@ -101,11 +107,12 @@ export const App: React.FC = () => {
 
   const loadWorkspaceData = useCallback(async () => {
     try {
-      const [srvRes, credRes, snipRes, monRes] = await Promise.all([
+      const [srvRes, credRes, snipRes, monRes, aiRes] = await Promise.all([
         api.listServers(),
         api.listCredentials(),
         api.listSnippets(),
         api.getMonitorOverview().catch(() => null),
+        api.getAIOverview('center').catch(() => null),
       ]);
       setServers(srvRes.servers || []);
       setGroups(srvRes.groups || []);
@@ -114,6 +121,9 @@ export const App: React.FC = () => {
       setSnippets(snipRes.snippets || []);
       if (monRes) {
         setFiringAlertsCount(monRes.kpi.firing_alerts || 0);
+      }
+      if (aiRes) {
+        setPatrolUnreadCount(aiRes.patrol_status?.unread_alerts || 0);
       }
     } catch {
       // Handled by global 401 listener if session expired
@@ -137,12 +147,22 @@ export const App: React.FC = () => {
   }, [checkStatus, clearUnlockedMemory, notify]);
 
   useEffect(() => {
-    if (authStatus?.authenticated) {
+    if (authStatus?.authenticated && !uiLocked) {
       void loadWorkspaceData();
     }
-  }, [authStatus?.authenticated, loadWorkspaceData]);
+  }, [authStatus?.authenticated, uiLocked, loadWorkspaceData]);
 
-  const handleLockVault = useCallback(async () => {
+  // Screen lock keeps the isolated WASM Worker alive so Monitor & Scheduled AI Patrol stay running
+  const handleLockScreen = useCallback(() => {
+    setUiLocked(true);
+    void api
+      .getAuthStatus()
+      .then((st) => setAuthStatus(st))
+      .catch(() => {});
+  }, []);
+
+  // Full Vault Seal destroys WASM linear memory and wipes DEK / session keys
+  const handleSealVault = useCallback(async () => {
     try {
       await api.lockVault();
     } catch {
@@ -153,19 +173,19 @@ export const App: React.FC = () => {
     await checkStatus();
   }, [checkStatus, clearUnlockedMemory]);
 
-  // Global keyboard shortcut: Ctrl+Shift+L locks vault immediately
+  // Global keyboard shortcut: Ctrl+Shift+L locks screen immediately
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'l') {
         e.preventDefault();
-        if (authStatus?.authenticated) {
-          void handleLockVault();
+        if (authStatus?.authenticated && !uiLocked) {
+          handleLockScreen();
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [authStatus?.authenticated, handleLockVault]);
+  }, [authStatus?.authenticated, uiLocked, handleLockScreen]);
 
   const handleConnectTerminal = (srv: ServerView, openSftp = false) => {
     const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -207,14 +227,17 @@ export const App: React.FC = () => {
     );
   }
 
-  if (!authStatus.authenticated) {
+  if (!authStatus.authenticated || uiLocked) {
     return (
       <AuthGate
         status={authStatus}
+        screenLocked={uiLocked && authStatus.authenticated}
+        onSealVault={handleSealVault}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'light' ? 'dark' : 'light')}
         onRefreshStatus={checkStatus}
         onAuthenticated={(s, updatedStatus) => {
+          setUiLocked(false);
           if (s) setSettings(s);
           setAuthStatus(
             updatedStatus || { ...authStatus, vault_status: 'unlocked', authenticated: true }
@@ -288,6 +311,20 @@ export const App: React.FC = () => {
 
           <button
             type="button"
+            id="nav-ai-btn"
+            className={`nav-item ${activeNav === 'ai' ? 'active' : ''}`}
+            onClick={() => setActiveNav('ai')}
+          >
+            <span className="nav-item-left">
+              <Bot size={16} /> AI 智能运维
+            </span>
+            {patrolUnreadCount > 0 && (
+              <span className="nav-badge danger">{patrolUnreadCount}</span>
+            )}
+          </button>
+
+          <button
+            type="button"
             id="nav-keychain-btn"
             className={`nav-item ${activeNav === 'keychain' ? 'active' : ''}`}
             onClick={() => setActiveNav('keychain')}
@@ -347,10 +384,10 @@ export const App: React.FC = () => {
               id="sidebar-lock-btn"
               className="btn btn-sm btn-danger"
               style={{ flex: 1.25 }}
-              onClick={() => void handleLockVault()}
-              title="立即擦除内存密钥并锁定保险库 (Ctrl+Shift+L)"
+              onClick={handleLockScreen}
+              title="锁定操作界面，保持后台状态监控与 AI 定时巡检持续运行 (Ctrl+Shift+L)"
             >
-              <Lock size={13} /> 立即锁定
+              <Lock size={13} /> 锁定界面
             </button>
           </div>
         </div>
@@ -406,9 +443,19 @@ export const App: React.FC = () => {
               onCloseTab={handleCloseTab}
               onOpenServerTab={(srv) => handleConnectTerminal(srv, false)}
               onNavigateServers={() => setActiveNav('servers')}
+              onNavigateAICenter={() => setActiveNav('ai')}
               onNotify={notify}
             />
           </div>
+        )}
+
+        {activeNav === 'ai' && (
+          <AIOpsCenter
+            servers={servers}
+            onBadgeChange={setPatrolUnreadCount}
+            onRefreshWorkspace={loadWorkspaceData}
+            onNotify={notify}
+          />
         )}
 
         {activeNav === 'keychain' && (
@@ -432,7 +479,8 @@ export const App: React.FC = () => {
         {activeNav === 'vault' && (
           <VaultSecurity
             onSettingsChanged={(s) => setSettings(s)}
-            onLockVault={handleLockVault}
+            onLockScreen={handleLockScreen}
+            onLockVault={handleSealVault}
             onNotify={notify}
           />
         )}

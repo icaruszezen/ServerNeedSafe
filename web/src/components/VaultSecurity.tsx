@@ -21,12 +21,14 @@ import type { AppSettings, VaultSecurityOverview } from '../types';
 
 interface VaultSecurityProps {
   onSettingsChanged: (s: AppSettings) => void;
+  onLockScreen?: () => void;
   onLockVault: () => Promise<void>;
   onNotify: (msg: string) => void;
 }
 
 export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   onSettingsChanged,
+  onLockScreen,
   onLockVault,
   onNotify,
 }) => {
@@ -230,8 +232,18 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
           <button type="button" className="btn btn-teal" onClick={() => void handleExport()}>
             <Download size={14} /> 导出加密数据包 (.sns)
           </button>
+          {onLockScreen && (
+            <button
+              type="button"
+              className="btn"
+              onClick={onLockScreen}
+              title="锁定操作界面，保持后台状态监控与 AI 定时安全巡检持续运行"
+            >
+              <Lock size={14} /> 锁定界面
+            </button>
+          )}
           <button type="button" className="btn btn-danger" onClick={() => void onLockVault()}>
-            <Lock size={14} /> 立即销毁内存并锁定
+            <Lock size={14} /> 销毁内存并封存
           </button>
         </div>
       </div>

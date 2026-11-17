@@ -27,6 +27,7 @@ declare const self: DedicatedWorkerGlobalScope & {
   __snsOnAnchorUpdated?: (anchorJson: string) => void;
   __snsOnTermOutput?: (tabId: string, chunk: Uint8Array) => void;
   __snsOnTermExit?: (tabId: string, message: string) => void;
+  __snsOnAIStreamEvent?: (streamId: string, eventJson: string) => void;
 };
 
 // Compact pure-TS SHA-256 fallback for plain-HTTP LAN deployments where crypto.subtle may be unavailable
@@ -109,6 +110,10 @@ self.__snsOnTermOutput = (tabId: string, chunk: Uint8Array) => {
 
 self.__snsOnTermExit = (tabId: string, message: string) => {
   self.postMessage({ kind: 'term_exit', tabId, message });
+};
+
+self.__snsOnAIStreamEvent = (streamId: string, eventJson: string) => {
+  self.postMessage({ kind: 'ai_stream_event', streamId, eventJson });
 };
 
 async function bootWasmEngine(origin: string, anchor: unknown): Promise<void> {

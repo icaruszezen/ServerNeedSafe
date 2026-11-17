@@ -231,22 +231,28 @@ type AppSettings struct {
 // VaultState is the root plaintext structure serialized, compressed, padded,
 // and encrypted via XChaCha20-Poly1305 into vault.sns exclusively on the client.
 type VaultState struct {
-	SchemaVersion int               `json:"schema_version"`
-	VaultID       string            `json:"vault_id,omitempty"`
-	Revision      uint64            `json:"revision,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
-	Groups        []string          `json:"groups"`
-	Servers       []ServerConfig    `json:"servers"`
-	Credentials   []Credential      `json:"credentials"`
-	Snippets      []Snippet         `json:"snippets"`
-	KnownHosts    []KnownHost       `json:"known_hosts"`
-	AuditLogs     []AuditEntry      `json:"audit_logs"`
-	Settings      AppSettings       `json:"settings"`
-	Monitor       *MonitorVaultData `json:"monitor,omitempty"`
+	SchemaVersion   int                      `json:"schema_version"`
+	VaultID         string                   `json:"vault_id,omitempty"`
+	Revision        uint64                   `json:"revision,omitempty"`
+	CreatedAt       time.Time                `json:"created_at"`
+	UpdatedAt       time.Time                `json:"updated_at"`
+	Groups          []string                 `json:"groups"`
+	Servers         []ServerConfig           `json:"servers"`
+	Credentials     []Credential             `json:"credentials"`
+	Snippets        []Snippet                `json:"snippets"`
+	KnownHosts      []KnownHost              `json:"known_hosts"`
+	AuditLogs       []AuditEntry             `json:"audit_logs"`
+	Settings        AppSettings              `json:"settings"`
+	Monitor         *MonitorVaultData        `json:"monitor,omitempty"`
+	AISettings      AISettings               `json:"ai_settings"`
+	HostMemories    []HostMemory             `json:"host_memories"`
+	Runbooks        []AIRunbook              `json:"runbooks"`
+	AISessions      []AIChatSession          `json:"ai_sessions"`
+	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines"`
+	PatrolRecords   []PatrolRecord           `json:"patrol_records"`
 }
 
-// DefaultVaultState initializes a clean vault with practical default groups and security inspection snippets.
+// DefaultVaultState initializes a clean vault with practical default groups, security snippets, monitoring, and starter Runbooks.
 func DefaultVaultState() *VaultState {
 	now := time.Now().UTC()
 	return &VaultState{
@@ -310,5 +316,15 @@ func DefaultVaultState() *VaultState {
 			ShowHiddenFiles:    true,
 		},
 		Monitor: DefaultMonitorVaultData(),
+		AISettings: AISettings{
+			DefaultMode: AIModeStandard,
+			Providers:   []AIProviderConfig{},
+			Patrol:      DefaultPatrolConfig(),
+		},
+		HostMemories:    []HostMemory{},
+		Runbooks:        DefaultStarterRunbooks(now),
+		AISessions:      []AIChatSession{},
+		PatrolBaselines: []ServerBaselineSnapshot{},
+		PatrolRecords:   []PatrolRecord{},
 	}
 }

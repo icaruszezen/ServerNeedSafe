@@ -18,6 +18,8 @@ import type { AppSettings, AuthStatusResponse } from '../types';
 
 interface AuthGateProps {
   status: AuthStatusResponse;
+  screenLocked?: boolean;
+  onSealVault?: () => Promise<void>;
   onAuthenticated: (settings?: AppSettings, updatedStatus?: AuthStatusResponse) => void;
   onRefreshStatus?: () => Promise<void>;
   theme: 'light' | 'dark';
@@ -37,13 +39,15 @@ function calcPasswordStrength(pw: string): { level: number; label: string } {
 
 export const AuthGate: React.FC<AuthGateProps> = ({
   status,
+  screenLocked = false,
+  onSealVault,
   onAuthenticated,
   onRefreshStatus,
   theme,
   onToggleTheme,
 }) => {
-  const isSetup = status.vault_status === 'uninitialized';
-  const serverHasVault = Boolean(status.initialized) || status.vault_status === 'locked';
+  const isSetup = !screenLocked && status.vault_status === 'uninitialized';
+  const serverHasVault = screenLocked || Boolean(status.initialized) || status.vault_status === 'locked';
 
   const [tab, setTab] = useState<'primary' | 'restore'>('primary');
   const [password, setPassword] = useState('');
@@ -99,6 +103,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     try {
       const res = isSetup
         ? await api.setupVault(password)
+        : screenLocked
+        ? await api.verifyUnlockPassword(password)
         : await api.unlockVault(password);
       setPassword('');
       setConfirmPassword('');
@@ -203,6 +209,26 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           </span>
         </div>
 
+        {screenLocked && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: '10px 13px',
+              borderRadius: 'var(--radius-sm)',
+              background: 'var(--accent-teal-soft)',
+              border: '1px solid var(--accent-teal-border)',
+              color: 'var(--accent-teal)',
+              fontSize: 12.5,
+              lineHeight: 1.55,
+            }}
+          >
+            <strong>界面已安全锁定 · WASM 零知识隔离后台持续值守中</strong>
+            <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>
+              已打开的 SSH 终端会话、状态监控采集{status.patrol_enabled ? '与 AI 定时安全巡检' : ''}在独立 Web Worker 内存中保持运行；输入管理员密码即可无损恢复工作台。
+            </div>
+          </div>
+        )}
+
         {unexpectedWipeDetected && (
           <div
             className="alert alert-error"
@@ -237,7 +263,11 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               setError('');
             }}
           >
-            {isSetup ? '初始化零知识保险库' : '客户端解密并解锁'}
+            {isSetup
+              ? '初始化零知识保险库'
+              : screenLocked
+              ? '验证密码恢复工作台'
+              : '客户端解密并解锁'}
           </button>
           <button
             type="button"
@@ -354,8 +384,23 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                 ? '正在客户端 WASM 派生密钥并验证签名...'
                 : isSetup
                 ? '在本地生成加密容器并初始化系统'
+                : screenLocked
+                ? '验证密码并恢复工作台'
                 : '零知识挑战签名并本地解密进入'}
             </button>
+
+            {screenLocked && onSealVault && (
+              <button
+                type="button"
+                id="auth-seal-vault-btn"
+                className="btn btn-danger btn-block"
+                disabled={loading}
+                style={{ marginTop: 8 }}
+                onClick={() => void onSealVault()}
+              >
+                <Lock size={14} /> 彻底封存保险库（销毁 WASM 内存并停止后台巡检）
+              </button>
+            )}
           </form>
         ) : (
           <form onSubmit={handleSubmitRestore} id="auth-restore-form">

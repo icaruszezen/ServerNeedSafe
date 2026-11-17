@@ -44,6 +44,12 @@
    - **12 大全方位监控采集维度**：连通性与系统画像（RTT 延迟、OS/内核/CPU/虚拟化/Uptime/NTP/温度）、250ms 双采样真实 CPU 分解（`User / System / IOWait / Steal`）与归一化负载、物理内存/Swap/文件句柄（`file-nr`）/OOM Kill、全分区容量/Inode 与块设备读写速率/IOPS、多网卡上下行速率/错丢包与内核 TCP/UDP Socket 状态矩阵、进程状态分布与 Top CPU/RSS 排行、监听端口审计与公网暴露端口安全基线、Systemd 故障服务与自定义必监服务、Docker 容器健康、以及主机防火墙/SELinux/特权账号/在线终端/SSH 爆破源 IP 安全态势。
    - **18 项多维告警规则与防抖自愈**：内置主机离线、CPU/IOWait/负载、内存/Swap/OOM/FD、磁盘空间/Inode、SSH 高延迟、僵尸进程、CLOSE_WAIT 泄漏、Systemd/必监服务故障、Docker 异常容器、新公网暴露端口漂移、必监端口掉线及 SSH 爆破攻击等 18 条可配置规则，支持连续超限次数防抖、自动销警恢复、手动确认与 Webhook 推送。
    - **100% 客户端零知识加密持久化与报表导出**：所有监控配置、最新快照、环形缓冲历史时序曲线、告警记录与端口基线均在客户端经 `XChaCha20-Poly1305` 封装进 `SNSVAULT v2` 密文容器，锁库时随 Web Worker 立即物理销毁并暂停巡检；支持纯客户端零知识导出 CSV（含 UTF-8 BOM）/ JSON 历史报表。
+6. **纯客户端零知识 AI 智能运维、混合记忆与定时安全巡检（零 Python / 零服务端明文）**
+   - **WASM 隔离沙箱直连大模型（双协议多厂商）**：AI ReAct 引擎完整运行在客户端独立 Web Worker WASM 内，纯 Go 原生兼容 **OpenAI Chat Completions** 与 **Anthropic Messages** 两大流式 Tool-Calling 协议，内置 DeepSeek、阿里云百炼（通义千问）、Anthropic Claude、OpenAI、SiliconFlow 及本地离线 **Ollama** 一键预设；大模型 API Key 与 Webhook 密钥随保险库零知识加密，且受管主机 SSH 密码/私钥严格物理隔离、绝不进入大模型上下文。
+   - **独立 AI 诊断中心 + SSH 终端同屏副驾驶**：既可在独立中心跨多台主机进行流式安全体检与排障，也可在 Xterm 终端右侧一键唤出副驾驶，自动感知端到端终端最近输出报错并将修复命令一键注入当前 PTY。
+   - **三级受控执行（HITL）与 Git Unified Diff 审批**：支持 `参谋模式`、`标准受控`（默认：只读探针自动采集，服务重启与远程配置文件修改自动生成 Git Unified Diff 对比卡片等待管理员一键批准）与 `自治执行`（底层硬拦截 `rm -rf /`、`mkfs`、`dd` 等毁灭性命令）。
+   - **主机环境画像记忆与 Runbook 技能沉淀**：AI 在排障中自动增量归档每台服务器的系统架构、核心服务与部署路径（`HostMemory`），并在复杂故障解决后提炼标准化 `Runbook` 草案，一键加密保存并可同步至快捷指令。
+   - **后台定时巡检与多通道告警推送**：低开销只读探针周期检测 CPU/内存/磁盘阈值、监听端口基线突变、1 小时内 SSH 暴力破解激增与非 root `UID=0` 特权账号；仅当发现异常时按需唤醒大模型生成根因报告，并推送至飞书、钉钉、企业微信或自定义 HMAC 签名 Webhook；支持「锁定界面（保持后台监控与巡检）」与「彻底销毁内存封存」双级锁控。
 
 ---
 
@@ -91,16 +97,17 @@ ServerNeedSafe/
 ├── cmd/
 │   ├── server/          # 零知识盲存储 + 盲 TCP 中继 Web 服务端入口（零明文、零密钥）
 │   ├── desktop/         # Windows 纯本地原生桌面 GUI 应用入口 (WebView2 + 回环守卫)
-│   └── wasm/            # 浏览器独立 Web Worker 零知识密码学、监控引擎与端到端 SSH/SFTP WASM 入口
+│   └── wasm/            # 浏览器独立 Web Worker 零知识密码学、监控、AI 运维与 SSH/SFTP WASM 入口
 ├── internal/
-│   ├── vault/           # SNSVAULT v2 容器 (Argon2id + HKDF + XChaCha20-Poly1305 + 监控时序加密归档)
+│   ├── vault/           # SNSVAULT v2 容器 (Argon2id + HKDF + XChaCha20-Poly1305 + 监控与 AI 记忆加密归档)
 │   ├── auth/            # Ed25519 单次随机挑战会话、指数退避防爆破与单次中继票据
 │   ├── relay/           # 零元数据保留的 WebSocket ↔ TCP 盲二进制流中继器
 │   ├── sshmanager/      # 纯客户端端到端 SSHv2 拨号、ProxyJump、PTY 终端、SFTP 与密钥生成
 │   ├── monitor/         # 客户端无 Agent 全维状态采集脚本、解析器、定时巡检调度、18 项告警与报表导出
+│   ├── aiops/           # 客户端零知识 AI 运维 ReAct 引擎、风险分类器、Unified Diff、混合记忆与巡检推送
 │   ├── zkclient/        # 跨原生与 WASM 的零知识客户端引擎、CAS 自动合并与远端密文云同步
 │   └── api/             # 严格拒绝未知字段的零知识 REST/WS 路由与模拟服务器 root 沦陷测试套件
-└── web/                 # React + TypeScript + SVG 时序图表 + Dedicated Web Worker + SRI 完整性校验前端
+└── web/                 # React + TypeScript + SVG 时序图表 + AI 运维工作台 + Web Worker + SRI 前端
 ```
 
 ---
@@ -112,6 +119,6 @@ ServerNeedSafe/
 ```bash
 cd web && npm ci && npm run build && cd ..
 go vet ./...
-GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/zkclient
+GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/aiops ./internal/zkclient
 go test ./... -v -race -count=1
 ```

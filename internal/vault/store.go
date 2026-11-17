@@ -360,6 +360,7 @@ func (s *ClientVault) UnlockFromRawBlob(raw []byte, password, clientIP string, r
 		return ErrCorruptedVault
 	}
 	ensureMonitorInitialized(state)
+	EnsureStateDefaults(state)
 
 	s.mu.Lock()
 
@@ -437,6 +438,7 @@ func (s *ClientVault) UnlockWithPreDerivedKeys(
 		return err
 	}
 	ensureMonitorInitialized(state)
+	EnsureStateDefaults(state)
 
 	s.mu.Lock()
 
@@ -524,6 +526,7 @@ func scrubStateSecrets(st *VaultState) {
 		st.Credentials[i].Notes = ""
 	}
 	scrubMonitorData(st)
+	scrubAIData(st)
 }
 
 func cloneVaultState(st *VaultState) *VaultState {
@@ -546,6 +549,7 @@ func cloneVaultState(st *VaultState) *VaultState {
 	cp.KnownHosts = slices.Clone(st.KnownHosts)
 	cp.AuditLogs = slices.Clone(st.AuditLogs)
 	cp.Monitor = cloneMonitorVaultData(st.Monitor)
+	cloneAIData(&cp, st)
 	return &cp
 }
 
@@ -594,6 +598,8 @@ func (s *ClientVault) mutateLocked(mutFn func(st *VaultState) error) error {
 		if latestHdr.Revision <= s.header.Revision {
 			return ErrRollbackDetected
 		}
+		ensureMonitorInitialized(latestState)
+		EnsureStateDefaults(latestState)
 		s.header = latestHdr
 		s.state = latestState
 		s.lastBlob = latestRaw
@@ -613,7 +619,7 @@ func (s *ClientVault) TouchActivity() {
 }
 
 // CheckAutoLock locks the client vault if AutoLockMinutes > 0 and inactivity exceeds threshold
-// (unless UnattendedWhileUnlocked monitoring is actively running with configured servers).
+// (unless UnattendedWhileUnlocked monitoring or AI patrol is actively running with configured servers).
 func (s *ClientVault) CheckAutoLock() bool {
 	s.mu.RLock()
 	if len(s.dek) == 0 || s.state == nil {
@@ -623,10 +629,11 @@ func (s *ClientVault) CheckAutoLock() bool {
 	mins := s.state.Settings.AutoLockMinutes
 	last := s.lastActivity
 	mon := s.state.Monitor
-	unattended := mon != nil && mon.Settings.Enabled && mon.Settings.UnattendedWhileUnlocked && len(s.state.Servers) > 0
+	unattendedMon := mon != nil && mon.Settings.Enabled && mon.Settings.UnattendedWhileUnlocked && len(s.state.Servers) > 0
+	unattendedPatrol := s.state.AISettings.Patrol.Enabled && len(s.state.Servers) > 0
 	s.mu.RUnlock()
 
-	if mins <= 0 || unattended {
+	if mins <= 0 || unattendedMon || unattendedPatrol {
 		return false
 	}
 	if time.Since(last) >= time.Duration(mins)*time.Minute {
@@ -770,6 +777,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 		return err
 	}
 	ensureMonitorInitialized(state)
+	EnsureStateDefaults(state)
 
 	s.mu.Lock()
 

@@ -54,6 +54,7 @@ export interface AuthStatusResponse {
   encryption: EncryptionInfo;
   settings?: AppSettings;
   anchor?: VaultAnchor;
+  patrol_enabled?: boolean;
   active_sessions?: number;
   active_relays?: number;
 }
@@ -605,3 +606,241 @@ export interface MonitorPolicyResponse {
   rules: MonitorAlertRule[];
   runtime: MonitorRuntimeStatus;
 }
+
+// ============================================================================
+// Client-Side Zero-Knowledge AI Ops, Hybrid Memory, Runbooks & Scheduled Patrol
+// ============================================================================
+
+export type AIProtocol = 'openai' | 'anthropic';
+export type AIExecutionMode = 'suggest' | 'standard' | 'autonomous';
+
+export interface AIProviderView {
+  id: string;
+  name: string;
+  protocol: AIProtocol;
+  base_url: string;
+  has_api_key: boolean;
+  api_key_preview?: string;
+  model: string;
+  max_tokens: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProviderPreset {
+  id: string;
+  name: string;
+  protocol: AIProtocol;
+  base_url: string;
+  default_model: string;
+  description: string;
+}
+
+export interface WebhookChannelView {
+  id: string;
+  name: string;
+  kind: 'feishu' | 'dingtalk' | 'wecom' | 'custom';
+  url_masked: string;
+  has_secret: boolean;
+  enabled: boolean;
+}
+
+export interface PatrolConfigView {
+  enabled: boolean;
+  interval_minutes: number;
+  server_ids: string[];
+  cpu_warn_percent: number;
+  mem_warn_percent: number;
+  disk_warn_percent: number;
+  ssh_fail_warn_count: number;
+  check_listening_ports: boolean;
+  check_privileged_users: boolean;
+  webhooks: WebhookChannelView[];
+}
+
+export interface PatrolStatusView {
+  running: boolean;
+  vault_ready: boolean;
+  last_run_at?: string;
+  next_run_at?: string;
+  unread_alerts: number;
+}
+
+export interface PatrolFinding {
+  server_id: string;
+  server_name: string;
+  host: string;
+  reachable: boolean;
+  severity?: 'healthy' | 'warning' | 'critical';
+  latency_ms?: number;
+  cpu_load_percent?: number;
+  mem_percent?: number;
+  disk_percent?: number;
+  ssh_fail_count_1h?: number;
+  new_ports?: string[];
+  metrics_summary?: string;
+  anomalies?: string[];
+}
+
+export interface PatrolRecord {
+  id: string;
+  trigger: 'scheduled' | 'manual';
+  started_at: string;
+  completed_at: string;
+  status: 'healthy' | 'warning' | 'critical';
+  total_servers: number;
+  healthy_count: number;
+  warning_count: number;
+  critical_count: number;
+  findings: PatrolFinding[];
+  ai_analyzed: boolean;
+  ai_model?: string;
+  ai_summary?: string;
+  ai_root_cause?: string;
+  ai_recommendations?: string[];
+  webhook_notified: boolean;
+  unread: boolean;
+}
+
+export interface HostMemory {
+  server_id: string;
+  server_name: string;
+  summary: string;
+  os_arch?: string;
+  key_services: string[];
+  deploy_paths: string[];
+  ports_note?: string;
+  notes?: string;
+  auto_updated_count: number;
+  updated_at: string;
+}
+
+export interface AIRunbook {
+  id: string;
+  title: string;
+  category: string;
+  tags: string[];
+  symptom: string;
+  root_cause: string;
+  diagnostic_steps: string[];
+  fix_commands: string[];
+  verification?: string;
+  linked_snippet_id?: string;
+  source_session_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIToolCallRecord {
+  id: string;
+  name: string;
+  arguments: string;
+  summary?: string;
+  risk_level: 'readonly' | 'mutating' | 'blocked';
+  status: 'running' | 'completed' | 'pending_approval' | 'approved' | 'rejected' | 'blocked' | 'error';
+  output?: string;
+  duration_ms?: number;
+}
+
+export interface AIPendingApproval {
+  id: string;
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  risk_level: string;
+  reason: string;
+  server_ids: string[];
+  server_names: string[];
+  command?: string;
+  file_path?: string;
+  new_content?: string;
+  diff_preview?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  execution_out?: string;
+  created_at: string;
+  resolved_at?: string;
+}
+
+export interface AIRunbookProposal {
+  id: string;
+  session_id: string;
+  title: string;
+  category: string;
+  symptom: string;
+  root_cause: string;
+  diagnostic_steps: string[];
+  fix_commands: string[];
+  verification?: string;
+  status: 'pending' | 'accepted' | 'dismissed';
+  saved_runbook_id?: string;
+  created_at: string;
+}
+
+export interface AIChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: AIToolCallRecord[];
+  tool_call_id?: string;
+  tool_name?: string;
+  is_error?: boolean;
+  timestamp: string;
+}
+
+export interface AIChatSessionSummary {
+  id: string;
+  title: string;
+  scope: 'center' | 'terminal';
+  server_ids: string[];
+  mode: AIExecutionMode;
+  message_count: number;
+  pending_approval_count: number;
+  updated_at: string;
+}
+
+export interface AIChatSession {
+  id: string;
+  title: string;
+  scope: 'center' | 'terminal';
+  server_ids: string[];
+  mode: AIExecutionMode;
+  messages: AIChatMessage[];
+  pending_approvals: AIPendingApproval[];
+  runbook_proposals: AIRunbookProposal[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIOverviewResponse {
+  active_provider_id: string;
+  default_mode: AIExecutionMode;
+  providers: AIProviderView[];
+  presets: ProviderPreset[];
+  patrol_config: PatrolConfigView;
+  patrol_status: PatrolStatusView;
+  patrol_records: PatrolRecord[];
+  host_memories: HostMemory[];
+  runbooks: AIRunbook[];
+  sessions: AIChatSessionSummary[];
+}
+
+export interface AIStreamEvent {
+  type:
+    | 'delta'
+    | 'tool_start'
+    | 'tool_result'
+    | 'approval_required'
+    | 'memory_updated'
+    | 'runbook_proposed'
+    | 'session_sync'
+    | 'done'
+    | 'error';
+  delta?: string;
+  tool?: AIToolCallRecord;
+  approval?: AIPendingApproval;
+  memory?: HostMemory;
+  proposal?: AIRunbookProposal;
+  session?: AIChatSession;
+  error?: string;
+}
+
