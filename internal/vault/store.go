@@ -384,6 +384,7 @@ func (s *ClientVault) UnlockFromRawBlob(raw []byte, password, clientIP string, r
 	s.header = hdr
 	s.state = state
 	s.lastBlob = slices.Clone(raw)
+	s.adoptHeaderKDFLocked(hdr)
 	s.unlockedAt = now
 	s.lastActivity = now
 
@@ -400,6 +401,24 @@ func (s *ClientVault) UnlockFromRawBlob(raw []byte, password, clientIP string, r
 		fn()
 	}
 	return nil
+}
+
+// adoptHeaderKDFLocked keeps the in-memory Argon2id profile in sync with the mounted container header,
+// so password rotation re-wraps the vault with the SAME (possibly user-tuned) KDF cost instead of
+// silently falling back to the compile-time defaults. Caller must hold s.mu.
+func (s *ClientVault) adoptHeaderKDFLocked(hdr *EnvelopeHeader) {
+	if hdr == nil {
+		return
+	}
+	if hdr.KDFTime >= 1 {
+		s.kdfTime = hdr.KDFTime
+	}
+	if hdr.KDFMemoryKiB >= MinAllowedKDFMemoryKiB {
+		s.kdfMemoryKiB = hdr.KDFMemoryKiB
+	}
+	if hdr.KDFThreads >= 1 {
+		s.kdfThreads = hdr.KDFThreads
+	}
 }
 
 // MinMemoryKiB returns the enforced Argon2id KDF memory floor.
@@ -421,6 +440,40 @@ func (s *ClientVault) LastSealedBlob() ([]byte, *EnvelopeHeader, error) {
 	}
 	hdrCp := *s.header
 	return slices.Clone(s.lastBlob), &hdrCp, nil
+}
+
+// RefreshFromBackend re-reads the latest ciphertext container from the backend and, when it is a NEWER
+// revision of the currently mounted vault (same VaultID + AuthPublicKey, authenticated under the in-memory
+// DEK), adopts it. This keeps the 7x24 daemon from serving stale credentials / monitor policies after an
+// external Ed25519-signed PUT /api/vault/blob. Older revisions are rejected as rollback.
+func (s *ClientVault) RefreshFromBackend() (refreshed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.dek) != dekSize || s.header == nil || s.state == nil {
+		return false, ErrVaultLocked
+	}
+	raw, err := s.backend.Read()
+	if err != nil {
+		return false, err
+	}
+	hdr, state, err := OpenVaultWithKnownDEK(raw, s.dek, s.header.VaultID, s.header.AuthPublicKey)
+	if err != nil {
+		return false, err
+	}
+	if hdr.Revision < s.header.Revision {
+		return false, ErrRollbackDetected
+	}
+	if hdr.Revision == s.header.Revision {
+		return false, nil
+	}
+	ensureMonitorInitialized(state)
+	EnsureStateDefaults(state)
+	s.header = hdr
+	s.state = state
+	s.lastBlob = slices.Clone(raw)
+	s.adoptHeaderKDFLocked(hdr)
+	_ = s.verifyAndAdvanceAnchorLocked(hdr)
+	return true, nil
 }
 
 // UnlockWithPreDerivedKeys completes unlock using KEK + AuthKeyPair derived during the zero-knowledge login step.
@@ -881,6 +934,7 @@ func (s *ClientVault) ImportEncryptedVault(raw []byte, backupPassword, currentAd
 	s.header = sealedHdr
 	s.state = state
 	s.lastBlob = sealedBlob
+	s.adoptHeaderKDFLocked(sealedHdr)
 	s.anchor = &VaultAnchor{
 		VaultID:          sealedHdr.VaultID,
 		MinRevision:      sealedHdr.Revision,

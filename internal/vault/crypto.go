@@ -32,6 +32,13 @@ const (
 	DefaultKDFMemoryKiB       = uint32(64 * 1024) // 64 MiB Argon2id memory-hard cost
 	DefaultKDFThreads         = uint8(4)
 	MinAllowedKDFMemoryKiB    = uint32(16 * 1024) // 16 MiB strict floor to block server KDF downgrade attacks
+	// Hard ceilings for Argon2id cost parameters. KDF parameters are read from untrusted inputs
+	// (uploaded .sns backups, remote /api/auth/challenge responses, on-disk headers), so without an
+	// upper bound a crafted header such as kdf_memory_kib=4294967295 would make argon2.IDKey try to
+	// allocate terabytes of RAM and crash the 7x24 daemon (unauthenticated OOM DoS on import).
+	MaxAllowedKDFMemoryKiB = uint32(1024 * 1024) // 1 GiB
+	MaxAllowedKDFTime      = uint32(32)
+	MaxAllowedKDFThreads   = uint8(64)
 	kdfSaltSize               = 32
 	dekSize                   = 32
 	paddingBlockSize          = 4096
@@ -159,6 +166,9 @@ func DeriveVaultKeys(
 	if kdfMemoryKiB < minMemoryKiB {
 		return nil, nil, nil, ErrKDFDowngrade
 	}
+	if err := checkKDFCeiling(kdfTime, kdfMemoryKiB, kdfThreads); err != nil {
+		return nil, nil, nil, err
+	}
 
 	pwBytes := []byte(password)
 	master := argon2.IDKey(pwBytes, salt, kdfTime, kdfMemoryKiB, kdfThreads, dekSize)
@@ -182,10 +192,22 @@ func DeriveVaultKeys(
 	return kek, authPriv, authPub, nil
 }
 
+// checkKDFCeiling rejects Argon2id parameters above the hard safety ceilings (anti-OOM DoS).
+func checkKDFCeiling(kdfTime, kdfMemoryKiB uint32, kdfThreads uint8) error {
+	if kdfTime > MaxAllowedKDFTime || kdfMemoryKiB > MaxAllowedKDFMemoryKiB || kdfThreads > MaxAllowedKDFThreads {
+		return fmt.Errorf("%w: Argon2id 参数超出安全上限（内存 ≤ %d MiB / 轮数 ≤ %d / 并行度 ≤ %d）",
+			ErrCorruptedVault, MaxAllowedKDFMemoryKiB/1024, MaxAllowedKDFTime, MaxAllowedKDFThreads)
+	}
+	return nil
+}
+
 // legacy v1 KEK derivation for seamless v1 backup import & upgrade
 func deriveLegacyV1KEK(password string, h *EnvelopeHeader) ([]byte, error) {
 	if h.KDFAlgo != "argon2id" || len(h.KDFSalt) < 16 || h.KDFTime < 1 || h.KDFMemoryKiB < 8192 || h.KDFThreads < 1 {
 		return nil, ErrCorruptedVault
+	}
+	if err := checkKDFCeiling(h.KDFTime, h.KDFMemoryKiB, h.KDFThreads); err != nil {
+		return nil, err
 	}
 	pwBytes := []byte(password)
 	defer zeroBytes(pwBytes)
@@ -478,6 +500,9 @@ func ValidateV2HeaderStructural(ver uint16, h *EnvelopeHeader) error {
 	}
 	if h.KDFAlgo != "argon2id" || len(h.KDFSalt) != kdfSaltSize || h.KDFTime < 1 || h.KDFMemoryKiB < MinAllowedKDFMemoryKiB || h.KDFThreads < 1 {
 		return ErrCorruptedVault
+	}
+	if err := checkKDFCeiling(h.KDFTime, h.KDFMemoryKiB, h.KDFThreads); err != nil {
+		return err
 	}
 	if h.AuthAlgo != "ed25519" || len(h.AuthPublicKey) != ed25519.PublicKeySize {
 		return ErrCorruptedVault

@@ -67,6 +67,14 @@ docker compose up -d --build
 
 > **反向代理与外部主密钥建议**：生产环境推荐容器仅绑定 `127.0.0.1:18899`，外部通过域名 Nginx 开启 HTTPS（TLS）与 `/api/ws/` WebSocket 反向代理访问（完整配置模板见 [`deploy/nginx-reverse-proxy.conf.example`](deploy/nginx-reverse-proxy.conf.example)）。如需将快速启动主密钥与 `/data` 目录分离，可额外注入环境变量 `SNS_MASTER_KEY=<32字节以上随机高熵密钥>`。
 
+> [!WARNING]
+> **`.vault.key` 威胁模型说明**
+> - **文件模式（未配置 `SNS_MASTER_KEY`，默认）**：封装主密钥与被封装的 `DEK` 同存于 `/data/.vault.key`，仅依赖 `0600` 文件权限保护。**获得整个 `/data` 目录（或宿主机 root）的攻击者可直接解密 `vault.sns`**；导出的 `.sns` 备份不含 `.vault.key`，仍只能凭管理员密码解密。服务端模式启动时会打印安全提示，安全中心接口 `auto_unlock_mode` 字段显示 `file`。
+> - **外部主密钥模式（推荐）**：注入 `SNS_MASTER_KEY`（**至少 32 字节**随机值，如 `openssl rand -base64 48`；过短会被拒绝），`.vault.key` 仅含密文，单独泄露 `/data` 无法解密。已启用外部主密钥的 `.vault.key` 在环境变量缺失时**不会被静默降级**为文件模式（需手动删除 `.vault.key` 后重新登录方可降级）。
+> - 远端轮换密码或导入其他保险库后，失效的 `.vault.key` 会被自动清除，下次管理员密码登录时重新生成。
+>
+> **其他加固约束**：会话 Cookie 仅对同源请求生效（反向代理须保留 `Host` 或传递 `X-Forwarded-Host`）；`X-Real-IP` / `X-Forwarded-For` 仅在直连对端为本机/内网反向代理时采信；未认证的服务端 `Argon2id` 口令校验并发上限为 2（繁忙时返回 `429 KDF_BUSY`）；加密容器 KDF 参数上限为 `1 GiB / t=32 / p=64`，超限的备份或远端容器将被拒绝以防内存耗尽。
+
 ### 方式二：Windows 纯本地桌面应用（直接双击运行）
 
 1. 前往本仓库 **GitHub Releases** 或 **Actions Artifacts (`ServerNeedSafe-Windows-App`)** 下载 `ServerNeedSafe-windows-amd64.exe`（或 `arm64` 版本）直接双击运行。

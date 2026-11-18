@@ -13,9 +13,14 @@ services:
       - SNS_ADDR=0.0.0.0:8080
       - SNS_DATA_DIR=/data
       - SNS_SESSION_TTL=8h
+      # 强烈建议（生产环境）：注入 ≥32 字节的随机高熵外部主密钥，使 /data/.vault.key 与解封密钥分离存放。
+      # 生成示例：openssl rand -base64 48 ；请通过 .env / Docker secret 注入，切勿与 /data 一同备份。
+      # 未配置时 .vault.key 内含明文封装主密钥（仅依赖 0600 文件权限），/data 整体外泄即等同保险库泄露。
+      # - SNS_MASTER_KEY=${SNS_MASTER_KEY:?请设置至少32字节的随机密钥}
     volumes:
-      # 持久化存储零知识全量加密数据包 (vault.sns)
-      # 即使该目录或文件外泄，未持有管理员主密码的攻击者无法解密任何应用数据
+      # 持久化存储加密数据包 (vault.sns) 与 7×24 自动挂载封装密钥 (.vault.key)
+      # 注意：导出的 .sns 备份仅凭管理员密码加密；但 /data 目录本身含 .vault.key，
+      # 未配置 SNS_MASTER_KEY 时获得整个 /data 目录的攻击者可直接解密全部应用数据，请严格保护该目录。
       - ./data:/data
     security_opt:
       - no-new-privileges:true

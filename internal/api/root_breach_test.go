@@ -362,8 +362,9 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 	evilDialer := websocket.Dialer{Jar: adminHTTP.Jar}
 	evilHeader := http.Header{"Origin": []string{"https://evil-attacker.example"}}
 	_, evilResp, evilErr := evilDialer.Dial(wsURL, evilHeader)
-	if evilErr == nil || evilResp == nil || evilResp.StatusCode != http.StatusForbidden {
-		t.Fatalf("SECURITY FAILURE: cross-origin WebSocket hijack was not blocked with 403! resp=%v err=%v", evilResp, evilErr)
+	// Blocked either by the cookie same-origin guard in the auth layer (401) or by the WS origin check (403).
+	if evilErr == nil || evilResp == nil || (evilResp.StatusCode != http.StatusForbidden && evilResp.StatusCode != http.StatusUnauthorized) {
+		t.Fatalf("SECURITY FAILURE: cross-origin WebSocket hijack was not blocked with 401/403! resp=%v err=%v", evilResp, evilErr)
 	}
 
 	sameOriginHeader := http.Header{"Origin": []string{primaryTS.URL}}

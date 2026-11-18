@@ -100,16 +100,20 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 
 	// Path A: Native Web Admin Console setup (creates SNSVAULT v2 + .vault.key auto-mount seal)
 	if body.Password != "" {
-		if err := s.cfg.Store.Setup(body.Password, clientIP); err != nil {
+		release, ok := s.acquirePasswordKDFSlot(w, r)
+		if !ok {
 			body.Password = ""
+			return
+		}
+		err := s.cfg.Store.Setup(body.Password, clientIP)
+		release()
+		body.Password = ""
+		if err != nil {
 			writeDomainError(w, err)
 			return
 		}
-		body.Password = ""
 
-		if s.cfg.KeyMgr != nil {
-			_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-		}
+		s.persistAutoUnlockKey("setup")
 		s.setMigrationPending(false)
 		if s.cfg.Monitor != nil {
 			s.cfg.Monitor.Wake()
@@ -198,23 +202,28 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	clientIP := extractClientIP(r)
 	var authErr error
 
+	release, ok := s.acquirePasswordKDFSlot(w, r)
+	if !ok {
+		body.Password = ""
+		return
+	}
 	if s.isDaemonUnlocked() {
 		// Fast native Argon2id check against wrapped DEK (~45ms) without interrupting 7x24 tasks
 		authErr = s.cfg.Store.VerifyPassword(body.Password)
+		release()
 		if authErr == nil {
-			if s.cfg.KeyMgr != nil && !s.cfg.KeyMgr.HasLocalKey() {
-				_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-			}
+			// Always re-seal: heals a missing / stale / downgraded .vault.key (e.g. after a remote
+			// rotation or a newly configured SNS_MASTER_KEY) instead of only when the file is absent.
+			s.persistAutoUnlockKey("login")
 			s.setMigrationPending(false)
 			s.cfg.Store.RecordAuditAsync("auth.login", "web-console", "管理员登录 Web 管理控制台", clientIP, true)
 		}
 	} else {
 		// Seamless migration path: legacy vault.sns without .vault.key is decrypted & auto-mounted on first login!
 		authErr = s.cfg.Store.UnlockOrVerify(body.Password, clientIP)
+		release()
 		if authErr == nil {
-			if s.cfg.KeyMgr != nil {
-				_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-			}
+			s.persistAutoUnlockKey("login-unlock")
 			s.setMigrationPending(false)
 			if s.cfg.Monitor != nil {
 				s.cfg.Monitor.Wake()
@@ -373,6 +382,11 @@ func (s *Server) handleAuthLock(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Relay != nil {
 		s.cfg.Relay.CloseAll()
 	}
+	// Interactive PTY terminals were opened under the now-revoked sessions: tear them down as well,
+	// otherwise a stolen/forgotten browser tab keeps a live root shell after "lock all sessions".
+	if s.cfg.SSH != nil {
+		s.cfg.SSH.CloseAllSessions()
+	}
 	s.clearAdminSessionCookie(w, r)
 	if s.isDaemonUnlocked() {
 		s.cfg.Store.RecordAuditAsync("auth.sessions_revoked", "web-console", "管理员锁定控制台并注销全部活跃 Web 会话（7×24 后台监控与巡检保持运行）", extractClientIP(r), true)
@@ -407,9 +421,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 			writeDomainError(w, err)
 			return
 		}
-		if s.cfg.KeyMgr != nil {
-			_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-		}
+		s.persistAutoUnlockKey("change-password")
 		s.setMigrationPending(false)
 
 		newPubFP := s.currentAuthPubFingerprint()
@@ -449,6 +461,9 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Store != nil {
 		s.cfg.Store.Lock("远端轮换密码后等待新主密钥挂载", clientIP)
 	}
+	// The old .vault.key wraps the pre-rotation key material / auth identity: it can no longer mount
+	// the rotated container and must not linger on disk. It is re-created on the next password login.
+	s.dropStaleAutoUnlockKey("remote password rotation", true)
 	s.setMigrationPending(true)
 	s.cfg.Auth.RevokeAll()
 	sess, err := s.cfg.Auth.CreateSession(newPubFP, clientIP, r.UserAgent())
@@ -488,9 +503,7 @@ func (s *Server) handleUpdateVaultKDF(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	if s.cfg.KeyMgr != nil {
-		_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-	}
+	s.persistAutoUnlockKey("kdf-update")
 	s.setMigrationPending(false)
 
 	newPubFP := s.currentAuthPubFingerprint()

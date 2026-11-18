@@ -372,6 +372,27 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                         : '待生成'}
                     </span>
                   </div>
+                  {data?.auto_unlock_enabled && data?.auto_unlock_mode && (
+                    <div className="kv-row">
+                      <span className="kv-key">自动挂载密钥封装方式</span>
+                      <span
+                        className="kv-val"
+                        style={{
+                          fontSize: 12,
+                          color: data.auto_unlock_mode === 'env' ? 'var(--accent-teal)' : 'var(--amber-text)',
+                        }}
+                        title={
+                          data.auto_unlock_mode === 'env'
+                            ? '.vault.key 仅含密文，解封主密钥来自进程环境变量 SNS_MASTER_KEY'
+                            : '解封主密钥与 DEK 同存于 .vault.key，仅受 0600 文件权限保护：数据目录整体泄露即可解密保险库'
+                        }
+                      >
+                        {data.auto_unlock_mode === 'env'
+                          ? '外部主密钥 SNS_MASTER_KEY（与数据目录分离）'
+                          : '⚠ 文件内主密钥（数据目录泄露即可解密，建议配置 SNS_MASTER_KEY）'}
+                      </span>
+                    </div>
+                  )}
                   <div className="kv-row">
                     <span className="kv-key">密码学套件 (KDF / AEAD)</span>
                     <span className="kv-val">

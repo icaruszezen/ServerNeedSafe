@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +37,7 @@ func (s *Server) handleGetVaultSecurity(w http.ResponseWriter, r *http.Request) 
 		"vault_path":          s.cfg.BlindStore.FilePath(),
 		"daemon_running":      s.isDaemonUnlocked(),
 		"auto_unlock_enabled": s.cfg.KeyMgr != nil && s.cfg.KeyMgr.HasLocalKey(),
+		"auto_unlock_mode":    s.autoUnlockMode(),
 		"key_seal_path":       s.keySealPathDisplay(),
 		"encryption":          encInfo,
 		"settings":            settings,
@@ -130,10 +130,7 @@ func (s *Server) handlePutVaultBlob(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	if s.cfg.KeyMgr != nil {
-		_, mig, _ := s.cfg.KeyMgr.TryAutoUnlock(s.cfg.Store, s.cfg.BlindStore)
-		s.setMigrationPending(mig)
-	}
+	s.reloadDaemonAfterRemoteWrite("远端同步写入", extractClientIP(r))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"encryption": encInfo,
@@ -206,22 +203,9 @@ func (s *Server) handleImportVaultBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reload in-memory daemon if .vault.key matches the synced VaultID; otherwise wait for next login
-	if s.cfg.KeyMgr != nil {
-		unlocked, mig, _ := s.cfg.KeyMgr.TryAutoUnlock(s.cfg.Store, s.cfg.BlindStore)
-		if !unlocked && s.cfg.Store != nil {
-			s.cfg.Store.Lock("远端导入新保险库后等待重新挂载", extractClientIP(r))
-			s.setMigrationPending(true)
-		} else {
-			s.setMigrationPending(mig)
-			if s.cfg.Monitor != nil {
-				s.cfg.Monitor.Wake()
-			}
-			if s.cfg.AI != nil {
-				s.cfg.AI.NotifyPatrolConfigUpdated()
-			}
-		}
-	}
+	// Reload in-memory daemon if the in-memory DEK / .vault.key matches the imported VaultID;
+	// otherwise lock it, drop the obsolete seal and wait for the next password login.
+	s.reloadDaemonAfterRemoteWrite("远端导入保险库", extractClientIP(r))
 
 	s.cfg.Auth.ResetAuthFailures()
 	s.cfg.Auth.RevokeAll()
@@ -289,6 +273,13 @@ func (s *Server) handleImportVaultFile(w http.ResponseWriter, r *http.Request) {
 	clearAnchor := r.FormValue("clear_anchor") == "true" || r.FormValue("clear_anchor") == "1"
 	clientIP := extractClientIP(r)
 
+	// Both the existing-password proof and the backup decryption run memory-hard Argon2id server-side.
+	release, ok := s.acquirePasswordKDFSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	_, callerAuthed := s.validateRequestSession(r, false)
 	if s.cfg.BlindStore.IsInitialized() && !callerAuthed {
 		// Unauthenticated restore MUST prove possession of the existing server vault's admin password!
@@ -308,19 +299,25 @@ func (s *Server) handleImportVaultFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Remember the anti-rollback anchor so that a FAILED import (wrong backup password, corrupt file)
+	// cannot be abused to silently wipe rollback protection.
+	prevAnchor := s.cfg.Store.GetAnchor()
 	if clearAnchor {
 		s.cfg.Store.SetAnchor(nil)
 	}
 
 	if err := s.cfg.Store.ImportEncryptedVault(rawBytes, backupPassword, currentAdminPassword, clientIP); err != nil {
+		if clearAnchor {
+			s.cfg.Store.SetAnchor(prevAnchor)
+		}
 		s.cfg.Auth.RecordAuthFailure()
 		writeDomainError(w, err)
 		return
 	}
 
-	if s.cfg.KeyMgr != nil {
-		_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-	}
+	s.persistAutoUnlockKey("import-file")
+	// If re-sealing failed, never keep a seal that belongs to the replaced vault.
+	s.dropStaleAutoUnlockKey("import-file", false)
 	s.setMigrationPending(false)
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Wake()
@@ -565,21 +562,26 @@ func (s *Server) handleVaultSyncPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if anchor := s.cfg.Store.GetAnchor(); anchor != nil && anchor.VaultID != chResp.KDF.VaultID {
+	prevAnchor := s.cfg.Store.GetAnchor()
+	if prevAnchor != nil && prevAnchor.VaultID != chResp.KDF.VaultID {
 		s.cfg.Store.SetAnchor(nil)
 	}
 
 	clientIP := extractClientIP(r)
 	if err := s.cfg.Store.ImportEncryptedVault(remoteBlob, req.RemotePassword, req.CurrentLocalPassword, clientIP); err != nil {
+		req.RemotePassword = ""
+		req.CurrentLocalPassword = ""
+		if s.cfg.Store.GetAnchor() == nil && prevAnchor != nil {
+			s.cfg.Store.SetAnchor(prevAnchor)
+		}
 		writeDomainError(w, err)
 		return
 	}
 	req.RemotePassword = ""
 	req.CurrentLocalPassword = ""
 
-	if s.cfg.KeyMgr != nil {
-		_ = s.cfg.KeyMgr.SaveFromStore(s.cfg.Store)
-	}
+	s.persistAutoUnlockKey("sync-pull")
+	s.dropStaleAutoUnlockKey("sync-pull", false)
 	s.setMigrationPending(false)
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Wake()
@@ -615,11 +617,7 @@ func checkWebSocketSameOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(u.Host, r.Host)
+	return origin != "null" && isSameOriginRequest(r, origin)
 }
 
 func (s *Server) handleWebSocketTerminal(w http.ResponseWriter, r *http.Request) {
@@ -735,8 +733,32 @@ func (s *Server) handleWebSocketTerminal(w http.ResponseWriter, r *http.Request)
 			if rErr != nil {
 				return
 			}
-			// Keep admin session active while typing in terminal
-			_, _ = s.validateRequestSession(r, true)
+			var ctrl struct {
+				Type string `json:"type"`
+				Data string `json:"data,omitempty"`
+				Cols int    `json:"cols,omitempty"`
+				Rows int    `json:"rows,omitempty"`
+			}
+			isInput := msgType == websocket.BinaryMessage
+			if !isInput {
+				if json.Unmarshal(payload, &ctrl) != nil {
+					continue
+				}
+				isInput = ctrl.Type == "input"
+			}
+
+			// Every frame requires a still-valid admin session. Previously the validation result was
+			// ignored, so a tab whose session had been revoked (lock / logout / password change) or had
+			// expired kept a fully interactive shell indefinitely. Only real keystrokes refresh the idle
+			// timer, so automatic keep-alive pings / resizes can no longer defeat the idle timeout.
+			if _, ok := s.validateRequestSession(r, isInput); !ok {
+				vault.ZeroBytes(payload)
+				_ = writeJSONFrame(map[string]any{
+					"type":    "exit",
+					"message": sessionGoneTerminalMsg,
+				})
+				return
+			}
 
 			if msgType == websocket.BinaryMessage {
 				if len(payload) > 0 {
@@ -746,25 +768,17 @@ func (s *Server) handleWebSocketTerminal(w http.ResponseWriter, r *http.Request)
 				continue
 			}
 
-			var ctrl struct {
-				Type string `json:"type"`
-				Data string `json:"data,omitempty"`
-				Cols int    `json:"cols,omitempty"`
-				Rows int    `json:"rows,omitempty"`
-			}
-			if json.Unmarshal(payload, &ctrl) == nil {
-				switch ctrl.Type {
-				case "input":
-					if ctrl.Data != "" {
-						_ = ts.WriteInput([]byte(ctrl.Data))
-					}
-				case "resize":
-					if ctrl.Cols > 0 && ctrl.Rows > 0 {
-						_ = ts.Resize(ctrl.Cols, ctrl.Rows)
-					}
-				case "ping":
-					_ = writeJSONFrame(map[string]any{"type": "pong"})
+			switch ctrl.Type {
+			case "input":
+				if ctrl.Data != "" {
+					_ = ts.WriteInput([]byte(ctrl.Data))
 				}
+			case "resize":
+				if ctrl.Cols > 0 && ctrl.Rows > 0 {
+					_ = ts.Resize(ctrl.Cols, ctrl.Rows)
+				}
+			case "ping":
+				_ = writeJSONFrame(map[string]any{"type": "pong"})
 			}
 		}
 	}()
@@ -778,6 +792,13 @@ func (s *Server) handleWebSocketTerminal(w http.ResponseWriter, r *http.Request)
 		case <-r.Context().Done():
 			return
 		case <-pingTicker.C:
+			if _, ok := s.validateRequestSession(r, false); !ok {
+				_ = writeJSONFrame(map[string]any{
+					"type":    "exit",
+					"message": sessionGoneTerminalMsg,
+				})
+				return
+			}
 			writeMu.Lock()
 			_ = wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			err := wsConn.WriteMessage(websocket.PingMessage, nil)
