@@ -166,15 +166,6 @@ func (m *Manager) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 	_ = wsConn.SetReadDeadline(time.Time{})
 	wsConn.SetReadLimit(2 * 1024 * 1024)
 
-	okBytes, _ := json.Marshal(dialHandshakeResp{OK: true})
-	_ = wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := wsConn.WriteMessage(websocket.TextMessage, okBytes); err != nil {
-		_ = tcpConn.Close()
-		_ = wsConn.Close()
-		return
-	}
-	_ = wsConn.SetWriteDeadline(time.Time{})
-
 	pipeID := m.nextID.Add(1)
 	pipe := &activePipe{ws: wsConn, tcp: tcpConn}
 	m.mu.Lock()
@@ -187,6 +178,13 @@ func (m *Manager) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 		m.mu.Unlock()
 		pipe.Close()
 	}()
+
+	okBytes, _ := json.Marshal(dialHandshakeResp{OK: true})
+	_ = wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := wsConn.WriteMessage(websocket.TextMessage, okBytes); err != nil {
+		return
+	}
+	_ = wsConn.SetWriteDeadline(time.Time{})
 
 	var writeMu sync.Mutex
 	writeWSBinary := func(payload []byte) error {
