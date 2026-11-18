@@ -326,9 +326,16 @@ func (s *Server) handleTestAIProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var cfg vault.AIProviderConfig
+	var storedBaseURL string
+	var storedProtocol vault.AIProtocol
 	if req.ID != "" {
 		if stored, sErr := s.cfg.Store.GetAIProviderSecret(req.ID); sErr == nil && stored != nil {
 			cfg = *stored
+			storedBaseURL = cfg.BaseURL
+			storedProtocol = cfg.Protocol
+			if storedProtocol == "" {
+				storedProtocol = vault.AIProtocolOpenAI
+			}
 		}
 	}
 	if req.Protocol != "" {
@@ -345,6 +352,13 @@ func (s *Server) handleTestAIProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.APIKey) != "" {
 		cfg.APIKey = strings.TrimSpace(req.APIKey)
+	} else if cfg.APIKey != "" && (!vault.SameEndpointURL(cfg.BaseURL, storedBaseURL) || cfg.Protocol != storedProtocol) {
+		// The stored (masked) API key must never be sent to a caller-chosen endpoint: otherwise anyone
+		// holding a session could exfiltrate the plaintext key by "testing" against their own server.
+		cfg.APIKey = ""
+		req.APIKey = ""
+		writeDomainError(w, fmt.Errorf("%w: 更换接口地址或协议时必须重新填写 API Key", vault.ErrInvalidInput))
+		return
 	}
 	req.APIKey = ""
 	if cfg.BaseURL == "" || cfg.Model == "" {
@@ -680,6 +694,13 @@ func (s *Server) handleTestAIWebhook(w http.ResponseWriter, r *http.Request) {
 		if cfg, cErr := s.cfg.Store.GetPatrolConfigSecret(); cErr == nil && cfg != nil {
 			for _, wch := range cfg.Webhooks {
 				if wch.ID == req.ID {
+					// Only sign with the stored secret when delivering to the STORED destination;
+					// otherwise a session holder could harvest valid signatures on their own server.
+					sameDest := (ch.URL == "" || vault.SameEndpointURL(ch.URL, wch.URL)) && (ch.Kind == "" || ch.Kind == wch.Kind)
+					if ch.Secret == "" && wch.Secret != "" && !sameDest {
+						writeDomainError(w, fmt.Errorf("%w: 更换 Webhook 地址或类型时必须重新填写签名密钥", vault.ErrInvalidInput))
+						return
+					}
 					if ch.URL == "" {
 						ch.URL = wch.URL
 					}

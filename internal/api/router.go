@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,6 +48,9 @@ type Server struct {
 
 	stateMu          sync.RWMutex
 	migrationPending bool
+
+	// kdfSlots bounds concurrent server-side Argon2id password derivations on unauthenticated endpoints.
+	kdfSlots chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -81,13 +85,21 @@ func NewServer(cfg Config) *Server {
 
 	var migPending bool
 	if cfg.KeyMgr != nil && cfg.Store != nil && cfg.BlindStore != nil {
-		_, migPending, _ = cfg.KeyMgr.TryAutoUnlock(cfg.Store, cfg.BlindStore)
+		var unlockErr error
+		_, migPending, unlockErr = cfg.KeyMgr.TryAutoUnlock(cfg.Store, cfg.BlindStore)
+		if unlockErr != nil {
+			log.Printf("[ServerNeedSafe] 自动挂载加密保险库失败，需管理员密码登录一次完成挂载：%v", unlockErr)
+		}
+		if cfg.DeployMode == "server" && cfg.KeyMgr.HasLocalKey() && cfg.KeyMgr.SealMode() == vault.SealModeFile {
+			log.Printf("[ServerNeedSafe] 安全提示：%s 以文件内主密钥方式封装（数据目录整体泄露即可解密保险库），生产环境建议配置 SNS_MASTER_KEY 将封装主密钥与数据目录分离", cfg.KeyMgr.KeyPath())
+		}
 	}
 
 	s := &Server{
 		cfg:              cfg,
 		mux:              http.NewServeMux(),
 		migrationPending: migPending,
+		kdfSlots:         make(chan struct{}, maxConcurrentPasswordKDF),
 	}
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Start()
@@ -167,10 +179,18 @@ func isSameOriginRequest(r *http.Request, origin string) bool {
 		return true
 	}
 	u, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || u.Host == "" {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	// Reverse proxies that rewrite Host (e.g. proxy_pass to 127.0.0.1 without "proxy_set_header Host")
+	// usually forward the public host here; only believe it when the peer is our own local proxy.
+	if fwdHost := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); fwdHost != "" && isTrustedProxyPeer(r.RemoteAddr) {
+		return strings.EqualFold(u.Host, fwdHost)
+	}
+	return false
 }
 
 func (s *Server) registerRoutes() {
@@ -325,6 +345,10 @@ func extractSessionToken(r *http.Request) string {
 			return tok
 		}
 	}
+	// HttpOnly cookie sessions are ONLY accepted for same-origin requests (CSRF protection).
+	if !isCookieSessionRequestAllowed(r) {
+		return ""
+	}
 	if c, err := r.Cookie(adminSessionCookieName); err == nil && strings.TrimSpace(c.Value) != "" {
 		return strings.TrimSpace(c.Value)
 	}
@@ -363,17 +387,26 @@ func (s *Server) clearAdminSessionCookie(w http.ResponseWriter, r *http.Request)
 }
 
 func extractClientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		first := strings.TrimSpace(strings.Split(xff, ",")[0])
-		if first != "" {
-			return first
-		}
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
+	if err != nil || host == "" {
+		host = r.RemoteAddr
+	}
+	// Proxy headers are attacker-controlled unless the direct peer is our own local reverse proxy.
+	if !isTrustedProxyPeer(r.RemoteAddr) {
 		return host
 	}
-	return r.RemoteAddr
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" && net.ParseIP(realIP) != nil {
+		return realIP
+	}
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		// The RIGHTMOST hop is the one appended by the trusted proxy ($proxy_add_x_forwarded_for);
+		// leftmost entries can be forged by the client.
+		parts := strings.Split(xff, ",")
+		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" && net.ParseIP(last) != nil {
+			return last
+		}
+	}
+	return host
 }
 
 func (s *Server) currentAuthPubFingerprint() string {

@@ -147,14 +147,23 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 			for i := range st.AISettings.Providers {
 				if st.AISettings.Providers[i].ID == in.ID {
 					existing := st.AISettings.Providers[i]
+					newKey := ""
+					if in.APIKey != nil {
+						newKey = strings.TrimSpace(*in.APIKey)
+					}
+					// Never silently re-point a stored (masked) API key to a different endpoint or protocol:
+					// a hijacked session could otherwise exfiltrate the plaintext key to its own server.
+					if newKey == "" && existing.APIKey != "" && (!SameEndpointURL(existing.BaseURL, in.BaseURL) || normalizeAIProtocol(existing.Protocol) != in.Protocol) {
+						return fmt.Errorf("%w: 更换接口地址或协议时必须重新填写 API Key", ErrInvalidInput)
+					}
 					existing.Name = in.Name
 					existing.Protocol = in.Protocol
 					existing.BaseURL = in.BaseURL
 					existing.Model = in.Model
 					existing.MaxTokens = in.MaxTokens
 					existing.UpdatedAt = now
-					if in.APIKey != nil && strings.TrimSpace(*in.APIKey) != "" {
-						existing.APIKey = strings.TrimSpace(*in.APIKey)
+					if newKey != "" {
+						existing.APIKey = newKey
 					}
 					st.AISettings.Providers[i] = existing
 					if in.SetActive || st.AISettings.ActiveProviderID == "" {

@@ -19,6 +19,23 @@ import (
 const (
 	localKeyFileName = ".vault.key"
 	localSealAAD     = "SNS-LOCAL-SEAL-v1:"
+	// minEnvMasterKeyLen is the documented minimum length of SNS_MASTER_KEY. The env secret is only
+	// expanded with HKDF (no password stretching), so it MUST already be a high-entropy random value.
+	minEnvMasterKeyLen = 32
+
+	// SealModeEnv means .vault.key is wrapped under a key derived from SNS_MASTER_KEY (secret kept outside /data).
+	SealModeEnv = "env"
+	// SealModeFile means the random wrapping key is stored inside .vault.key itself (protected only by 0600
+	// file permissions): anyone who can read the data directory can decrypt vault.sns.
+	SealModeFile = "file"
+)
+
+var (
+	// ErrWeakMasterKey is returned when SNS_MASTER_KEY is set but shorter than the documented minimum.
+	ErrWeakMasterKey = fmt.Errorf("SNS_MASTER_KEY 长度不足 %d 字节，拒绝使用低熵外部主密钥封装 .vault.key", minEnvMasterKeyLen)
+	// ErrSealDowngrade is returned when an SNS_MASTER_KEY-protected .vault.key would be silently rewritten
+	// as a plaintext-key file seal because the env variable is missing (e.g. a misconfigured restart).
+	ErrSealDowngrade = errors.New("现有 .vault.key 受 SNS_MASTER_KEY 外部主密钥保护，但当前进程未配置该环境变量；已拒绝降级为明文文件密钥封装（如确需关闭外部主密钥，请手动删除 .vault.key 后重新登录）")
 )
 
 type localKeySealFile struct {
@@ -35,6 +52,10 @@ type localKeySealFile struct {
 // so sns-server and desktop mode can auto-mount vault.sns in <1ms across restarts and run
 // 7x24 SSH monitoring and scheduled AI patrol without manual unsealing, while keeping vault.sns
 // and exported .sns backups strictly encrypted with the admin password.
+//
+// SECURITY NOTE: without SNS_MASTER_KEY the wrapping key is stored inside .vault.key next to vault.sns,
+// so a leak of the whole data directory (or a host root compromise) is equivalent to a leak of the
+// vault DEK. Exported .sns backups never contain .vault.key and stay password-protected.
 type ServerKeyManager struct {
 	mu      sync.Mutex
 	keyPath string
@@ -58,10 +79,74 @@ func (m *ServerKeyManager) HasLocalKey() bool {
 	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
+func (m *ServerKeyManager) readSeal() (*localKeySealFile, error) {
+	m.mu.Lock()
+	raw, err := os.ReadFile(m.keyPath)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	defer zeroBytes(raw)
+	var seal localKeySealFile
+	if err := json.Unmarshal(raw, &seal); err != nil {
+		return nil, err
+	}
+	return &seal, nil
+}
+
+// SealMode reports how the current .vault.key is protected: SealModeEnv, SealModeFile, or "" if absent/unreadable.
+func (m *ServerKeyManager) SealMode() string {
+	seal, err := m.readSeal()
+	if err != nil {
+		return ""
+	}
+	if seal.EnvProtected {
+		return SealModeEnv
+	}
+	return SealModeFile
+}
+
+// SealVaultID returns the VaultID the current .vault.key was issued for ("" if absent/unreadable).
+func (m *ServerKeyManager) SealVaultID() string {
+	seal, err := m.readSeal()
+	if err != nil {
+		return ""
+	}
+	return seal.VaultID
+}
+
+// Remove best-effort overwrites and deletes .vault.key (used when the seal no longer matches the mounted
+// vault, e.g. after a remote password rotation re-keyed the DEK), so a stale wrapped DEK does not linger on disk.
+func (m *ServerKeyManager) Remove() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info, err := os.Stat(m.keyPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() && info.Size() > 0 {
+		if f, oErr := os.OpenFile(m.keyPath, os.O_WRONLY, 0o600); oErr == nil {
+			_, _ = f.Write(make([]byte, info.Size()))
+			_ = f.Sync()
+			_ = f.Close()
+		}
+	}
+	if err := os.Remove(m.keyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func resolveEnvMasterKey() ([]byte, bool, error) {
 	rawEnv := strings.TrimSpace(os.Getenv("SNS_MASTER_KEY"))
 	if rawEnv == "" {
 		return nil, false, nil
+	}
+	if len(rawEnv) < minEnvMasterKeyLen {
+		return nil, true, ErrWeakMasterKey
 	}
 	key, err := hkdfDerive32([]byte(rawEnv), []byte("ServerNeedSafe-MasterKey-Salt-v1"), "SNS-LOCAL-MASTER-KEY-v1")
 	if err != nil {
@@ -73,6 +158,8 @@ func resolveEnvMasterKey() ([]byte, bool, error) {
 // TryAutoUnlock attempts to unwrap DEK + AuthPrivateKey from .vault.key and unlock store in <1ms.
 // If vault.sns exists from a legacy v2 deployment without .vault.key, migrationPending is returned as true
 // so the first admin password login automatically upgrades and persists .vault.key.
+// A non-nil err (with migrationPending=true) explains why an EXISTING seal could not be used
+// (stale VaultID, missing/weak SNS_MASTER_KEY, tampering); callers should log it.
 func (m *ServerKeyManager) TryAutoUnlock(store *ClientVault, bs *BlindStore) (autoUnlocked bool, migrationPending bool, err error) {
 	if store == nil || bs == nil || !bs.IsInitialized() {
 		return false, false, nil
@@ -90,25 +177,32 @@ func (m *ServerKeyManager) TryAutoUnlock(store *ClientVault, bs *BlindStore) (au
 		if errors.Is(sErr, os.ErrNotExist) {
 			return false, true, nil
 		}
-		return false, true, nil
+		return false, true, fmt.Errorf("读取 .vault.key 失败: %w", sErr)
 	}
+	defer zeroBytes(sealBytes)
 
 	var seal localKeySealFile
-	if err := json.Unmarshal(sealBytes, &seal); err != nil || seal.VaultID == "" || seal.VaultID != vaultID {
-		return false, true, nil
+	if err := json.Unmarshal(sealBytes, &seal); err != nil {
+		return false, true, fmt.Errorf(".vault.key 格式损坏: %w", err)
+	}
+	if seal.VaultID == "" || seal.VaultID != vaultID {
+		return false, true, errors.New(".vault.key 与当前 vault.sns 的 VaultID 不匹配（已过期的自动挂载密钥）")
 	}
 
 	var masterKey []byte
 	if seal.EnvProtected {
 		envKey, hasEnv, kErr := resolveEnvMasterKey()
-		if kErr != nil || !hasEnv {
-			return false, true, nil
+		if kErr != nil {
+			return false, true, kErr
+		}
+		if !hasEnv {
+			return false, true, errors.New(".vault.key 受 SNS_MASTER_KEY 保护，但当前进程未配置该环境变量")
 		}
 		masterKey = envKey
 	} else {
 		mk, dErr := base64.StdEncoding.DecodeString(seal.MasterKeyB64)
 		if dErr != nil || len(mk) != dekSize {
-			return false, true, nil
+			return false, true, errors.New(".vault.key 文件主密钥字段损坏")
 		}
 		masterKey = mk
 	}
@@ -117,26 +211,26 @@ func (m *ServerKeyManager) TryAutoUnlock(store *ClientVault, bs *BlindStore) (au
 	nonce, nErr := base64.StdEncoding.DecodeString(seal.NonceB64)
 	wrapped, wErr := base64.StdEncoding.DecodeString(seal.WrappedSecretsB64)
 	if nErr != nil || wErr != nil {
-		return false, true, nil
+		return false, true, errors.New(".vault.key 封装字段编码损坏")
 	}
 
 	block, cErr := aes.NewCipher(masterKey)
 	if cErr != nil {
-		return false, true, nil
+		return false, true, cErr
 	}
 	gcm, gErr := cipher.NewGCM(block)
 	if gErr != nil || len(nonce) != gcm.NonceSize() {
-		return false, true, nil
+		return false, true, errors.New(".vault.key 封装 nonce 无效")
 	}
 
 	plain, oErr := gcm.Open(nil, nonce, wrapped, []byte(localSealAAD+vaultID))
 	if oErr != nil {
-		return false, true, nil
+		return false, true, errors.New(".vault.key 认证解封失败（外部主密钥不匹配或文件遭到篡改）")
 	}
 	defer zeroBytes(plain)
 
 	if len(plain) != dekSize+ed25519.PrivateKeySize {
-		return false, true, nil
+		return false, true, errors.New(".vault.key 解封载荷长度异常")
 	}
 	dek := slices.Clone(plain[:dekSize])
 	authPriv := ed25519.PrivateKey(slices.Clone(plain[dekSize:]))
@@ -144,7 +238,7 @@ func (m *ServerKeyManager) TryAutoUnlock(store *ClientVault, bs *BlindStore) (au
 	if uErr := store.UnlockWithLocalKey(rawBlob, dek, authPriv); uErr != nil {
 		zeroBytes(dek)
 		zeroBytes(authPriv)
-		return false, true, nil
+		return false, true, fmt.Errorf(".vault.key 中的密钥无法挂载当前 vault.sns（密码/DEK 已轮换）: %w", uErr)
 	}
 	zeroBytes(dek)
 	zeroBytes(authPriv)
@@ -190,7 +284,15 @@ func (m *ServerKeyManager) SaveFromStore(store *ClientVault) error {
 		// Reuse existing random master key if present, else generate a fresh 256-bit key
 		if prevRaw, rErr := os.ReadFile(m.keyPath); rErr == nil {
 			var prev localKeySealFile
-			if json.Unmarshal(prevRaw, &prev) == nil && !prev.EnvProtected {
+			uErr := json.Unmarshal(prevRaw, &prev)
+			zeroBytes(prevRaw)
+			if uErr == nil && prev.EnvProtected {
+				// The operator previously moved the wrapping secret OUT of the data directory via
+				// SNS_MASTER_KEY. Re-writing the seal with a plaintext file key here would silently
+				// re-expose the DEK to anyone who can read /data (e.g. after a misconfigured restart).
+				return ErrSealDowngrade
+			}
+			if uErr == nil {
 				if prevMK, dErr := base64.StdEncoding.DecodeString(prev.MasterKeyB64); dErr == nil && len(prevMK) == dekSize {
 					masterKey = prevMK
 				}
@@ -259,6 +361,10 @@ func (m *ServerKeyManager) SaveFromStore(store *ClientVault) error {
 	if err := os.Rename(tmpPath, m.keyPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
+	}
+	if dir, dErr := os.Open(filepath.Dir(m.keyPath)); dErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return nil
 }

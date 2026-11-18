@@ -225,6 +225,8 @@ export interface VaultSecurityOverview {
   vault_path: string;
   daemon_running?: boolean;
   auto_unlock_enabled?: boolean;
+  /** "env" = wrapped by SNS_MASTER_KEY, "file" = wrapping key stored inside .vault.key, "" = no seal */
+  auto_unlock_mode?: 'env' | 'file' | '';
   key_seal_path?: string;
   encryption: EncryptionInfo;
   settings: AppSettings;
