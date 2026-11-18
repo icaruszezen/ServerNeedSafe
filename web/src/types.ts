@@ -49,14 +49,17 @@ export interface AuthStatusResponse {
   vault_status: VaultStatus;
   authenticated: boolean;
   deploy_mode: 'server' | 'desktop';
-  zero_knowledge?: boolean;
-  vault_path: string;
+  daemon_running?: boolean;
+  migration_pending?: boolean;
+  auto_unlock_enabled?: boolean;
+  vault_path?: string;
   encryption: EncryptionInfo;
   settings?: AppSettings;
   anchor?: VaultAnchor;
   patrol_enabled?: boolean;
   active_sessions?: number;
   active_relays?: number;
+  active_ssh_tabs?: number;
 }
 
 export interface ServerView {
@@ -220,7 +223,9 @@ export interface AuditEntry {
 export interface VaultSecurityOverview {
   deploy_mode: string;
   vault_path: string;
-  zero_knowledge?: boolean;
+  daemon_running?: boolean;
+  auto_unlock_enabled?: boolean;
+  key_seal_path?: string;
   encryption: EncryptionInfo;
   settings: AppSettings;
   known_hosts: KnownHost[];
@@ -229,6 +234,16 @@ export interface VaultSecurityOverview {
   active_relays?: number;
   active_ssh_tabs: number;
   anchor?: VaultAnchor;
+}
+
+export interface WorkspaceBootstrapResponse {
+  servers: ServerView[];
+  groups: string[];
+  credentials: CredentialView[];
+  snippets: Snippet[];
+  active_sessions: { id: string; server_id: string; server_name: string; started_at: string }[];
+  firing_alerts: number;
+  patrol_unread: number;
 }
 
 export interface TerminalReadyInfo {

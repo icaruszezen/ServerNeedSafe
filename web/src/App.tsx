@@ -12,8 +12,7 @@ import {
   Sun,
   Moon,
 } from 'lucide-react';
-import { api, registerOnUnauthorized, setSessionToken } from './api';
-import { zkClient } from './zk/zkClient';
+import { api, registerOnUnauthorized, terminalClient } from './api';
 import type {
   AppSettings,
   AuthStatusResponse,
@@ -41,14 +40,13 @@ export const App: React.FC = () => {
 
   const [bootLoading, setBootLoading] = useState(true);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
-  const [uiLocked, setUiLocked] = useState(false);
   const [settings, setSettings] = useState<AppSettings | undefined>(undefined);
   const [activeNav, setActiveNav] = useState<NavKey>('servers');
   const [monitorTargetId, setMonitorTargetId] = useState<string>('');
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
   const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
 
-  // Decrypted Workspace State (exists strictly in memory while unlocked)
+  // Workspace State (populated in 1 RTT once session is authenticated)
   const [servers, setServers] = useState<ServerView[]>([]);
   const [groups, setGroups] = useState<string[]>([]);
   const [credentials, setCredentials] = useState<CredentialView[]>([]);
@@ -77,7 +75,7 @@ export const App: React.FC = () => {
   }, []);
 
   const clearUnlockedMemory = useCallback(() => {
-    setUiLocked(false);
+    terminalClient.closeAll();
     setServers([]);
     setGroups([]);
     setCredentials([]);
@@ -107,24 +105,14 @@ export const App: React.FC = () => {
 
   const loadWorkspaceData = useCallback(async () => {
     try {
-      const [srvRes, credRes, snipRes, monRes, aiRes] = await Promise.all([
-        api.listServers(),
-        api.listCredentials(),
-        api.listSnippets(),
-        api.getMonitorOverview().catch(() => null),
-        api.getAIOverview('center').catch(() => null),
-      ]);
-      setServers(srvRes.servers || []);
-      setGroups(srvRes.groups || []);
-      setBackendActiveServerIds((srvRes.active_sessions || []).map((s) => s.server_id));
-      setCredentials(credRes.credentials || []);
-      setSnippets(snipRes.snippets || []);
-      if (monRes) {
-        setFiringAlertsCount(monRes.kpi.firing_alerts || 0);
-      }
-      if (aiRes) {
-        setPatrolUnreadCount(aiRes.patrol_status?.unread_alerts || 0);
-      }
+      const boot = await api.getWorkspaceBootstrap();
+      setServers(boot.servers || []);
+      setGroups(boot.groups || []);
+      setBackendActiveServerIds((boot.active_sessions || []).map((s) => s.server_id));
+      setCredentials(boot.credentials || []);
+      setSnippets(boot.snippets || []);
+      setFiringAlertsCount(boot.firing_alerts || 0);
+      setPatrolUnreadCount(boot.patrol_unread || 0);
     } catch {
       // Handled by global 401 listener if session expired
     }
@@ -135,57 +123,42 @@ export const App: React.FC = () => {
       clearUnlockedMemory();
       void checkStatus();
     });
-    zkClient.setOnAutoLocked(() => {
-      clearUnlockedMemory();
-      notify('因无操作超时，客户端零知识加密内存已自动销毁锁定');
-      void checkStatus();
-    });
     void checkStatus();
-    return () => {
-      zkClient.setOnAutoLocked(null);
-    };
-  }, [checkStatus, clearUnlockedMemory, notify]);
+  }, [checkStatus, clearUnlockedMemory]);
 
   useEffect(() => {
-    if (authStatus?.authenticated && !uiLocked) {
+    if (authStatus?.authenticated) {
       void loadWorkspaceData();
     }
-  }, [authStatus?.authenticated, uiLocked, loadWorkspaceData]);
+  }, [authStatus?.authenticated, loadWorkspaceData]);
 
-  // Screen lock keeps the isolated WASM Worker alive so Monitor & Scheduled AI Patrol stay running
-  const handleLockScreen = useCallback(() => {
-    setUiLocked(true);
-    void api
-      .getAuthStatus()
-      .then((st) => setAuthStatus(st))
-      .catch(() => {});
-  }, []);
-
-  // Full Vault Seal destroys WASM linear memory and wipes DEK / session keys
-  const handleSealVault = useCallback(async () => {
-    try {
-      await api.lockVault();
-    } catch {
-      // ignore
-    }
-    setSessionToken('');
+  // Logout current Web admin session while keeping 7x24 monitoring & AI patrol daemon running
+  const handleLogoutSession = useCallback(async () => {
+    await api.logoutSession();
     clearUnlockedMemory();
     await checkStatus();
   }, [checkStatus, clearUnlockedMemory]);
 
-  // Global keyboard shortcut: Ctrl+Shift+L locks screen immediately
+  // Revoke ALL active Web sessions across devices while keeping 7x24 monitoring & AI patrol daemon running
+  const handleRevokeAllSessions = useCallback(async () => {
+    await api.revokeAllSessions();
+    clearUnlockedMemory();
+    await checkStatus();
+  }, [checkStatus, clearUnlockedMemory]);
+
+  // Global keyboard shortcut: Ctrl+Shift+L locks Web console session immediately
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'l') {
         e.preventDefault();
-        if (authStatus?.authenticated && !uiLocked) {
-          handleLockScreen();
+        if (authStatus?.authenticated) {
+          void handleLogoutSession();
         }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [authStatus?.authenticated, uiLocked, handleLockScreen]);
+  }, [authStatus?.authenticated, handleLogoutSession]);
 
   const handleConnectTerminal = (srv: ServerView, openSftp = false) => {
     const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -201,7 +174,7 @@ export const App: React.FC = () => {
   };
 
   const handleCloseTab = (tabId: string) => {
-    zkClient.closeTerminal(tabId);
+    terminalClient.closeTerminal(tabId);
     setTerminalTabs((prev) => {
       const next = prev.filter((t) => t.tabId !== tabId);
       if (activeTabId === tabId) {
@@ -221,23 +194,19 @@ export const App: React.FC = () => {
     return (
       <div className="auth-viewport">
         <div style={{ color: 'var(--text-muted)', fontSize: 13.5 }}>
-          正在启动客户端零知识密码学隔离环境 (WASM)...
+          正在连接 ServerNeedSafe 管理服务...
         </div>
       </div>
     );
   }
 
-  if (!authStatus.authenticated || uiLocked) {
+  if (!authStatus.authenticated) {
     return (
       <AuthGate
         status={authStatus}
-        screenLocked={uiLocked && authStatus.authenticated}
-        onSealVault={handleSealVault}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-        onRefreshStatus={checkStatus}
         onAuthenticated={(s, updatedStatus) => {
-          setUiLocked(false);
           if (s) setSettings(s);
           setAuthStatus(
             updatedStatus || { ...authStatus, vault_status: 'unlocked', authenticated: true }
@@ -258,7 +227,7 @@ export const App: React.FC = () => {
           <div>
             <div className="sidebar-title">ServerNeedSafe</div>
             <div className="sidebar-subtitle">
-              <span className="status-dot" /> 保险库已解锁
+              <span className="status-dot" /> 7×24 守护运行中
             </div>
           </div>
         </div>
@@ -347,7 +316,7 @@ export const App: React.FC = () => {
             <span className="nav-badge">{snippets.length}</span>
           </button>
 
-          <div className="nav-section-label">数据加密与合规</div>
+          <div className="nav-section-label">数据加密与安全</div>
           <button
             type="button"
             id="nav-vault-btn"
@@ -361,10 +330,13 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="sidebar-vault-pill" title="客户端 WASM 零知识隔离 · 服务端零明文零密钥">
-            <span>零知识 E2EE</span>
+          <div
+            className="sidebar-vault-pill"
+            title="XChaCha20-Poly1305 落盘加密 · 7×24 后台无人值守监控与 AI 巡检"
+          >
+            <span>加密守护运行</span>
             <span className="mono" style={{ fontSize: 10.5 }}>
-              WASM · XChaCha20
+              7×24 · XChaCha20
             </span>
           </div>
           <div className="sidebar-actions">
@@ -384,10 +356,10 @@ export const App: React.FC = () => {
               id="sidebar-lock-btn"
               className="btn btn-sm btn-danger"
               style={{ flex: 1.25 }}
-              onClick={handleLockScreen}
-              title="锁定操作界面，保持后台状态监控与 AI 定时巡检持续运行 (Ctrl+Shift+L)"
+              onClick={() => void handleLogoutSession()}
+              title="退出当前 Web 管理会话，后台 7×24 状态监控与 AI 定时巡检保持运行 (Ctrl+Shift+L)"
             >
-              <Lock size={13} /> 锁定界面
+              <Lock size={13} /> 锁定控制台
             </button>
           </div>
         </div>
@@ -479,8 +451,8 @@ export const App: React.FC = () => {
         {activeNav === 'vault' && (
           <VaultSecurity
             onSettingsChanged={(s) => setSettings(s)}
-            onLockScreen={handleLockScreen}
-            onLockVault={handleSealVault}
+            onLogoutSession={handleLogoutSession}
+            onRevokeAllSessions={handleRevokeAllSessions}
             onNotify={notify}
           />
         )}

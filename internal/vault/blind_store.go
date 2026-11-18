@@ -113,21 +113,23 @@ func (b *BlindStore) EncryptionInfo(includeAuthFingerprint bool) *EncryptionInfo
 		}
 	}
 	info := &EncryptionInfo{
-		FormatVersion:  int(vaultFormatVersion),
-		VaultID:        b.header.VaultID,
-		Revision:       b.header.Revision,
-		KDFAlgo:        b.header.KDFAlgo,
-		KDFTime:        b.header.KDFTime,
-		KDFMemoryKiB:   b.header.KDFMemoryKiB,
-		KDFThreads:     b.header.KDFThreads,
-		WrapAlgo:       b.header.WrapAlgo,
-		CipherAlgo:     b.header.CipherAlgo,
-		AuthAlgo:       b.header.AuthAlgo,
-		VaultSizeBytes: b.fileSize,
-		ZeroKnowledge:  true,
+		FormatVersion: int(vaultFormatVersion),
+		KDFAlgo:       b.header.KDFAlgo,
+		KDFTime:       b.header.KDFTime,
+		KDFMemoryKiB:  b.header.KDFMemoryKiB,
+		KDFThreads:    b.header.KDFThreads,
+		WrapAlgo:      b.header.WrapAlgo,
+		CipherAlgo:    b.header.CipherAlgo,
+		AuthAlgo:      b.header.AuthAlgo,
+		ZeroKnowledge: true,
 	}
-	if includeAuthFingerprint && len(b.header.AuthPublicKey) == ed25519.PublicKeySize {
-		info.AuthPubKeySHA256 = sha256Hex(b.header.AuthPublicKey)
+	if includeAuthFingerprint {
+		info.VaultID = b.header.VaultID
+		info.Revision = b.header.Revision
+		info.VaultSizeBytes = b.fileSize
+		if len(b.header.AuthPublicKey) == ed25519.PublicKeySize {
+			info.AuthPubKeySHA256 = sha256Hex(b.header.AuthPublicKey)
+		}
 	}
 	return info
 }

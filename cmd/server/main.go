@@ -32,8 +32,8 @@ func main() {
 	defaultTTL := envOrDefault("SNS_SESSION_TTL", "8h")
 
 	addr := flag.String("addr", defaultAddr, "HTTP 监听地址 (例如 0.0.0.0:8080)")
-	dataDir := flag.String("data-dir", defaultDataDir, "零知识盲密文容器持久化目录")
-	ttlStr := flag.String("session-ttl", defaultTTL, "单次零知识认证会话最长有效期")
+	dataDir := flag.String("data-dir", defaultDataDir, "加密保险库与自动挂载密钥持久化目录")
+	ttlStr := flag.String("session-ttl", defaultTTL, "Web 管理会话最长有效期")
 	flag.Parse()
 
 	sessionTTL, err := time.ParseDuration(*ttlStr)
@@ -44,24 +44,26 @@ func main() {
 	vaultPath := filepath.Join(*dataDir, "vault.sns")
 	blindStore, err := vault.NewBlindStore(vaultPath)
 	if err != nil {
-		log.Fatalf("[ServerNeedSafe] 初始化零知识盲密文存储失败: %v", err)
+		log.Fatalf("[ServerNeedSafe] 初始化加密存储失败: %v", err)
 	}
 
 	authMgr, err := auth.NewManager(sessionTTL, false)
 	if err != nil {
-		log.Fatalf("[ServerNeedSafe] 初始化零知识挑战认证引擎失败: %v", err)
+		log.Fatalf("[ServerNeedSafe] 初始化认证会话引擎失败: %v", err)
 	}
 
 	relayMgr := relay.NewManager(*addr)
 
 	staticFS, err := web.DistFS()
 	if err != nil {
-		log.Fatalf("[ServerNeedSafe] 加载内置 Web + WASM 静态资源失败: %v", err)
+		log.Fatalf("[ServerNeedSafe] 加载内置 Web 静态资源失败: %v", err)
 	}
 
+	keyMgr := vault.NewServerKeyManager(*dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "server",
 		BlindStore: blindStore,
+		KeyMgr:     keyMgr,
 		Auth:       authMgr,
 		Relay:      relayMgr,
 		StaticFS:   staticFS,
@@ -75,11 +77,11 @@ func main() {
 
 	go func() {
 		fmt.Printf("====================================================================\n")
-		fmt.Printf("  ServerNeedSafe — 多服务器安全管理与零知识加密终端 (Zero-Knowledge)\n")
+		fmt.Printf("  ServerNeedSafe — 多服务器安全管理与 7×24 智能巡检守护引擎\n")
 		fmt.Printf("  监听地址: http://%s\n", *addr)
-		fmt.Printf("  盲密文包: %s\n", vaultPath)
-		fmt.Printf("  隔离架构: 客户端 WASM E2EE (Argon2id + XChaCha20-Poly1305 + Ed25519)\n")
-		fmt.Printf("  安全保证: 服务端零密码 · 零主密钥 · 零明文（抗服务器 root 泄露）\n")
+		fmt.Printf("  加密存储: %s (XChaCha20-Poly1305 + Argon2id)\n", vaultPath)
+		fmt.Printf("  自动挂载: %s (0600 守护进程密钥，重启 <1ms 自动恢复)\n", keyMgr.KeyPath())
+		fmt.Printf("  后台能力: 7×24 SSH 状态监控 · AI 定时安全巡检 · 轻量极速 Web 控制台\n")
 		fmt.Printf("====================================================================\n")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[ServerNeedSafe] HTTP 服务异常退出: %v", err)
@@ -90,7 +92,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("[ServerNeedSafe] 收到停止信号，正在注销全部会话并关闭加密 TCP 中继流...")
+	log.Println("[ServerNeedSafe] 收到停止信号，正在注销 Web 会话并安全停止 7×24 守护协程...")
 	authMgr.RevokeAll()
 	apiServer.Close()
 

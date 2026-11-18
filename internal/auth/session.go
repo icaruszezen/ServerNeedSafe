@@ -233,8 +233,20 @@ func (m *Manager) CreateSession(authPubSHA256, clientIP, userAgent string) (*Ses
 	return sess, nil
 }
 
-// ValidateSession verifies a bearer token and binds it to the active vault's AuthPubKeySHA256.
+// SessionTTL returns the configured maximum lifetime of a single authenticated session.
+func (m *Manager) SessionTTL() time.Duration {
+	return m.sessionTTL
+}
+
+// ValidateSession verifies a bearer/cookie token against max sessionTTL and expectedAuthPubSHA256.
 func (m *Manager) ValidateSession(token, expectedAuthPubSHA256 string) (*Session, error) {
+	return m.ValidateSessionWithIdle(token, expectedAuthPubSHA256, 0, true)
+}
+
+// ValidateSessionWithIdle enforces BOTH maximum session lifetime (CreatedAt + sessionTTL, e.g. 8h)
+// AND optional idle inactivity timeout (LastSeenAt + idleTimeout, e.g. 30m from AutoLockMinutes).
+// Web session expiration ONLY invalidates the web session token; background 7x24 daemon tasks stay running.
+func (m *Manager) ValidateSessionWithIdle(token, expectedAuthPubSHA256 string, idleTimeout time.Duration, touch bool) (*Session, error) {
 	if token == "" {
 		return nil, ErrUnauthorized
 	}
@@ -246,7 +258,11 @@ func (m *Manager) ValidateSession(token, expectedAuthPubSHA256 string) (*Session
 	if !ok {
 		return nil, ErrUnauthorized
 	}
-	if now.Sub(sess.LastSeenAt) > m.sessionTTL {
+	if now.Sub(sess.CreatedAt) > m.sessionTTL {
+		delete(m.sessions, token)
+		return nil, ErrUnauthorized
+	}
+	if idleTimeout > 0 && now.Sub(sess.LastSeenAt) > idleTimeout {
 		delete(m.sessions, token)
 		return nil, ErrUnauthorized
 	}
@@ -254,7 +270,9 @@ func (m *Manager) ValidateSession(token, expectedAuthPubSHA256 string) (*Session
 		delete(m.sessions, token)
 		return nil, ErrUnauthorized
 	}
-	sess.LastSeenAt = now
+	if touch {
+		sess.LastSeenAt = now
+	}
 	cp := *sess
 	return &cp, nil
 }
@@ -328,7 +346,7 @@ func (m *Manager) ConsumeTicket(code, expectedPurpose, expectedAuthPubSHA256 str
 
 func (m *Manager) pruneExpiredLocked(now time.Time) {
 	for k, s := range m.sessions {
-		if now.Sub(s.LastSeenAt) > m.sessionTTL {
+		if now.Sub(s.CreatedAt) > m.sessionTTL {
 			delete(m.sessions, k)
 		}
 	}

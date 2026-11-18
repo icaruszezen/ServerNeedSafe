@@ -7,10 +7,9 @@ data/
 data-local/
 *.sns
 *.sns.tmp
+.vault.key
+.vault.key.tmp
 *.exe
 *.log
 *.tsbuildinfo
 .DS_Store
-web/public/sns-zk.wasm.gz
-web/src/zk/wasm_exec.js
-web/src/zk/wasmIntegrity.json

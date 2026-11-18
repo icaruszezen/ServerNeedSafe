@@ -81,4 +81,15 @@ func TestSessionLifecycleChallengeRateLimitAndDesktopGuard(t *testing.T) {
 	if _, err := mgr.ValidateSession(sess2.Token, pubFP); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected revoked session to fail, got %v", err)
 	}
+
+	// Idle timeout vs Max TTL check
+	sess3, err := mgr.CreateSession(pubFP, "127.0.0.1", "TestAgent")
+	if err != nil {
+		t.Fatalf("CreateSession sess3: %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if _, err := mgr.ValidateSessionWithIdle(sess3.Token, pubFP, 25*time.Millisecond, true); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected idle timeout to invalidate session, got %v", err)
+	}
 }
+

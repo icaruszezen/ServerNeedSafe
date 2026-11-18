@@ -16,8 +16,7 @@ import {
   Server,
   Bot,
 } from 'lucide-react';
-import { api, ApiError } from '../api';
-import { zkClient } from '../zk/zkClient';
+import { api, ApiError, terminalClient } from '../api';
 import type {
   AppSettings,
   HostKeyUntrustedInfo,
@@ -112,7 +111,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
       onStatusChange(tab.tabId, 'connecting');
       term.writeln(
-        `\x1b[38;5;245m[ServerNeedSafe 零知识终端] 正在客户端 WASM 发起端到端 SSHv2 握手 → ${tab.server.username}@${tab.server.host}:${tab.server.port} ...\x1b[0m`
+        `\x1b[38;5;245m[ServerNeedSafe 加密终端] 正在建立 SSHv2 会话 → ${tab.server.username}@${tab.server.host}:${tab.server.port} ...\x1b[0m`
       );
 
       try {
@@ -131,7 +130,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
         onStatusChange(tab.tabId, 'connected', ready.fingerprint, ready.latency_ms);
         try {
           fit.fit();
-          zkClient.resizeTerminal(tab.tabId, term.cols, term.rows);
+          terminalClient.resizeTerminal(tab.tabId, term.cols, term.rows);
         } catch {
           // ignore
         }
@@ -145,7 +144,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
           return;
         }
         onStatusChange(tab.tabId, 'error');
-        term.writeln(`\r\n\x1b[31m[端到端 SSH 连接失败] ${err?.message || '请求失败'}\x1b[0m`);
+        term.writeln(`\r\n\x1b[31m[SSH 连接失败] ${err?.message || '请求失败'}\x1b[0m`);
       }
     },
     [tab, onStatusChange, onHostKeyChallenge]
@@ -199,7 +198,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
     const decoder = new TextDecoder('utf-8', { fatal: false });
 
-    const unsubWorker = zkClient.subscribeTerminal(tab.tabId, {
+    const unsubSocket = terminalClient.subscribeTerminal(tab.tabId, {
       onOutput: (chunk) => {
         term.write(chunk);
         try {
@@ -222,7 +221,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
     const dataSub = term.onData((data) => {
       if (connectedRef.current) {
-        zkClient.sendTerminalInput(tab.tabId, data);
+        terminalClient.sendTerminalInput(tab.tabId, data);
       }
     });
 
@@ -231,7 +230,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       try {
         fitAddon.fit();
         if (connectedRef.current) {
-          zkClient.resizeTerminal(tab.tabId, term.cols, term.rows);
+          terminalClient.resizeTerminal(tab.tabId, term.cols, term.rows);
         }
       } catch {
         // Ignore transient resize errors
@@ -242,7 +241,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     registerHandle(tab.tabId, {
       sendCommand: (cmd: string) => {
         if (connectedRef.current) {
-          zkClient.sendTerminalInput(tab.tabId, cmd.endsWith('\n') ? cmd : `${cmd}\n`);
+          terminalClient.sendTerminalInput(tab.tabId, cmd.endsWith('\n') ? cmd : `${cmd}\n`);
           term.focus();
         }
       },
@@ -273,8 +272,8 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       registerHandle(tab.tabId, null);
       ro.disconnect();
       dataSub.dispose();
-      unsubWorker();
-      zkClient.closeTerminal(tab.tabId);
+      unsubSocket();
+      terminalClient.closeTerminal(tab.tabId);
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

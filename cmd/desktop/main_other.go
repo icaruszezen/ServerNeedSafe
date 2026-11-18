@@ -52,9 +52,11 @@ func main() {
 	}
 
 	relayMgr := relay.NewManager(ln.Addr().String())
+	keyMgr := vault.NewServerKeyManager(dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
 		BlindStore: blindStore,
+		KeyMgr:     keyMgr,
 		Auth:       authMgr,
 		Relay:      relayMgr,
 		StaticFS:   staticFS,
@@ -67,7 +69,7 @@ func main() {
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	bootURL := fmt.Sprintf("http://127.0.0.1:%d/__desktop_boot?boot=%s", port, authMgr.DesktopBootCode())
-	fmt.Printf("[ServerNeedSafe Zero-Knowledge Local Mode] Loopback URL: %s\n", bootURL)
+	fmt.Printf("[ServerNeedSafe Local Desktop Mode] Loopback URL: %s\n", bootURL)
 
 	go func() {
 		_ = httpServer.Serve(ln)

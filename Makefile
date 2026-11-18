@@ -16,11 +16,10 @@ windows: web
 
 test: web
 	go vet ./...
-	GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/zkclient
 	go test ./... -v -race -count=1
 
 docker:
 	docker compose up -d --build
 
 clean:
-	rm -rf dist web/dist web/public/sns-zk.wasm.gz web/src/zk/wasm_exec.js web/src/zk/wasmIntegrity.json
+	rm -rf dist web/dist
