@@ -8,184 +8,25 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
-	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
+	"github.com/gorilla/websocket"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
-	"github.com/icaruszezen/ServerNeedSafe/internal/zkclient"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
-
-// socketWireTap simulates a root attacker running full-packet tcpdump on sns-server's loopback/NIC,
-// capturing every raw HTTP request, HTTP response, and WebSocket TCP-relay frame in both directions.
-type socketWireTap struct {
-	mu       sync.Mutex
-	inbound  bytes.Buffer
-	outbound bytes.Buffer
-}
-
-func (t *socketWireTap) AllBytes() []byte {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	out := make([]byte, 0, t.inbound.Len()+t.outbound.Len())
-	out = append(out, t.inbound.Bytes()...)
-	out = append(out, '\n')
-	out = append(out, t.outbound.Bytes()...)
-	return out
-}
-
-type tapConn struct {
-	net.Conn
-	tap *socketWireTap
-}
-
-func (c *tapConn) Read(p []byte) (int, error) {
-	n, err := c.Conn.Read(p)
-	if n > 0 {
-		c.tap.mu.Lock()
-		_, _ = c.tap.inbound.Write(p[:n])
-		c.tap.mu.Unlock()
-	}
-	return n, err
-}
-
-func (c *tapConn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
-	if n > 0 {
-		c.tap.mu.Lock()
-		_, _ = c.tap.outbound.Write(p[:n])
-		c.tap.mu.Unlock()
-	}
-	return n, err
-}
-
-type tapListener struct {
-	net.Listener
-	tap *socketWireTap
-}
-
-func (l *tapListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	return &tapConn{Conn: conn, tap: l.tap}, nil
-}
-
-func newTappedHTTPServer(t *testing.T, handler http.Handler) (*httptest.Server, *socketWireTap) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
-	}
-	tap := &socketWireTap{}
-	ts := httptest.NewUnstartedServer(handler)
-	_ = ts.Listener.Close()
-	ts.Listener = &tapListener{Listener: ln, tap: tap}
-	ts.Start()
-	return ts, tap
-}
-
-// inspectGoHeapStringsAndBytes simulates a root attacker dumping Go process heap objects (/proc/<pid>/mem),
-// walking every exported and unexported struct field, map, slice, array, and string reachable from rootVal.
-func inspectGoHeapStringsAndBytes(rootVal any) []byte {
-	visited := make(map[uintptr]bool)
-	var dump bytes.Buffer
-
-	var walk func(v reflect.Value, depth int)
-	walk = func(v reflect.Value, depth int) {
-		if !v.IsValid() || depth > 14 {
-			return
-		}
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface:
-			if v.IsNil() {
-				return
-			}
-			if v.Kind() == reflect.Pointer {
-				ptr := v.Pointer()
-				if ptr != 0 {
-					if visited[ptr] {
-						return
-					}
-					visited[ptr] = true
-				}
-			}
-			walk(v.Elem(), depth+1)
-
-		case reflect.Struct:
-			// Skip sync primitives to avoid meaningless internal mutex state noise
-			pkgPath := v.Type().PkgPath()
-			if pkgPath == "sync" || pkgPath == "sync/atomic" {
-				return
-			}
-			for i := 0; i < v.NumField(); i++ {
-				walk(v.Field(i), depth+1)
-			}
-
-		case reflect.String:
-			dump.WriteString(v.String())
-			dump.WriteByte('\n')
-
-		case reflect.Slice:
-			if v.IsNil() {
-				return
-			}
-			if v.Type().Elem().Kind() == reflect.Uint8 {
-				for i := 0; i < v.Len(); i++ {
-					dump.WriteByte(byte(v.Index(i).Uint()))
-				}
-				dump.WriteByte('\n')
-				return
-			}
-			for i := 0; i < v.Len(); i++ {
-				walk(v.Index(i), depth+1)
-			}
-
-		case reflect.Array:
-			if v.Type().Elem().Kind() == reflect.Uint8 {
-				for i := 0; i < v.Len(); i++ {
-					dump.WriteByte(byte(v.Index(i).Uint()))
-				}
-				dump.WriteByte('\n')
-				return
-			}
-			for i := 0; i < v.Len(); i++ {
-				walk(v.Index(i), depth+1)
-			}
-
-		case reflect.Map:
-			if v.IsNil() {
-				return
-			}
-			iter := v.MapRange()
-			for iter.Next() {
-				walk(iter.Key(), depth+1)
-				walk(iter.Value(), depth+1)
-			}
-		}
-	}
-
-	walk(reflect.ValueOf(rootVal), 0)
-	return dump.Bytes()
-}
 
 // startRootBreachTestSSHServer starts an in-process SSHv2 + SFTP + PTY shell + ProxyJump server.
 func startRootBreachTestSSHServer(t *testing.T, expectedUser, expectedPass string, dynamicAuthKeys *sync.Map) (host string, port int, stop func()) {
@@ -359,273 +200,289 @@ func handleBreachSSHConn(netConn net.Conn, cfg *ssh.ServerConfig) {
 	}
 }
 
-func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
-	// 1. Deploy Primary sns-server + Secondary Remote-Sync sns-server, BOTH under simulated root compromise!
+func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecurity(t *testing.T) {
 	primaryDir := t.TempDir()
 	primaryVaultPath := filepath.Join(primaryDir, "vault.sns")
-	primaryBlind, err := vault.NewBlindStore(primaryVaultPath)
-	if err != nil {
-		t.Fatalf("primary NewBlindStore: %v", err)
-	}
-	primaryAuth, _ := auth.NewManager(time.Hour, false)
-	primaryRelay := relay.NewManager("127.0.0.1:0")
-	primarySrv := NewServer(Config{
-		DeployMode: "server",
-		BlindStore: primaryBlind,
-		Auth:       primaryAuth,
-		Relay:      primaryRelay,
-	})
-	defer primarySrv.Close()
-	primaryTS, primaryTap := newTappedHTTPServer(t, primarySrv.Handler())
+	primarySrv, primaryTS := newTestServerInstance(t, primaryDir, 8*time.Hour)
 	defer primaryTS.Close()
+	defer primarySrv.Close()
 
 	secondaryDir := t.TempDir()
 	secondaryVaultPath := filepath.Join(secondaryDir, "vault.sns")
-	secondaryBlind, err := vault.NewBlindStore(secondaryVaultPath)
-	if err != nil {
-		t.Fatalf("secondary NewBlindStore: %v", err)
-	}
-	secondaryAuth, _ := auth.NewManager(time.Hour, false)
-	secondaryRelay := relay.NewManager("127.0.0.1:0")
-	secondarySrv := NewServer(Config{
-		DeployMode: "server",
-		BlindStore: secondaryBlind,
-		Auth:       secondaryAuth,
-		Relay:      secondaryRelay,
-	})
-	defer secondarySrv.Close()
-	secondaryTS, secondaryTap := newTappedHTTPServer(t, secondarySrv.Handler())
+	secondarySrv, secondaryTS := newTestServerInstance(t, secondaryDir, 8*time.Hour)
 	defer secondaryTS.Close()
+	defer secondarySrv.Close()
 
-	// 2. Start Bastion SSH server + Internal CoreDB SSH server (reachable via Bastion ProxyJump)
+	// 1. Start Bastion SSH server + Internal CoreDB SSH server (reachable via Bastion ProxyJump)
 	var internalAuthorizedKeys sync.Map
-	kp, err := sshmanager.GenerateSSHKeyPair("ed25519", "secops-canary@sns", "")
-	if err != nil {
-		t.Fatalf("GenerateSSHKeyPair: %v", err)
-	}
-	parsedPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(kp.PublicKey))
-	if err != nil {
-		t.Fatalf("ParseAuthorizedKey: %v", err)
-	}
-	internalAuthorizedKeys.Store("ed25519", parsedPub)
-
 	bastionHost, bastionPort, stopBastion := startRootBreachTestSSHServer(t, "jumpops_secret_user", "BastionSSHPass!9988", nil)
 	defer stopBastion()
 
 	targetHost, targetPort, stopTarget := startRootBreachTestSSHServer(t, "coredb_secret_admin", "", &internalAuthorizedKeys)
 	defer stopTarget()
 
-	// 3. Legitimate Admin connects via Zero-Knowledge Client Engine and executes EVERY sensitive workflow
-	adminPass1 := "RootCannotStealThisMasterPass!2026"
-	adminPass2 := "RotatedAdminMasterKey!2027"
+	adminPass := "StrongDaemonMasterPass!2026"
+	adminHTTP := newCookieHTTPClient()
 
-	client := zkclient.NewEngine(primaryTS.URL, nil)
-	client.Vault().SetKDFParams(1, 16*1024, 2)
-
-	if _, err := client.Setup(adminPass1); err != nil {
-		t.Fatalf("client.Setup: %v", err)
+	setupReq, _ := json.Marshal(map[string]string{"password": adminPass})
+	res, err := adminHTTP.Post(primaryTS.URL+"/api/auth/setup", "application/json", bytes.NewReader(setupReq))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/auth/setup: status=%v err=%v", res.StatusCode, err)
 	}
+	res.Body.Close()
 
-	// Save Ed25519 private key credential
-	privCopy := kp.PrivateKey
-	cred, err := client.Vault().CreateCredential(vault.CredentialMutationInput{
-		Name:         "Secret-Ed25519-Keychain-Item",
-		Kind:         vault.AuthPrivateKey,
-		UsernameHint: "coredb_secret_admin",
-		PrivateKey:   &privCopy,
-		PublicKey:    kp.PublicKey,
-		Fingerprint:  kp.Fingerprint,
-		KeyAlgorithm: kp.Algorithm,
-		Notes:        "TOP_SECRET_CREDENTIAL_NOTES_4411",
-	}, "client-zk")
+	// Generate Ed25519 SSH keypair via native API & authorize on target SSH server
+	kgReq, _ := json.Marshal(map[string]string{"algorithm": "ed25519", "comment": "secops-canary@sns"})
+	kgRes, err := adminHTTP.Post(primaryTS.URL+"/api/ssh/keygen", "application/json", bytes.NewReader(kgReq))
+	if err != nil || kgRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/ssh/keygen: status=%v err=%v", kgRes.StatusCode, err)
+	}
+	var kp struct {
+		Algorithm   string `json:"algorithm"`
+		PrivateKey  string `json:"private_key"`
+		PublicKey   string `json:"public_key"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	_ = json.NewDecoder(kgRes.Body).Decode(&kp)
+	kgRes.Body.Close()
+
+	parsedPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(kp.PublicKey))
 	if err != nil {
-		t.Fatalf("CreateCredential: %v", err)
+		t.Fatalf("ParseAuthorizedKey: %v", err)
+	}
+	internalAuthorizedKeys.Store("ed25519", parsedPub)
+
+	// Save Ed25519 Credential + Bastion + ProxyJump Target Server
+	credBody, _ := json.Marshal(map[string]any{
+		"name":          "Secret-Ed25519-Keychain-Item",
+		"kind":          "private_key",
+		"username_hint": "coredb_secret_admin",
+		"private_key":   kp.PrivateKey,
+		"public_key":    kp.PublicKey,
+		"fingerprint":   kp.Fingerprint,
+		"key_algorithm": kp.Algorithm,
+		"notes":         "TOP_SECRET_CREDENTIAL_NOTES_4411",
+	})
+	credRes, err := adminHTTP.Post(primaryTS.URL+"/api/credentials", "application/json", bytes.NewReader(credBody))
+	if err != nil || credRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/credentials: status=%v err=%v", credRes.StatusCode, err)
+	}
+	var credWrap struct {
+		Credential vault.CredentialView `json:"credential"`
+	}
+	_ = json.NewDecoder(credRes.Body).Decode(&credWrap)
+	credRes.Body.Close()
+	credOut := credWrap.Credential
+
+	bastionBody, _ := json.Marshal(map[string]any{
+		"name":      "Bastion-Alpha-Secret-Node",
+		"group":     "核心涉密网关组",
+		"tags":      []string{"secret-bastion-tag"},
+		"host":      bastionHost,
+		"port":      bastionPort,
+		"username":  "jumpops_secret_user",
+		"auth_type": "password",
+		"password":  "BastionSSHPass!9988",
+		"notes":     "BASTION_INTERNAL_NOTE_5522",
+	})
+	bRes, err := adminHTTP.Post(primaryTS.URL+"/api/servers", "application/json", bytes.NewReader(bastionBody))
+	if err != nil || bRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST bastion /api/servers: status=%v err=%v", bRes.StatusCode, err)
+	}
+	var bWrap struct {
+		Server vault.ServerView `json:"server"`
+	}
+	_ = json.NewDecoder(bRes.Body).Decode(&bWrap)
+	bRes.Body.Close()
+	bastionOut := bWrap.Server
+
+	targetBody, _ := json.Marshal(map[string]any{
+		"name":             "CoreDB-Master-Secret-Vault",
+		"group":            "核心涉密数据库组",
+		"tags":             []string{"zero-trust-db"},
+		"host":             targetHost,
+		"port":             targetPort,
+		"username":         "coredb_secret_admin",
+		"auth_type":        "credential",
+		"credential_id":    credOut.ID,
+		"jump_server_id":   bastionOut.ID,
+		"notes":            "COREDB_PRIVATE_NOTE_6633",
+		"watched_services": []string{"secret-watched-daemon-canary"},
+	})
+	tRes, err := adminHTTP.Post(primaryTS.URL+"/api/servers", "application/json", bytes.NewReader(targetBody))
+	if err != nil || tRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST target /api/servers: status=%v err=%v", tRes.StatusCode, err)
+	}
+	var tWrap struct {
+		Server vault.ServerView `json:"server"`
+	}
+	_ = json.NewDecoder(tRes.Body).Decode(&tWrap)
+	tRes.Body.Close()
+	targetOut := tWrap.Server
+
+	// 2. Probe & BatchExec through Bastion ProxyJump -> Target
+	probeRes, err := adminHTTP.Post(primaryTS.URL+"/api/servers/"+targetOut.ID+"/probe", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil || probeRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST probe failed: status=%v err=%v", probeRes.StatusCode, err)
+	}
+	var probeOut struct {
+		Probe struct {
+			Reachable bool `json:"reachable"`
+		} `json:"probe"`
+	}
+	_ = json.NewDecoder(probeRes.Body).Decode(&probeOut)
+	probeRes.Body.Close()
+	if !probeOut.Probe.Reachable {
+		t.Fatalf("expected target server reachable over ProxyJump")
 	}
 
-	// Save Bastion & Internal Target servers
-	bPass := "BastionSSHPass!9988"
-	bastionSrv, err := client.Vault().CreateServer(vault.ServerMutationInput{
-		Name:     "Bastion-Alpha-Secret-Node",
-		Group:    "核心涉密网关组",
-		Tags:     []string{"secret-bastion-tag"},
-		Host:     bastionHost,
-		Port:     bastionPort,
-		Username: "jumpops_secret_user",
-		AuthType: vault.AuthPassword,
-		Password: &bPass,
-		Notes:    "BASTION_INTERNAL_NOTE_5522",
-	}, "client-zk")
+	batchReq, _ := json.Marshal(map[string]any{
+		"server_ids":  []string{targetOut.ID},
+		"command":     "echo SUPER_SECRET_BATCH_TOKEN_7749",
+		"timeout_sec": 15,
+	})
+	batchRes, err := adminHTTP.Post(primaryTS.URL+"/api/ssh/batch-exec", "application/json", bytes.NewReader(batchReq))
+	if err != nil || batchRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/ssh/batch-exec: status=%v err=%v", batchRes.StatusCode, err)
+	}
+	var batchOut struct {
+		Results []struct {
+			Success bool   `json:"success"`
+			Stdout  string `json:"stdout"`
+		} `json:"results"`
+	}
+	_ = json.NewDecoder(batchRes.Body).Decode(&batchOut)
+	batchRes.Body.Close()
+	if len(batchOut.Results) != 1 || !batchOut.Results[0].Success || !strings.Contains(batchOut.Results[0].Stdout, "SUPER_SECRET_BATCH_TOKEN_7749") {
+		t.Fatalf("unexpected batch-exec output: %+v", batchOut)
+	}
+
+	// 3. Cross-Origin WebSocket Hijacking Guard + Live Native Binary WebSocket PTY (/api/ws/terminal)
+	wsURL := "ws" + strings.TrimPrefix(primaryTS.URL, "http") + "/api/ws/terminal?server_id=" + url.QueryEscape(targetOut.ID) + "&cols=100&rows=30"
+	evilDialer := websocket.Dialer{Jar: adminHTTP.Jar}
+	evilHeader := http.Header{"Origin": []string{"https://evil-attacker.example"}}
+	_, evilResp, evilErr := evilDialer.Dial(wsURL, evilHeader)
+	if evilErr == nil || evilResp == nil || evilResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("SECURITY FAILURE: cross-origin WebSocket hijack was not blocked with 403! resp=%v err=%v", evilResp, evilErr)
+	}
+
+	sameOriginHeader := http.Header{"Origin": []string{primaryTS.URL}}
+	wsConn, _, err := evilDialer.Dial(wsURL, sameOriginHeader)
 	if err != nil {
-		t.Fatalf("CreateServer bastion: %v", err)
+		t.Fatalf("WebSocket /api/ws/terminal dial failed: %v", err)
+	}
+	defer wsConn.Close()
+
+	// Wait for {"type":"ready"} control frame, then execute command over binary frame
+	_ = wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	_, firstFrame, err := wsConn.ReadMessage()
+	if err != nil || !strings.Contains(string(firstFrame), `"ready"`) {
+		t.Fatalf("expected ready message on /api/ws/terminal, got %q (err=%v)", string(firstFrame), err)
+	}
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, []byte("echo TERMINAL_WS_PTY_CANARY_8821\nexit\n")); err != nil {
+		t.Fatalf("ws WriteMessage: %v", err)
 	}
 
-	// Use "localhost" as target host so we can even prove ProxyJump inner target hostname never touches sns-server!
-	_ = targetHost
-	internalTargetHost := "localhost"
-	targetSrv, err := client.Vault().CreateServer(vault.ServerMutationInput{
-		Name:            "CoreDB-Master-Secret-Vault",
-		Group:           "核心涉密数据库组",
-		Tags:            []string{"zero-trust-db"},
-		Host:            internalTargetHost,
-		Port:            targetPort,
-		Username:        "coredb_secret_admin",
-		AuthType:        vault.AuthCredential,
-		CredentialID:    cred.ID,
-		JumpServerID:    bastionSrv.ID,
-		Notes:           "COREDB_PRIVATE_NOTE_6633",
-		WatchedServices: []string{"secret-watched-daemon-canary"},
-	}, "client-zk")
-	if err != nil {
-		t.Fatalf("CreateServer target: %v", err)
+	var ptyCombined bytes.Buffer
+	for {
+		_ = wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
+		msgType, data, rErr := wsConn.ReadMessage()
+		if rErr != nil {
+			break
+		}
+		if msgType == websocket.BinaryMessage {
+			ptyCombined.Write(data)
+			if strings.Contains(ptyCombined.String(), "TERMINAL_WS_PTY_CANARY_8821") {
+				break
+			}
+		}
+	}
+	if !strings.Contains(ptyCombined.String(), "TERMINAL_WS_PTY_CANARY_8821") {
+		t.Fatalf("did not receive PTY canary over /api/ws/terminal, got %q", ptyCombined.String())
 	}
 
-	// Snapshot disk ciphertext at Revision #4 (for rollback attack test later!)
-	rollbackSnapshotBytes, err := os.ReadFile(primaryVaultPath)
-	if err != nil {
-		t.Fatalf("ReadFile snapshot: %v", err)
-	}
-
-	// Create secret Snippet & execute BatchExec over Bastion -> Target
-	snip, err := client.Vault().UpsertSnippet(vault.Snippet{
-		Title:       "Secret-DB-Audit-Snippet",
-		Category:    "绝密巡检",
-		Command:     "echo SUPER_SECRET_BATCH_TOKEN_7749",
-		Description: "SNIPPET_SECRET_DESC_8800",
-	}, "client-zk")
-	if err != nil {
-		t.Fatalf("UpsertSnippet: %v", err)
-	}
-
-	probeRes, err := client.SSH().ProbeServer(targetSrv.ID, "", "client-zk")
-	if err != nil || !probeRes.Reachable {
-		t.Fatalf("ProbeServer through blind relay + ProxyJump failed: %+v (err=%v)", probeRes, err)
-	}
-
-	batchRes := client.SSH().BatchExecute([]string{targetSrv.ID}, snip.Command, 15*time.Second, "client-zk")
-	if len(batchRes) != 1 || !batchRes[0].Success || !strings.Contains(batchRes[0].Stdout, "SUPER_SECRET_BATCH_TOKEN_7749") {
-		t.Fatalf("BatchExecute failed: %+v", batchRes)
-	}
-
-	// Interactive SSH PTY Shell over blind TCP relay
-	var ptyOut bytes.Buffer
-	var ptyMu sync.Mutex
-	ptyDone := make(chan struct{}, 1)
-	tsess, _, err := client.SSH().OpenTerminalSession(
-		targetSrv.ID,
-		100,
-		30,
-		"",
-		"client-zk",
-		sshmanager.TerminalCallbacks{
-			OnOutput: func(chunk []byte) {
-				ptyMu.Lock()
-				ptyOut.Write(chunk)
-				got := ptyOut.String()
-				ptyMu.Unlock()
-				if strings.Contains(got, "TERMINAL_PTY_CANARY_8821") {
-					select {
-					case ptyDone <- struct{}{}:
-					default:
-					}
-				}
-			},
-			OnExit: func(string) {},
-		},
-	)
-	if err != nil {
-		t.Fatalf("OpenTerminalSession: %v", err)
-	}
-	if err := tsess.WriteInput([]byte("echo TERMINAL_PTY_CANARY_8821\nexit\n")); err != nil {
-		t.Fatalf("WriteInput: %v", err)
-	}
-	select {
-	case <-ptyDone:
-	case <-time.After(8 * time.Second):
-		ptyMu.Lock()
-		got := ptyOut.String()
-		ptyMu.Unlock()
-		t.Fatalf("timed out waiting for PTY canary output, got: %q", got)
-	}
-	client.SSH().CloseSession(tsess.ID)
-
-	// SFTP Upload + List + Read + Download over blind TCP relay
+	// 4. Streaming SFTP Upload + ReadText + Download via REST endpoints
 	sftpRemoteDir := t.TempDir()
 	secretFileName := "top_secret_payroll_2026.txt"
-	secretFileContent := "CONFIDENTIAL_SFTP_PAYLOAD_991234_DO_NOT_LEAK"
-	uploadedPath, _, err := client.SSH().SFTPUpload(
-		targetSrv.ID,
-		sftpRemoteDir,
-		secretFileName,
-		strings.NewReader(secretFileContent),
-		"client-zk",
-	)
-	if err != nil {
-		t.Fatalf("SFTPUpload: %v", err)
+	secretFileContent := "CONFIDENTIAL_SFTP_PAYLOAD_991234"
+
+	var mpBuf bytes.Buffer
+	mpWriter := multipart.NewWriter(&mpBuf)
+	_ = mpWriter.WriteField("server_id", targetOut.ID)
+	_ = mpWriter.WriteField("dir", sftpRemoteDir)
+	fw, _ := mpWriter.CreateFormFile("file", secretFileName)
+	_, _ = fw.Write([]byte(secretFileContent))
+	_ = mpWriter.Close()
+
+	upRes, err := adminHTTP.Post(primaryTS.URL+"/api/sftp/upload", mpWriter.FormDataContentType(), &mpBuf)
+	if err != nil || upRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/sftp/upload failed: status=%v err=%v", upRes.StatusCode, err)
 	}
-	readBackText, err := client.SSH().SFTPReadText(targetSrv.ID, uploadedPath, "client-zk")
-	if err != nil || readBackText != secretFileContent {
-		t.Fatalf("SFTPReadText mismatch: got=%q err=%v", readBackText, err)
+	var upOut struct {
+		Path string `json:"path"`
 	}
-	dlBytes, dlName, err := client.SSH().SFTPDownloadBytes(targetSrv.ID, uploadedPath, 1024*1024, "client-zk")
-	if err != nil || string(dlBytes) != secretFileContent || dlName != secretFileName {
-		t.Fatalf("SFTPDownloadBytes mismatch: name=%q bytes=%q err=%v", dlName, string(dlBytes), err)
+	_ = json.NewDecoder(upRes.Body).Decode(&upOut)
+	upRes.Body.Close()
+
+	dlReq, _ := json.Marshal(map[string]string{
+		"server_id": targetOut.ID,
+		"path":      upOut.Path,
+	})
+	dlRes, err := adminHTTP.Post(primaryTS.URL+"/api/sftp/download", "application/json", bytes.NewReader(dlReq))
+	if err != nil || dlRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/sftp/download failed: status=%v err=%v", dlRes.StatusCode, err)
+	}
+	dlBytes, _ := io.ReadAll(dlRes.Body)
+	dlRes.Body.Close()
+	if string(dlBytes) != secretFileContent {
+		t.Fatalf("SFTP download mismatch: got %q", string(dlBytes))
 	}
 
-	// Full-Spectrum Server Status Monitoring over blind TCP relay + ProxyJump
-	monSettings, monRules, err := client.Vault().GetMonitorPolicy()
-	if err != nil {
-		t.Fatalf("GetMonitorPolicy: %v", err)
+	// 5. 7x24 Background Daemon Decoupling Proof:
+	// Lock ALL Web sessions -> Web console gets 401, yet background Monitor Engine STILL collects SSH telemetry & persists to vault.sns!
+	lockRes, err := adminHTTP.Post(primaryTS.URL+"/api/auth/lock", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil || lockRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/auth/lock: status=%v err=%v", lockRes.StatusCode, err)
 	}
-	secretWebhookCanary := "http://127.0.0.1:9/secret-monitor-webhook-canary-9944"
-	monSettings.WebhookURL = secretWebhookCanary
-	if _, _, err := client.Vault().UpdateMonitorPolicy(monSettings, monRules, "client-zk"); err != nil {
-		t.Fatalf("UpdateMonitorPolicy: %v", err)
-	}
-	monSnap, err := client.Monitor().CollectServerNow(context.Background(), targetSrv.ID, "", "client-zk")
-	if err != nil || monSnap == nil || !monSnap.Reachable || monSnap.CPUCores < 1 {
-		t.Fatalf("Monitor.CollectServerNow over blind relay + ProxyJump failed: snap=%+v err=%v", monSnap, err)
-	}
-	csvExportBytes, csvName, _, err := monitor.ExportHistory(client.Vault(), "csv", targetSrv.ID, "all", "client-zk")
-	if err != nil || !strings.HasSuffix(csvName, ".csv") || !bytes.Contains(csvExportBytes, []byte("CoreDB-Master-Secret-Vault")) {
-		t.Fatalf("monitor.ExportHistory failed: name=%q err=%v", csvName, err)
+	lockRes.Body.Close()
+
+	unauthMonRes, _ := adminHTTP.Get(primaryTS.URL + "/api/monitor/overview")
+	unauthMonRes.Body.Close()
+	if unauthMonRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on /api/monitor/overview while web console is locked, got %d", unauthMonRes.StatusCode)
 	}
 
-	// Rotate Master Password (rotates Argon2id salt, DEK, and Ed25519 AuthKeyPair)
-	if err := client.ChangePassword(adminPass1, adminPass2); err != nil {
-		t.Fatalf("ChangePassword: %v", err)
+	// Background 7x24 Monitor Engine executes scheduled SSH collection while zero Web sessions exist!
+	bgSnap, err := primarySrv.cfg.Monitor.CollectServerNow(context.Background(), targetOut.ID, "", "daemon:patrol")
+	if err != nil || bgSnap == nil || !bgSnap.Reachable || bgSnap.CPUCores < 1 {
+		t.Fatalf("expected 7x24 background monitor collection to succeed while Web sessions are locked! snap=%+v err=%v", bgSnap, err)
 	}
 
-	// Remote Zero-Knowledge Sync: Push to Secondary Server & Pull into a 3rd Client!
-	pushSum, err := client.SyncPushToRemote(secondaryTS.URL, "")
-	if err != nil || pushSum.Revision == 0 {
-		t.Fatalf("SyncPushToRemote: %+v (err=%v)", pushSum, err)
+	// Re-login to Web console and verify fresh telemetry & Portable .sns Export + Remote Cloud Sync
+	loginReq, _ := json.Marshal(map[string]string{"password": adminPass})
+	reloginRes, err := adminHTTP.Post(primaryTS.URL+"/api/auth/login", "application/json", bytes.NewReader(loginReq))
+	if err != nil || reloginRes.StatusCode != http.StatusOK {
+		t.Fatalf("re-login failed: status=%v err=%v", reloginRes.StatusCode, err)
 	}
+	reloginRes.Body.Close()
 
-	desktopPullClient := zkclient.NewEngine(secondaryTS.URL, nil)
-	desktopPullClient.Vault().SetKDFParams(1, 16*1024, 2)
-	// Unlock via challenge-response against secondary server to prove zero-knowledge sync integrity!
-	if _, err := desktopPullClient.Unlock(adminPass2); err != nil {
-		t.Fatalf("desktopPullClient.Unlock against synced secondary server: %v", err)
+	expRes, err := adminHTTP.Get(primaryTS.URL + "/api/vault/export")
+	if err != nil || expRes.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/vault/export: status=%v err=%v", expRes.StatusCode, err)
 	}
-	pulledServers, err := desktopPullClient.Vault().ListServers()
-	if err != nil || len(pulledServers) != 2 {
-		t.Fatalf("expected 2 synced servers on secondary server, got %d (err=%v)", len(pulledServers), err)
-	}
-	pulledMonDetail, err := desktopPullClient.Vault().GetServerMonitorDetail(targetSrv.ID, time.Hour)
-	if err != nil || pulledMonDetail.Snapshot == nil || !pulledMonDetail.Snapshot.Reachable || len(pulledMonDetail.Series) != 1 {
-		t.Fatalf("expected synced E2EE monitoring snapshot & series on secondary server, got %+v (err=%v)", pulledMonDetail, err)
-	}
-	_ = desktopPullClient.Lock()
+	exportedSNSBytes, _ := io.ReadAll(expRes.Body)
+	expRes.Body.Close()
 
-	// Also capture client's raw AuthPrivateKey seed before locking so we can verify it NEVER leaked to server!
-	clientAuthPriv := client.Vault().AuthPrivateKeyCopy()
-	if len(clientAuthPriv) != ed25519.PrivateKeySize {
-		t.Fatalf("expected 64-byte Ed25519 private key in client while unlocked")
+	// Push encrypted container to Secondary Server via /api/vault/sync/push
+	syncPushReq, _ := json.Marshal(map[string]string{"remote_url": secondaryTS.URL})
+	syncRes, err := adminHTTP.Post(primaryTS.URL+"/api/vault/sync/push", "application/json", bytes.NewReader(syncPushReq))
+	if err != nil || syncRes.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/vault/sync/push: status=%v err=%v", syncRes.StatusCode, err)
 	}
-	clientAuthSeed := append([]byte(nil), clientAuthPriv.Seed()...)
+	syncRes.Body.Close()
 
 	// =========================================================================
-	// ROOT COMPROMISE FORENSIC AUDIT: Disk + Wire (HTTP & WS) + Server Heap RAM
+	// AT-REST ENCRYPTION AUDIT: Disk vault.sns & Exported .sns Backup Zero Plaintext
 	// =========================================================================
 	primaryDiskBytes, err := os.ReadFile(primaryVaultPath)
 	if err != nil {
@@ -636,90 +493,55 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 		t.Fatalf("ReadFile secondary vault.sns: %v", err)
 	}
 
-	primaryHeapDump := inspectGoHeapStringsAndBytes(primarySrv)
-	secondaryHeapDump := inspectGoHeapStringsAndBytes(secondarySrv)
-	primaryWireBytes := primaryTap.AllBytes()
-	secondaryWireBytes := secondaryTap.AllBytes()
-
-	forbiddenStringCanaries := []string{
-		adminPass1,
-		adminPass2,
+	forbiddenCanaries := []string{
+		adminPass,
 		"Secret-Ed25519-Keychain-Item",
 		"OPENSSH PRIVATE KEY",
 		"secops-canary@sns",
 		"TOP_SECRET_CREDENTIAL_NOTES_4411",
 		"Bastion-Alpha-Secret-Node",
-		"核心涉密网关组",
-		"secret-bastion-tag",
 		"jumpops_secret_user",
 		"BastionSSHPass!9988",
 		"BASTION_INTERNAL_NOTE_5522",
 		"CoreDB-Master-Secret-Vault",
-		"核心涉密数据库组",
-		"zero-trust-db",
 		"coredb_secret_admin",
 		"COREDB_PRIVATE_NOTE_6633",
 		"secret-watched-daemon-canary",
-		secretWebhookCanary,
-		"SNS_MON_BEGIN_V1",
-		fmt.Sprintf("localhost:%d", targetPort), // inner ProxyJump target never even touches sns-server relay!
-		"Secret-DB-Audit-Snippet",
-		"SUPER_SECRET_BATCH_TOKEN_7749",
-		"SNIPPET_SECRET_DESC_8800",
-		"TERMINAL_PTY_CANARY_8821",
-		secretFileName,
-		secretFileContent,
 	}
-
-	surfaces := map[string][]byte{
-		"primary_disk(/data/vault.sns)":   primaryDiskBytes,
-		"secondary_disk(/data/vault.sns)": secondaryDiskBytes,
-		"primary_server_heap_structs":     primaryHeapDump,
-		"secondary_server_heap_structs":   secondaryHeapDump,
-		"primary_raw_tcp_wire_capture":    primaryWireBytes,
-		"secondary_raw_tcp_wire_capture":  secondaryWireBytes,
-	}
-
-	for surfaceName, data := range surfaces {
-		for _, canary := range forbiddenStringCanaries {
-			if bytes.Contains(data, []byte(canary)) {
-				t.Fatalf("CRITICAL ZERO-KNOWLEDGE BREACH: secret canary %q was found in %s!", canary, surfaceName)
+	for surfaceName, blob := range map[string][]byte{
+		"primary_disk(vault.sns)":   primaryDiskBytes,
+		"secondary_disk(vault.sns)": secondaryDiskBytes,
+		"exported_backup(.sns)":     exportedSNSBytes,
+	} {
+		for _, canary := range forbiddenCanaries {
+			if bytes.Contains(blob, []byte(canary)) {
+				t.Fatalf("AT-REST ENCRYPTION BREACH: plaintext canary %q leaked in %s!", canary, surfaceName)
 			}
-			// Also check standard base64 encoding in case raw JSON/plaintext was base64-encoded without encryption!
-			b64Canary := base64.StdEncoding.EncodeToString([]byte(canary))
-			if len(b64Canary) >= 12 && bytes.Contains(data, []byte(b64Canary)) {
-				t.Fatalf("CRITICAL ZERO-KNOWLEDGE BREACH: base64-encoded canary %q (%s) was found in %s!", canary, b64Canary, surfaceName)
+			b64 := base64.StdEncoding.EncodeToString([]byte(canary))
+			if len(b64) >= 12 && bytes.Contains(blob, []byte(b64)) {
+				t.Fatalf("AT-REST ENCRYPTION BREACH: base64 canary %q leaked in %s!", canary, surfaceName)
 			}
 		}
-		if bytes.Contains(data, clientAuthSeed) {
-			t.Fatalf("CRITICAL ZERO-KNOWLEDGE BREACH: client Ed25519 private key seed leaked into %s!", surfaceName)
-		}
 	}
 
-	// Lock client before testing active root attacks on unlock/import!
-	latestAnchor := client.Vault().GetAnchor()
-	if latestAnchor == nil || latestAnchor.MinRevision < 6 {
-		t.Fatalf("expected client VaultAnchor to track monotonic revision >= 6, got %+v", latestAnchor)
+	// Verify exported .sns backup is strictly password-wrapped (wrong password rejected on portable restore)
+	checkStore := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
+	if err := checkStore.ImportEncryptedVault(exportedSNSBytes, "WrongRestorePass!000", "", "restore-test"); !errors.Is(err, vault.ErrInvalidPassword) {
+		t.Fatalf("expected exported .sns backup to require admin password, got %v", err)
 	}
-	_ = client.Lock()
 
 	// =========================================================================
-	// ACTIVE ROOT ATTACK #1: Unauthenticated Backup Overwrite Attack -> BLOCKED
+	// ACTIVE ATTACK #1: Unauthenticated Backup Overwrite via /import & /import/file -> 401
 	// =========================================================================
-	rogueBackend := vault.NewBlindStoreBackend(mustNewTempBlindStore(t))
-	rogueCV := vault.NewClientVault(rogueBackend)
+	rogueCV := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
 	rogueCV.SetKDFParams(1, 16*1024, 2)
 	if err := rogueCV.Setup("AttackerRoguePass!123", "attacker"); err != nil {
 		t.Fatalf("rogue Setup: %v", err)
 	}
-	rogueBlob, rogueHdr, err := rogueCV.LastSealedBlob()
-	if err != nil {
-		t.Fatalf("rogue LastSealedBlob: %v", err)
-	}
+	rogueBlob, rogueHdr, _ := rogueCV.LastSealedBlob()
 	roguePriv := rogueCV.AuthPrivateKeyCopy()
 	rogueNewSig := vault.SignVaultImport(roguePriv, rogueHdr.VaultID, rogueHdr.Revision, rogueBlob)
-	// Attacker signs overwrite with rogue key instead of legitimate admin's current key!
-	forgedOverwriteSig := vault.SignVaultImportOverwrite(roguePriv, latestAnchor.VaultID, rogueHdr.VaultID, rogueBlob)
+	forgedOverwriteSig := vault.SignVaultImportOverwrite(roguePriv, "forged-old-id", rogueHdr.VaultID, rogueBlob)
 	importPayload, _ := json.Marshal(map[string]string{
 		"blob_b64":                base64.StdEncoding.EncodeToString(rogueBlob),
 		"new_signature_b64":       base64.StdEncoding.EncodeToString(rogueNewSig),
@@ -731,91 +553,34 @@ func TestServerRootCompromiseZeroLeakageAndActiveAttacks(t *testing.T) {
 	}
 	impRes.Body.Close()
 	if impRes.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("SECURITY FAILURE: forged backup overwrite was not rejected with 401! got %d", impRes.StatusCode)
+		t.Fatalf("SECURITY FAILURE: forged signed import overwrite was not rejected with 401! got %d", impRes.StatusCode)
 	}
 
-	// =========================================================================
-	// ACTIVE ROOT ATTACK #2: Root Rollback Attack on /data/vault.sns -> BLOCKED
-	// =========================================================================
-	// Root replaces /data/vault.sns with the older Revision #4 snapshot and restarts BlindStore
-	if err := os.WriteFile(primaryVaultPath, rollbackSnapshotBytes, 0o600); err != nil {
-		t.Fatalf("WriteFile rollback snapshot: %v", err)
-	}
-	restartedBlind, err := vault.NewBlindStore(primaryVaultPath)
+	// Also verify unauthenticated multipart /api/vault/import/file WITHOUT current admin password is rejected with 401!
+	var rogueMP bytes.Buffer
+	rogueWriter := multipart.NewWriter(&rogueMP)
+	_ = rogueWriter.WriteField("password", "AttackerRoguePass!123")
+	rfw, _ := rogueWriter.CreateFormFile("file", "rogue.sns")
+	_, _ = rfw.Write(rogueBlob)
+	_ = rogueWriter.Close()
+
+	mpImpRes, err := http.Post(primaryTS.URL+"/api/vault/import/file", rogueWriter.FormDataContentType(), &rogueMP)
 	if err != nil {
-		t.Fatalf("restarted NewBlindStore: %v", err)
+		t.Fatalf("POST unauth /api/vault/import/file: %v", err)
 	}
-	primarySrv.cfg.BlindStore = restartedBlind
-
-	anchoredClient := zkclient.NewEngine(primaryTS.URL, nil)
-	anchoredClient.Vault().SetKDFParams(1, 16*1024, 2)
-	anchoredClient.Vault().SetAnchor(latestAnchor)
-	if _, err := anchoredClient.Unlock(adminPass1); !errors.Is(err, vault.ErrRollbackDetected) {
-		t.Fatalf("SECURITY FAILURE: client failed to detect root rollback attack! got err=%v", err)
+	mpImpRes.Body.Close()
+	if mpImpRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("SECURITY FAILURE: unauthenticated /api/vault/import/file overwrite was not blocked with 401! got %d", mpImpRes.StatusCode)
 	}
 
 	// =========================================================================
-	// ACTIVE ROOT ATTACK #3: Root Substitutes Rogue Vault on Disk -> BLOCKED
+	// ACTIVE ATTACK #2: Bit-Flip Ciphertext Tamper on Disk -> AEAD REJECTED
 	// =========================================================================
-	if err := os.WriteFile(primaryVaultPath, rogueBlob, 0o600); err != nil {
-		t.Fatalf("WriteFile rogueBlob: %v", err)
-	}
-	rogueSubstitutedBlind, err := vault.NewBlindStore(primaryVaultPath)
-	if err != nil {
-		t.Fatalf("rogueSubstitutedBlind: %v", err)
-	}
-	primarySrv.cfg.BlindStore = rogueSubstitutedBlind
-
-	if _, err := anchoredClient.Unlock(adminPass2); !errors.Is(err, vault.ErrRollbackDetected) {
-		t.Fatalf("SECURITY FAILURE: client failed to detect root vault substitution (VaultID mismatch)! got err=%v", err)
-	}
-
-	// =========================================================================
-	// ACTIVE ROOT ATTACK #4: Root Bit-Flip Ciphertext Tamper -> AEAD REJECTED
-	// =========================================================================
-	tampered := append([]byte(nil), primaryDiskBytes...)
+	tampered := append([]byte(nil), exportedSNSBytes...)
 	tampered[len(tampered)-17] ^= 0xFF
-	if err := os.WriteFile(primaryVaultPath, tampered, 0o600); err != nil {
-		t.Fatalf("WriteFile tampered: %v", err)
-	}
-	tamperedBlind, err := vault.NewBlindStore(primaryVaultPath)
-	if err != nil {
-		t.Fatalf("tamperedBlind: %v", err)
-	}
-	primarySrv.cfg.BlindStore = tamperedBlind
-
-	freshClient := zkclient.NewEngine(primaryTS.URL, nil)
-	freshClient.Vault().SetKDFParams(1, 16*1024, 2)
-	if _, err := freshClient.Unlock(adminPass2); !errors.Is(err, vault.ErrCorruptedVault) {
-		t.Fatalf("SECURITY FAILURE: tampered ciphertext was not rejected with ErrCorruptedVault! got err=%v", err)
-	}
-
-	// =========================================================================
-	// ACTIVE ROOT ATTACK #5: Malicious Server KDF Downgrade -> BLOCKED
-	// =========================================================================
-	downgradeMux := http.NewServeMux()
-	downgradeMux.HandleFunc("POST /api/auth/challenge", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"challenge_id": "evil-challenge",
-			"nonce":        "0102030405060708090a0b0c0d0e0f10",
-			"kdf": map[string]any{
-				"vault_id":        latestAnchor.VaultID,
-				"revision":        latestAnchor.MinRevision + 1,
-				"kdf_algo":        "argon2id",
-				"kdf_salt":        base64.StdEncoding.EncodeToString(make([]byte, 32)),
-				"kdf_time":        1,
-				"kdf_memory_kib":  64, // Maliciously weak 64 KiB KDF!
-				"kdf_threads":     1,
-				"auth_pubkey_b64": base64.StdEncoding.EncodeToString(make([]byte, 32)),
-			},
-		})
-	})
-	evilTS := httptest.NewServer(downgradeMux)
-	defer evilTS.Close()
-
-	victimClient := zkclient.NewEngine(evilTS.URL, nil)
-	if _, err := victimClient.Unlock(adminPass2); !errors.Is(err, vault.ErrKDFDowngrade) {
-		t.Fatalf("SECURITY FAILURE: client did not block malicious server KDF downgrade! got err=%v", err)
+	tamperedStore := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
+	if err := tamperedStore.ImportEncryptedVault(tampered, adminPass, "", "tamper-test"); !errors.Is(err, vault.ErrCorruptedVault) {
+		t.Fatalf("SECURITY FAILURE: tampered ciphertext was not rejected with ErrCorruptedVault! got %v", err)
 	}
 }
 

@@ -139,7 +139,7 @@ func main() {
 
 	staticFS, err := web.DistFS()
 	if err != nil {
-		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("加载内置前端与 WASM 资源失败:\n%v", err), 0x10)
+		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("加载内置前端静态资源失败:\n%v", err), 0x10)
 		return
 	}
 
@@ -151,9 +151,11 @@ func main() {
 	}
 
 	relayMgr := relay.NewManager(ln.Addr().String())
+	keyMgr := vault.NewServerKeyManager(dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
 		BlindStore: blindStore,
+		KeyMgr:     keyMgr,
 		Auth:       authMgr,
 		Relay:      relayMgr,
 		StaticFS:   staticFS,
@@ -195,7 +197,7 @@ func main() {
 		showMessageBox(
 			windowTitle,
 			fmt.Sprintf(
-				"未检测到 Microsoft Edge WebView2 运行时，已在系统默认浏览器中打开纯本地零知识安全控制台。\n\n加密保险库路径：\n%s\n\n点击【确定】将立即注销会话并退出 ServerNeedSafe 本地进程。",
+				"未检测到 Microsoft Edge WebView2 运行时，已在系统默认浏览器中打开纯本地安全管理控制台。\n\n加密保险库路径：\n%s\n\n点击【确定】将立即注销会话并退出 ServerNeedSafe 本地进程。",
 				vaultPath,
 			),
 			0x40,

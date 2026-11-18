@@ -38,16 +38,15 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Install & Build WASM + Frontend Bundle (with SRI)
+      - name: Install & Build Frontend Bundle (with SRI)
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
           npm run build
 
-      - name: Static Vet & Race-Enabled Root-Breach Security Suite
+      - name: Static Vet & Race-Enabled Security Integration Suite
         run: |
           go vet ./...
-          GOOS=js GOARCH=wasm go vet ./cmd/wasm ./internal/vault ./internal/sshmanager ./internal/monitor ./internal/aiops ./internal/zkclient
           go test ./... -v -race -count=1
 
   # ============================================================================
@@ -197,7 +196,7 @@ jobs:
             echo "Container failed healthcheck within 25s"
             exit 1
           fi
-          curl -fsS http://127.0.0.1:18080/api/health | grep -q '"zero_knowledge":true'
+          curl -fsS http://127.0.0.1:18080/api/health | grep -q '"daemon_mode":true'
           curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deploy_mode":"server"'
           curl -fsS http://127.0.0.1:18080/ | grep -q 'integrity="sha384-'
 
@@ -428,7 +427,7 @@ jobs:
             exit 1
           fi
 
-          fetch_local "http://${LISTEN_ADDR}/api/health" | grep -q '"zero_knowledge":true'
+          fetch_local "http://${LISTEN_ADDR}/api/health" | grep -q '"daemon_mode":true'
           fetch_local "http://${LISTEN_ADDR}/api/auth/status" | grep -q '"deploy_mode":"server"'
           fetch_local "http://${LISTEN_ADDR}/" | grep -q 'integrity="sha384-'
           docker exec serverneedsafe test -w /data
