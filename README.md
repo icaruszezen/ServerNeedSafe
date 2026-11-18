@@ -61,20 +61,21 @@
 docker run -d \
   --name serverneedsafe \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 127.0.0.1:18899:8080 \
   -v $(pwd)/data:/data \
   ghcr.io/icaruszezen/serverneedsafe:latest
 ```
 
-或使用 Docker Compose 从源码构建启动：
+或使用 Docker Compose 从源码构建启动（默认仅监听宿主机回环 `127.0.0.1:18899`）：
 
 ```bash
 git clone https://github.com/icaruszezen/ServerNeedSafe.git
 cd ServerNeedSafe
+mkdir -p data && chown -R 10001:10001 data
 docker compose up -d --build
 ```
 
-> **安全建议**：公网部署时建议配合反向代理开启 HTTPS（TLS），结合内置的 HTML `SHA-384 SRI` 与 Worker `WASM SHA-256` 完整性校验，确保首次加载的前端静态代码不被网络链路篡改。
+> **反向代理与自动部署建议**：生产环境推荐容器仅绑定 `127.0.0.1:18899`，外部通过域名 Nginx 开启 HTTPS（TLS）与 `/api/ws/` WebSocket 反向代理访问（完整配置模板见 [`deploy/nginx-reverse-proxy.conf.example`](deploy/nginx-reverse-proxy.conf.example)），结合内置的 HTML `SHA-384 SRI` 与 Worker `WASM SHA-256` 完整性校验保障静态资源防篡改。仓库同时内置 GitHub Actions 自动构建与 SSH 部署流水线（配置 `DEPLOY_HOST`、`DEPLOY_PORT`、`DEPLOY_USER`、`DEPLOY_SSH_KEY` Secrets 后推送 `main` 即自动部署）。
 
 ### 方式二：Windows 纯本地桌面应用（直接双击运行）
 

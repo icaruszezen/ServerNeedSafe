@@ -7,7 +7,7 @@ services:
     container_name: serverneedsafe
     restart: unless-stopped
     ports:
-      - "${SNS_PORT:-8080}:8080"
+      - "${SNS_BIND_IP:-127.0.0.1}:${SNS_PORT:-18899}:8080"
     environment:
       - TZ=Asia/Shanghai
       - SNS_ADDR=0.0.0.0:8080

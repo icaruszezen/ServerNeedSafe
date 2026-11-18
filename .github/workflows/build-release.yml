@@ -152,6 +152,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.img.outputs.ghcr }}
+      digest: ${{ steps.build_push.outputs.digest }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -219,6 +222,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build & Push Multi-Platform Image (linux/amd64, linux/arm64)
+        id: build_push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -230,7 +234,219 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ============================================================================
-  # 4. 推送 v* 版本标签时自动创建 GitHub Release 并附带 Windows/Linux 安装包
+  # 4. 自动通过 SSH 部署容器至目标生产服务器（严格仅绑定 127.0.0.1:18899 供 Nginx 反代）
+  # ============================================================================
+  deploy:
+    name: Auto Deploy to Production Server (127.0.0.1:18899)
+    needs: [build-docker]
+    if: >-
+      github.event_name != 'pull_request' &&
+      !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check Deployment Secrets
+        id: check_secrets
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_SSH_KEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "DEPLOY_HOST or DEPLOY_SSH_KEY not configured; skipping auto-deploy."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH Key & Probe Server Environment
+        id: probe
+        if: steps.check_secrets.outputs.enabled == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          awk '{sub(/\r$/, ""); print}' <<< "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          SSH_OPTS=(
+            -i ~/.ssh/deploy_key
+            -p "${DEPLOY_PORT:-22}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile=~/.ssh/known_hosts
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+          )
+
+          REMOTE_ARCH=$(ssh "${SSH_OPTS[@]}" "${DEPLOY_USER:-root}@${DEPLOY_HOST}" '
+            set -euo pipefail
+            ARCH=$(uname -m)
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "[deploy] Docker not found on target host, installing..." >&2
+              if command -v apt-get >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get update -y >&2
+                DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 >&2 || \
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io >&2
+              elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y docker >&2 || curl -fsSL https://get.docker.com | sh >&2
+              elif command -v yum >/dev/null 2>&1; then
+                yum install -y docker >&2 || curl -fsSL https://get.docker.com | sh >&2
+              else
+                curl -fsSL https://get.docker.com | sh >&2
+              fi
+            fi
+            if command -v systemctl >/dev/null 2>&1; then
+              systemctl enable --now docker >&2 || true
+            fi
+            docker info >/dev/null
+            echo "$ARCH"
+          ')
+
+          REMOTE_ARCH=$(printf '%s\n' "$REMOTE_ARCH" | tail -n 1 | tr -d '[:space:]')
+          case "$REMOTE_ARCH" in
+            x86_64|amd64) PLATFORM="linux/amd64" ;;
+            aarch64|arm64) PLATFORM="linux/arm64" ;;
+            *)
+              echo "Unsupported remote architecture: $REMOTE_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          echo "platform=${PLATFORM}" >> "$GITHUB_OUTPUT"
+          echo "Remote server ready (arch=${REMOTE_ARCH} -> ${PLATFORM})"
+
+      - name: Log in to GHCR on Runner
+        if: steps.check_secrets.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stream Verified Image & Deploy Strictly on 127.0.0.1:18899
+        if: steps.check_secrets.outputs.enabled == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          IMAGE="${{ needs.build-docker.outputs.image }}"
+          DIGEST="${{ needs.build-docker.outputs.digest }}"
+          PLATFORM="${{ steps.probe.outputs.platform }}"
+          DEPLOY_DIR="/opt/serverneedsafe"
+          LISTEN_ADDR="127.0.0.1:18899"
+
+          docker pull --platform "${PLATFORM}" "${IMAGE}@${DIGEST}"
+          docker tag "${IMAGE}@${DIGEST}" "${IMAGE}:latest"
+
+          SSH_OPTS=(
+            -i ~/.ssh/deploy_key
+            -p "${DEPLOY_PORT:-22}"
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile=~/.ssh/known_hosts
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+          )
+
+          echo "Streaming ${IMAGE}@${DIGEST} (${PLATFORM}) over encrypted SSH..."
+          docker save "${IMAGE}:latest" | gzip -1 | ssh "${SSH_OPTS[@]}" "${DEPLOY_USER:-root}@${DEPLOY_HOST}" 'gunzip | docker load'
+
+          ssh "${SSH_OPTS[@]}" "${DEPLOY_USER:-root}@${DEPLOY_HOST}" \
+            "DEPLOY_DIR='${DEPLOY_DIR}' IMAGE='${IMAGE}:latest' LISTEN_ADDR='${LISTEN_ADDR}' bash -s" <<'EOF'
+          set -euo pipefail
+
+          mkdir -p "${DEPLOY_DIR}/data"
+          chown -R 10001:10001 "${DEPLOY_DIR}/data"
+          chmod 700 "${DEPLOY_DIR}/data"
+
+          cat > "${DEPLOY_DIR}/docker-compose.yml" <<YAML
+          services:
+            serverneedsafe:
+              image: ${IMAGE}
+              container_name: serverneedsafe
+              restart: unless-stopped
+              ports:
+                - "${LISTEN_ADDR}:8080"
+              environment:
+                - TZ=Asia/Shanghai
+                - SNS_ADDR=0.0.0.0:8080
+                - SNS_DATA_DIR=/data
+                - SNS_SESSION_TTL=8h
+              volumes:
+                - ${DEPLOY_DIR}/data:/data
+              security_opt:
+                - no-new-privileges:true
+          YAML
+
+          docker rm -f serverneedsafe >/dev/null 2>&1 || true
+          if docker compose version >/dev/null 2>&1; then
+            (cd "${DEPLOY_DIR}" && docker compose up -d --remove-orphans)
+          else
+            docker run -d \
+              --name serverneedsafe \
+              --restart unless-stopped \
+              -p "${LISTEN_ADDR}:8080" \
+              -e TZ=Asia/Shanghai \
+              -e SNS_ADDR=0.0.0.0:8080 \
+              -e SNS_DATA_DIR=/data \
+              -e SNS_SESSION_TTL=8h \
+              -v "${DEPLOY_DIR}/data:/data" \
+              --security-opt no-new-privileges:true \
+              "${IMAGE}"
+          fi
+
+          fetch_local() {
+            if command -v curl >/dev/null 2>&1; then
+              curl --noproxy '*' -fsS "$1"
+            else
+              wget --no-proxy -qO- "$1"
+            fi
+          }
+
+          READY=0
+          for i in $(seq 1 30); do
+            if fetch_local "http://${LISTEN_ADDR}/api/health" 2>/dev/null | grep -q '"ok":true'; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "[ERROR] ServerNeedSafe container failed healthcheck on ${LISTEN_ADDR}" >&2
+            docker logs serverneedsafe || true
+            exit 1
+          fi
+
+          fetch_local "http://${LISTEN_ADDR}/api/health" | grep -q '"zero_knowledge":true'
+          fetch_local "http://${LISTEN_ADDR}/api/auth/status" | grep -q '"deploy_mode":"server"'
+          fetch_local "http://${LISTEN_ADDR}/" | grep -q 'integrity="sha384-'
+          docker exec serverneedsafe test -w /data
+
+          PORT_BINDING=$(docker port serverneedsafe 8080/tcp)
+          echo "Verified Docker port binding: ${PORT_BINDING}"
+          if [ "${PORT_BINDING}" != "${LISTEN_ADDR}" ]; then
+            echo "[SECURITY ERROR] Unexpected port binding '${PORT_BINDING}', expected strictly '${LISTEN_ADDR}'!" >&2
+            docker rm -f serverneedsafe || true
+            exit 1
+          fi
+
+          docker image prune -f >/dev/null 2>&1 || true
+          echo "[OK] ServerNeedSafe is running and strictly bound to http://${LISTEN_ADDR}"
+          EOF
+
+  # ============================================================================
+  # 5. 推送 v* 版本标签时自动创建 GitHub Release 并附带 Windows/Linux 安装包
   # ============================================================================
   publish-release:
     name: Publish GitHub Release Assets
