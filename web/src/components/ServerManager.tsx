@@ -281,7 +281,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
           </p>
         </div>
         <div className="page-header-actions">
-          <div className="input-with-icon" style={{ width: 250 }}>
+          <div className="input-with-icon server-search-box">
             <span className="input-icon-left">
               <Search size={14} />
             </span>
@@ -685,8 +685,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     </label>
                     <textarea
                       id="srv-privkey-input"
-                      className="textarea mono"
-                      style={{ fontSize: 12, minHeight: 110 }}
+                      className="textarea mono code-textarea"
                       placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."
                       value={form.private_key || ''}
                       onChange={(e) => setForm({ ...form, private_key: e.target.value })}
@@ -964,7 +963,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       {/* Standalone Full SFTP Modal */}
       {standaloneSftpServer && (
         <div className="modal-backdrop">
-          <div className="modal-panel wide" style={{ height: '82vh', maxWidth: 880 }}>
+          <div className="modal-panel wide sftp-standalone-modal">
             <SftpPanel
               serverId={standaloneSftpServer.id}
               serverName={standaloneSftpServer.name}

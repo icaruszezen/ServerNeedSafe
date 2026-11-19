@@ -212,8 +212,8 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
                     <div className="server-icon-box connected">
                       {cred.kind === 'private_key' ? <KeyRound size={18} /> : <Lock size={18} />}
                     </div>
-                    <div>
-                      <div className="server-name">{cred.name}</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="server-name" title={cred.name}>{cred.name}</div>
                       <div className="server-endpoint">
                         {cred.kind === 'private_key'
                           ? `${(cred.key_algorithm || 'SSH Key').toUpperCase()}${
@@ -251,7 +251,9 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
                 )}
 
                 {cred.notes && (
-                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{cred.notes}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', wordBreak: 'break-word' }}>
+                    {cred.notes}
+                  </div>
                 )}
 
                 <div className="server-card-footer">
@@ -419,8 +421,7 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
                   <div className="field">
                     <label className="field-label">私钥 PEM 内容 *</label>
                     <textarea
-                      className="textarea mono"
-                      style={{ fontSize: 12, minHeight: 110 }}
+                      className="textarea mono code-textarea"
                       value={privateKey}
                       onChange={(e) => setPrivateKey(e.target.value)}
                       placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."

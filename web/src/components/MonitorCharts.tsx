@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { MonitorHealthLevel, MonitorSamplePoint } from '../types';
 
 export type MetricUnitType = 'percent' | 'bps' | 'ms' | 'load' | 'count' | 'temp';
@@ -245,13 +245,41 @@ export const TimeSeriesChart: React.FC<{
   fixedMax?: number;
   height?: number;
 }> = ({ title, subtitle, points, series, unit, fixedMax, height = 186 }) => {
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [compact, setCompact] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 480 : false
+  );
 
-  const viewW = 580;
-  const viewH = height;
-  const padL = 74;
-  const padR = 14;
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width || el.clientWidth;
+      if (w > 0) {
+        setCompact(w < 430);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [points.length]);
+
+  useEffect(() => {
+    if (hoverIdx === null) return;
+    const onDocTouch = (ev: TouchEvent) => {
+      if (stageRef.current && !stageRef.current.contains(ev.target as Node)) {
+        setHoverIdx(null);
+      }
+    };
+    document.addEventListener('touchstart', onDocTouch, { passive: true });
+    return () => document.removeEventListener('touchstart', onDocTouch);
+  }, [hoverIdx]);
+
+  const viewW = compact ? 360 : 580;
+  const viewH = compact ? Math.min(height, 168) : height;
+  const padL = compact ? 58 : 74;
+  const padR = compact ? 10 : 14;
   const padT = 10;
   const padB = 22;
   const plotW = viewW - padL - padR;
@@ -317,22 +345,35 @@ export const TimeSeriesChart: React.FC<{
     }
 
     return { maxY, stats, paths, offlineBands, xFor, yFor };
-  }, [points, series, fixedMax, unit, plotW, plotH]);
+  }, [points, series, fixedMax, unit, padL, plotW, plotH]);
 
-  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+  const updateHoverByClientX = (clientX: number, clampToBounds = false) => {
     if (!svgRef.current || points.length === 0) return;
     const rect = svgRef.current.getBoundingClientRect();
-    const relX = ((e.clientX - rect.left) / rect.width) * viewW;
-    if (relX < padL - 6 || relX > viewW - padR + 6) {
+    if (rect.width <= 0) return;
+    if (!clampToBounds && (clientX < rect.left || clientX > rect.right)) {
       setHoverIdx(null);
       return;
     }
+    const rawRelX = ((clientX - rect.left) / rect.width) * viewW;
+    const relX = Math.max(padL, Math.min(viewW - padR, rawRelX));
     if (points.length === 1) {
       setHoverIdx(0);
       return;
     }
     const ratio = Math.max(0, Math.min(1, (relX - padL) / plotW));
     setHoverIdx(Math.round(ratio * (points.length - 1)));
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    updateHoverByClientX(e.clientX, false);
+  };
+
+  const handleTouchScrub = (e: React.TouchEvent<SVGSVGElement>) => {
+    const touch = e.touches[0];
+    if (touch) {
+      updateHoverByClientX(touch.clientX, true);
+    }
   };
 
   const activePoint = hoverIdx !== null && points[hoverIdx] ? points[hoverIdx] : null;
@@ -363,17 +404,20 @@ export const TimeSeriesChart: React.FC<{
       </div>
 
       {points.length === 0 ? (
-        <div className="mon-chart-empty" style={{ height }}>
+        <div className="mon-chart-empty" style={{ height: viewH }}>
           尚无历史采样点，点击「立即采集」或等待定时巡检自动记录
         </div>
       ) : (
-        <div className="mon-chart-stage">
+        <div className="mon-chart-stage" ref={stageRef}>
           <svg
             ref={svgRef}
             viewBox={`0 0 ${viewW} ${viewH}`}
             className="mon-chart-svg"
+            style={{ touchAction: 'pan-y' }}
             onMouseMove={handleMouseMove}
             onMouseLeave={() => setHoverIdx(null)}
+            onTouchStart={handleTouchScrub}
+            onTouchMove={handleTouchScrub}
           >
             {/* Horizontal gridlines & Y ticks */}
             {[0, 0.5, 1].map((frac) => {
@@ -391,11 +435,11 @@ export const TimeSeriesChart: React.FC<{
                     strokeWidth={1}
                   />
                   <text
-                    x={padL - 7}
+                    x={padL - 6}
                     y={y + 3.5}
                     textAnchor="end"
                     fill="var(--text-muted)"
-                    fontSize={10}
+                    fontSize={compact ? 9.5 : 10}
                     fontFamily="var(--font-mono)"
                   >
                     {formatMetricValue(labelVal, unit)}
@@ -457,7 +501,7 @@ export const TimeSeriesChart: React.FC<{
               y={viewH - 5}
               textAnchor="start"
               fill="var(--text-muted)"
-              fontSize={10}
+              fontSize={compact ? 9.5 : 10}
               fontFamily="var(--font-mono)"
             >
               {formatTimeShort(points[0]?.ts)}
@@ -468,7 +512,7 @@ export const TimeSeriesChart: React.FC<{
                 y={viewH - 5}
                 textAnchor="middle"
                 fill="var(--text-muted)"
-                fontSize={10}
+                fontSize={compact ? 9.5 : 10}
                 fontFamily="var(--font-mono)"
               >
                 {formatTimeShort(points[Math.floor(points.length / 2)]?.ts)}
@@ -480,7 +524,7 @@ export const TimeSeriesChart: React.FC<{
                 y={viewH - 5}
                 textAnchor="end"
                 fill="var(--text-muted)"
-                fontSize={10}
+                fontSize={compact ? 9.5 : 10}
                 fontFamily="var(--font-mono)"
               >
                 {formatTimeShort(points[points.length - 1]?.ts)}
@@ -521,8 +565,21 @@ export const TimeSeriesChart: React.FC<{
             <div
               className="mon-chart-tooltip"
               style={{
-                left: activeX > viewW * 0.62 ? 'auto' : `${(activeX / viewW) * 100}%`,
-                right: activeX > viewW * 0.62 ? `${((viewW - activeX) / viewW) * 100}%` : 'auto',
+                maxWidth: 'calc(100% - 12px)',
+                left: compact
+                  ? activeX > viewW * 0.5
+                    ? 'auto'
+                    : 6
+                  : activeX > viewW * 0.62
+                  ? 'auto'
+                  : `${(activeX / viewW) * 100}%`,
+                right: compact
+                  ? activeX > viewW * 0.5
+                    ? 6
+                    : 'auto'
+                  : activeX > viewW * 0.62
+                  ? `${((viewW - activeX) / viewW) * 100}%`
+                  : 'auto',
               }}
             >
               <div className="mon-tooltip-time mono">{formatDateTime(activePoint.ts)}</div>

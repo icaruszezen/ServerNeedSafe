@@ -726,16 +726,16 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     ) : (
                       data.known_hosts.map((kh) => (
                         <tr key={kh.address}>
-                          <td style={{ fontWeight: 550 }}>{kh.server_name}</td>
-                          <td className="mono">{kh.address}</td>
-                          <td className="mono">{kh.key_type}</td>
-                          <td className="mono" style={{ fontSize: 12, color: 'var(--accent-teal)' }}>
+                          <td style={{ fontWeight: 550, whiteSpace: 'nowrap' }}>{kh.server_name}</td>
+                          <td className="mono" style={{ whiteSpace: 'nowrap' }}>{kh.address}</td>
+                          <td className="mono" style={{ whiteSpace: 'nowrap' }}>{kh.key_type}</td>
+                          <td className="mono" style={{ fontSize: 12, color: 'var(--accent-teal)', whiteSpace: 'nowrap' }}>
                             {kh.fingerprint}
                           </td>
-                          <td style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                          <td style={{ color: 'var(--text-muted)', fontSize: 12, whiteSpace: 'nowrap' }}>
                             {new Date(kh.last_verified_at).toLocaleString('zh-CN')}
                           </td>
-                          <td style={{ textAlign: 'right' }}>
+                          <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                             <button
                               type="button"
                               className="btn btn-ghost btn-sm btn-icon"
@@ -763,7 +763,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
               <p className="sec-panel-desc">
                 登录鉴权、密码与 KDF 轮换、SSH/SFTP 操作与备份导出均使用 XChaCha20-Poly1305 随保险库加密落盘。
               </p>
-              <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+              <div style={{ maxHeight: 320, overflowY: 'auto', overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
                 <table className="data-table">
                   <thead>
                     <tr>

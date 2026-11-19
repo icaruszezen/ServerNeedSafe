@@ -20,6 +20,8 @@ import {
   RefreshCw,
   ArrowUpRight,
   KeyRound,
+  MessageSquare,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -97,6 +99,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [subTab, setSubTab] = useState<CenterTab>('diagnosis');
   const [overview, setOverview] = useState<AIOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false);
 
   // Active Chat Session State
   const [activeSessionId, setActiveSessionId] = useState<string>('');
@@ -245,6 +248,26 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   }, []);
 
   useEffect(() => {
+    if (!mobileSessionsOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMobileSessionsOpen(false);
+      }
+    };
+    const onResize = () => {
+      if (window.innerWidth > 768) {
+        setMobileSessionsOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [mobileSessionsOpen]);
+
+  useEffect(() => {
     if (subTab === 'patrol' && overview?.patrol_status?.unread_alerts) {
       void api.listPatrolRecords(30, true).then((res) => {
         setOverview((prev) =>
@@ -278,6 +301,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   }, [overview]);
 
   const handleSelectSession = async (summary: AIChatSessionSummary) => {
+    setMobileSessionsOpen(false);
     setActiveSessionId(summary.id);
     try {
       const { session } = await api.getAISession(summary.id);
@@ -293,6 +317,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     initialTitle = '新建 AI 运维排障会话',
     serverIds?: string[]
   ): Promise<AIChatSession | null> => {
+    setMobileSessionsOpen(false);
     try {
       const sids =
         serverIds ??
@@ -729,24 +754,48 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       {/* Page Header */}
       <div className="page-header">
         <div className="page-header-title">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              flexWrap: 'wrap',
+              minWidth: 0,
+              maxWidth: '100%',
+            }}
+          >
             <h2>AI 智能运维与安全诊断中心</h2>
             {activeProvider ? (
               <button
                 type="button"
                 className="tag-chip teal"
-                style={{ border: 'none', cursor: 'pointer' }}
+                style={{
+                  border: 'none',
+                  cursor: 'pointer',
+                  maxWidth: 'min(100%, 310px)',
+                  minWidth: 0,
+                  flexShrink: 1,
+                }}
                 onClick={() => setSubTab('providers')}
-                title="点击切换或管理全局激活大模型"
+                title={`${activeProvider.name} · ${activeProvider.model}（点击切换或管理全局激活大模型）`}
               >
-                <Sparkles size={11.5} style={{ marginRight: 4 }} />
-                {activeProvider.name} · {activeProvider.model}
+                <Sparkles size={11.5} style={{ marginRight: 4, flexShrink: 0 }} />
+                <span
+                  style={{
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    minWidth: 0,
+                  }}
+                >
+                  {activeProvider.name} · {activeProvider.model}
+                </span>
               </button>
             ) : (
               <button
                 type="button"
                 className="tag-chip amber"
-                style={{ border: 'none', cursor: 'pointer' }}
+                style={{ border: 'none', cursor: 'pointer', maxWidth: '100%', minWidth: 0, flexShrink: 1 }}
                 onClick={() => setSubTab('providers')}
               >
                 尚未配置大模型 · 点击接入
@@ -803,15 +852,35 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       {/* TAB 1: Intelligent Troubleshooting & Security Checkup */}
       {subTab === 'diagnosis' && (
         <div className="ai-workbench">
-          <aside className="ai-session-rail">
+          {mobileSessionsOpen && (
+            <div
+              className="ai-session-rail-backdrop"
+              onClick={() => setMobileSessionsOpen(false)}
+              aria-hidden="true"
+            />
+          )}
+
+          <aside
+            id="ai-session-rail"
+            className={`ai-session-rail ${mobileSessionsOpen ? 'mobile-open' : ''}`}
+          >
             <div className="ai-session-rail-header">
               <button
                 type="button"
                 id="ai-new-session-btn"
                 className="btn btn-primary btn-block"
+                style={{ flex: 1 }}
                 onClick={() => void handleCreateSession()}
               >
                 <Plus size={14} /> 新建排障会话
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm btn-icon ai-session-rail-close-btn"
+                onClick={() => setMobileSessionsOpen(false)}
+                aria-label="关闭会话列表"
+              >
+                <X size={15} />
               </button>
             </div>
             <div className="ai-session-list">
@@ -860,7 +929,18 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             {/* Target Servers & 3-Tier HITL Execution Mode Bar */}
             <div className="ai-context-toolbar">
               <div className="ai-server-pills">
-                <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 560 }}>
+                <button
+                  type="button"
+                  id="ai-mobile-sessions-btn"
+                  className="ai-mobile-sessions-btn"
+                  onClick={() => setMobileSessionsOpen((prev) => !prev)}
+                  aria-expanded={mobileSessionsOpen}
+                  aria-controls="ai-session-rail"
+                >
+                  <MessageSquare size={13} />
+                  <span>会话 ({overview?.sessions?.length || 0})</span>
+                </button>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 560, flexShrink: 0 }}>
                   诊断目标主机：
                 </span>
                 {servers.length === 0 ? (
@@ -876,10 +956,20 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           key={srv.id}
                           type="button"
                           className={`ai-server-chip ${sel ? 'selected' : ''}`}
+                          title={srv.name}
                           onClick={() => void toggleServerTarget(srv.id)}
                         >
-                          <ServerIcon size={11.5} />
-                          <span>{srv.name}</span>
+                          <ServerIcon size={11.5} style={{ flexShrink: 0 }} />
+                          <span
+                            style={{
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                              minWidth: 0,
+                            }}
+                          >
+                            {srv.name}
+                          </span>
                         </button>
                       );
                     })}
@@ -887,7 +977,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
-                        style={{ height: 25, fontSize: 11.5 }}
+                        style={{ height: 25, fontSize: 11.5, flexShrink: 0 }}
                         onClick={() => {
                           const allIds =
                             selectedServerIds.length === servers.length
@@ -903,7 +993,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                 )}
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>执行安全级别：</span>
                 <div className="ai-mode-pill-group" role="radiogroup" aria-label="AI 执行权限模式">
                   <button
@@ -932,6 +1022,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                     自治执行
                   </button>
                 </div>
+                <span className="ai-mode-hint">
+                  {sessionMode === 'suggest'
+                    ? '仅建议方案 · 所有操作需人工确认'
+                    : sessionMode === 'standard'
+                    ? '只读自动采集 · 变更展示 Diff 待审批'
+                    : '自动修复常规问题 · 高危命令底层硬拦截'}
+                </span>
               </div>
             </div>
 
@@ -948,14 +1045,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   <p>
                     自动调用只读 SSH 探针与 SFTP 读取分析线上配置，遇到服务重启或配置文件修改时自动生成 Git Unified Diff 供您一键审批。
                   </p>
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(2, minmax(0, 260px))',
-                      gap: 10,
-                      marginTop: 6,
-                    }}
-                  >
+                  <div className="ai-empty-prompts-grid">
                     {QUICK_DIAGNOSTIC_PROMPTS.map((q) => (
                       <button
                         key={q.label}
@@ -1092,7 +1182,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                 <button
                   type="submit"
                   id="ai-center-send-btn"
-                  className="btn btn-primary"
+                  className="btn btn-primary ai-composer-send-btn"
                   style={{ height: 44, padding: '0 18px' }}
                   disabled={streaming || !promptInput.trim()}
                 >
@@ -1124,12 +1214,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
+                  flexShrink: 0,
                 }}
               >
                 <Radar size={20} />
               </div>
               <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                   <strong style={{ fontSize: 15 }}>
                     {overview?.patrol_config.enabled
                       ? `定时无人值守巡检已开启（每 ${overview.patrol_config.interval_minutes} 分钟）`
@@ -1148,7 +1239,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               </div>
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <button
                 type="button"
                 className="btn"
@@ -1192,7 +1283,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       gap: 10,
                     }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                       {rec.status === 'healthy' ? (
                         <CheckCircle2 size={16} style={{ color: 'var(--status-online)' }} />
                       ) : (
@@ -1221,7 +1312,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       </span>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                       <span style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
                         共 {rec.total_servers} 台（正常 {rec.healthy_count} · 预警 {rec.warning_count} · 严重{' '}
                         {rec.critical_count}）
@@ -1244,7 +1335,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   </div>
 
                   {/* Per-server Findings */}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(290px, 1fr))', gap: 8 }}>
+                  <div className="patrol-findings-grid">
                     {rec.findings.map((f) => (
                       <div
                         key={f.server_id}
@@ -1254,22 +1345,64 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           background: 'var(--bg-subtle)',
                           border: '1px solid var(--border-subtle)',
                           fontSize: 12,
+                          minWidth: 0,
+                          maxWidth: '100%',
                         }}
                       >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 600 }}>
-                          <span>{f.server_name}</span>
-                          <span className="mono" style={{ color: 'var(--text-muted)' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'flex-start',
+                            flexWrap: 'wrap',
+                            gap: 4,
+                            fontWeight: 600,
+                            minWidth: 0,
+                          }}
+                        >
+                          <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+                            {f.server_name}
+                          </span>
+                          <span
+                            className="mono"
+                            style={{
+                              color: 'var(--text-muted)',
+                              minWidth: 0,
+                              maxWidth: '100%',
+                              overflowWrap: 'anywhere',
+                              wordBreak: 'break-all',
+                            }}
+                          >
                             {f.host}
                           </span>
                         </div>
                         {f.reachable && (
-                          <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                          <div
+                            className="mono"
+                            style={{
+                              fontSize: 11,
+                              color: 'var(--text-muted)',
+                              marginTop: 4,
+                              overflowWrap: 'anywhere',
+                              wordBreak: 'break-word',
+                            }}
+                          >
                             CPU负载 {f.cpu_load_percent ?? 0}% · 内存 {f.mem_percent ?? 0}% · 磁盘 {f.disk_percent ?? 0}% · 1h爆破{' '}
                             {f.ssh_fail_count_1h ?? 0}次
                           </div>
                         )}
                         {f.anomalies && f.anomalies.length > 0 ? (
-                          <div style={{ color: 'var(--amber-text)', marginTop: 4, fontWeight: 550 }}>
+                          <div
+                            style={{
+                              color: 'var(--amber-text)',
+                              marginTop: 4,
+                              fontWeight: 550,
+                              minWidth: 0,
+                              maxWidth: '100%',
+                              overflowWrap: 'anywhere',
+                              wordBreak: 'break-word',
+                            }}
+                          >
                             {f.anomalies.join('；')}
                           </div>
                         ) : (
@@ -1288,6 +1421,10 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         background: 'var(--accent-teal-soft)',
                         border: '1px solid var(--accent-teal-border)',
                         fontSize: 12.5,
+                        minWidth: 0,
+                        maxWidth: '100%',
+                        overflowWrap: 'anywhere',
+                        wordBreak: 'break-word',
                       }}
                     >
                       <div style={{ fontWeight: 620, marginBottom: 4, color: 'var(--accent-teal)' }}>
@@ -1320,7 +1457,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           <div className="security-grid">
             {/* Left Column: Per-Server Objective Environment Memories */}
             <section className="sec-panel">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
                 <h3>
                   <BrainCircuit size={16} style={{ color: 'var(--accent-teal)' }} />
                   主机环境画像记忆 ({overview?.host_memories?.length || 0})
@@ -1363,17 +1500,18 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         borderRadius: 8,
                         border: '1px solid var(--border-default)',
                         background: 'var(--bg-subtle)',
+                        minWidth: 0,
                       }}
                     >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <strong>{m.server_name}</strong>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+                          <strong style={{ wordBreak: 'break-word' }}>{m.server_name}</strong>
                           {m.os_arch && <span className="tag-chip">{m.os_arch}</span>}
                           {m.auto_updated_count > 0 && (
                             <span className="tag-chip teal">AI 自学习 {m.auto_updated_count} 次</span>
                           )}
                         </div>
-                        <div style={{ display: 'flex', gap: 4 }}>
+                        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
                           <button
                             type="button"
                             className="btn btn-ghost btn-sm btn-icon"
@@ -1407,7 +1545,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           </button>
                         </div>
                       </div>
-                      <div style={{ fontSize: 12.5, marginTop: 6, color: 'var(--text-secondary)' }}>
+                      <div style={{ fontSize: 12.5, marginTop: 6, color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
                         {m.summary}
                       </div>
                       {(m.key_services?.length > 0 || m.deploy_paths?.length > 0) && (
@@ -1432,7 +1570,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
             {/* Right Column: Troubleshooting Runbooks (Hermes-inspired Skill Library) */}
             <section className="sec-panel">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
                 <h3>
                   <BookOpen size={16} style={{ color: 'var(--accent-teal)' }} />
                   排障技能 Runbook 库 ({overview?.runbooks?.length || 0})
@@ -1469,14 +1607,15 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       borderRadius: 8,
                       border: '1px solid var(--border-default)',
                       background: 'var(--bg-subtle)',
+                      minWidth: 0,
                     }}
                   >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-                        <strong>{rb.title}</strong>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', minWidth: 0 }}>
+                        <strong style={{ wordBreak: 'break-word' }}>{rb.title}</strong>
                         <span className="tag-chip teal">{rb.category}</span>
                       </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
                         <button
                           type="button"
                           className="btn btn-sm"
@@ -1518,13 +1657,15 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         </button>
                       </div>
                     </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>
                       <strong>适用症状：</strong>
                       {rb.symptom}
                     </div>
                     {rb.fix_commands?.length > 0 && (
                       <div className="copilot-cmd-box" style={{ marginTop: 8 }}>
-                        <code style={{ whiteSpace: 'pre-wrap' }}>{rb.fix_commands.join(' && ')}</code>
+                        <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                          {rb.fix_commands.join(' && ')}
+                        </code>
                       </div>
                     )}
                   </div>
@@ -1549,13 +1690,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                 className="preset-card"
                 onClick={() => applyPreset(preset)}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6, width: '100%' }}>
                   <strong style={{ fontSize: 13.5, color: 'var(--text-primary)' }}>{preset.name}</strong>
                   <span className="tag-chip mono" style={{ fontSize: 10.5 }}>
                     {preset.protocol === 'anthropic' ? 'Anthropic 原生' : 'OpenAI 兼容'}
                   </span>
                 </div>
-                <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent-teal)' }}>
+                <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent-teal)', wordBreak: 'break-all' }}>
                   默认模型: {preset.default_model}
                 </span>
                 <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>{preset.description}</span>
@@ -1670,7 +1811,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   />
                 </div>
 
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
                   <button type="submit" className="btn btn-primary">
                     {provForm.id ? '更新模型配置' : '加密保存并设为激活'}
                   </button>
@@ -1722,7 +1863,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   暂未保存任何大模型供应商，可点击上方预设卡片快速配置
                 </div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
                   {overview.providers.map((p) => {
                     const isActive = overview.active_provider_id === p.id;
                     return (
@@ -1735,15 +1876,68 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                             isActive ? 'var(--accent-teal-border)' : 'var(--border-default)'
                           }`,
                           background: isActive ? 'var(--accent-teal-soft)' : 'var(--bg-subtle)',
+                          minWidth: 0,
+                          maxWidth: '100%',
                         }}
                       >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-                            <strong>{p.name}</strong>
-                            <span className="tag-chip mono">{p.model}</span>
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: 8,
+                            flexWrap: 'wrap',
+                            minWidth: 0,
+                            maxWidth: '100%',
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 7,
+                              flexWrap: 'wrap',
+                              minWidth: 0,
+                              maxWidth: '100%',
+                            }}
+                          >
+                            <strong
+                              style={{
+                                minWidth: 0,
+                                maxWidth: '100%',
+                                overflowWrap: 'anywhere',
+                                wordBreak: 'break-word',
+                              }}
+                            >
+                              {p.name}
+                            </strong>
+                            <span
+                              className="tag-chip mono"
+                              style={{
+                                display: 'inline-block',
+                                maxWidth: '100%',
+                                minWidth: 0,
+                                flexShrink: 1,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}
+                              title={p.model}
+                            >
+                              {p.model}
+                            </span>
                             {isActive && <span className="tag-chip teal">当前全局激活</span>}
                           </div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 4,
+                              flexWrap: 'wrap',
+                              minWidth: 0,
+                              maxWidth: '100%',
+                            }}
+                          >
                             {!isActive && (
                               <button
                                 type="button"
@@ -1788,20 +1982,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                             </button>
                           </div>
                         </div>
-                        <div
-                          className="mono"
-                          style={{
-                            fontSize: 11.5,
-                            color: 'var(--text-muted)',
-                            marginTop: 6,
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                          }}
-                        >
-                          <span>
+                        <div className="mono provider-meta-row">
+                          <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
                             [{p.protocol}] {p.base_url}
                           </span>
-                          <span>密钥: {p.has_api_key ? p.api_key_preview : '未设置(免密本地)'}</span>
+                          <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+                            密钥: {p.has_api_key ? p.api_key_preview : '未设置(免密本地)'}
+                          </span>
                         </div>
                       </div>
                     );
@@ -1900,7 +2087,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   </div>
                 </div>
 
-                <div style={{ display: 'flex', gap: 18, margin: '8px 0 16px' }}>
+                <div style={{ display: 'flex', gap: 18, margin: '8px 0 16px', flexWrap: 'wrap' }}>
                   <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
                     <input
                       type="checkbox"
@@ -1919,7 +2106,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   </label>
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
                   <strong>外部告警 Webhook 通道（飞书 / 钉钉 / 企微 / 自定义签名）</strong>
                   <button
                     type="button"
@@ -2017,7 +2204,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         />
                       </div>
                     </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                       <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12.5 }}>
                         <input
                           type="checkbox"

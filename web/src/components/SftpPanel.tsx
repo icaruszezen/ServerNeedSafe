@@ -203,11 +203,13 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 8,
           padding: '10px 14px',
           borderBottom: '1px solid var(--border-subtle)',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flexWrap: 'wrap' }}>
           <strong style={{ fontSize: 13.5 }}>SFTP 安全文件管理</strong>
           <span className="tag-chip">{serverName}</span>
         </div>
@@ -221,7 +223,12 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
             {showHidden ? '隐藏 .*' : '显示 .*'}
           </button>
           {onClose && (
-            <button type="button" className="btn btn-ghost btn-sm btn-icon" onClick={onClose}>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm btn-icon sftp-close-btn"
+              aria-label="关闭文件面板"
+              onClick={onClose}
+            >
               <X size={15} />
             </button>
           )}
@@ -246,6 +253,7 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
           <Home size={14} />
         </button>
         <form
+          className="sftp-path-form"
           style={{ display: 'flex', flex: 1, minWidth: 150 }}
           onSubmit={(e) => {
             e.preventDefault();
@@ -314,32 +322,32 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
       )}
 
       <div className="sftp-table-wrap">
-        <table className="data-table">
+        <table className="data-table sftp-file-table">
           <thead>
             <tr>
               <th>名称</th>
               <th>大小</th>
-              <th>权限</th>
+              <th className="sftp-col-perm">权限</th>
               <th style={{ textAlign: 'right' }}>操作</th>
             </tr>
           </thead>
           <tbody>
             {loading && entries.length === 0 ? (
-              <tr>
+              <tr className="sftp-empty-row">
                 <td colSpan={4} style={{ textAlign: 'center', padding: 28, color: 'var(--text-muted)' }}>
                   正在通过加密 SSH 隧道读取目录...
                 </td>
               </tr>
             ) : visibleEntries.length === 0 ? (
-              <tr>
+              <tr className="sftp-empty-row">
                 <td colSpan={4} style={{ textAlign: 'center', padding: 28, color: 'var(--text-muted)' }}>
                   当前目录为空
                 </td>
               </tr>
             ) : (
               visibleEntries.map((entry) => (
-                <tr key={entry.path}>
-                  <td>
+                <tr key={entry.path} className="sftp-file-row">
+                  <td className="sftp-cell-name">
                     <div
                       className="sftp-name-cell"
                       onClick={() => {
@@ -355,17 +363,21 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
                       ) : (
                         <FileText size={15} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
                       )}
-                      <span style={{ wordBreak: 'break-all' }}>{entry.name}</span>
+                      <span className="sftp-entry-name">{entry.name}</span>
                     </div>
                   </td>
-                  <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-                    {entry.is_dir ? '—' : formatBytes(entry.size)}
+                  <td
+                    className="mono sftp-cell-size"
+                    data-perm={entry.octal_perm}
+                    style={{ fontSize: 12, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}
+                  >
+                    {entry.is_dir ? '目录' : formatBytes(entry.size)}
                   </td>
-                  <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                  <td className="mono sftp-col-perm sftp-cell-perm" style={{ fontSize: 11.5, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
                     {entry.octal_perm}
                   </td>
-                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                    <div style={{ display: 'inline-flex', gap: 3 }}>
+                  <td className="sftp-cell-actions" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <div className="sftp-actions-group" style={{ display: 'inline-flex', gap: 3 }}>
                       {!entry.is_dir && (
                         <>
                           <button
@@ -431,7 +443,7 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
         <div className="modal-backdrop">
           <form className="modal-panel" style={{ maxWidth: 400 }} onSubmit={handleDialogConfirm}>
             <div className="modal-header">
-              <h3>
+              <h3 style={{ wordBreak: 'break-word', minWidth: 0 }}>
                 {dialogMode.kind === 'mkdir' && '新建远程目录'}
                 {dialogMode.kind === 'newfile' && '新建远程文本文件'}
                 {dialogMode.kind === 'rename' && `重命名 ${dialogMode.entry.name}`}
@@ -449,7 +461,11 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
             <div className="modal-body">
               {dialogMode.kind === 'delete' ? (
                 <p style={{ fontSize: 13.5 }}>
-                  确定要永久删除远程路径 <code className="mono">{dialogMode.entry.path}</code> 吗？此操作不可撤销。
+                  确定要永久删除远程路径{' '}
+                  <code className="mono" style={{ wordBreak: 'break-all' }}>
+                    {dialogMode.entry.path}
+                  </code>{' '}
+                  吗？此操作不可撤销。
                 </p>
               ) : (
                 <div className="field" style={{ marginBottom: 0 }}>
@@ -485,9 +501,17 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
         <div className="modal-backdrop">
           <div className="modal-panel wide">
             <div className="modal-header">
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <h3>在线安全文件编辑</h3>
-                <span className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--text-muted)',
+                    wordBreak: 'break-all',
+                    display: 'block',
+                  }}
+                >
                   {editorState.path}
                 </span>
               </div>
@@ -501,8 +525,7 @@ export const SftpPanel: React.FC<SftpPanelProps> = ({
             </div>
             <div className="modal-body">
               <textarea
-                className="textarea mono"
-                style={{ minHeight: 380, fontSize: 12.5, lineHeight: 1.55 }}
+                className="textarea mono sftp-editor-textarea"
                 value={editorState.content}
                 onChange={(e) => setEditorState({ ...editorState, content: e.target.value })}
                 spellCheck={false}
