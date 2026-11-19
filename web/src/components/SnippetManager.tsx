@@ -120,8 +120,8 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
                   <div className="server-icon-box">
                     <Zap size={17} />
                   </div>
-                  <div>
-                    <div className="server-name">{sn.title}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <div className="server-name" title={sn.title}>{sn.title}</div>
                     <span className="tag-chip" style={{ marginTop: 4 }}>
                       {sn.category}
                     </span>
@@ -147,7 +147,7 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
               </div>
 
               {sn.description && (
-                <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
+                <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
                   {sn.description}
                 </div>
               )}
@@ -253,9 +253,11 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
       {/* Multi-Server Batch Exec Modal */}
       {batchSnippet && (
         <div className="modal-backdrop">
-          <div className="modal-panel wide" style={{ maxHeight: '88vh' }}>
+          <div className="modal-panel wide">
             <div className="modal-header">
-              <h3>多服务器并发执行 — {batchSnippet.title}</h3>
+              <h3 style={{ minWidth: 0, wordBreak: 'break-word' }}>
+                多服务器并发执行 — {batchSnippet.title}
+              </h3>
               <button
                 type="button"
                 className="btn btn-ghost btn-sm btn-icon"
@@ -286,14 +288,14 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
                 <label className="field-label">
                   <span>选择目标服务器 ({selectedServerIds.length}/{servers.length})</span>
                 </label>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
                   {servers.map((srv) => {
                     const checked = selectedServerIds.includes(srv.id);
                     return (
                       <label
                         key={srv.id}
                         className={`group-pill ${checked ? 'active' : ''}`}
-                        style={{ cursor: 'pointer' }}
+                        style={{ cursor: 'pointer', maxWidth: '100%' }}
                       >
                         <input
                           type="checkbox"
@@ -301,7 +303,15 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
                           onChange={() => toggleServerCheck(srv.id)}
                           style={{ display: 'none' }}
                         />
-                        {srv.name} ({srv.host})
+                        <span
+                          style={{
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {srv.name} ({srv.host})
+                        </span>
                       </label>
                     );
                   })}
@@ -324,18 +334,29 @@ export const SnippetManager: React.FC<SnippetManagerProps> = ({
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
+                          flexWrap: 'wrap',
+                          gap: 6,
                           padding: '8px 12px',
                           background: 'var(--bg-subtle)',
                           fontSize: 12.5,
                         }}
                       >
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
+                        <span
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            fontWeight: 600,
+                            minWidth: 0,
+                            wordBreak: 'break-word',
+                          }}
+                        >
                           {r.success ? (
-                            <CheckCircle2 size={15} style={{ color: 'var(--status-online)' }} />
+                            <CheckCircle2 size={15} style={{ color: 'var(--status-online)', flexShrink: 0 }} />
                           ) : (
-                            <XCircle size={15} style={{ color: 'var(--danger-text)' }} />
+                            <XCircle size={15} style={{ color: 'var(--danger-text)', flexShrink: 0 }} />
                           )}
-                          {r.server_name} ({r.host})
+                          <span>{r.server_name} ({r.host})</span>
                         </span>
                         <span className="mono" style={{ color: 'var(--text-muted)', fontSize: 11.5 }}>
                           耗时 {r.duration_ms}ms · Exit {r.exit_code}

@@ -736,10 +736,18 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                     ))}
                   </div>
 
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      minWidth: 0,
+                      maxWidth: '100%',
+                    }}
+                  >
                     <select
-                      className="select"
-                      style={{ width: 148, height: 32, padding: '0 10px', fontSize: 12.5 }}
+                      className="select mon-filter-select"
                       value={groupFilter}
                       onChange={(e) => setGroupFilter(e.target.value)}
                     >
@@ -751,13 +759,12 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                       ))}
                     </select>
 
-                    <div className="input-with-icon" style={{ width: 220 }}>
+                    <div className="input-with-icon mon-search-box">
                       <span className="input-icon-left">
                         <Search size={13.5} />
                       </span>
                       <input
-                        className="input"
-                        style={{ height: 32, fontSize: 12.5 }}
+                        className="input mon-search-input"
                         placeholder="搜索节点名、IP、主机名或系统..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
@@ -807,9 +814,9 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           id={`mon-node-card-${item.server.id}`}
                         >
                           <div className="mon-node-head">
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
+                            <div className="mon-node-head-main">
                               <HealthScoreGauge score={s?.health_score || 0} level={lvl} size={46} />
-                              <div style={{ minWidth: 0 }}>
+                              <div style={{ flex: '1 1 0%', minWidth: 0 }}>
                                 <div className="mon-node-title-row">
                                   <span
                                     className="mon-node-name"
@@ -833,7 +840,9 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 </div>
                               </div>
                             </div>
-                            <span className="tag-chip">{item.server.group}</span>
+                            <span className="tag-chip mon-node-group-chip" title={item.server.group}>
+                              {item.server.group}
+                            </span>
                           </div>
 
                           {/* OS / Uptime / SLA Strip */}
@@ -848,8 +857,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           </div>
 
                           {s && !s.reachable ? (
-                            <div className="alert alert-error" style={{ margin: '4px 0', padding: '8px 10px' }}>
-                              <span>{s.error || 'SSH 握手或采集超时，主机不可达'}</span>
+                            <div
+                              className="alert alert-error"
+                              style={{ margin: '4px 0', padding: '8px 10px', minWidth: 0 }}
+                            >
+                              <span style={{ minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+                                {s.error || 'SSH 握手或采集超时，主机不可达'}
+                              </span>
                             </div>
                           ) : s ? (
                             <>
@@ -1000,8 +1014,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                 ) : (
                   /* Compact Table View */
                   <div className="mon-panel-card" style={{ padding: 0, overflow: 'hidden' }}>
-                    <div style={{ overflowX: 'auto' }}>
-                      <table className="data-table">
+                    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+                      <table className="data-table mon-compact-fleet-table">
                         <thead>
                           <tr>
                             <th>节点名称 / 地址</th>
@@ -1027,8 +1041,15 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               <tr key={item.server.id}>
                                 <td>
                                   <div
-                                    style={{ fontWeight: 600, cursor: 'pointer' }}
+                                    style={{
+                                      fontWeight: 600,
+                                      cursor: 'pointer',
+                                      overflow: 'hidden',
+                                      textOverflow: 'ellipsis',
+                                      whiteSpace: 'nowrap',
+                                    }}
                                     onClick={() => handleOpenServerInspector(item.server.id)}
+                                    title={item.server.name}
                                   >
                                     {item.server.name}
                                   </div>
@@ -1101,14 +1122,22 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
               <div id="monitor-detail-pane">
                 {/* Node & Time Range Selector Bar */}
                 <div className="mon-detail-topbar">
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      flexWrap: 'wrap',
+                      minWidth: 0,
+                      maxWidth: '100%',
+                    }}
+                  >
                     <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-secondary)' }}>
                       透视节点:
                     </label>
                     <select
                       id="mon-detail-server-select"
-                      className="select"
-                      style={{ width: 260, height: 34, fontWeight: 600 }}
+                      className="select mon-detail-select"
                       value={selectedServerId}
                       onChange={(e) => setSelectedServerId(e.target.value)}
                     >
@@ -1186,9 +1215,20 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           level={snap?.health_level || 'unknown'}
                           size={58}
                         />
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                            <h3 style={{ fontSize: 16.5, fontWeight: 650 }}>{nodeDetail.server.name}</h3>
+                        <div style={{ minWidth: 0, flex: '1 1 0%' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+                            <h3
+                              style={{
+                                fontSize: 16.5,
+                                fontWeight: 650,
+                                minWidth: 0,
+                                maxWidth: '100%',
+                                overflowWrap: 'anywhere',
+                                wordBreak: 'break-word',
+                              }}
+                            >
+                              {nodeDetail.server.name}
+                            </h3>
                             <span className={`tag-chip ${healthBadgeClass(snap?.health_level)}`}>
                               {healthLabel(snap?.health_level)}
                             </span>
@@ -2054,30 +2094,32 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             当前在线交互式终端会话 (who)
                           </h4>
                           {snap.security.active_users && snap.security.active_users.length > 0 ? (
-                            <table className="data-table">
-                              <thead>
-                                <tr>
-                                  <th>登录用户</th>
-                                  <th>终端 TTY</th>
-                                  <th>来源 IP</th>
-                                  <th>登录时间</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {snap.security.active_users.map((u, idx) => (
-                                  <tr key={`${u.user}-${u.tty}-${idx}`}>
-                                    <td className="mono" style={{ fontWeight: 600 }}>
-                                      {u.user}
-                                    </td>
-                                    <td className="mono">{u.tty}</td>
-                                    <td className="mono">{u.from_ip || '本地'}</td>
-                                    <td className="mono" style={{ fontSize: 12 }}>
-                                      {u.login_time || '—'}
-                                    </td>
+                            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+                              <table className="data-table">
+                                <thead>
+                                  <tr>
+                                    <th>登录用户</th>
+                                    <th>终端 TTY</th>
+                                    <th>来源 IP</th>
+                                    <th>登录时间</th>
                                   </tr>
-                                ))}
-                              </tbody>
-                            </table>
+                                </thead>
+                                <tbody>
+                                  {snap.security.active_users.map((u, idx) => (
+                                    <tr key={`${u.user}-${u.tty}-${idx}`}>
+                                      <td className="mono" style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
+                                        {u.user}
+                                      </td>
+                                      <td className="mono" style={{ whiteSpace: 'nowrap' }}>{u.tty}</td>
+                                      <td className="mono" style={{ whiteSpace: 'nowrap' }}>{u.from_ip || '本地'}</td>
+                                      <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                                        {u.login_time || '—'}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
                           ) : (
                             <div className="mon-empty-inline">当前无活跃的交互式 PTS/TTY 登录会话</div>
                           )}
@@ -2114,10 +2156,18 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                     ))}
                   </div>
 
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      minWidth: 0,
+                      maxWidth: '100%',
+                    }}
+                  >
                     <select
-                      className="select"
-                      style={{ width: 210, height: 32, fontSize: 12.5 }}
+                      className="select mon-alert-server-select"
                       value={alertServerFilter}
                       onChange={(e) => setAlertServerFilter(e.target.value)}
                     >
@@ -2152,7 +2202,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                 ) : (
                   <div className="mon-panel-card" style={{ padding: 0, overflow: 'hidden' }}>
                     <div style={{ overflowX: 'auto' }}>
-                      <table className="data-table">
+                      <table className="data-table mon-alerts-table">
                         <thead>
                           <tr>
                             <th>级别 / 状态</th>
@@ -2167,8 +2217,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                         <tbody>
                           {alertsList.map((al) => (
                             <tr key={al.id}>
-                              <td>
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              <td data-label="级别 / 状态">
+                                <div className="mon-alert-badges">
                                   <span
                                     className={`tag-chip ${
                                       al.severity === 'critical' ? 'danger' : 'amber'
@@ -2193,52 +2243,63 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                   </span>
                                 </div>
                               </td>
-                              <td>
-                                <div
-                                  style={{
-                                    fontWeight: 620,
-                                    cursor: 'pointer',
-                                    color: 'var(--accent-teal)',
-                                  }}
-                                  onClick={() => handleOpenServerInspector(al.server_id)}
-                                >
-                                  {al.server_name}
-                                </div>
-                                <div className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
-                                  {al.host}
+                              <td data-label="关联节点">
+                                <div style={{ minWidth: 0 }}>
+                                  <div
+                                    style={{
+                                      fontWeight: 600,
+                                      cursor: 'pointer',
+                                      color: 'var(--accent-teal)',
+                                      overflowWrap: 'anywhere',
+                                      wordBreak: 'break-word',
+                                    }}
+                                    onClick={() => handleOpenServerInspector(al.server_id)}
+                                  >
+                                    {al.server_name}
+                                  </div>
+                                  <div
+                                    className="mono mon-alert-host"
+                                    style={{ fontSize: 11.5, color: 'var(--text-muted)' }}
+                                  >
+                                    {al.host}
+                                  </div>
                                 </div>
                               </td>
-                              <td style={{ maxWidth: 400 }}>
+                              <td data-label="告警详情" className="mon-alert-detail-cell">
                                 <div style={{ fontWeight: 600, marginBottom: 2 }}>{al.title}</div>
                                 <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                   [{al.rule_name}] {al.detail}
                                 </div>
                               </td>
-                              <td className="mono" style={{ fontSize: 12 }}>
+                              <td data-label="当前指标 / 阈值" className="mono" style={{ fontSize: 12 }}>
                                 <div>
-                                  实测: <strong>{al.metric_text}</strong>
+                                  <div>
+                                    实测: <strong>{al.metric_text}</strong>
+                                  </div>
+                                  {al.threshold_text && (
+                                    <div style={{ color: 'var(--text-muted)' }}>
+                                      条件: {al.threshold_text}
+                                    </div>
+                                  )}
                                 </div>
-                                {al.threshold_text && (
-                                  <div style={{ color: 'var(--text-muted)' }}>
-                                    条件: {al.threshold_text}
-                                  </div>
-                                )}
                               </td>
-                              <td className="tabular">{al.occurrences} 次</td>
-                              <td className="mono" style={{ fontSize: 11.5 }}>
-                                <div>触发: {formatDateTime(al.triggered_at)}</div>
-                                {al.resolved_at ? (
-                                  <div style={{ color: 'var(--status-online)' }}>
-                                    恢复: {formatDateTime(al.resolved_at)}
-                                  </div>
-                                ) : (
-                                  <div style={{ color: 'var(--text-muted)' }}>
-                                    持续: {formatDateTime(al.last_seen_at)}
-                                  </div>
-                                )}
+                              <td data-label="累计次数" className="tabular">{al.occurrences} 次</td>
+                              <td data-label="触发 / 恢复时间" className="mono" style={{ fontSize: 11.5 }}>
+                                <div>
+                                  <div>触发: {formatDateTime(al.triggered_at)}</div>
+                                  {al.resolved_at ? (
+                                    <div style={{ color: 'var(--status-online)' }}>
+                                      恢复: {formatDateTime(al.resolved_at)}
+                                    </div>
+                                  ) : (
+                                    <div style={{ color: 'var(--text-muted)' }}>
+                                      持续: {formatDateTime(al.last_seen_at)}
+                                    </div>
+                                  )}
+                                </div>
                               </td>
-                              <td style={{ textAlign: 'right' }}>
-                                <div style={{ display: 'inline-flex', gap: 6 }}>
+                              <td data-label="处置" className="mon-alert-actions-cell" style={{ textAlign: 'right' }}>
+                                <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
                                   {al.status === 'firing' && (
                                     <button
                                       type="button"
@@ -2514,6 +2575,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'space-between',
+                        flexWrap: 'wrap',
+                        gap: 8,
                       }}
                     >
                       <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
@@ -2570,7 +2633,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                   </div>
 
                   <div style={{ overflowX: 'auto' }}>
-                    <table className="data-table">
+                    <table className="data-table mon-policy-table">
                       <thead>
                         <tr>
                           <th style={{ width: 64 }}>启用</th>
@@ -2583,7 +2646,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                       <tbody>
                         {policyRules.map((rule, idx) => (
                           <tr key={rule.kind}>
-                            <td>
+                            <td data-label="启用状态">
                               <input
                                 type="checkbox"
                                 checked={rule.enabled}
@@ -2594,24 +2657,23 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 }}
                               />
                             </td>
-                            <td>
+                            <td data-label="告警规则" className="mon-policy-rule-cell">
                               <div style={{ fontWeight: 600 }}>{rule.name}</div>
                               <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                 {rule.description}
                               </div>
                             </td>
-                            <td>
+                            <td data-label="警告阈值 (Warning)">
                               {rule.state_based ? (
                                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                   状态触发型
                                 </span>
                               ) : (
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                                   <input
                                     type="number"
                                     step="any"
-                                    className="input mono"
-                                    style={{ height: 30, width: 86, padding: '0 8px' }}
+                                    className="input mono mon-rule-input"
                                     value={rule.warning_threshold}
                                     onChange={(e) => {
                                       const next = [...policyRules];
@@ -2628,18 +2690,17 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 </div>
                               )}
                             </td>
-                            <td>
+                            <td data-label="严重阈值 (Critical)">
                               {rule.state_based ? (
                                 <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                   异常即告警
                                 </span>
                               ) : (
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                                   <input
                                     type="number"
                                     step="any"
-                                    className="input mono"
-                                    style={{ height: 30, width: 86, padding: '0 8px' }}
+                                    className="input mono mon-rule-input"
                                     value={rule.critical_threshold}
                                     onChange={(e) => {
                                       const next = [...policyRules];
@@ -2656,14 +2717,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 </div>
                               )}
                             </td>
-                            <td>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                            <td data-label="连续超限防抖">
+                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                                 <input
                                   type="number"
                                   min={1}
                                   max={20}
-                                  className="input mono"
-                                  style={{ height: 30, width: 68, padding: '0 8px' }}
+                                  className="input mono mon-rule-input debounce"
                                   value={rule.consecutive_count}
                                   onChange={(e) => {
                                     const next = [...policyRules];

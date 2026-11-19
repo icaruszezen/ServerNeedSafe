@@ -218,16 +218,15 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           </strong>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', maxWidth: '100%' }}>
           <div className="ai-mode-pill-group">
             {(['suggest', 'standard', 'autonomous'] as AIExecutionMode[]).map((m) => (
               <button
                 key={m}
                 type="button"
-                className={`ai-mode-pill ${m === 'autonomous' ? 'autonomous' : ''} ${
+                className={`ai-mode-pill copilot-mode-pill ${m === 'autonomous' ? 'autonomous' : ''} ${
                   mode === m ? 'active' : ''
                 }`}
-                style={{ height: 22, padding: '0 6px', fontSize: 10.5 }}
                 onClick={async () => {
                   setMode(m);
                   if (session) {
@@ -448,13 +447,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
 
       {/* Compact Composer */}
       <form
-        style={{
-          padding: '10px 12px',
-          borderTop: '1px solid var(--border-default)',
-          display: 'flex',
-          gap: 6,
-          background: 'var(--bg-subtle)',
-        }}
+        className="copilot-composer-form"
         onSubmit={(e) => {
           e.preventDefault();
           void sendCopilotPrompt();
@@ -462,16 +455,14 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
       >
         <input
           id="terminal-copilot-input"
-          className="input"
-          style={{ flex: 1, height: 34, fontSize: 12.5 }}
+          className="input copilot-composer-input"
           placeholder="自然语言转命令或排查当前终端问题..."
           value={input}
           onChange={(e) => setInput(e.target.value)}
         />
         <button
           type="submit"
-          className="btn btn-primary btn-sm"
-          style={{ height: 34, padding: '0 12px' }}
+          className="btn btn-primary btn-sm copilot-composer-send"
           disabled={streaming || !input.trim()}
         >
           <Send size={13} />

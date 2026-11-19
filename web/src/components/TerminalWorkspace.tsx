@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -54,6 +54,8 @@ interface TerminalWorkspaceProps {
 
 interface SinglePaneHandle {
   sendCommand: (cmd: string) => void;
+  sendRaw: (seq: string) => void;
+  focus: () => void;
   reconnect: (trustFp?: string) => void;
   searchNext: (query: string) => void;
   fit: () => void;
@@ -66,6 +68,7 @@ interface SinglePaneProps {
   isWorkspaceVisible: boolean;
   fontSize: number;
   scrollback: number;
+  consumeModifiers: (data: string) => string;
   onStatusChange: (
     tabId: string,
     state: 'connecting' | 'connected' | 'closed' | 'error',
@@ -76,12 +79,20 @@ interface SinglePaneProps {
   registerHandle: (tabId: string, handle: SinglePaneHandle | null) => void;
 }
 
+function resolvePaneFontSize(baseSize: number, containerWidth: number): number {
+  if (containerWidth > 0 && containerWidth < 460 && baseSize >= 13) {
+    return Math.max(12, baseSize - 2);
+  }
+  return baseSize;
+}
+
 const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   tab,
   isActive,
   isWorkspaceVisible,
   fontSize,
   scrollback,
+  consumeModifiers,
   onStatusChange,
   onHostKeyChallenge,
   registerHandle,
@@ -93,6 +104,11 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   const connectedRef = useRef(false);
   const connectSeqRef = useRef(0);
   const recentOutputRef = useRef<string>('');
+  const fontSizeRef = useRef(fontSize);
+  const consumeModifiersRef = useRef(consumeModifiers);
+
+  fontSizeRef.current = fontSize;
+  consumeModifiersRef.current = consumeModifiers;
 
   const connectSession = useCallback(
     async (trustFp = '') => {
@@ -154,9 +170,14 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     const container = mountRef.current;
     if (!container) return;
 
+    const initialFontSize = resolvePaneFontSize(
+      fontSizeRef.current,
+      container.clientWidth || window.innerWidth
+    );
+
     const term = new Terminal({
       cursorBlink: true,
-      fontSize,
+      fontSize: initialFontSize,
       scrollback,
       fontFamily:
         '"JetBrains Mono", "Cascadia Mono", "SF Mono", "Consolas", "Liberation Mono", monospace',
@@ -221,13 +242,18 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
     const dataSub = term.onData((data) => {
       if (connectedRef.current) {
-        terminalClient.sendTerminalInput(tab.tabId, data);
+        const transformed = consumeModifiersRef.current(data);
+        terminalClient.sendTerminalInput(tab.tabId, transformed);
       }
     });
 
-    const ro = new ResizeObserver(() => {
+    const syncFitAndResize = () => {
       if (!container.offsetWidth || !container.offsetHeight) return;
       try {
+        const nextFs = resolvePaneFontSize(fontSizeRef.current, container.offsetWidth);
+        if (term.options.fontSize !== nextFs) {
+          term.options.fontSize = nextFs;
+        }
         fitAddon.fit();
         if (connectedRef.current) {
           terminalClient.resizeTerminal(tab.tabId, term.cols, term.rows);
@@ -235,8 +261,42 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       } catch {
         // Ignore transient resize errors
       }
-    });
+    };
+
+    const ro = new ResizeObserver(syncFitAndResize);
     ro.observe(container);
+
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', syncFitAndResize);
+
+    // Touch-drag scrollback support for mobile screens
+    let touchLastY: number | null = null;
+    let touchRemainder = 0;
+    const onTouchStart = (ev: TouchEvent) => {
+      if (ev.touches.length === 1) {
+        touchLastY = ev.touches[0].clientY;
+        touchRemainder = 0;
+      }
+    };
+    const onTouchMove = (ev: TouchEvent) => {
+      if (ev.touches.length !== 1 || touchLastY === null) return;
+      const curY = ev.touches[0].clientY;
+      const deltaPx = touchLastY - curY + touchRemainder;
+      const linePx = Math.max(14, (term.options.fontSize || 12) * 1.24);
+      const lines = Math.trunc(deltaPx / linePx);
+      if (lines !== 0) {
+        term.scrollLines(lines);
+        touchRemainder = deltaPx - lines * linePx;
+        touchLastY = curY;
+      }
+    };
+    const onTouchEnd = () => {
+      touchLastY = null;
+      touchRemainder = 0;
+    };
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: true });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
 
     registerHandle(tab.tabId, {
       sendCommand: (cmd: string) => {
@@ -244,6 +304,14 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
           terminalClient.sendTerminalInput(tab.tabId, cmd.endsWith('\n') ? cmd : `${cmd}\n`);
           term.focus();
         }
+      },
+      sendRaw: (seq: string) => {
+        if (connectedRef.current && seq) {
+          terminalClient.sendTerminalInput(tab.tabId, seq);
+        }
+      },
+      focus: () => {
+        term.focus();
       },
       reconnect: (trustFp?: string) => {
         term.clear();
@@ -254,11 +322,7 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
         if (query) searchAddon.findNext(query);
       },
       fit: () => {
-        try {
-          fitAddon.fit();
-        } catch {
-          // ignore
-        }
+        syncFitAndResize();
       },
       getRecentOutput: () => recentOutputRef.current,
     });
@@ -270,6 +334,10 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
       connectedRef.current = false;
       recentOutputRef.current = '';
       registerHandle(tab.tabId, null);
+      vv?.removeEventListener('resize', syncFitAndResize);
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', onTouchEnd);
       ro.disconnect();
       dataSub.dispose();
       unsubSocket();
@@ -280,8 +348,11 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   }, [tab.tabId]);
 
   useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.fontSize = fontSize;
+    if (termRef.current && mountRef.current) {
+      termRef.current.options.fontSize = resolvePaneFontSize(
+        fontSize,
+        mountRef.current.offsetWidth || window.innerWidth
+      );
       try {
         fitRef.current?.fit();
       } catch {
@@ -342,12 +413,158 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   const [sideDrawer, setSideDrawer] = useState<'none' | 'sftp' | 'ai'>('none');
   const [showQuickMenu, setShowQuickMenu] = useState(false);
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
+  const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
+  const tabbarRef = useRef<HTMLDivElement | null>(null);
+  const newTabBtnRef = useRef<HTMLButtonElement | null>(null);
+  const quickBtnRef = useRef<HTMLButtonElement | null>(null);
+  const newTabMenuRef = useRef<HTMLDivElement | null>(null);
+  const quickMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [ctrlLatch, setCtrlLatch] = useState(false);
+  const [altLatch, setAltLatch] = useState(false);
+  const ctrlLatchRef = useRef(false);
+  const altLatchRef = useRef(false);
   const [pendingHostKey, setPendingHostKey] = useState<{
     tabId: string;
     info: HostKeyUntrustedInfo;
   } | null>(null);
+
+  const clearModifierLatches = useCallback(() => {
+    ctrlLatchRef.current = false;
+    altLatchRef.current = false;
+    setCtrlLatch(false);
+    setAltLatch(false);
+  }, []);
+
+  const toggleCtrlLatch = useCallback(() => {
+    setCtrlLatch((prev) => {
+      const next = !prev;
+      ctrlLatchRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const toggleAltLatch = useCallback(() => {
+    setAltLatch((prev) => {
+      const next = !prev;
+      altLatchRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const consumeModifiers = useCallback(
+    (raw: string): string => {
+      const hasCtrl = ctrlLatchRef.current;
+      const hasAlt = altLatchRef.current;
+      if (!hasCtrl && !hasAlt) return raw;
+
+      let out = raw;
+      if (hasCtrl && raw.length === 1) {
+        const upper = raw.toUpperCase().charCodeAt(0);
+        if (upper >= 64 && upper <= 95) {
+          out = String.fromCharCode(upper - 64);
+        } else if (raw === ' ') {
+          out = '\x00';
+        }
+      }
+      if (hasAlt) {
+        out = `\x1b${out}`;
+      }
+
+      clearModifierLatches();
+      return out;
+    },
+    [clearModifierLatches]
+  );
+
+  const applyDropdownPosition = useCallback((kind: 'newtab' | 'snippets') => {
+    const triggerEl = kind === 'newtab' ? newTabBtnRef.current : quickBtnRef.current;
+    if (!triggerEl) return;
+
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const btnRect = triggerEl.getBoundingClientRect();
+    const tabbarRect = tabbarRef.current?.getBoundingClientRect();
+
+    if (vw <= 640) {
+      const anchorBottom = tabbarRect ? Math.max(btnRect.bottom, tabbarRect.bottom) : btnRect.bottom;
+      const top = Math.min(Math.round(anchorBottom + 6), Math.max(48, vh - 140));
+      setDropdownStyle({
+        position: 'fixed',
+        top,
+        left: 12,
+        right: 12,
+        width: 'auto',
+        maxHeight: Math.max(120, vh - top - 16),
+      });
+      return;
+    }
+
+    const menuWidth = kind === 'newtab' ? 250 : 290;
+    const anchorBottom =
+      vw <= 768 && tabbarRect ? Math.max(btnRect.bottom, tabbarRect.bottom) : btnRect.bottom;
+    const top = Math.min(Math.round(anchorBottom + 6), Math.max(44, vh - 150));
+    const idealLeft =
+      kind === 'newtab' ? Math.round(btnRect.left) : Math.round(btnRect.right - menuWidth);
+    const clampedLeft = Math.max(12, Math.min(idealLeft, Math.max(12, vw - menuWidth - 12)));
+
+    setDropdownStyle({
+      position: 'fixed',
+      top,
+      left: clampedLeft,
+      right: 'auto',
+      width: Math.min(menuWidth, vw - 24),
+      maxHeight: Math.max(120, Math.min(320, vh - top - 16)),
+    });
+  }, []);
+
+  const updateOpenDropdownPosition = useCallback(() => {
+    const kind = showNewTabMenu ? 'newtab' : showQuickMenu ? 'snippets' : null;
+    if (!kind) return;
+    applyDropdownPosition(kind);
+  }, [showNewTabMenu, showQuickMenu, applyDropdownPosition]);
+
+  useLayoutEffect(() => {
+    if (!showNewTabMenu && !showQuickMenu) return;
+    updateOpenDropdownPosition();
+
+    const onPointerDown = (ev: PointerEvent) => {
+      const target = ev.target as Node | null;
+      if (!target) return;
+      if (
+        newTabBtnRef.current?.contains(target) ||
+        quickBtnRef.current?.contains(target) ||
+        newTabMenuRef.current?.contains(target) ||
+        quickMenuRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setShowNewTabMenu(false);
+      setShowQuickMenu(false);
+    };
+
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        ev.stopPropagation();
+        setShowNewTabMenu(false);
+        setShowQuickMenu(false);
+      }
+    };
+
+    const onReposition = () => updateOpenDropdownPosition();
+
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('resize', onReposition);
+    window.addEventListener('scroll', onReposition, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('resize', onReposition);
+      window.removeEventListener('scroll', onReposition, true);
+    };
+  }, [showNewTabMenu, showQuickMenu, updateOpenDropdownPosition]);
 
   useEffect(() => {
     if (defaultOpenSftp) {
@@ -356,7 +573,29 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     }
   }, [defaultOpenSftp, onConsumeDefaultSftp]);
 
+  useEffect(() => {
+    clearModifierLatches();
+  }, [activeTabId, isVisible, sideDrawer, clearModifierLatches]);
+
   const activeTab = tabs.find((t) => t.tabId === activeTabId) || tabs[0];
+
+  const handleVirtualKey = useCallback(
+    (seq: string, bypassLatch = false) => {
+      if (!activeTab) {
+        clearModifierLatches();
+        return;
+      }
+      const handle = handlesRef.current[activeTab.tabId];
+      const payload = bypassLatch ? seq : consumeModifiers(seq);
+      if (bypassLatch) {
+        clearModifierLatches();
+      }
+      if (!handle) return;
+      handle.sendRaw(payload);
+      handle.focus();
+    },
+    [activeTab, consumeModifiers, clearModifierLatches]
+  );
 
   const refreshTelemetry = useCallback(async (serverId: string) => {
     try {
@@ -448,7 +687,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     <div className="workspace-surface" id="terminal-workspace">
       <div className="terminal-stage">
         {/* Top Multi-Tab Bar */}
-        <div className="terminal-tabbar">
+        <div className="terminal-tabbar" ref={tabbarRef}>
           <div className="terminal-tabs-scroll">
             {tabs.map((t) => {
               const st = tabMeta[t.tabId]?.status || 'connecting';
@@ -489,51 +728,23 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
               );
             })}
 
-            <div style={{ position: 'relative' }}>
-              <button
-                type="button"
-                className="term-tool-btn"
-                onClick={() => setShowNewTabMenu(!showNewTabMenu)}
-                title="新建终端标签页"
-              >
-                <Plus size={13} />
-              </button>
-              {showNewTabMenu && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: 34,
-                    left: 0,
-                    zIndex: 40,
-                    minWidth: 210,
-                    background: 'var(--bg-elevated)',
-                    color: 'var(--text-primary)',
-                    border: '1px solid var(--border-default)',
-                    borderRadius: 8,
-                    boxShadow: 'var(--shadow-md)',
-                    padding: 5,
-                  }}
-                >
-                  {servers.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      className="nav-item"
-                      style={{ padding: '6px 9px', fontSize: 12.5 }}
-                      onClick={() => {
-                        setShowNewTabMenu(false);
-                        onOpenServerTab(s);
-                      }}
-                    >
-                      <span>{s.name}</span>
-                      <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        {s.host}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <button
+              ref={newTabBtnRef}
+              type="button"
+              id="term-new-tab-btn"
+              className={`term-tool-btn ${showNewTabMenu ? 'active' : ''}`}
+              aria-expanded={showNewTabMenu}
+              onClick={() => {
+                setShowQuickMenu(false);
+                if (!showNewTabMenu) {
+                  applyDropdownPosition('newtab');
+                }
+                setShowNewTabMenu((prev) => !prev);
+              }}
+              title="新建终端标签页"
+            >
+              <Plus size={13} />
+            </button>
           </div>
 
           {/* Right Terminal Action Controls */}
@@ -549,19 +760,10 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
                 }}
               >
                 <input
+                  className="term-search-input"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索终端输出..."
-                  style={{
-                    height: 26,
-                    width: 140,
-                    padding: '0 8px',
-                    borderRadius: 5,
-                    border: '1px solid rgba(255,255,255,0.18)',
-                    background: '#0b0e14',
-                    color: '#fff',
-                    fontSize: 12,
-                  }}
                   autoFocus
                 />
               </form>
@@ -575,70 +777,22 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
               <Search size={13} />
             </button>
 
-            <div style={{ position: 'relative' }}>
-              <button
-                type="button"
-                className={`term-tool-btn ${showQuickMenu ? 'active' : ''}`}
-                onClick={() => setShowQuickMenu(!showQuickMenu)}
-                id="term-quick-snippet-btn"
-              >
-                <Zap size={13} /> 快捷指令
-              </button>
-              {showQuickMenu && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: 34,
-                    right: 0,
-                    zIndex: 40,
-                    width: 290,
-                    maxHeight: 320,
-                    overflowY: 'auto',
-                    background: 'var(--bg-elevated)',
-                    color: 'var(--text-primary)',
-                    border: '1px solid var(--border-default)',
-                    borderRadius: 8,
-                    boxShadow: 'var(--shadow-md)',
-                    padding: 6,
-                  }}
-                >
-                  {snippets.map((sn) => (
-                    <button
-                      key={sn.id}
-                      type="button"
-                      className="nav-item"
-                      style={{
-                        flexDirection: 'column',
-                        alignItems: 'flex-start',
-                        gap: 2,
-                        padding: '7px 9px',
-                      }}
-                      onClick={() => {
-                        setShowQuickMenu(false);
-                        if (activeTab) {
-                          handlesRef.current[activeTab.tabId]?.sendCommand(sn.command);
-                        }
-                      }}
-                    >
-                      <span style={{ fontWeight: 600, fontSize: 12.5 }}>{sn.title}</span>
-                      <span
-                        className="mono"
-                        style={{
-                          fontSize: 11,
-                          color: 'var(--text-muted)',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          width: '100%',
-                        }}
-                      >
-                        {sn.command}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <button
+              ref={quickBtnRef}
+              type="button"
+              className={`term-tool-btn ${showQuickMenu ? 'active' : ''}`}
+              aria-expanded={showQuickMenu}
+              onClick={() => {
+                setShowNewTabMenu(false);
+                if (!showQuickMenu) {
+                  applyDropdownPosition('snippets');
+                }
+                setShowQuickMenu((prev) => !prev);
+              }}
+              id="term-quick-snippet-btn"
+            >
+              <Zap size={13} /> 快捷指令
+            </button>
 
             <button
               type="button"
@@ -673,6 +827,111 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Hoisted Popover Menus (outside overflow-x: auto scroll strips) */}
+        {showNewTabMenu && (
+          <div
+            ref={newTabMenuRef}
+            className="term-dropdown-menu term-dropdown-newtab"
+            style={dropdownStyle}
+            role="menu"
+          >
+            {servers.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className="nav-item"
+                style={{
+                  padding: '6px 9px',
+                  fontSize: 12.5,
+                  gap: 8,
+                  minWidth: 0,
+                  maxWidth: '100%',
+                  overflow: 'hidden',
+                }}
+                onClick={() => {
+                  setShowNewTabMenu(false);
+                  onOpenServerTab(s);
+                }}
+              >
+                <span
+                  style={{
+                    flex: '1 1 55%',
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    textAlign: 'left',
+                  }}
+                  title={s.name}
+                >
+                  {s.name}
+                </span>
+                <span
+                  className="mono"
+                  style={{
+                    flex: '0 1 42%',
+                    maxWidth: '45%',
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontSize: 11,
+                    color: 'var(--text-tertiary, var(--text-muted))',
+                    textAlign: 'right',
+                  }}
+                  title={s.host}
+                >
+                  {s.host}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {showQuickMenu && (
+          <div
+            ref={quickMenuRef}
+            className="term-dropdown-menu term-dropdown-snippets"
+            style={dropdownStyle}
+            role="menu"
+          >
+            {snippets.map((sn) => (
+              <button
+                key={sn.id}
+                type="button"
+                className="nav-item"
+                style={{
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  gap: 2,
+                  padding: '7px 9px',
+                }}
+                onClick={() => {
+                  setShowQuickMenu(false);
+                  if (activeTab) {
+                    handlesRef.current[activeTab.tabId]?.sendCommand(sn.command);
+                  }
+                }}
+              >
+                <span style={{ fontWeight: 600, fontSize: 12.5 }}>{sn.title}</span>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--text-muted)',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    width: '100%',
+                  }}
+                >
+                  {sn.command}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Live Server Security & Telemetry Bar */}
         {activeTab && (
@@ -732,6 +991,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
                 isWorkspaceVisible={isVisible}
                 fontSize={settings?.terminal_font_size || 14}
                 scrollback={settings?.terminal_scrollback || 5000}
+                consumeModifiers={consumeModifiers}
                 onStatusChange={handleStatusChange}
                 onHostKeyChallenge={(tid, info) => setPendingHostKey({ tabId: tid, info })}
                 registerHandle={(tid, h) => {
@@ -773,6 +1033,164 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
             </aside>
           )}
         </div>
+
+        {/* Mobile Touch Virtual Key Strip (<= 768px) */}
+        {activeTab && (
+          <div
+            className={`mobile-terminal-keybar ${sideDrawer !== 'none' ? 'hidden-under-drawer' : ''}`}
+            id="mobile-terminal-keybar"
+            role="toolbar"
+            aria-label="移动端终端虚拟功能键"
+          >
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="esc"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x1b', true)}
+            >
+              ESC
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="tab"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\t', true)}
+            >
+              TAB
+            </button>
+            <button
+              type="button"
+              className={`term-vkey-btn ${ctrlLatch ? 'active' : ''}`}
+              data-vkey="ctrl"
+              aria-pressed={ctrlLatch}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                toggleCtrlLatch();
+                handlesRef.current[activeTab.tabId]?.focus();
+              }}
+            >
+              CTRL
+            </button>
+            <button
+              type="button"
+              className={`term-vkey-btn ${altLatch ? 'active' : ''}`}
+              data-vkey="alt"
+              aria-pressed={altLatch}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                toggleAltLatch();
+                handlesRef.current[activeTab.tabId]?.focus();
+              }}
+            >
+              ALT
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="ctrl-c"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x03', true)}
+            >
+              ^C
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="ctrl-d"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x04', true)}
+            >
+              ^D
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="ctrl-l"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x0c', true)}
+            >
+              ^L
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="up"
+              aria-label="上一条命令"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x1b[A', true)}
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="down"
+              aria-label="下一条命令"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x1b[B', true)}
+            >
+              ↓
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="left"
+              aria-label="光标左移"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x1b[D', true)}
+            >
+              ←
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="right"
+              aria-label="光标右移"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('\x1b[C', true)}
+            >
+              →
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="slash"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('/')}
+            >
+              /
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="dash"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('-')}
+            >
+              -
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="pipe"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('|')}
+            >
+              |
+            </button>
+            <button
+              type="button"
+              className="term-vkey-btn"
+              data-vkey="tilde"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => handleVirtualKey('~')}
+            >
+              ~
+            </button>
+          </div>
+        )}
       </div>
 
       {pendingHostKey && (

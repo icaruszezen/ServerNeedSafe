@@ -209,8 +209,7 @@ export const HITLApprovalCard: React.FC<HITLApprovalCardProps> = ({
             {onInjectTerminal && (
               <button
                 type="button"
-                className="btn btn-sm"
-                style={{ height: 24, fontSize: 11, flexShrink: 0 }}
+                className="btn btn-sm copilot-cmd-btn"
                 onClick={() => onInjectTerminal(approval.command!)}
                 title="将该命令直接发送到当前交互终端手动执行"
               >
@@ -230,10 +229,11 @@ export const HITLApprovalCard: React.FC<HITLApprovalCardProps> = ({
                 display: 'flex',
                 alignItems: 'center',
                 gap: 6,
+                wordBreak: 'break-all',
               }}
             >
-              <FileCode2 size={14} style={{ color: 'var(--accent-teal)' }} />
-              目标配置文件: {approval.file_path}
+              <FileCode2 size={14} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+              <span>目标配置文件: {approval.file_path}</span>
             </div>
             {approval.diff_preview && <UnifiedDiffViewer diff={approval.diff_preview} />}
           </div>
@@ -246,7 +246,7 @@ export const HITLApprovalCard: React.FC<HITLApprovalCardProps> = ({
         )}
 
         {isPending && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2, flexWrap: 'wrap' }}>
             <button
               type="button"
               className="btn btn-teal btn-sm"
@@ -285,9 +285,9 @@ export const RunbookProposalCard: React.FC<RunbookProposalCardProps> = ({
   return (
     <div className="ai-proposal-card">
       <div className="ai-proposal-header">
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-          <BookOpenCheck size={15} style={{ color: 'var(--accent-teal)' }} />
-          排障经验沉淀草案：{proposal.title}
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+          <BookOpenCheck size={15} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+          <span style={{ wordBreak: 'break-word' }}>排障经验沉淀草案：{proposal.title}</span>
         </span>
         <span className="tag-chip teal">{proposal.category || '排障技能'}</span>
       </div>
@@ -302,7 +302,9 @@ export const RunbookProposalCard: React.FC<RunbookProposalCardProps> = ({
         </div>
         {proposal.fix_commands?.length > 0 && (
           <div className="copilot-cmd-box">
-            <code style={{ whiteSpace: 'pre-wrap' }}>{proposal.fix_commands.join(' && ')}</code>
+            <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+              {proposal.fix_commands.join(' && ')}
+            </code>
           </div>
         )}
         {isPending ? (
@@ -366,24 +368,14 @@ export const ShellSnippetActionBar: React.FC<{
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {commands.slice(0, 3).map((cmd, idx) => (
-        <div key={idx} className="copilot-cmd-box">
-          <code
-            style={{
-              flex: 1,
-              minWidth: 0,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-            title={cmd}
-          >
+        <div key={idx} className="copilot-cmd-box copilot-snippet-row">
+          <code className="copilot-snippet-code" title={cmd}>
             $ {cmd}
           </code>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+          <div className="copilot-cmd-actions">
             <button
               type="button"
-              className="btn btn-sm"
-              style={{ height: 23, padding: '0 7px', fontSize: 11 }}
+              className="btn btn-sm copilot-cmd-btn"
               onClick={() => {
                 void navigator.clipboard?.writeText(cmd);
                 onNotify?.('命令已复制到剪贴板');
@@ -394,8 +386,7 @@ export const ShellSnippetActionBar: React.FC<{
             {onInject && (
               <button
                 type="button"
-                className="btn btn-teal btn-sm"
-                style={{ height: 23, padding: '0 8px', fontSize: 11 }}
+                className="btn btn-teal btn-sm copilot-cmd-btn"
                 onClick={() => onInject(cmd)}
               >
                 <Play size={11} /> 注入当前终端
