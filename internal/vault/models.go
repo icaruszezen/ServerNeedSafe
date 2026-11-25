@@ -246,6 +246,7 @@ type VaultState struct {
 	Monitor         *MonitorVaultData        `json:"monitor,omitempty"`
 	AISettings      AISettings               `json:"ai_settings"`
 	HostMemories    []HostMemory             `json:"host_memories"`
+	AIMemories      []AIMemoryEntry          `json:"ai_memories"`
 	Runbooks        []AIRunbook              `json:"runbooks"`
 	AISessions      []AIChatSession          `json:"ai_sessions"`
 	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines"`
@@ -317,11 +318,14 @@ func DefaultVaultState() *VaultState {
 		},
 		Monitor: DefaultMonitorVaultData(),
 		AISettings: AISettings{
-			DefaultMode: AIModeStandard,
-			Providers:   []AIProviderConfig{},
-			Patrol:      DefaultPatrolConfig(),
+			DefaultMode:  AIModeStandard,
+			Providers:    []AIProviderConfig{},
+			Patrol:       DefaultPatrolConfig(),
+			AgentsMD:     DefaultAgentsMDConfig(now),
+			MemoryConfig: DefaultAIMemoryConfig(),
 		},
 		HostMemories:    []HostMemory{},
+		AIMemories:      []AIMemoryEntry{},
 		Runbooks:        DefaultStarterRunbooks(now),
 		AISessions:      []AIChatSession{},
 		PatrolBaselines: []ServerBaselineSnapshot{},

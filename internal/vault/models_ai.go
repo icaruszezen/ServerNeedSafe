@@ -24,15 +24,16 @@ const (
 
 // AIProviderConfig stores an LLM endpoint and secret API key strictly inside encrypted vault.sns.
 type AIProviderConfig struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Protocol  AIProtocol `json:"protocol"`
-	BaseURL   string     `json:"base_url"`
-	APIKey    string     `json:"api_key,omitempty"`
-	Model     string     `json:"model"`
-	MaxTokens int        `json:"max_tokens,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Protocol      AIProtocol `json:"protocol"`
+	BaseURL       string     `json:"base_url"`
+	APIKey        string     `json:"api_key,omitempty"`
+	Model         string     `json:"model"`
+	MaxTokens     int        `json:"max_tokens,omitempty"`
+	ContextWindow int        `json:"context_window,omitempty"` // 0 = auto-infer from model name (default 65536)
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // AIProviderView omits the raw API key when listing providers to UI views.
@@ -45,6 +46,7 @@ type AIProviderView struct {
 	APIKeyPreview string     `json:"api_key_preview,omitempty"`
 	Model         string     `json:"model"`
 	MaxTokens     int        `json:"max_tokens"`
+	ContextWindow int        `json:"context_window"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
@@ -74,6 +76,7 @@ func (p AIProviderConfig) ToView() AIProviderView {
 		APIKeyPreview: maskSecretPreview(p.APIKey),
 		Model:         p.Model,
 		MaxTokens:     maxTok,
+		ContextWindow: p.ContextWindow,
 		CreatedAt:     p.CreatedAt,
 		UpdatedAt:     p.UpdatedAt,
 	}
@@ -171,26 +174,85 @@ func (c PatrolConfig) ToView() PatrolConfigView {
 	}
 }
 
-// AISettings holds global single-active LLM selection, providers, default HITL mode, and patrol rules.
+// AgentsMDConfig stores the encrypted global AGENTS.md operational charter for all AI surfaces.
+type AgentsMDConfig struct {
+	Enabled     bool      `json:"enabled"`
+	Content     string    `json:"content"`
+	Revision    int       `json:"revision"`
+	Initialized bool      `json:"initialized,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// AIMemoryConfig tunes prompt injection budgets, rolling session compaction, and automatic memory sync.
+type AIMemoryConfig struct {
+	AgentsMDMaxChars          int     `json:"agents_md_max_chars"`
+	MemoryPromptBudgetChars   int     `json:"memory_prompt_budget_chars"`
+	CompactionTriggerRatio    float64 `json:"compaction_trigger_ratio"`
+	CompactionKeepRecent      int     `json:"compaction_keep_recent"`
+	AutoSyncMonitorToMemory   bool    `json:"auto_sync_monitor_to_memory"`
+	AutoRecordApprovedChanges bool    `json:"auto_record_approved_changes"`
+	Initialized               bool    `json:"initialized,omitempty"`
+}
+
+// AISettings holds global single-active LLM selection, providers, default HITL mode, patrol rules,
+// global AGENTS.md charter, and memory/context budget preferences.
 type AISettings struct {
 	ActiveProviderID string             `json:"active_provider_id"`
 	DefaultMode      AIExecutionMode    `json:"default_mode"`
 	Providers        []AIProviderConfig `json:"providers"`
 	Patrol           PatrolConfig       `json:"patrol"`
+	AgentsMD         AgentsMDConfig     `json:"agents_md"`
+	MemoryConfig     AIMemoryConfig     `json:"memory_config"`
 }
 
-// HostMemory stores objective server environment facts automatically learned by AI (and editable by admin).
+// HostMemory stores objective server environment facts automatically learned by AI or synced from
+// 7x24 monitor snapshots, plus human-maintained operational constraints & notes.
 type HostMemory struct {
-	ServerID         string    `json:"server_id"`
-	ServerName       string    `json:"server_name"`
-	Summary          string    `json:"summary"`
-	OSArch           string    `json:"os_arch,omitempty"`
-	KeyServices      []string  `json:"key_services"`
-	DeployPaths      []string  `json:"deploy_paths"`
-	PortsNote        string    `json:"ports_note,omitempty"`
-	Notes            string    `json:"notes,omitempty"`
-	AutoUpdatedCount int       `json:"auto_updated_count"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ServerID         string     `json:"server_id"`
+	ServerName       string     `json:"server_name"`
+	Summary          string     `json:"summary"`
+	OSArch           string     `json:"os_arch,omitempty"`
+	KeyServices      []string   `json:"key_services"`
+	DeployPaths      []string   `json:"deploy_paths"`
+	PortsNote        string     `json:"ports_note,omitempty"`
+	Constraints      string     `json:"constraints,omitempty"` // Operational redlines / pitfalls for this server
+	Notes            string     `json:"notes,omitempty"`
+	AutoUpdatedCount int        `json:"auto_updated_count"`
+	MonitorSyncedAt  *time.Time `json:"monitor_synced_at,omitempty"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+// AIMemoryEntry stores a durable cross-session operational memory (preference, topology, incident, change, lesson).
+type AIMemoryEntry struct {
+	ID              string     `json:"id"`
+	Scope           string     `json:"scope"` // "global" or "server"
+	ServerIDs       []string   `json:"server_ids"`
+	Category        string     `json:"category"` // "preference", "topology", "incident", "change", "lesson"
+	Title           string     `json:"title"`
+	Content         string     `json:"content"`
+	Tags            []string   `json:"tags"`
+	Pinned          bool       `json:"pinned"`
+	Importance      int        `json:"importance"` // 1..5 (default 3)
+	Source          string     `json:"source"`     // "manual", "ai", "approval"
+	SourceSessionID string     `json:"source_session_id,omitempty"`
+	UseCount        int        `json:"use_count"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+// AIAgentsMDProposal represents an AI-proposed revision to global AGENTS.md with Unified Diff preview,
+// awaiting explicit administrator approval before merging.
+type AIAgentsMDProposal struct {
+	ID              string     `json:"id"`
+	SessionID       string     `json:"session_id"`
+	Reason          string     `json:"reason"`
+	Summary         string     `json:"summary"`
+	ProposedContent string     `json:"proposed_content"`
+	DiffPreview     string     `json:"diff_preview"`
+	Status          string     `json:"status"` // "pending", "accepted", "dismissed"
+	CreatedAt       time.Time  `json:"created_at"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
 }
 
 // AIRunbook stores a reusable troubleshooting SOP confirmed by the administrator.
@@ -273,29 +335,36 @@ type AIChatMessage struct {
 
 // AIChatSession stores an encrypted AI Ops troubleshooting or Terminal Copilot conversation.
 type AIChatSession struct {
-	ID               string              `json:"id"`
-	Title            string              `json:"title"`
-	Scope            string              `json:"scope"` // "center" or "terminal"
-	ServerIDs        []string            `json:"server_ids"`
-	Mode             AIExecutionMode     `json:"mode"`
-	Messages         []AIChatMessage     `json:"messages"`
-	PendingApprovals []AIPendingApproval `json:"pending_approvals"`
-	RunbookProposals []AIRunbookProposal `json:"runbook_proposals"`
-	CreatedAt        time.Time           `json:"created_at"`
-	UpdatedAt        time.Time           `json:"updated_at"`
+	ID                  string               `json:"id"`
+	Title               string               `json:"title"`
+	Scope               string               `json:"scope"` // "center" or "terminal"
+	ServerIDs           []string             `json:"server_ids"`
+	Mode                AIExecutionMode      `json:"mode"`
+	Messages            []AIChatMessage      `json:"messages"`
+	PendingApprovals    []AIPendingApproval  `json:"pending_approvals"`
+	RunbookProposals    []AIRunbookProposal  `json:"runbook_proposals"`
+	AgentsMDProposals   []AIAgentsMDProposal `json:"agents_md_proposals"`
+	CompactedSummary    string               `json:"compacted_summary,omitempty"`
+	CompactedUntilCount int                  `json:"compacted_until_count,omitempty"`
+	CompactedAt         *time.Time           `json:"compacted_at,omitempty"`
+	CompactionCount     int                  `json:"compaction_count,omitempty"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
 }
 
 // AIChatSessionSummary is a lightweight list item for session history sidebars.
 type AIChatSessionSummary struct {
-	ID                   string          `json:"id"`
-	Title                string          `json:"title"`
-	Scope                string          `json:"scope"`
-	ServerIDs            []string        `json:"server_ids"`
-	Mode                 AIExecutionMode `json:"mode"`
-	MessageCount         int             `json:"message_count"`
-	PendingApprovalCount int             `json:"pending_approval_count"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+	ID                           string          `json:"id"`
+	Title                        string          `json:"title"`
+	Scope                        string          `json:"scope"`
+	ServerIDs                    []string        `json:"server_ids"`
+	Mode                         AIExecutionMode `json:"mode"`
+	MessageCount                 int             `json:"message_count"`
+	PendingApprovalCount         int             `json:"pending_approval_count"`
+	PendingAgentsMDProposalCount int             `json:"pending_agents_md_proposal_count"`
+	CompactionCount              int             `json:"compaction_count"`
+	CreatedAt                    time.Time       `json:"created_at"`
+	UpdatedAt                    time.Time       `json:"updated_at"`
 }
 
 func (cs AIChatSession) ToSummary() AIChatSessionSummary {
@@ -305,20 +374,28 @@ func (cs AIChatSession) ToSummary() AIChatSessionSummary {
 			pending++
 		}
 	}
+	pendingAgents := 0
+	for _, p := range cs.AgentsMDProposals {
+		if p.Status == "pending" {
+			pendingAgents++
+		}
+	}
 	sids := cs.ServerIDs
 	if sids == nil {
 		sids = []string{}
 	}
 	return AIChatSessionSummary{
-		ID:                   cs.ID,
-		Title:                cs.Title,
-		Scope:                cs.Scope,
-		ServerIDs:            sids,
-		Mode:                 cs.Mode,
-		MessageCount:         len(cs.Messages),
-		PendingApprovalCount: pending,
-		CreatedAt:            cs.CreatedAt,
-		UpdatedAt:            cs.UpdatedAt,
+		ID:                           cs.ID,
+		Title:                        cs.Title,
+		Scope:                        cs.Scope,
+		ServerIDs:                    sids,
+		Mode:                         cs.Mode,
+		MessageCount:                 len(cs.Messages),
+		PendingApprovalCount:         pending,
+		PendingAgentsMDProposalCount: pendingAgents,
+		CompactionCount:              cs.CompactionCount,
+		CreatedAt:                    cs.CreatedAt,
+		UpdatedAt:                    cs.UpdatedAt,
 	}
 }
 
@@ -384,6 +461,74 @@ func DefaultPatrolConfig() PatrolConfig {
 	}
 }
 
+// DefaultAgentsMDTemplate returns a practical built-in global AGENTS.md SRE operational charter.
+func DefaultAgentsMDTemplate() string {
+	return `# ServerNeedSafe 全局运维智能体规范 (AGENTS.md)
+
+## 1. 排查与诊断习惯
+- **先查已有态势与记忆**：优先结合已注入的主机画像、7×24 实时监控快照与历史记忆判断现状，避免重复执行冗余探测。
+- **证据优先**：涉及性能、网络或安全问题时，优先采用无损只读命令（` + "`ss`" + `、` + "`journalctl`" + `、` + "`systemctl status`" + `、` + "`df -h`" + `、` + "`free -m`" + `）取证，再给出明确根因结论。
+- **按需深度召回**：排查疑似复发问题或跨机关联故障时，主动调用 ` + "`search_memory`" + ` 查阅历史变更与根因记录，或调用 ` + "`get_runbook`" + ` 获取完整标准 SOP。
+
+## 2. 变更安全红线
+- **配置变更先校验再重载**：修改 Nginx、SSH、Systemd 等关键配置前优先使用 ` + "`sftp_write_file`" + ` 展示 Diff，重载前务必验证语法（如 ` + "`nginx -t`" + `、` + "`sshd -t`" + `）。
+- **尊重主机避坑约束**：严格遵守每台主机画像中标注的「运维红线/禁忌（Constraints）」，涉及数据库主节点、核心网关或在线业务重启前必须先说明业务影响范围与回滚方案。
+- **零凭据泄漏**：禁止在回答、记忆条目或 Runbook 中记录任何明文密码、SSH 私钥、API Key 或 Token。
+
+## 3. 记忆沉淀与协同规范
+- 发现新的服务拓扑、非标准部署路径或业务端口用途时，及时调用 ` + "`update_host_memory`" + ` 补充主机画像。
+- 定位典型故障根因、跨机依赖关系或管理员明确提到的运维偏好时，调用 ` + "`save_memory`" + ` 沉淀长期记忆（避免重复条目）。
+- 若管理员提出适用于全部主机的长期规范修订，请调用 ` + "`propose_agents_md_update`" + ` 生成变更对比卡片供审批合入。
+
+## 4. 回答输出风格
+- 使用简洁、结构化的中文 Markdown：**结论先行 → 关键证据 → 建议操作 / 风险提示**。
+- 巡检研判时结合主机既有端口用途与运维备注，避免将已知正常业务端口或预期缓存内存误判为入侵告警。
+`
+}
+
+// DefaultAgentsMDConfig returns the initial enabled global AGENTS.md configuration.
+func DefaultAgentsMDConfig(now time.Time) AgentsMDConfig {
+	return AgentsMDConfig{
+		Enabled:     true,
+		Content:     DefaultAgentsMDTemplate(),
+		Revision:    1,
+		Initialized: true,
+		UpdatedAt:   now,
+	}
+}
+
+// DefaultAIMemoryConfig returns balanced out-of-the-box budgets for AGENTS.md, memory recall, and rolling compaction.
+func DefaultAIMemoryConfig() AIMemoryConfig {
+	return AIMemoryConfig{
+		AgentsMDMaxChars:          6000,
+		MemoryPromptBudgetChars:   4500,
+		CompactionTriggerRatio:    0.70,
+		CompactionKeepRecent:      6,
+		AutoSyncMonitorToMemory:   true,
+		AutoRecordApprovedChanges: true,
+		Initialized:               true,
+	}
+}
+
+// SanitizeAIMemoryConfig clamps user-edited memory/context budget parameters into safe operational bounds.
+func SanitizeAIMemoryConfig(in AIMemoryConfig) AIMemoryConfig {
+	def := DefaultAIMemoryConfig()
+	if in.AgentsMDMaxChars < 1000 || in.AgentsMDMaxChars > 30000 {
+		in.AgentsMDMaxChars = def.AgentsMDMaxChars
+	}
+	if in.MemoryPromptBudgetChars < 1000 || in.MemoryPromptBudgetChars > 24000 {
+		in.MemoryPromptBudgetChars = def.MemoryPromptBudgetChars
+	}
+	if in.CompactionTriggerRatio < 0.40 || in.CompactionTriggerRatio > 0.90 {
+		in.CompactionTriggerRatio = def.CompactionTriggerRatio
+	}
+	if in.CompactionKeepRecent < 2 || in.CompactionKeepRecent > 20 {
+		in.CompactionKeepRecent = def.CompactionKeepRecent
+	}
+	in.Initialized = true
+	return in
+}
+
 // DefaultStarterRunbooks returns built-in operational SOPs seeded in a fresh encrypted vault.
 func DefaultStarterRunbooks(now time.Time) []AIRunbook {
 	return []AIRunbook{
@@ -433,6 +578,7 @@ func EnsureStateDefaults(st *VaultState) {
 	if st == nil {
 		return
 	}
+	now := time.Now().UTC()
 	if st.SchemaVersion < 2 {
 		st.SchemaVersion = 2
 	}
@@ -458,11 +604,22 @@ func EnsureStateDefaults(st *VaultState) {
 	if st.AISettings.Patrol.Webhooks == nil {
 		st.AISettings.Patrol.Webhooks = []WebhookChannel{}
 	}
+	if !st.AISettings.AgentsMD.Initialized && st.AISettings.AgentsMD.Revision == 0 && st.AISettings.AgentsMD.Content == "" {
+		st.AISettings.AgentsMD = DefaultAgentsMDConfig(now)
+	}
+	if !st.AISettings.MemoryConfig.Initialized && st.AISettings.MemoryConfig.AgentsMDMaxChars == 0 {
+		st.AISettings.MemoryConfig = DefaultAIMemoryConfig()
+	} else if clean := SanitizeAIMemoryConfig(st.AISettings.MemoryConfig); clean != st.AISettings.MemoryConfig {
+		st.AISettings.MemoryConfig = clean
+	}
 	if st.HostMemories == nil {
 		st.HostMemories = []HostMemory{}
 	}
+	if st.AIMemories == nil {
+		st.AIMemories = []AIMemoryEntry{}
+	}
 	if st.Runbooks == nil {
-		st.Runbooks = DefaultStarterRunbooks(time.Now().UTC())
+		st.Runbooks = DefaultStarterRunbooks(now)
 	}
 	if st.AISessions == nil {
 		st.AISessions = []AIChatSession{}
@@ -487,7 +644,9 @@ func scrubAIData(st *VaultState) {
 		st.AISettings.Patrol.Webhooks[i].URL = ""
 		st.AISettings.Patrol.Webhooks[i].Secret = ""
 	}
+	st.AISettings.AgentsMD.Content = ""
 	st.HostMemories = nil
+	st.AIMemories = nil
 	st.Runbooks = nil
 	st.AISessions = nil
 	st.PatrolBaselines = nil
@@ -508,7 +667,23 @@ func cloneAIData(dst, src *VaultState) {
 		mc := m
 		mc.KeyServices = slices.Clone(m.KeyServices)
 		mc.DeployPaths = slices.Clone(m.DeployPaths)
+		if m.MonitorSyncedAt != nil {
+			t := *m.MonitorSyncedAt
+			mc.MonitorSyncedAt = &t
+		}
 		dst.HostMemories[i] = mc
+	}
+
+	dst.AIMemories = make([]AIMemoryEntry, len(src.AIMemories))
+	for i, mem := range src.AIMemories {
+		mc := mem
+		mc.ServerIDs = slices.Clone(mem.ServerIDs)
+		mc.Tags = slices.Clone(mem.Tags)
+		if mem.LastUsedAt != nil {
+			t := *mem.LastUsedAt
+			mc.LastUsedAt = &t
+		}
+		dst.AIMemories[i] = mc
 	}
 
 	dst.Runbooks = make([]AIRunbook, len(src.Runbooks))

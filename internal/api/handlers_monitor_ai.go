@@ -229,7 +229,22 @@ func (s *Server) handleGetAIOverview(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	memories, err := s.cfg.Store.ListHostMemories()
+	agentsMD, err := s.cfg.Store.GetAgentsMD()
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	memoryCfg, err := s.cfg.Store.GetAIMemoryConfig()
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	hostMemories, err := s.cfg.Store.ListHostMemories()
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	longMemories, err := s.cfg.Store.ListAIMemories()
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -253,10 +268,14 @@ func (s *Server) handleGetAIOverview(w http.ResponseWriter, r *http.Request) {
 		"default_mode":       defaultMode,
 		"providers":          providers,
 		"presets":            aiops.BuiltinProviderPresets(),
+		"agents_md":          agentsMD,
+		"agents_md_template": vault.DefaultAgentsMDTemplate(),
+		"memory_config":      memoryCfg,
 		"patrol_config":      patrolCfg,
 		"patrol_status":      patrolStatus,
 		"patrol_records":     records,
-		"host_memories":      memories,
+		"host_memories":      hostMemories,
+		"memories":           longMemories,
 		"runbooks":           runbooks,
 		"sessions":           sessions,
 	})
@@ -562,6 +581,143 @@ func (s *Server) handleDeleteHostMemory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSyncHostMemoryFromMonitor(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServerID string `json:"server_id"`
+	}
+	_ = decodeJSON(r, &req, 32*1024)
+	memories, syncedCount, err := s.cfg.Store.SyncHostMemoriesFromMonitor(strings.TrimSpace(req.ServerID), extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"synced_count":  syncedCount,
+		"host_memories": memories,
+	})
+}
+
+func (s *Server) handleUpdateAgentsMD(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled      bool   `json:"enabled"`
+		Content      string `json:"content"`
+		ResetDefault bool   `json:"reset_default"`
+	}
+	if err := decodeJSON(r, &req, 128*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "AGENTS.md 请求参数格式错误")
+		return
+	}
+	cfg, err := s.cfg.Store.UpdateAgentsMD(req.Enabled, req.Content, req.ResetDefault, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"agents_md": cfg,
+	})
+}
+
+func (s *Server) handleUpdateAIMemoryConfig(w http.ResponseWriter, r *http.Request) {
+	var in vault.AIMemoryConfig
+	if err := decodeJSON(r, &in, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "记忆与上下文预算配置参数格式错误")
+		return
+	}
+	cfg, err := s.cfg.Store.UpdateAIMemoryConfig(in, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"memory_config": cfg,
+	})
+}
+
+func (s *Server) handleResolveAgentsMDProposal(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProposalID string `json:"proposal_id"`
+		Accept     bool   `json:"accept"`
+	}
+	if err := decodeJSON(r, &req, 64*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "AGENTS.md 修订提案参数格式错误")
+		return
+	}
+	cfg, prop, err := s.cfg.Store.ResolveAgentsMDProposal(strings.TrimSpace(req.ProposalID), req.Accept, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"agents_md": cfg,
+		"proposal":  prop,
+	})
+}
+
+func (s *Server) handleListAIMemories(w http.ResponseWriter, r *http.Request) {
+	memories, err := s.cfg.Store.ListAIMemories()
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"memories": memories})
+}
+
+func (s *Server) handleUpsertAIMemory(w http.ResponseWriter, r *http.Request) {
+	var in vault.AIMemoryEntry
+	if err := decodeJSON(r, &in, 128*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "长期记忆参数格式错误")
+		return
+	}
+	saved, err := s.cfg.Store.UpsertAIMemory(in, false, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"memory": saved})
+}
+
+func (s *Server) handleDeleteAIMemory(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.cfg.Store.DeleteAIMemory(id, extractClientIP(r)); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleInspectAISessionContext(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inspection, err := s.cfg.AI.InspectSessionContext(id)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"context": inspection})
+}
+
+func (s *Server) handleCompactAISession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Reset bool `json:"reset"`
+	}
+	_ = decodeJSON(r, &req, 16*1024)
+	sess, compInfo, inspection, err := s.cfg.AI.CompactSessionNow(r.Context(), id, req.Reset)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"session":    sess,
+		"compaction": compInfo,
+		"context":    inspection,
+	})
 }
 
 func (s *Server) handleResolveRunbookProposal(w http.ResponseWriter, r *http.Request) {

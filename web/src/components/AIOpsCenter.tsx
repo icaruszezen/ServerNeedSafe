@@ -13,7 +13,6 @@ import {
   CheckCircle2,
   AlertTriangle,
   Sparkles,
-  BookOpen,
   Server as ServerIcon,
   Bell,
   Edit3,
@@ -22,6 +21,8 @@ import {
   KeyRound,
   MessageSquare,
   X,
+  Layers,
+  Minimize2,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -33,12 +34,15 @@ import type {
   AIProviderView,
   AIRunbook,
   AIToolCallRecord,
-  HostMemory,
   PatrolRecord,
   ProviderPreset,
   ServerView,
+  SessionContextInspection,
 } from '../types';
 import {
+  AgentsMDProposalCard,
+  CompactionDivider,
+  ContextInspectorModal,
   FormattedMarkdownText,
   HITLApprovalCard,
   RunbookProposalCard,
@@ -46,6 +50,7 @@ import {
   ToolTraceStep,
   extractShellSnippets,
 } from './AIMessageWidgets';
+import { AIMemoryAgentsTab, type MemorySubSection } from './AIMemoryAgentsTab';
 
 type CenterTab = 'diagnosis' | 'patrol' | 'memory' | 'providers';
 
@@ -97,6 +102,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   onNotify,
 }) => {
   const [subTab, setSubTab] = useState<CenterTab>('diagnosis');
+  const [memorySubSection, setMemorySubSection] = useState<MemorySubSection>('agents_md');
   const [overview, setOverview] = useState<AIOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false);
@@ -111,6 +117,12 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [streamDelta, setStreamDelta] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Context Inspector & Rolling Compaction State
+  const [contextInspection, setContextInspection] = useState<SessionContextInspection | null>(null);
+  const [showContextInspector, setShowContextInspector] = useState(false);
+  const [loadingContext, setLoadingContext] = useState(false);
+  const [compactingContext, setCompactingContext] = useState(false);
 
   // Patrol Config & Execution State
   const [runningPatrol, setRunningPatrol] = useState(false);
@@ -127,29 +139,6 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [webhookDrafts, setWebhookDrafts] = useState<WebhookDraft[]>([]);
   const [testingWebhookIdx, setTestingWebhookIdx] = useState<number | null>(null);
 
-  // Memory & Runbook Editor Modals
-  const [editingMemory, setEditingMemory] = useState<{
-    server_id: string;
-    summary: string;
-    os_arch: string;
-    key_services_csv: string;
-    deploy_paths_csv: string;
-    ports_note: string;
-    notes: string;
-  } | null>(null);
-
-  const [editingRunbook, setEditingRunbook] = useState<{
-    id?: string;
-    title: string;
-    category: string;
-    symptom: string;
-    root_cause: string;
-    diagnostic_steps_text: string;
-    fix_commands_text: string;
-    verification: string;
-    sync_snippet: boolean;
-  } | null>(null);
-
   // Provider Form State
   const [provForm, setProvForm] = useState<{
     id: string;
@@ -159,6 +148,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     api_key: string;
     model: string;
     max_tokens: number;
+    context_window: number;
     set_active: boolean;
   }>({
     id: '',
@@ -168,6 +158,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     api_key: '',
     model: 'deepseek-chat',
     max_tokens: 4096,
+    context_window: 0,
     set_active: true,
   });
   const [testingProvId, setTestingProvId] = useState<string>('');
@@ -300,6 +291,72 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     );
   }, [overview]);
 
+  const refreshSessionContext = useCallback(async (sessionId?: string) => {
+    const sid = sessionId ?? activeSessionId;
+    if (!sid) {
+      setContextInspection(null);
+      return;
+    }
+    setLoadingContext(true);
+    try {
+      const { context } = await api.inspectAISessionContext(sid);
+      setContextInspection(context);
+    } catch {
+      // ignore transient
+    } finally {
+      setLoadingContext(false);
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (activeSession?.id) {
+      void refreshSessionContext(activeSession.id);
+    } else {
+      setContextInspection(null);
+    }
+  }, [activeSession?.id, activeSession?.messages.length, activeSession?.compaction_count, activeSession?.server_ids?.length, refreshSessionContext]);
+
+  const handleCompactSession = async (reset = false) => {
+    if (!activeSession || compactingContext) return;
+    setCompactingContext(true);
+    try {
+      const res = await api.compactAISession(activeSession.id, reset);
+      setActiveSession(res.session);
+      setContextInspection(res.context);
+      if (reset) {
+        onNotify('已清空历史滚动摘要，恢复全量上下文窗口');
+      } else if (res.compaction.triggered) {
+        onNotify(
+          `无损滚动压缩完成（${res.compaction.mode === 'llm' ? '模型摘要' : '本地摘要'}）：估算占用 ${res.compaction.estimated_tokens_before} → ${res.compaction.estimated_tokens_after} tokens`
+        );
+      } else {
+        onNotify('当前对话轮次较少，暂无需压缩');
+      }
+      await loadOverview(activeSession.id);
+    } catch (err: any) {
+      onNotify(err?.message || '上下文压缩失败');
+    } finally {
+      setCompactingContext(false);
+    }
+  };
+
+  const handleResolveAgentsProposal = async (proposalId: string, accept: boolean) => {
+    try {
+      await api.resolveAgentsMDProposal(proposalId, accept);
+      onNotify(
+        accept
+          ? '已批准并合入全局 AGENTS.md，新规范已加密生效'
+          : '已忽略该 AGENTS.md 修订建议'
+      );
+      await loadOverview(activeSession?.id);
+      if (activeSession?.id) {
+        void refreshSessionContext(activeSession.id);
+      }
+    } catch (err: any) {
+      onNotify(err?.message || '处理 AGENTS.md 修订提案失败');
+    }
+  };
+
   const handleSelectSession = async (summary: AIChatSessionSummary) => {
     setMobileSessionsOpen(false);
     setActiveSessionId(summary.id);
@@ -424,9 +481,26 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             onNotify(`AI 已自动更新「${ev.memory.server_name}」主机环境画像`);
           }
           break;
+        case 'memory_saved':
+          if (ev.memory_entry) {
+            onNotify(`已沉淀长期运维记忆《${ev.memory_entry.title}》`);
+          }
+          break;
         case 'runbook_proposed':
           if (ev.proposal) {
             onNotify(`AI 已提炼排障技能草案《${ev.proposal.title}》，请确认是否归档`);
+          }
+          break;
+        case 'agents_md_proposed':
+          if (ev.agents_md_proposal) {
+            onNotify(`AI 提议修订全局 AGENTS.md：《${ev.agents_md_proposal.summary}》，请审阅 Diff`);
+          }
+          break;
+        case 'context_compacted':
+          if (ev.compaction?.triggered) {
+            onNotify(
+              `长会话已自动无损压缩前 ${ev.compaction.compacted_until_count} 条历史（${ev.compaction.estimated_tokens_before} → ${ev.compaction.estimated_tokens_after} tokens）`
+            );
           }
           break;
         case 'session_sync':
@@ -607,6 +681,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       api_key: '',
       model: preset.default_model,
       max_tokens: 4096,
+      context_window: 0,
       set_active: true,
     });
     setTestResultBanner(null);
@@ -621,6 +696,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       api_key: '',
       model: p.model,
       max_tokens: p.max_tokens || 4096,
+      context_window: p.context_window || 0,
       set_active: overview?.active_provider_id === p.id,
     });
     setTestResultBanner(null);
@@ -637,6 +713,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         api_key: provForm.api_key || undefined,
         model: provForm.model,
         max_tokens: provForm.max_tokens,
+        context_window: provForm.context_window || 0,
         set_active: provForm.set_active,
       });
       setProvForm((prev) => ({ ...prev, id: '', api_key: '' }));
@@ -668,63 +745,6 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       onNotify(msg);
     } finally {
       setTestingProvId('');
-    }
-  };
-
-  // --- Memory & Runbook Save Handlers ---
-  const handleSaveMemoryModal = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingMemory) return;
-    try {
-      await api.upsertHostMemory(editingMemory.server_id, {
-        summary: editingMemory.summary,
-        os_arch: editingMemory.os_arch,
-        key_services: editingMemory.key_services_csv
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        deploy_paths: editingMemory.deploy_paths_csv
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        ports_note: editingMemory.ports_note,
-        notes: editingMemory.notes,
-      });
-      setEditingMemory(null);
-      onNotify('主机环境画像记忆已更新');
-      await loadOverview(activeSessionId);
-    } catch (err: any) {
-      onNotify(err?.message || '更新主机记忆失败');
-    }
-  };
-
-  const handleSaveRunbookModal = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingRunbook) return;
-    try {
-      await api.upsertRunbook({
-        id: editingRunbook.id,
-        title: editingRunbook.title,
-        category: editingRunbook.category,
-        symptom: editingRunbook.symptom,
-        root_cause: editingRunbook.root_cause,
-        diagnostic_steps: editingRunbook.diagnostic_steps_text
-          .split('\n')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        fix_commands: editingRunbook.fix_commands_text
-          .split('\n')
-          .map((s) => s.trim())
-          .filter(Boolean),
-        verification: editingRunbook.verification,
-        sync_snippet: editingRunbook.sync_snippet,
-      });
-      if (editingRunbook.sync_snippet) await onRefreshWorkspace();
-      setEditingRunbook(null);
-      onNotify('排障技能 Runbook 已加密归档');
-      await loadOverview(activeSessionId);
-    } catch (err: any) {
-      onNotify(err?.message || '保存 Runbook 失败');
     }
   };
 
@@ -833,9 +853,11 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             className={`ai-subnav-btn ${subTab === 'memory' ? 'active' : ''}`}
             onClick={() => setSubTab('memory')}
           >
-            <BrainCircuit size={14} /> 主机记忆与技能库
+            <BrainCircuit size={14} /> AGENTS.md 与记忆中心
             <span className="nav-badge">
-              {(overview?.host_memories?.length || 0) + (overview?.runbooks?.length || 0)}
+              {(overview?.memories?.length || 0) +
+                (overview?.host_memories?.length || 0) +
+                (overview?.runbooks?.length || 0)}
             </span>
           </button>
           <button
@@ -915,8 +937,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         <span className="tag-chip amber" style={{ fontSize: 10.5, padding: '1px 6px' }}>
                           {s.pending_approval_count} 待授权
                         </span>
+                      ) : (s.pending_agents_md_proposal_count || 0) > 0 ? (
+                        <span className="tag-chip teal" style={{ fontSize: 10.5, padding: '1px 6px' }}>
+                          AGENTS 提案
+                        </span>
                       ) : (
-                        <span>{s.message_count} 条记录</span>
+                        <span>
+                          {s.message_count} 条{s.compaction_count ? ` · 压缩×${s.compaction_count}` : ''}
+                        </span>
                       )}
                     </div>
                   </div>
@@ -994,6 +1022,42 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                {activeSession && (
+                  <>
+                    <button
+                      type="button"
+                      id="ai-context-inspector-btn"
+                      className={`ai-ctx-pill-btn ${contextInspection?.needs_compaction ? 'warn' : ''}`}
+                      onClick={() => {
+                        setShowContextInspector(true);
+                        void refreshSessionContext(activeSession.id);
+                      }}
+                      title="透视当前注入的 AGENTS.md、长期记忆、实时监控快照与上下文 Token 占用"
+                    >
+                      <Layers size={12.5} />
+                      <span>上下文透视</span>
+                      {contextInspection && (
+                        <span className="mono ai-ctx-pct">
+                          {contextInspection.usage_percent.toFixed(0)}%
+                        </span>
+                      )}
+                    </button>
+                    {activeSession.messages.length >= 4 && (
+                      <button
+                        type="button"
+                        id="ai-toolbar-compact-btn"
+                        className="btn btn-ghost btn-sm"
+                        style={{ height: 27, fontSize: 11.5 }}
+                        disabled={compactingContext || streaming}
+                        onClick={() => void handleCompactSession(false)}
+                        title="无损滚动压缩早期历史，保留完整审计记录"
+                      >
+                        <Minimize2 size={12} />
+                        {compactingContext ? '压缩中...' : '压缩'}
+                      </button>
+                    )}
+                  </>
+                )}
                 <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>执行安全级别：</span>
                 <div className="ai-mode-pill-group" role="radiogroup" aria-label="AI 执行权限模式">
                   <button
@@ -1043,7 +1107,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   </div>
                   <h3>原生加密 AI 运维排障助手已就绪</h3>
                   <p>
-                    自动调用只读 SSH 探针与 SFTP 读取分析线上配置，遇到服务重启或配置文件修改时自动生成 Git Unified Diff 供您一键审批。
+                    自动注入全局 AGENTS.md 运维宪章、主机画像 2.0、高优长期记忆与 7×24 实时监控态势；涉及变更时生成 Git Unified Diff 供您一键审批。
                   </p>
                   <div className="ai-empty-prompts-grid">
                     {QUICK_DIAGNOSTIC_PROMPTS.map((q) => (
@@ -1065,14 +1129,34 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                 </div>
               ) : (
                 <>
-                  {activeSession.messages
-                    .filter((m) => m.role === 'user' || m.role === 'assistant')
-                    .map((msg) => {
+                  {(() => {
+                    const compactedUntil = activeSession.compacted_until_count || 0;
+                    const visibleItems = activeSession.messages
+                      .map((msg, rawIdx) => ({ msg, rawIdx }))
+                      .filter((x) => x.msg.role === 'user' || x.msg.role === 'assistant');
+                    let dividerShown = false;
+
+                    return visibleItems.map(({ msg, rawIdx }) => {
+                      const showDividerBefore =
+                        !dividerShown && compactedUntil > 0 && rawIdx >= compactedUntil;
+                      if (showDividerBefore) {
+                        dividerShown = true;
+                      }
+
                       if (msg.role === 'user') {
                         return (
-                          <div key={msg.id} className="ai-msg-row user">
-                            <div className="ai-msg-bubble">{msg.content}</div>
-                          </div>
+                          <React.Fragment key={msg.id}>
+                            {showDividerBefore && (
+                              <CompactionDivider
+                                compactedUntilCount={compactedUntil}
+                                compactionCount={activeSession.compaction_count}
+                                onInspect={() => setShowContextInspector(true)}
+                              />
+                            )}
+                            <div className="ai-msg-row user">
+                              <div className="ai-msg-bubble">{msg.content}</div>
+                            </div>
+                          </React.Fragment>
                         );
                       }
                       const linkedApprovals = (msg.tool_calls || [])
@@ -1081,36 +1165,57 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       const snippets = extractShellSnippets(msg.content || '');
 
                       return (
-                        <div key={msg.id} className="ai-msg-row assistant">
-                          {msg.tool_calls && msg.tool_calls.length > 0 && (
-                            <div className="ai-tool-trace-list">
-                              {msg.tool_calls.map((tc) => (
-                                <ToolTraceStep key={tc.id} tool={tc} />
-                              ))}
-                            </div>
-                          )}
-
-                          {msg.content && (
-                            <div className="ai-msg-bubble">
-                              <FormattedMarkdownText text={msg.content} />
-                            </div>
-                          )}
-
-                          {snippets.length > 0 && (
-                            <ShellSnippetActionBar commands={snippets} onNotify={onNotify} />
-                          )}
-
-                          {linkedApprovals.map((ap) => (
-                            <HITLApprovalCard
-                              key={ap.id}
-                              approval={ap}
-                              busy={streaming}
-                              onDecide={(id, ok) => void handleResolveApproval(id, ok)}
+                        <React.Fragment key={msg.id}>
+                          {showDividerBefore && (
+                            <CompactionDivider
+                              compactedUntilCount={compactedUntil}
+                              compactionCount={activeSession.compaction_count}
+                              onInspect={() => setShowContextInspector(true)}
                             />
-                          ))}
-                        </div>
+                          )}
+                          <div className="ai-msg-row assistant">
+                            {msg.tool_calls && msg.tool_calls.length > 0 && (
+                              <div className="ai-tool-trace-list">
+                                {msg.tool_calls.map((tc) => (
+                                  <ToolTraceStep key={tc.id} tool={tc} />
+                                ))}
+                              </div>
+                            )}
+
+                            {msg.content && (
+                              <div className="ai-msg-bubble">
+                                <FormattedMarkdownText text={msg.content} />
+                              </div>
+                            )}
+
+                            {snippets.length > 0 && (
+                              <ShellSnippetActionBar commands={snippets} onNotify={onNotify} />
+                            )}
+
+                            {linkedApprovals.map((ap) => (
+                              <HITLApprovalCard
+                                key={ap.id}
+                                approval={ap}
+                                busy={streaming}
+                                onDecide={(id, ok) => void handleResolveApproval(id, ok)}
+                              />
+                            ))}
+                          </div>
+                        </React.Fragment>
                       );
-                    })}
+                    });
+                  })()}
+
+                  {/* Render AGENTS.md Revision Proposals attached to this session */}
+                  {(activeSession.agents_md_proposals || []).map((prop) => (
+                    <div key={prop.id} className="ai-msg-row assistant">
+                      <AgentsMDProposalCard
+                        proposal={prop}
+                        busy={streaming}
+                        onResolve={(id, accept) => void handleResolveAgentsProposal(id, accept)}
+                      />
+                    </div>
+                  ))}
 
                   {/* Render Runbook Proposals attached to this session */}
                   {(activeSession.runbook_proposals || []).map((prop) => (
@@ -1451,229 +1556,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         </div>
       )}
 
-      {/* TAB 3: Hybrid Host Memories & Troubleshooting Runbooks */}
+      {/* TAB 3: Integrated Global AGENTS.md & Memory Center */}
       {subTab === 'memory' && (
-        <div className="page-body">
-          <div className="security-grid">
-            {/* Left Column: Per-Server Objective Environment Memories */}
-            <section className="sec-panel">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-                <h3>
-                  <BrainCircuit size={16} style={{ color: 'var(--accent-teal)' }} />
-                  主机环境画像记忆 ({overview?.host_memories?.length || 0})
-                </h3>
-                {servers.length > 0 && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    onClick={() =>
-                      setEditingMemory({
-                        server_id: servers[0].id,
-                        summary: '',
-                        os_arch: '',
-                        key_services_csv: '',
-                        deploy_paths_csv: '',
-                        ports_note: '',
-                        notes: '',
-                      })
-                    }
-                  >
-                    <Plus size={13} /> 手工录入画像
-                  </button>
-                )}
-              </div>
-              <p className="sec-panel-desc">
-                AI 在排障过程中自动增量归档每台服务器的发行版、核心服务与配置路径，下次会话零重复探测。全部加密存储于 vault.sns。
-              </p>
-
-              {!overview?.host_memories?.length ? (
-                <div style={{ padding: '28px 12px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12.5 }}>
-                  暂无主机记忆，发起一次「全面安全基线体检」后 AI 将自动建立画像
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {overview.host_memories.map((m: HostMemory) => (
-                    <div
-                      key={m.server_id}
-                      style={{
-                        padding: '12px 14px',
-                        borderRadius: 8,
-                        border: '1px solid var(--border-default)',
-                        background: 'var(--bg-subtle)',
-                        minWidth: 0,
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
-                          <strong style={{ wordBreak: 'break-word' }}>{m.server_name}</strong>
-                          {m.os_arch && <span className="tag-chip">{m.os_arch}</span>}
-                          {m.auto_updated_count > 0 && (
-                            <span className="tag-chip teal">AI 自学习 {m.auto_updated_count} 次</span>
-                          )}
-                        </div>
-                        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                          <button
-                            type="button"
-                            className="btn btn-ghost btn-sm btn-icon"
-                            onClick={() =>
-                              setEditingMemory({
-                                server_id: m.server_id,
-                                summary: m.summary,
-                                os_arch: m.os_arch || '',
-                                key_services_csv: (m.key_services || []).join(', '),
-                                deploy_paths_csv: (m.deploy_paths || []).join(', '),
-                                ports_note: m.ports_note || '',
-                                notes: m.notes || '',
-                              })
-                            }
-                            title="编辑主机记忆"
-                          >
-                            <Edit3 size={13.5} />
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-ghost btn-sm btn-icon"
-                            style={{ color: 'var(--danger-text)' }}
-                            onClick={async () => {
-                              await api.deleteHostMemory(m.server_id);
-                              onNotify('已清空该主机环境画像');
-                              await loadOverview(activeSessionId);
-                            }}
-                            title="清空记忆"
-                          >
-                            <Trash2 size={13.5} />
-                          </button>
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 12.5, marginTop: 6, color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
-                        {m.summary}
-                      </div>
-                      {(m.key_services?.length > 0 || m.deploy_paths?.length > 0) && (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 8 }}>
-                          {(m.key_services || []).map((svc) => (
-                            <span key={svc} className="tag-chip teal">
-                              {svc}
-                            </span>
-                          ))}
-                          {(m.deploy_paths || []).map((dp) => (
-                            <span key={dp} className="tag-chip mono">
-                              {dp}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-
-            {/* Right Column: Troubleshooting Runbooks (Hermes-inspired Skill Library) */}
-            <section className="sec-panel">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-                <h3>
-                  <BookOpen size={16} style={{ color: 'var(--accent-teal)' }} />
-                  排障技能 Runbook 库 ({overview?.runbooks?.length || 0})
-                </h3>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() =>
-                    setEditingRunbook({
-                      title: '',
-                      category: '安全加固',
-                      symptom: '',
-                      root_cause: '',
-                      diagnostic_steps_text: '',
-                      fix_commands_text: '',
-                      verification: '',
-                      sync_snippet: true,
-                    })
-                  }
-                >
-                  <Plus size={13} /> 新建 Runbook
-                </button>
-              </div>
-              <p className="sec-panel-desc">
-                复杂故障解决后由 AI 提炼草案并经管理员确认入库，AI 对话将自动检索匹配相关 SOP 技能，亦可一键同步至快捷指令。
-              </p>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {(overview?.runbooks || []).map((rb) => (
-                  <div
-                    key={rb.id}
-                    style={{
-                      padding: '12px 14px',
-                      borderRadius: 8,
-                      border: '1px solid var(--border-default)',
-                      background: 'var(--bg-subtle)',
-                      minWidth: 0,
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', minWidth: 0 }}>
-                        <strong style={{ wordBreak: 'break-word' }}>{rb.title}</strong>
-                        <span className="tag-chip teal">{rb.category}</span>
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          style={{ height: 25, fontSize: 11.5 }}
-                          onClick={() => void launchRunbookDiagnosis(rb)}
-                        >
-                          <Play size={11} /> 发起排障
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm btn-icon"
-                          onClick={() =>
-                            setEditingRunbook({
-                              id: rb.id,
-                              title: rb.title,
-                              category: rb.category,
-                              symptom: rb.symptom,
-                              root_cause: rb.root_cause,
-                              diagnostic_steps_text: (rb.diagnostic_steps || []).join('\n'),
-                              fix_commands_text: (rb.fix_commands || []).join('\n'),
-                              verification: rb.verification || '',
-                              sync_snippet: Boolean(rb.linked_snippet_id),
-                            })
-                          }
-                        >
-                          <Edit3 size={13.5} />
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-ghost btn-sm btn-icon"
-                          style={{ color: 'var(--danger-text)' }}
-                          onClick={async () => {
-                            await api.deleteRunbook(rb.id);
-                            onNotify('已删除该 Runbook');
-                            await loadOverview(activeSessionId);
-                          }}
-                        >
-                          <Trash2 size={13.5} />
-                        </button>
-                      </div>
-                    </div>
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>
-                      <strong>适用症状：</strong>
-                      {rb.symptom}
-                    </div>
-                    {rb.fix_commands?.length > 0 && (
-                      <div className="copilot-cmd-box" style={{ marginTop: 8 }}>
-                        <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                          {rb.fix_commands.join(' && ')}
-                        </code>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </section>
-          </div>
-        </div>
+        <AIMemoryAgentsTab
+          overview={overview}
+          servers={servers}
+          initialSection={memorySubSection}
+          onReloadOverview={() => loadOverview(activeSessionId)}
+          onRefreshWorkspace={onRefreshWorkspace}
+          onLaunchRunbook={launchRunbookDiagnosis}
+          onNotify={onNotify}
+        />
       )}
 
       {/* TAB 4: LLM Provider & Gateway Configuration */}
@@ -1797,18 +1690,38 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   </div>
                 </div>
 
-                <div className="field">
-                  <label className="field-label">
-                    API Key 密钥 {provForm.id ? '（留空则保留原加密密钥不变）' : '（本地 Ollama 可留空）'}
-                  </label>
-                  <input
-                    type="password"
-                    className="input mono"
-                    value={provForm.api_key}
-                    onChange={(e) => setProvForm({ ...provForm, api_key: e.target.value })}
-                    placeholder={provForm.id ? '已加密存储，如需更换请输入新密钥' : 'sk-...'}
-                    autoComplete="off"
-                  />
+                <div className="field-row">
+                  <div className="field">
+                    <label className="field-label">
+                      API Key 密钥 {provForm.id ? '（留空则保留原加密密钥不变）' : '（本地 Ollama 可留空）'}
+                    </label>
+                    <input
+                      type="password"
+                      className="input mono"
+                      value={provForm.api_key}
+                      onChange={(e) => setProvForm({ ...provForm, api_key: e.target.value })}
+                      placeholder={provForm.id ? '已加密存储，如需更换请输入新密钥' : 'sk-...'}
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">上下文窗口大小 (Context Window，0=智能推算)</label>
+                    <input
+                      type="number"
+                      className="input mono"
+                      min={0}
+                      max={2000000}
+                      step={4096}
+                      value={provForm.context_window}
+                      onChange={(e) =>
+                        setProvForm({
+                          ...provForm,
+                          context_window: Math.max(0, Number(e.target.value) || 0),
+                        })
+                      }
+                      placeholder="0 (默认按模型推算/65536)"
+                    />
+                  </div>
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
@@ -1837,6 +1750,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           api_key: '',
                           model: '',
                           max_tokens: 4096,
+                          context_window: 0,
                           set_active: true,
                         })
                       }
@@ -1988,6 +1902,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           </span>
                           <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
                             密钥: {p.has_api_key ? p.api_key_preview : '未设置(免密本地)'}
+                            {p.context_window ? ` · 窗口: ${p.context_window.toLocaleString()} tok` : ''}
                           </span>
                         </div>
                       </div>
@@ -2274,201 +2189,20 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         </div>
       )}
 
-      {/* Modal: Edit Host Memory */}
-      {editingMemory && (
-        <div className="modal-backdrop" onClick={() => setEditingMemory(null)}>
-          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>维护主机客观环境画像记忆</h3>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingMemory(null)}>
-                关闭
-              </button>
-            </div>
-            <form onSubmit={handleSaveMemoryModal}>
-              <div className="modal-body">
-                <div className="field">
-                  <label className="field-label">目标服务器</label>
-                  <select
-                    className="select"
-                    value={editingMemory.server_id}
-                    onChange={(e) =>
-                      setEditingMemory({ ...editingMemory, server_id: e.target.value })
-                    }
-                  >
-                    {servers.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.name} ({s.host})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field">
-                  <label className="field-label">业务角色与职责摘要</label>
-                  <input
-                    className="input"
-                    value={editingMemory.summary}
-                    onChange={(e) =>
-                      setEditingMemory({ ...editingMemory, summary: e.target.value })
-                    }
-                    placeholder="例如：生产核心 Nginx 反向代理网关 + Docker 业务节点"
-                    required
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">系统发行版与内核架构</label>
-                  <input
-                    className="input mono"
-                    value={editingMemory.os_arch}
-                    onChange={(e) =>
-                      setEditingMemory({ ...editingMemory, os_arch: e.target.value })
-                    }
-                    placeholder="Debian 12 / Linux 6.1 x86_64"
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">核心服务组件（逗号分隔）</label>
-                  <input
-                    className="input mono"
-                    value={editingMemory.key_services_csv}
-                    onChange={(e) =>
-                      setEditingMemory({ ...editingMemory, key_services_csv: e.target.value })
-                    }
-                    placeholder="nginx, postgresql, redis, docker"
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">关键配置与业务部署路径（逗号分隔）</label>
-                  <input
-                    className="input mono"
-                    value={editingMemory.deploy_paths_csv}
-                    onChange={(e) =>
-                      setEditingMemory({ ...editingMemory, deploy_paths_csv: e.target.value })
-                    }
-                    placeholder="/etc/nginx/conf.d, /srv/app, /var/log/nginx"
-                  />
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button type="button" className="btn" onClick={() => setEditingMemory(null)}>
-                  取消
-                </button>
-                <button type="submit" className="btn btn-primary">
-                  加密保存主机画像
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: Create/Edit Runbook */}
-      {editingRunbook && (
-        <div className="modal-backdrop" onClick={() => setEditingRunbook(null)}>
-          <div className="modal-panel wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>{editingRunbook.id ? '编辑排障技能 Runbook' : '新建排障技能 Runbook'}</h3>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingRunbook(null)}>
-                关闭
-              </button>
-            </div>
-            <form onSubmit={handleSaveRunbookModal}>
-              <div className="modal-body">
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">技能标题</label>
-                    <input
-                      className="input"
-                      value={editingRunbook.title}
-                      onChange={(e) =>
-                        setEditingRunbook({ ...editingRunbook, title: e.target.value })
-                      }
-                      required
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">所属分类</label>
-                    <input
-                      className="input"
-                      value={editingRunbook.category}
-                      onChange={(e) =>
-                        setEditingRunbook({ ...editingRunbook, category: e.target.value })
-                      }
-                    />
-                  </div>
-                </div>
-                <div className="field">
-                  <label className="field-label">适用故障症状</label>
-                  <input
-                    className="input"
-                    value={editingRunbook.symptom}
-                    onChange={(e) =>
-                      setEditingRunbook({ ...editingRunbook, symptom: e.target.value })
-                    }
-                    required
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">典型根因说明</label>
-                  <input
-                    className="input"
-                    value={editingRunbook.root_cause}
-                    onChange={(e) =>
-                      setEditingRunbook({ ...editingRunbook, root_cause: e.target.value })
-                    }
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">只读诊断步骤（每行一条命令或说明）</label>
-                  <textarea
-                    className="input mono"
-                    rows={3}
-                    style={{ height: 'auto', padding: 10 }}
-                    value={editingRunbook.diagnostic_steps_text}
-                    onChange={(e) =>
-                      setEditingRunbook({
-                        ...editingRunbook,
-                        diagnostic_steps_text: e.target.value,
-                      })
-                    }
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label">推荐处置命令（每行一条命令）</label>
-                  <textarea
-                    className="input mono"
-                    rows={3}
-                    style={{ height: 'auto', padding: 10 }}
-                    value={editingRunbook.fix_commands_text}
-                    onChange={(e) =>
-                      setEditingRunbook({
-                        ...editingRunbook,
-                        fix_commands_text: e.target.value,
-                      })
-                    }
-                  />
-                </div>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
-                  <input
-                    type="checkbox"
-                    checked={editingRunbook.sync_snippet}
-                    onChange={(e) =>
-                      setEditingRunbook({ ...editingRunbook, sync_snippet: e.target.checked })
-                    }
-                  />
-                  同时将该技能的推荐处置命令同步至「快捷指令」库
-                </label>
-              </div>
-              <div className="modal-footer">
-                <button type="button" className="btn" onClick={() => setEditingRunbook(null)}>
-                  取消
-                </button>
-                <button type="submit" className="btn btn-primary">
-                  加密保存 Runbook
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {/* Modal: Session Context Inspector & Manual Compaction */}
+      {showContextInspector && (
+        <ContextInspectorModal
+          inspection={contextInspection}
+          loading={loadingContext}
+          compacting={compactingContext}
+          onRefresh={() => void refreshSessionContext(activeSession?.id)}
+          onCompact={(reset) => void handleCompactSession(Boolean(reset))}
+          onClose={() => setShowContextInspector(false)}
+          onOpenAgentsMD={() => {
+            setMemorySubSection('agents_md');
+            setSubTab('memory');
+          }}
+        />
       )}
     </div>
   );
