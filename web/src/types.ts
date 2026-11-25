@@ -640,6 +640,7 @@ export interface AIProviderView {
   api_key_preview?: string;
   model: string;
   max_tokens: number;
+  context_window?: number;
   created_at: string;
   updated_at: string;
 }
@@ -719,6 +720,22 @@ export interface PatrolRecord {
   unread: boolean;
 }
 
+export interface AgentsMDConfig {
+  enabled: boolean;
+  content: string;
+  revision: number;
+  updated_at: string;
+}
+
+export interface AIMemoryConfig {
+  agents_md_max_chars: number;
+  memory_prompt_budget_chars: number;
+  compaction_trigger_ratio: number;
+  compaction_keep_recent: number;
+  auto_sync_monitor_to_memory: boolean;
+  auto_record_approved_changes: boolean;
+}
+
 export interface HostMemory {
   server_id: string;
   server_name: string;
@@ -727,9 +744,43 @@ export interface HostMemory {
   key_services: string[];
   deploy_paths: string[];
   ports_note?: string;
+  constraints?: string;
   notes?: string;
   auto_updated_count: number;
+  monitor_synced_at?: string;
   updated_at: string;
+}
+
+export type AIMemoryCategory = 'preference' | 'topology' | 'incident' | 'change' | 'lesson';
+
+export interface AIMemoryEntry {
+  id: string;
+  scope: 'global' | 'server';
+  server_ids: string[];
+  category: AIMemoryCategory;
+  title: string;
+  content: string;
+  tags: string[];
+  pinned: boolean;
+  importance: number;
+  source: 'manual' | 'ai' | 'approval' | string;
+  source_session_id?: string;
+  use_count: number;
+  last_used_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIAgentsMDProposal {
+  id: string;
+  session_id: string;
+  reason: string;
+  summary: string;
+  proposed_content: string;
+  diff_preview: string;
+  status: 'pending' | 'accepted' | 'dismissed';
+  created_at: string;
+  resolved_at?: string;
 }
 
 export interface AIRunbook {
@@ -812,6 +863,8 @@ export interface AIChatSessionSummary {
   mode: AIExecutionMode;
   message_count: number;
   pending_approval_count: number;
+  pending_agents_md_proposal_count?: number;
+  compaction_count?: number;
   updated_at: string;
 }
 
@@ -824,8 +877,96 @@ export interface AIChatSession {
   messages: AIChatMessage[];
   pending_approvals: AIPendingApproval[];
   runbook_proposals: AIRunbookProposal[];
+  agents_md_proposals?: AIAgentsMDProposal[];
+  compacted_summary?: string;
+  compacted_until_count?: number;
+  compacted_at?: string;
+  compaction_count?: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface ContextHostItem {
+  server_id: string;
+  server_name: string;
+  has_memory: boolean;
+  summary?: string;
+  os_arch?: string;
+  key_services?: string[];
+  has_constraints: boolean;
+  constraints?: string;
+  ports_note?: string;
+  monitor_synced_at?: string;
+}
+
+export interface ContextMemoryItem {
+  id: string;
+  scope: 'global' | 'server' | string;
+  category: AIMemoryCategory | string;
+  title: string;
+  preview: string;
+  pinned: boolean;
+  importance: number;
+  source: string;
+  server_ids?: string[];
+}
+
+export interface ContextMonitorItem {
+  server_id: string;
+  server_name: string;
+  reachable: boolean;
+  health_level: string;
+  cpu_percent: number;
+  mem_percent: number;
+  disk_percent: number;
+  latency_ms: number;
+  alert_count: number;
+  collected_at: string;
+}
+
+export interface CompactionInfo {
+  triggered: boolean;
+  mode: 'llm' | 'fallback' | 'noop' | 'reset';
+  compacted_until_count: number;
+  total_messages: number;
+  compaction_count: number;
+  summary_chars: number;
+  estimated_tokens_before: number;
+  estimated_tokens_after: number;
+  compacted_at?: string;
+}
+
+export interface SessionContextInspection {
+  session_id: string;
+  provider_name?: string;
+  model?: string;
+  agents_md_enabled: boolean;
+  agents_md_revision: number;
+  agents_md_chars: number;
+  agents_md_max_chars: number;
+  agents_md_truncated: boolean;
+  host_memories: ContextHostItem[];
+  injected_memories: ContextMemoryItem[];
+  total_memories_count: number;
+  memory_budget_chars: number;
+  memory_used_chars: number;
+  live_monitors: ContextMonitorItem[];
+  firing_alerts_count: number;
+  runbook_count: number;
+  total_messages: number;
+  uncompacted_messages: number;
+  compacted_until_count: number;
+  compaction_count: number;
+  compacted_at?: string;
+  compacted_summary?: string;
+  estimated_system_tokens: number;
+  estimated_summary_tokens: number;
+  estimated_history_tokens: number;
+  estimated_total_tokens: number;
+  context_window_tokens: number;
+  compaction_threshold_tokens: number;
+  usage_percent: number;
+  needs_compaction: boolean;
 }
 
 export interface AIOverviewResponse {
@@ -833,10 +974,14 @@ export interface AIOverviewResponse {
   default_mode: AIExecutionMode;
   providers: AIProviderView[];
   presets: ProviderPreset[];
+  agents_md: AgentsMDConfig;
+  agents_md_template: string;
+  memory_config: AIMemoryConfig;
   patrol_config: PatrolConfigView;
   patrol_status: PatrolStatusView;
   patrol_records: PatrolRecord[];
   host_memories: HostMemory[];
+  memories: AIMemoryEntry[];
   runbooks: AIRunbook[];
   sessions: AIChatSessionSummary[];
 }
@@ -848,7 +993,10 @@ export interface AIStreamEvent {
     | 'tool_result'
     | 'approval_required'
     | 'memory_updated'
+    | 'memory_saved'
     | 'runbook_proposed'
+    | 'agents_md_proposed'
+    | 'context_compacted'
     | 'session_sync'
     | 'done'
     | 'error';
@@ -856,8 +1004,12 @@ export interface AIStreamEvent {
   tool?: AIToolCallRecord;
   approval?: AIPendingApproval;
   memory?: HostMemory;
+  memory_entry?: AIMemoryEntry;
   proposal?: AIRunbookProposal;
+  agents_md_proposal?: AIAgentsMDProposal;
+  compaction?: CompactionInfo;
   session?: AIChatSession;
   error?: string;
 }
+
 

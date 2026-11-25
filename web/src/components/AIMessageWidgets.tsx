@@ -11,11 +11,22 @@ import {
   Sparkles,
   Play,
   Copy,
+  FileText,
+  Layers,
+  Minimize2,
+  RotateCcw,
+  RefreshCw,
+  Pin,
+  AlertTriangle,
+  Activity,
+  BrainCircuit,
 } from 'lucide-react';
 import type {
+  AIAgentsMDProposal,
   AIPendingApproval,
   AIRunbookProposal,
   AIToolCallRecord,
+  SessionContextInspection,
 } from '../types';
 
 const TOOL_LABELS: Record<string, string> = {
@@ -25,7 +36,26 @@ const TOOL_LABELS: Record<string, string> = {
   sftp_read_file: 'SFTP 读取远程文件',
   sftp_write_file: 'SFTP 修改远程配置',
   update_host_memory: '归档主机环境画像',
+  save_memory: '沉淀长期运维记忆',
+  delete_memory: '清理过期长期记忆',
+  search_memory: '深度检索历史记忆',
+  get_runbook: '调阅 Runbook 详情',
+  propose_agents_md_update: '提议修订 AGENTS.md',
   propose_runbook: '提炼排障技能草案',
+};
+
+export const MEMORY_CATEGORY_LABELS: Record<string, string> = {
+  preference: '管理员偏好',
+  topology: '架构拓扑',
+  incident: '故障根因',
+  change: '重要变更',
+  lesson: '运维经验',
+};
+
+export const MEMORY_SOURCE_LABELS: Record<string, string> = {
+  manual: '人工录入',
+  ai: 'AI 自学习',
+  approval: '审批变更自动沉淀',
 };
 
 export const UnifiedDiffViewer: React.FC<{ diff: string }> = ({ diff }) => {
@@ -62,6 +92,9 @@ export const ToolTraceStep: React.FC<{ tool: AIToolCallRecord }> = ({ tool }) =>
     if (parsed.command) argSummary = parsed.command;
     else if (parsed.path) argSummary = parsed.path;
     else if (parsed.title) argSummary = parsed.title;
+    else if (parsed.query) argSummary = parsed.query;
+    else if (parsed.runbook_id) argSummary = parsed.runbook_id;
+    else if (parsed.memory_id) argSummary = parsed.memory_id;
     else if (parsed.summary) argSummary = parsed.summary;
   } catch {
     argSummary = '';
@@ -456,13 +489,495 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
         }
         const trimmed = seg.trim();
         if (!trimmed) return null;
+        const lines = trimmed.split('\n');
         return (
-          <div key={idx} style={{ whiteSpace: 'pre-wrap', lineHeight: 1.62 }}>
-            {renderInlineFormatting(trimmed)}
+          <div key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 3, lineHeight: 1.62 }}>
+            {lines.map((line, li) => {
+              const h1 = line.match(/^#\s+(.+)$/);
+              if (h1) {
+                return (
+                  <div
+                    key={li}
+                    style={{
+                      fontSize: 15.5,
+                      fontWeight: 700,
+                      color: 'var(--text-primary)',
+                      paddingBottom: 4,
+                      marginTop: li > 0 ? 6 : 0,
+                      borderBottom: '1px solid var(--border-subtle)',
+                    }}
+                  >
+                    {renderInlineFormatting(h1[1])}
+                  </div>
+                );
+              }
+              const h2 = line.match(/^##\s+(.+)$/);
+              if (h2) {
+                return (
+                  <div
+                    key={li}
+                    style={{
+                      fontSize: 14,
+                      fontWeight: 680,
+                      color: 'var(--text-primary)',
+                      marginTop: li > 0 ? 8 : 2,
+                    }}
+                  >
+                    {renderInlineFormatting(h2[1])}
+                  </div>
+                );
+              }
+              const h3 = line.match(/^###\s+(.+)$/);
+              if (h3) {
+                return (
+                  <div
+                    key={li}
+                    style={{
+                      fontSize: 13.2,
+                      fontWeight: 650,
+                      color: 'var(--accent-teal)',
+                      marginTop: li > 0 ? 6 : 2,
+                    }}
+                  >
+                    {renderInlineFormatting(h3[1])}
+                  </div>
+                );
+              }
+              if (line.trim() === '') {
+                return <div key={li} style={{ height: 4 }} />;
+              }
+              return (
+                <div key={li} style={{ whiteSpace: 'pre-wrap' }}>
+                  {renderInlineFormatting(line)}
+                </div>
+              );
+            })}
           </div>
         );
       })}
     </div>
   );
 };
+
+interface AgentsMDProposalCardProps {
+  proposal: AIAgentsMDProposal;
+  busy?: boolean;
+  onResolve: (proposalId: string, accept: boolean) => void;
+}
+
+export const AgentsMDProposalCard: React.FC<AgentsMDProposalCardProps> = ({
+  proposal,
+  busy,
+  onResolve,
+}) => {
+  const isPending = proposal.status === 'pending';
+  const isAccepted = proposal.status === 'accepted';
+  return (
+    <div
+      className={`ai-proposal-card ai-agents-proposal-card ${
+        isAccepted ? 'resolved-approved' : proposal.status === 'dismissed' ? 'resolved-rejected' : ''
+      }`}
+      data-agents-proposal-id={proposal.id}
+    >
+      <div className="ai-proposal-header">
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+          <FileText size={15} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+          <span style={{ wordBreak: 'break-word' }}>
+            全局 AGENTS.md 规范修订建议：{proposal.summary}
+          </span>
+        </span>
+        <span className={`tag-chip ${isPending ? 'amber' : isAccepted ? 'teal' : ''}`}>
+          {isPending ? '待审阅合入' : isAccepted ? '已合入生效' : '已忽略'}
+        </span>
+      </div>
+      <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 9, fontSize: 12.5 }}>
+        <div style={{ color: 'var(--text-secondary)' }}>
+          <strong>修订原因：</strong>
+          {proposal.reason}
+        </div>
+        {proposal.diff_preview && <UnifiedDiffViewer diff={proposal.diff_preview} />}
+        {isPending ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn btn-teal btn-sm"
+              disabled={busy}
+              onClick={() => onResolve(proposal.id, true)}
+            >
+              <CheckCircle2 size={13.5} /> 批准并合入全局 AGENTS.md
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy}
+              onClick={() => onResolve(proposal.id, false)}
+            >
+              <XCircle size={13.5} /> 忽略此建议
+            </button>
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            {isAccepted
+              ? '已加密合入全局 AGENTS.md，后续所有会话与后台巡检立即生效'
+              : '已忽略该 AGENTS.md 修订建议，现有规范保持不变'}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export const CompactionDivider: React.FC<{
+  compactedUntilCount: number;
+  compactionCount?: number;
+  onInspect: () => void;
+}> = ({ compactedUntilCount, compactionCount, onInspect }) => (
+  <div className="ai-compaction-divider" role="separator">
+    <span className="ai-compaction-line" />
+    <button
+      type="button"
+      className="ai-compaction-pill"
+      onClick={onInspect}
+      title="点击打开上下文透视查看无损滚动摘要全文"
+    >
+      <Minimize2 size={11.5} />
+      <span>
+        以上 {compactedUntilCount} 条历史已无损压缩为滚动摘要
+        {compactionCount && compactionCount > 1 ? `（第 ${compactionCount} 次）` : ''}
+      </span>
+    </button>
+    <span className="ai-compaction-line" />
+  </div>
+);
+
+interface ContextInspectorModalProps {
+  inspection: SessionContextInspection | null;
+  loading?: boolean;
+  compacting?: boolean;
+  onRefresh: () => void;
+  onCompact: (reset?: boolean) => void;
+  onClose: () => void;
+  onOpenAgentsMD?: () => void;
+}
+
+export const ContextInspectorModal: React.FC<ContextInspectorModalProps> = ({
+  inspection,
+  loading,
+  compacting,
+  onRefresh,
+  onCompact,
+  onClose,
+  onOpenAgentsMD,
+}) => {
+  const [summaryExpanded, setSummaryExpanded] = useState(true);
+  const usagePct = Math.min(100, Math.max(0, inspection?.usage_percent ?? 0));
+  const barTone =
+    usagePct >= 75 ? 'var(--danger-text)' : usagePct >= 55 ? 'var(--amber-text)' : 'var(--accent-teal)';
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal-panel wide"
+        id="ai-context-inspector-modal"
+        style={{ maxWidth: 820 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Layers size={16} style={{ color: 'var(--accent-teal)' }} />
+            <h3 style={{ margin: 0 }}>对话上下文透视与滚动压缩 (Context Inspector)</h3>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={loading}
+              onClick={onRefresh}
+              title="重新测算当前注入上下文"
+            >
+              <RefreshCw size={13} /> 刷新
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
+              关闭
+            </button>
+          </div>
+        </div>
+
+        <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {loading && !inspection ? (
+            <div style={{ padding: '28px 12px', textAlign: 'center', color: 'var(--text-muted)' }}>
+              正在测算当前会话注入上下文与 Token 预算...
+            </div>
+          ) : !inspection ? (
+            <div style={{ padding: '28px 12px', textAlign: 'center', color: 'var(--text-muted)' }}>
+              当前暂无活跃会话，发送首条指令或新建会话后即可透视注入上下文。
+            </div>
+          ) : (
+            <>
+              {/* Token Budget & Compaction Meter */}
+              <div className="ai-ctx-card">
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 8,
+                    marginBottom: 8,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <strong style={{ fontSize: 13 }}>上下文窗口占用估算</strong>
+                    {inspection.model && (
+                      <span className="tag-chip mono" style={{ fontSize: 11 }}>
+                        {inspection.provider_name ? `${inspection.provider_name} · ` : ''}
+                        {inspection.model}
+                      </span>
+                    )}
+                    {inspection.needs_compaction && (
+                      <span className="tag-chip amber">建议压缩上下文</span>
+                    )}
+                  </div>
+                  <span className="mono" style={{ fontSize: 12, fontWeight: 620, color: barTone }}>
+                    ~{inspection.estimated_total_tokens.toLocaleString()} /{' '}
+                    {inspection.context_window_tokens.toLocaleString()} tokens ({usagePct.toFixed(1)}%)
+                  </span>
+                </div>
+
+                <div className="ai-ctx-progress-track">
+                  <div
+                    className="ai-ctx-progress-fill"
+                    style={{ width: `${usagePct}%`, background: barTone }}
+                  />
+                </div>
+
+                <div className="ai-ctx-token-breakdown">
+                  <span>System + AGENTS.md + 记忆: ~{inspection.estimated_system_tokens.toLocaleString()} tok</span>
+                  <span>滚动摘要: ~{inspection.estimated_summary_tokens.toLocaleString()} tok</span>
+                  <span>未压缩对话 ({inspection.uncompacted_messages}/{inspection.total_messages} 条): ~{inspection.estimated_history_tokens.toLocaleString()} tok</span>
+                  <span>自动压缩阈值: ~{inspection.compaction_threshold_tokens.toLocaleString()} tok</span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    id="ai-ctx-compact-now-btn"
+                    className="btn btn-teal btn-sm"
+                    disabled={compacting || inspection.total_messages < 4}
+                    onClick={() => onCompact(false)}
+                  >
+                    <Minimize2 size={13} />
+                    {compacting ? '正在压缩生成摘要...' : '立即无损压缩历史上下文'}
+                  </button>
+                  {inspection.compacted_summary && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={compacting}
+                      onClick={() => onCompact(true)}
+                    >
+                      <RotateCcw size={13} /> 清空摘要恢复全量历史
+                    </button>
+                  )}
+                  <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                    原始完整消息永久保存在加密保险库中，压缩仅优化发给大模型的有效上下文。
+                  </span>
+                </div>
+              </div>
+
+              {/* Global AGENTS.md & Summary Row */}
+              <div className="ai-ctx-grid">
+                <div className="ai-ctx-card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <strong style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <FileText size={14} style={{ color: 'var(--accent-teal)' }} />
+                      全局 AGENTS.md 运维宪章
+                    </strong>
+                    <span className={`tag-chip ${inspection.agents_md_enabled ? 'teal' : ''}`}>
+                      {inspection.agents_md_enabled
+                        ? `已注入 · v${inspection.agents_md_revision || 1}`
+                        : '未启用'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+                    {inspection.agents_md_enabled ? (
+                      <>
+                        当前注入 <span className="mono">{inspection.agents_md_chars}</span> /{' '}
+                        <span className="mono">{inspection.agents_md_max_chars}</span> 字符
+                        {inspection.agents_md_truncated && (
+                          <span style={{ color: 'var(--amber-text)', marginLeft: 6 }}>
+                            （超出预算已截断）
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      '已关闭或内容为空，仅应用系统级安全护栏。'
+                    )}
+                  </div>
+                  {onOpenAgentsMD && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      style={{ marginTop: 8 }}
+                      onClick={() => {
+                        onClose();
+                        onOpenAgentsMD();
+                      }}
+                    >
+                      前往编辑全局 AGENTS.md
+                    </button>
+                  )}
+                </div>
+
+                <div className="ai-ctx-card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <strong style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <BrainCircuit size={14} style={{ color: 'var(--accent-teal)' }} />
+                      长期记忆与技能索引
+                    </strong>
+                    <span className="tag-chip teal">
+                      直注 {inspection.injected_memories.length} / 总计 {inspection.total_memories_count} 条
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+                    记忆预算使用 <span className="mono">{inspection.memory_used_chars}</span> /{' '}
+                    <span className="mono">{inspection.memory_budget_chars}</span> 字符 · Runbook 技能索引{' '}
+                    <span className="mono">{inspection.runbook_count}</span> 项（AI 可通过{' '}
+                    <code className="mono">search_memory</code> / <code className="mono">get_runbook</code> 按需深度召回）
+                  </div>
+                </div>
+              </div>
+
+              {/* Target Hosts & Live Telemetry */}
+              <div className="ai-ctx-card">
+                <strong style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                  <Activity size={14} style={{ color: 'var(--accent-teal)' }} />
+                  目标主机画像与 7×24 实时监控态势 ({inspection.host_memories.length} 台 · 活跃告警{' '}
+                  {inspection.firing_alerts_count} 条)
+                </strong>
+                {inspection.host_memories.length === 0 ? (
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>当前会话未绑定特定服务器。</div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {inspection.host_memories.map((hm) => {
+                      const live = inspection.live_monitors.find((m) => m.server_id === hm.server_id);
+                      return (
+                        <div key={hm.server_id} className="ai-ctx-host-row">
+                          <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              <strong style={{ fontSize: 12.5 }}>{hm.server_name}</strong>
+                              {hm.os_arch && <span className="tag-chip">{hm.os_arch}</span>}
+                              {!hm.has_memory && <span className="tag-chip">暂无主机画像</span>}
+                              {hm.has_constraints && (
+                                <span className="tag-chip amber">
+                                  <AlertTriangle size={10.5} style={{ marginRight: 3 }} /> 含避坑红线
+                                </span>
+                              )}
+                            </div>
+                            {live && (
+                              <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                {live.reachable
+                                  ? `CPU ${live.cpu_percent.toFixed(1)}% · 内存 ${live.mem_percent.toFixed(1)}% · 磁盘 ${live.disk_percent.toFixed(1)}% · ${live.latency_ms}ms`
+                                  : '离线不可达'}
+                                {live.alert_count > 0 ? ` · ${live.alert_count} 告警` : ''}
+                              </span>
+                            )}
+                          </div>
+                          {hm.summary && (
+                            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 3 }}>
+                              {hm.summary}
+                            </div>
+                          )}
+                          {hm.constraints && (
+                            <div className="ai-constraint-banner" style={{ marginTop: 5 }}>
+                              <AlertTriangle size={12} style={{ flexShrink: 0 }} />
+                              <span>运维红线：{hm.constraints}</span>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Injected Long-Term Memories */}
+              {inspection.injected_memories.length > 0 && (
+                <div className="ai-ctx-card">
+                  <strong style={{ fontSize: 13, marginBottom: 8, display: 'block' }}>
+                    本次自动注入的高优长期记忆 ({inspection.injected_memories.length} 条)
+                  </strong>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {inspection.injected_memories.map((m) => (
+                      <div key={m.id} className="ai-ctx-mem-row">
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          {m.pinned && <Pin size={11.5} style={{ color: 'var(--accent-teal)' }} />}
+                          <strong style={{ fontSize: 12.5 }}>{m.title}</strong>
+                          <span className="tag-chip teal" style={{ fontSize: 10.5 }}>
+                            {MEMORY_CATEGORY_LABELS[m.category] || m.category}
+                          </span>
+                          <span className="tag-chip" style={{ fontSize: 10.5 }}>
+                            {m.scope === 'global' ? '全局' : '主机专属'}
+                          </span>
+                          <span className="tag-chip" style={{ fontSize: 10.5 }}>
+                            {MEMORY_SOURCE_LABELS[m.source] || m.source}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 3 }}>
+                          {m.preview}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Rolling Compacted Summary Preview */}
+              {inspection.compacted_summary && (
+                <div className="ai-ctx-card">
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => setSummaryExpanded((v) => !v)}
+                  >
+                    <strong style={{ fontSize: 13, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      {summaryExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      当前无损滚动压缩摘要（涵盖前 {inspection.compacted_until_count} 条历史）
+                    </strong>
+                    {inspection.compacted_at && (
+                      <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                        更新于 {new Date(inspection.compacted_at).toLocaleString('zh-CN')}
+                      </span>
+                    )}
+                  </div>
+                  {summaryExpanded && (
+                    <div
+                      style={{
+                        marginTop: 8,
+                        padding: '10px 12px',
+                        borderRadius: 7,
+                        background: 'var(--bg-subtle)',
+                        border: '1px solid var(--border-subtle)',
+                        fontSize: 12.5,
+                        maxHeight: 240,
+                        overflowY: 'auto',
+                      }}
+                    >
+                      <FormattedMarkdownText text={inspection.compacted_summary} />
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 

@@ -18,14 +18,17 @@ const maxReActIterations = 8
 
 // StreamEvent is serialized as JSON over SSE (text/event-stream) to the browser.
 type StreamEvent struct {
-	Type     string                   `json:"type"` // "delta", "tool_start", "tool_result", "approval_required", "memory_updated", "runbook_proposed", "session_sync", "done", "error"
-	Delta    string                   `json:"delta,omitempty"`
-	Tool     *vault.AIToolCallRecord  `json:"tool,omitempty"`
-	Approval *vault.AIPendingApproval `json:"approval,omitempty"`
-	Memory   *vault.HostMemory        `json:"memory,omitempty"`
-	Proposal *vault.AIRunbookProposal `json:"proposal,omitempty"`
-	Session  *vault.AIChatSession     `json:"session,omitempty"`
-	Error    string                   `json:"error,omitempty"`
+	Type             string                    `json:"type"` // "delta", "tool_start", "tool_result", "approval_required", "memory_updated", "memory_saved", "runbook_proposed", "agents_md_proposed", "context_compacted", "session_sync", "done", "error"
+	Delta            string                    `json:"delta,omitempty"`
+	Tool             *vault.AIToolCallRecord   `json:"tool,omitempty"`
+	Approval         *vault.AIPendingApproval  `json:"approval,omitempty"`
+	Memory           *vault.HostMemory         `json:"memory,omitempty"`
+	MemoryEntry      *vault.AIMemoryEntry      `json:"memory_entry,omitempty"`
+	Proposal         *vault.AIRunbookProposal  `json:"proposal,omitempty"`
+	AgentsMDProposal *vault.AIAgentsMDProposal `json:"agents_md_proposal,omitempty"`
+	Compaction       *CompactionInfo           `json:"compaction,omitempty"`
+	Session          *vault.AIChatSession      `json:"session,omitempty"`
+	Error            string                    `json:"error,omitempty"`
 }
 
 // ChatRequest encapsulates a user prompt sent from either AIOpsCenter or TerminalCopilot.
@@ -249,6 +252,12 @@ func (s *Service) ResolveApprovalStream(
 		return err
 	}
 
+	if approve && !isErr {
+		if savedMem := s.maybeRecordApprovedChangeMemory(sess, ap, clientIP); savedMem != nil {
+			emit(StreamEvent{Type: "memory_saved", MemoryEntry: savedMem})
+		}
+	}
+
 	emit(StreamEvent{
 		Type: "tool_result",
 		Tool: &vault.AIToolCallRecord{
@@ -279,6 +288,50 @@ func (s *Service) ResolveApprovalStream(
 	return s.continueAgentLoop(ctx, sess, *prov, clientIP, emit)
 }
 
+func (s *Service) maybeRecordApprovedChangeMemory(sess *vault.AIChatSession, ap vault.AIPendingApproval, clientIP string) *vault.AIMemoryEntry {
+	memCfg, err := s.store.GetAIMemoryConfig()
+	if err != nil || !memCfg.AutoRecordApprovedChanges {
+		return nil
+	}
+	if ap.ToolName != "exec_ssh_command" && ap.ToolName != "sftp_write_file" {
+		return nil
+	}
+	var title string
+	var content strings.Builder
+	targets := nonEmpty(strings.Join(ap.ServerNames, ", "), "目标主机")
+	if ap.ToolName == "sftp_write_file" {
+		title = fmt.Sprintf("配置变更：%s (%s)", ap.FilePath, targets)
+		content.WriteString(fmt.Sprintf("管理员审批通过并在 [%s] 修改了远程配置文件 `%s`。\n变更说明：%s", targets, ap.FilePath, nonEmpty(ap.Reason, "无")))
+		if strings.TrimSpace(ap.DiffPreview) != "" {
+			diffBrief, _ := truncateRunes(strings.TrimSpace(ap.DiffPreview), 420)
+			content.WriteString("\n变更摘要：\n" + diffBrief)
+		}
+	} else {
+		cmdBrief, _ := truncateRunes(strings.TrimSpace(ap.Command), 64)
+		title = fmt.Sprintf("远程变更：%s (%s)", cmdBrief, targets)
+		content.WriteString(fmt.Sprintf("管理员审批通过并在 [%s] 执行了命令：`%s`\n变更说明：%s", targets, strings.TrimSpace(ap.Command), nonEmpty(ap.Reason, "无")))
+	}
+	scope := "global"
+	if len(ap.ServerIDs) > 0 {
+		scope = "server"
+	}
+	saved, err := s.store.UpsertAIMemory(vault.AIMemoryEntry{
+		Scope:           scope,
+		ServerIDs:       ap.ServerIDs,
+		Category:        "change",
+		Title:           title,
+		Content:         content.String(),
+		Tags:            []string{"HITL审批", ap.ToolName},
+		Importance:      4,
+		Source:          "approval",
+		SourceSessionID: sess.ID,
+	}, true, clientIP)
+	if err != nil {
+		return nil
+	}
+	return saved
+}
+
 func (s *Service) continueAgentLoop(
 	ctx context.Context,
 	sess *vault.AIChatSession,
@@ -287,11 +340,34 @@ func (s *Service) continueAgentLoop(
 	emit func(StreamEvent),
 ) error {
 	tools := s.agentToolsSchema()
+	memCfg, _ := s.store.GetAIMemoryConfig()
+	if memCfg.CompactionKeepRecent <= 0 {
+		memCfg = vault.DefaultAIMemoryConfig()
+	}
 
 	for step := 0; step < maxReActIterations; step++ {
-		sysPrompt := s.buildSystemPrompt(sess)
+		// Automatically compact older turns into a non-destructive rolling summary when nearing context window
+		if compInfo, compErr := s.runCompactionOnSession(ctx, sess, &prov, memCfg.CompactionKeepRecent, false); compErr == nil && compInfo != nil && compInfo.Triggered {
+			emit(StreamEvent{Type: "context_compacted", Compaction: compInfo})
+		}
 
-		turn, err := s.llm.StreamChat(ctx, prov, sysPrompt, sess.Messages, tools, func(chunk string) {
+		assembled := s.assembleSessionPrompt(sess)
+		if step == 0 && len(assembled.InjectedMemoryIDs) > 0 {
+			s.store.TouchAIMemoryUsage(assembled.InjectedMemoryIDs)
+		}
+
+		ctxWin := EffectiveContextWindow(prov)
+		outReserve := prov.MaxTokens
+		if outReserve <= 0 {
+			outReserve = 4096
+		}
+		maxHistTokens := ctxWin - assembled.Inspection.EstimatedSystemTokens - assembled.Inspection.EstimatedSummaryTokens - outReserve - 1024
+		if maxHistTokens < 4096 {
+			maxHistTokens = 4096
+		}
+		effectiveHistory := buildEffectiveHistoryForLLM(sess, maxHistTokens)
+
+		turn, err := s.llm.StreamChat(ctx, prov, assembled.SystemPrompt, effectiveHistory, tools, func(chunk string) {
 			emit(StreamEvent{Type: "delta", Delta: chunk})
 		})
 		if err != nil {
@@ -699,6 +775,8 @@ func (s *Service) dispatchToolCall(
 			KeyServices []string `json:"key_services"`
 			DeployPaths []string `json:"deploy_paths"`
 			PortsNote   string   `json:"ports_note"`
+			Constraints string   `json:"constraints"`
+			Notes       string   `json:"notes"`
 		}
 		_ = json.Unmarshal([]byte(tc.Arguments), &args)
 		if args.ServerID == "" && len(sess.ServerIDs) > 0 {
@@ -716,6 +794,8 @@ func (s *Service) dispatchToolCall(
 			KeyServices: args.KeyServices,
 			DeployPaths: args.DeployPaths,
 			PortsNote:   args.PortsNote,
+			Constraints: args.Constraints,
+			Notes:       args.Notes,
 		}, true, clientIP)
 		rec.DurationMs = time.Since(start).Milliseconds()
 		if err != nil {
@@ -725,7 +805,149 @@ func (s *Service) dispatchToolCall(
 		}
 		emit(StreamEvent{Type: "memory_updated", Memory: mem})
 		rec.Status = "completed"
-		rec.Output = fmt.Sprintf("已将 %s 的客观环境特征增量保存至加密保险库", srvName)
+		rec.Output = fmt.Sprintf("已将 %s 的主机环境特征增量保存至加密保险库", srvName)
+		return toolDispatchOutcome{record: rec, toolOutput: rec.Output}
+
+	case "save_memory":
+		var args struct {
+			ID         string   `json:"id"`
+			Scope      string   `json:"scope"`
+			ServerIDs  []string `json:"server_ids"`
+			Category   string   `json:"category"`
+			Title      string   `json:"title"`
+			Content    string   `json:"content"`
+			Tags       []string `json:"tags"`
+			Importance int      `json:"importance"`
+			Pinned     bool     `json:"pinned"`
+		}
+		_ = json.Unmarshal([]byte(tc.Arguments), &args)
+		if strings.EqualFold(strings.TrimSpace(args.Scope), "server") && len(args.ServerIDs) == 0 && len(sess.ServerIDs) > 0 {
+			args.ServerIDs = slices.Clone(sess.ServerIDs)
+		}
+		rec.RiskLevel = string(RiskReadOnly)
+		rec.Summary = fmt.Sprintf("沉淀长期记忆: %s", nonEmpty(args.Title, "未命名记忆"))
+
+		saved, err := s.store.UpsertAIMemory(vault.AIMemoryEntry{
+			ID:              args.ID,
+			Scope:           args.Scope,
+			ServerIDs:       args.ServerIDs,
+			Category:        args.Category,
+			Title:           args.Title,
+			Content:         args.Content,
+			Tags:            args.Tags,
+			Importance:      args.Importance,
+			Pinned:          args.Pinned,
+			Source:          "ai",
+			SourceSessionID: sess.ID,
+		}, true, clientIP)
+		rec.DurationMs = time.Since(start).Milliseconds()
+		if err != nil {
+			rec.Status = "error"
+			rec.Output = err.Error()
+			return toolDispatchOutcome{record: rec, toolOutput: err.Error(), isError: true}
+		}
+		emit(StreamEvent{Type: "memory_saved", MemoryEntry: saved})
+		rec.Status = "completed"
+		rec.Output = fmt.Sprintf("已保存长期记忆 [%s/%s]《%s》(id: %s)", saved.Scope, memoryCategoryLabel(saved.Category), saved.Title, saved.ID)
+		return toolDispatchOutcome{record: rec, toolOutput: rec.Output}
+
+	case "delete_memory":
+		var args struct {
+			MemoryID string `json:"memory_id"`
+			Reason   string `json:"reason"`
+		}
+		_ = json.Unmarshal([]byte(tc.Arguments), &args)
+		rec.RiskLevel = string(RiskReadOnly)
+		rec.Summary = fmt.Sprintf("清理过期长期记忆 (%s)", args.MemoryID)
+
+		if err := s.store.DeleteAIMemory(strings.TrimSpace(args.MemoryID), clientIP); err != nil {
+			rec.DurationMs = time.Since(start).Milliseconds()
+			rec.Status = "error"
+			rec.Output = err.Error()
+			return toolDispatchOutcome{record: rec, toolOutput: "删除长期记忆失败: " + err.Error(), isError: true}
+		}
+		rec.DurationMs = time.Since(start).Milliseconds()
+		rec.Status = "completed"
+		rec.Output = fmt.Sprintf("已删除过期长期记忆 %s（原因: %s）", args.MemoryID, nonEmpty(args.Reason, "事实已更新"))
+		return toolDispatchOutcome{record: rec, toolOutput: rec.Output}
+
+	case "search_memory":
+		var args struct {
+			Query    string `json:"query"`
+			ServerID string `json:"server_id"`
+			Category string `json:"category"`
+			Limit    int    `json:"limit"`
+		}
+		_ = json.Unmarshal([]byte(tc.Arguments), &args)
+		if args.Limit <= 0 || args.Limit > 20 {
+			args.Limit = 8
+		}
+		rec.RiskLevel = string(RiskReadOnly)
+		rec.Summary = fmt.Sprintf("检索历史运维记忆 (%s)", nonEmpty(args.Query, "全部"))
+
+		out, hitIDs := s.executeSearchMemory(args.Query, args.ServerID, args.Category, args.Limit)
+		if len(hitIDs) > 0 {
+			s.store.TouchAIMemoryUsage(hitIDs)
+		}
+		rec.DurationMs = time.Since(start).Milliseconds()
+		rec.Status = "completed"
+		rec.Output = truncateStr(out, 3000)
+		return toolDispatchOutcome{record: rec, toolOutput: out}
+
+	case "get_runbook":
+		var args struct {
+			RunbookID string `json:"runbook_id"`
+			Query     string `json:"query"`
+		}
+		_ = json.Unmarshal([]byte(tc.Arguments), &args)
+		rec.RiskLevel = string(RiskReadOnly)
+		rec.Summary = fmt.Sprintf("调阅排障 Runbook 详情 (%s)", nonEmpty(args.RunbookID, args.Query))
+
+		out, found := s.executeGetRunbook(args.RunbookID, args.Query)
+		rec.DurationMs = time.Since(start).Milliseconds()
+		if !found {
+			rec.Status = "error"
+			rec.Output = out
+			return toolDispatchOutcome{record: rec, toolOutput: out, isError: true}
+		}
+		rec.Status = "completed"
+		rec.Output = truncateStr(out, 3000)
+		return toolDispatchOutcome{record: rec, toolOutput: out}
+
+	case "propose_agents_md_update":
+		var args struct {
+			Reason         string `json:"reason"`
+			Summary        string `json:"summary"`
+			UpdatedContent string `json:"updated_content"`
+		}
+		_ = json.Unmarshal([]byte(tc.Arguments), &args)
+		rec.RiskLevel = string(RiskReadOnly)
+		rec.Summary = fmt.Sprintf("提议修订全局 AGENTS.md: %s", nonEmpty(args.Summary, "规范更新"))
+
+		cleanNew := vault.RedactSensitiveText(strings.ReplaceAll(strings.TrimSpace(args.UpdatedContent), "\r\n", "\n"))
+		if cleanNew == "" {
+			rec.DurationMs = time.Since(start).Milliseconds()
+			rec.Status = "error"
+			rec.Output = "提议的 AGENTS.md 内容不能为空"
+			return toolDispatchOutcome{record: rec, toolOutput: rec.Output, isError: true}
+		}
+		curAgentsMD, _ := s.store.GetAgentsMD()
+		diff := BuildUnifiedDiff("AGENTS.md", curAgentsMD.Content, cleanNew)
+		prop := vault.AIAgentsMDProposal{
+			ID:              uuid.NewString(),
+			SessionID:       sess.ID,
+			Reason:          nonEmpty(vault.RedactSensitiveText(strings.TrimSpace(args.Reason)), "沉淀团队全局运维规范"),
+			Summary:         nonEmpty(vault.RedactSensitiveText(strings.TrimSpace(args.Summary)), "更新全局 AGENTS.md 运维规范"),
+			ProposedContent: cleanNew,
+			DiffPreview:     diff,
+			Status:          "pending",
+			CreatedAt:       time.Now().UTC(),
+		}
+		sess.AgentsMDProposals = append(sess.AgentsMDProposals, prop)
+		emit(StreamEvent{Type: "agents_md_proposed", AgentsMDProposal: &prop})
+		rec.DurationMs = time.Since(start).Milliseconds()
+		rec.Status = "completed"
+		rec.Output = fmt.Sprintf("已生成全局 AGENTS.md 修订提案卡片（%s），等待管理员审阅 Diff 后一键合入\n%s", prop.Summary, truncateStr(diff, 1200))
 		return toolDispatchOutcome{record: rec, toolOutput: rec.Output}
 
 	case "propose_runbook":
@@ -767,6 +989,178 @@ func (s *Service) dispatchToolCall(
 		rec.Output = "未知工具名称: " + tc.Name
 		return toolDispatchOutcome{record: rec, toolOutput: rec.Output, isError: true}
 	}
+}
+
+func (s *Service) executeSearchMemory(query, serverID, category string, limit int) (string, []string) {
+	longMems, _ := s.store.ListAIMemories()
+	hostMems, _ := s.store.ListHostMemories()
+	srvNames := s.serverNameLookup()
+
+	terms := strings.Fields(strings.ToLower(strings.TrimSpace(query)))
+	catFilter := strings.ToLower(strings.TrimSpace(category))
+	srvFilter := strings.TrimSpace(serverID)
+
+	matchTerms := func(haystack string) int {
+		if len(terms) == 0 {
+			return 1
+		}
+		low := strings.ToLower(haystack)
+		hits := 0
+		for _, t := range terms {
+			if strings.Contains(low, t) {
+				hits++
+			}
+		}
+		return hits
+	}
+
+	type memHit struct {
+		entry vault.AIMemoryEntry
+		score int
+	}
+	var hits []memHit
+	for _, m := range longMems {
+		if catFilter != "" && strings.ToLower(m.Category) != catFilter {
+			continue
+		}
+		if srvFilter != "" && m.Scope == "server" && !slices.Contains(m.ServerIDs, srvFilter) {
+			continue
+		}
+		hay := m.Title + " " + m.Content + " " + strings.Join(m.Tags, " ") + " " + memoryCategoryLabel(m.Category)
+		h := matchTerms(hay)
+		if h > 0 {
+			sc := h*100 + m.Importance*10
+			if m.Pinned {
+				sc += 40
+			}
+			hits = append(hits, memHit{entry: m, score: sc})
+		}
+	}
+	slices.SortStableFunc(hits, func(a, b memHit) int {
+		if a.score != b.score {
+			if a.score > b.score {
+				return -1
+			}
+			return 1
+		}
+		if a.entry.UpdatedAt.After(b.entry.UpdatedAt) {
+			return -1
+		}
+		return 1
+	})
+
+	var sb strings.Builder
+	var hitIDs []string
+	if len(hits) > 0 {
+		n := min(limit, len(hits))
+		sb.WriteString(fmt.Sprintf("=== 命中长期运维记忆 (%d/%d 条) ===\n", n, len(hits)))
+		for i := 0; i < n; i++ {
+			m := hits[i].entry
+			hitIDs = append(hitIDs, m.ID)
+			var scopeDesc string
+			if m.Scope == "server" && len(m.ServerIDs) > 0 {
+				var names []string
+				for _, sid := range m.ServerIDs {
+					names = append(names, nonEmpty(srvNames[sid], sid))
+				}
+				scopeDesc = "主机:" + strings.Join(names, ",")
+			} else {
+				scopeDesc = "全局"
+			}
+			sb.WriteString(fmt.Sprintf("- [%s | %s | 重要度:%d | %s] 《%s》 (id: `%s`)\n  %s\n",
+				scopeDesc, memoryCategoryLabel(m.Category), m.Importance, m.UpdatedAt.Format("2006-01-02"),
+				m.Title, m.ID, m.Content))
+		}
+	}
+
+	var matchedHosts []vault.HostMemory
+	if catFilter == "" {
+		for _, hm := range hostMems {
+			if srvFilter != "" && hm.ServerID != srvFilter {
+				continue
+			}
+			hay := hm.ServerName + " " + hm.Summary + " " + hm.OSArch + " " +
+				strings.Join(hm.KeyServices, " ") + " " + strings.Join(hm.DeployPaths, " ") + " " +
+				hm.PortsNote + " " + hm.Constraints + " " + hm.Notes
+			if matchTerms(hay) > 0 {
+				matchedHosts = append(matchedHosts, hm)
+			}
+		}
+	}
+	if len(matchedHosts) > 0 {
+		n := min(5, len(matchedHosts))
+		sb.WriteString(fmt.Sprintf("\n=== 命中主机环境画像 (%d/%d 台) ===\n", n, len(matchedHosts)))
+		for i := 0; i < n; i++ {
+			hm := matchedHosts[i]
+			sb.WriteString(fmt.Sprintf("- %s (`%s`): %s | 服务: %s | 路径: %s | 端口: %s | 约束: %s | 备注: %s\n",
+				hm.ServerName, hm.ServerID, nonEmpty(hm.Summary, "无"),
+				nonEmpty(strings.Join(hm.KeyServices, ","), "无"),
+				nonEmpty(strings.Join(hm.DeployPaths, ","), "无"),
+				nonEmpty(hm.PortsNote, "无"),
+				nonEmpty(hm.Constraints, "无"),
+				nonEmpty(hm.Notes, "无"),
+			))
+		}
+	}
+
+	if sb.Len() == 0 {
+		return "未检索到匹配的长期记忆或主机画像记录。", nil
+	}
+	return strings.TrimSpace(sb.String()), hitIDs
+}
+
+func (s *Service) executeGetRunbook(runbookID, query string) (string, bool) {
+	runbooks, _ := s.store.ListRunbooks()
+	idClean := strings.TrimSpace(runbookID)
+	qClean := strings.ToLower(strings.TrimSpace(query))
+
+	var matched []vault.AIRunbook
+	for _, rb := range runbooks {
+		if idClean != "" && rb.ID == idClean {
+			matched = []vault.AIRunbook{rb}
+			break
+		}
+		if qClean != "" {
+			hay := strings.ToLower(rb.Title + " " + rb.Category + " " + rb.Symptom + " " + rb.RootCause + " " + strings.Join(rb.Tags, " "))
+			if strings.Contains(hay, qClean) {
+				matched = append(matched, rb)
+			}
+		}
+	}
+	if len(matched) == 0 && idClean == "" && qClean == "" {
+		matched = runbooks
+	}
+	if len(matched) == 0 {
+		return "未找到匹配的 Runbook 排障技能。", false
+	}
+
+	var sb strings.Builder
+	limit := min(3, len(matched))
+	for i := 0; i < limit; i++ {
+		rb := matched[i]
+		sb.WriteString(fmt.Sprintf("### 《%s》 (`%s` | %s)\n", rb.Title, rb.ID, rb.Category))
+		sb.WriteString("- **适用症状**: " + rb.Symptom + "\n")
+		if rb.RootCause != "" {
+			sb.WriteString("- **典型根因**: " + rb.RootCause + "\n")
+		}
+		if len(rb.DiagnosticSteps) > 0 {
+			sb.WriteString("- **诊断步骤**:\n")
+			for idx, st := range rb.DiagnosticSteps {
+				sb.WriteString(fmt.Sprintf("  %d. %s\n", idx+1, st))
+			}
+		}
+		if len(rb.FixCommands) > 0 {
+			sb.WriteString("- **推荐修复命令**:\n")
+			for _, cmd := range rb.FixCommands {
+				sb.WriteString("  - `" + cmd + "`\n")
+			}
+		}
+		if rb.Verification != "" {
+			sb.WriteString("- **验证方法**: " + rb.Verification + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String()), true
 }
 
 func (s *Service) executeApprovedAction(ap vault.AIPendingApproval, clientIP string) (string, error) {
@@ -824,72 +1218,7 @@ func (s *Service) executeApprovedAction(ap vault.AIPendingApproval, clientIP str
 }
 
 func (s *Service) buildSystemPrompt(sess *vault.AIChatSession) string {
-	servers, _ := s.store.ListServers()
-	memories, _ := s.store.ListHostMemories()
-	runbooks, _ := s.store.ListRunbooks()
-
-	memMap := make(map[string]vault.HostMemory)
-	for _, m := range memories {
-		memMap[m.ServerID] = m
-	}
-
-	var sb strings.Builder
-	sb.WriteString(`你是 ServerNeedSafe 内置的资深 Linux SRE 与服务器安全运维智能体（AI Ops Agent）。
-请遵循以下核心行为准则：
-1. 证据驱动：排查故障或执行安全审计时，优先调用只读探针（probe_server、exec_ssh_command 只读命令、sftp_read_file）收集真实指标、日志与配置证据，切勿凭空猜测。
-2. 最小变更与安全加固：修改配置文件优先使用 sftp_write_file（系统会自动向管理员展示 Unified Diff 对比）；服务重载前先校验语法（如 nginx -t / sshd -t）。
-3. 客观环境画像自进化：当你在排查中发现了目标服务器的客观架构信息（如核心服务组件、项目部署目录、监听端口用途、OS版本），主动调用 update_host_memory 增量记录，方便后续会话直接复用。
-4. 排障技能沉淀（Runbook）：当你成功定位并解决了一个典型故障或完成了一套有价值的加固流程时，调用 propose_runbook 生成结构化 SOP 建议卡片供管理员一键归档。
-5. 输出简洁专业：使用清晰的中文 Markdown 结构呈现根因结论、关键证据和命令说明。
-`)
-
-	switch sess.Mode {
-	case vault.AIModeSuggest:
-		sb.WriteString("\n【当前会话执行模式：参谋模式 (suggest)】请直接结合已有信息给出精准的排查思路与命令建议；非必要不主动触发远程工具调用。\n")
-	case vault.AIModeAutonomous:
-		sb.WriteString("\n【当前会话执行模式：自治执行模式 (autonomous)】非毁灭性的排障与修复操作将自动执行，请务必谨慎评估每一步副作用并在变更后验证服务状态。\n")
-	default:
-		sb.WriteString("\n【当前会话执行模式：标准受控模式 (standard)】只读命令会自动放行执行；任何修改文件、重启服务、删除或未知复合指令都会自动挂起并弹出审批卡片由管理员确认。\n")
-	}
-
-	sb.WriteString("\n### 当前纳管与选定的目标服务器上下文（已严格隔离凭据密钥）\n")
-	selectedSet := make(map[string]bool)
-	for _, id := range sess.ServerIDs {
-		selectedSet[id] = true
-	}
-
-	listedCount := 0
-	for _, srv := range servers {
-		if len(selectedSet) > 0 && !selectedSet[srv.ID] {
-			continue
-		}
-		listedCount++
-		sb.WriteString(fmt.Sprintf("- **%s** (`server_id`: `%s`) | 分组: %s | 地址: `%s@%s:%d` | OS: %s\n",
-			srv.Name, srv.ID, srv.Group, srv.Username, srv.Host, srv.Port, nonEmpty(srv.LastOSInfo, "未知")))
-		if mem, ok := memMap[srv.ID]; ok {
-			sb.WriteString(fmt.Sprintf("  - 已记忆环境画像: %s | 关键组件: %s | 部署路径: %s | 端口备注: %s\n",
-				nonEmpty(mem.Summary, "无"),
-				strings.Join(mem.KeyServices, ", "),
-				strings.Join(mem.DeployPaths, ", "),
-				nonEmpty(mem.PortsNote, "无"),
-			))
-		}
-	}
-	if listedCount == 0 {
-		sb.WriteString("- 当前会话尚未绑定特定目标服务器（若需远程操作，请提示管理员在顶部勾选目标主机）。\n")
-	}
-
-	if len(runbooks) > 0 {
-		sb.WriteString("\n### 保险库已沉淀的可复用排障技能 (Runbook 参考)\n")
-		limit := min(8, len(runbooks))
-		for i := 0; i < limit; i++ {
-			rb := runbooks[i]
-			sb.WriteString(fmt.Sprintf("- 《%s》[%s] 适用症状: %s | 参考修复命令: `%s`\n",
-				rb.Title, rb.Category, rb.Symptom, strings.Join(rb.FixCommands, " ; ")))
-		}
-	}
-
-	return sb.String()
+	return s.assembleSessionPrompt(sess).SystemPrompt
 }
 
 func (s *Service) agentToolsSchema() []ToolDefinition {
@@ -975,7 +1304,7 @@ func (s *Service) agentToolsSchema() []ToolDefinition {
 		},
 		{
 			Name:        "update_host_memory",
-			Description: "自动增量更新某台服务器的客观环境画像记忆（运行的核心服务、项目部署路径、端口拓扑、系统架构摘要），后续对话将自动携带该记忆。",
+			Description: "自动增量更新某台服务器的客观环境画像与避坑约束（核心服务、部署路径、端口用途、系统架构、运维禁忌、备注），后续对话与巡检将自动携带。",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -985,8 +1314,78 @@ func (s *Service) agentToolsSchema() []ToolDefinition {
 					"key_services": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "运行的关键服务或组件列表，如 nginx, docker, postgres"},
 					"deploy_paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "关键配置或应用部署目录，如 /opt/app, /etc/nginx/conf.d"},
 					"ports_note":   map[string]any{"type": "string", "description": "重要监听端口与用途说明"},
+					"constraints":  map[string]any{"type": "string", "description": "该主机专属的运维禁忌与避坑红线（例如不可直接重启主库）"},
+					"notes":        map[string]any{"type": "string", "description": "其他补充运维备注（严禁含密码或密钥）"},
 				},
 				"required": []string{"server_id"},
+			},
+		},
+		{
+			Name:        "save_memory",
+			Description: "沉淀或更新一条跨会话长期记忆（管理员偏好、架构拓扑依赖、历史故障根因、重要变更结论或运维经验），系统会自动按标题去重合并并屏蔽敏感凭据。",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":         map[string]any{"type": "string", "description": "可选：更新已有记忆时填写其 id"},
+					"scope":      map[string]any{"type": "string", "enum": []string{"global", "server"}, "description": "记忆作用范围：global(全局) 或 server(指定主机)"},
+					"server_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "当 scope=server 时关联的 server_id 列表"},
+					"category":   map[string]any{"type": "string", "enum": []string{"preference", "topology", "incident", "change", "lesson"}, "description": "记忆分类"},
+					"title":      map[string]any{"type": "string", "description": "简明准确的记忆标题（25字以内）"},
+					"content":    map[string]any{"type": "string", "description": "具体可复用的事实、偏好或故障结论（严禁记录任何明文密码/私钥/API Key）"},
+					"tags":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "检索标签，如 nginx, backup, maintenance"},
+					"importance": map[string]any{"type": "integer", "description": "重要度 1-5（默认 3，关键红线或高频偏好填 4-5）"},
+					"pinned":     map[string]any{"type": "boolean", "description": "是否置顶强制注入每次对话"},
+				},
+				"required": []string{"category", "title", "content"},
+			},
+		},
+		{
+			Name:        "delete_memory",
+			Description: "清理一条已过时、错误或被新架构取代的长期记忆条目。",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"memory_id": map[string]any{"type": "string", "description": "要删除的长期记忆 ID"},
+					"reason":    map[string]any{"type": "string", "description": "删除原因说明"},
+				},
+				"required": []string{"memory_id"},
+			},
+		},
+		{
+			Name:        "search_memory",
+			Description: "按关键词、分类或主机 ID 深度检索全部长期记忆库与主机画像（用于召回未直接注入 System Prompt 的历史变更、故障根因或跨机信息）。",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":     map[string]any{"type": "string", "description": "检索关键词（支持多词空格分隔，留空则返回高优列表）"},
+					"server_id": map[string]any{"type": "string", "description": "可选：按特定服务器过滤"},
+					"category":  map[string]any{"type": "string", "description": "可选：preference / topology / incident / change / lesson"},
+					"limit":     map[string]any{"type": "integer", "description": "返回最大条数（默认 8，最大 20）"},
+				},
+			},
+		},
+		{
+			Name:        "get_runbook",
+			Description: "按 ID 或关键词调阅保险库中某条排障技能 Runbook 的完整诊断步骤、修复命令与验证方案。",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"runbook_id": map[string]any{"type": "string", "description": "Runbook ID（来自索引列表）"},
+					"query":      map[string]any{"type": "string", "description": "或者按标题/症状/标签模糊检索"},
+				},
+			},
+		},
+		{
+			Name:        "propose_agents_md_update",
+			Description: "向管理员提议修订全局 AGENTS.md 运维规范文档（不会直接生效，系统将生成 Unified Diff 提案卡片由管理员审阅并一键合入）。",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"summary":         map[string]any{"type": "string", "description": "本次规范修订的简短标题"},
+					"reason":          map[string]any{"type": "string", "description": "为什么建议将该条沉淀到全局 AGENTS.md"},
+					"updated_content": map[string]any{"type": "string", "description": "完整的修订后 AGENTS.md Markdown 全文"},
+				},
+				"required": []string{"summary", "reason", "updated_content"},
 			},
 		},
 		{

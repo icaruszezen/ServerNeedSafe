@@ -51,14 +51,15 @@ func (s *ClientVault) VerifyPassword(password string) error {
 
 // AIProviderMutationInput represents create/update request fields for an LLM provider.
 type AIProviderMutationInput struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Protocol  AIProtocol `json:"protocol"`
-	BaseURL   string     `json:"base_url"`
-	APIKey    *string    `json:"api_key,omitempty"` // nil = preserve existing key on update
-	Model     string     `json:"model"`
-	MaxTokens int        `json:"max_tokens"`
-	SetActive bool       `json:"set_active"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Protocol      AIProtocol `json:"protocol"`
+	BaseURL       string     `json:"base_url"`
+	APIKey        *string    `json:"api_key,omitempty"` // nil = preserve existing key on update
+	Model         string     `json:"model"`
+	MaxTokens     int        `json:"max_tokens"`
+	ContextWindow int        `json:"context_window"` // 0 = auto-infer from model
+	SetActive     bool       `json:"set_active"`
 }
 
 // GetAISettingsView returns redacted AI settings, provider list, and patrol config.
@@ -68,12 +69,19 @@ func (s *ClientVault) GetAISettingsView() (activeProviderID string, defaultMode 
 	if s.state == nil {
 		return "", "", nil, PatrolConfigView{}, ErrVaultLocked
 	}
-	EnsureStateDefaults(s.state)
+	defaultMode = s.state.AISettings.DefaultMode
+	if defaultMode == "" {
+		defaultMode = AIModeStandard
+	}
 	providers = make([]AIProviderView, len(s.state.AISettings.Providers))
 	for i, p := range s.state.AISettings.Providers {
 		providers[i] = p.ToView()
 	}
-	return s.state.AISettings.ActiveProviderID, s.state.AISettings.DefaultMode, providers, s.state.AISettings.Patrol.ToView(), nil
+	patrolCfg := s.state.AISettings.Patrol
+	if patrolCfg.IntervalMinutes <= 0 {
+		patrolCfg = DefaultPatrolConfig()
+	}
+	return s.state.AISettings.ActiveProviderID, defaultMode, providers, patrolCfg.ToView(), nil
 }
 
 // GetActiveAIProviderSecret returns a copy of the currently active AIProviderConfig including APIKey.
@@ -130,6 +138,9 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 	if in.MaxTokens <= 0 || in.MaxTokens > 65536 {
 		in.MaxTokens = 4096
 	}
+	if in.ContextWindow < 0 || in.ContextWindow > 2000000 {
+		in.ContextWindow = 0
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,6 +172,7 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 					existing.BaseURL = in.BaseURL
 					existing.Model = in.Model
 					existing.MaxTokens = in.MaxTokens
+					existing.ContextWindow = in.ContextWindow
 					existing.UpdatedAt = now
 					if newKey != "" {
 						existing.APIKey = newKey
@@ -178,14 +190,15 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 		}
 
 		newProv := AIProviderConfig{
-			ID:        uuid.NewString(),
-			Name:      in.Name,
-			Protocol:  in.Protocol,
-			BaseURL:   in.BaseURL,
-			Model:     in.Model,
-			MaxTokens: in.MaxTokens,
-			CreatedAt: now,
-			UpdatedAt: now,
+			ID:            uuid.NewString(),
+			Name:          in.Name,
+			Protocol:      in.Protocol,
+			BaseURL:       in.BaseURL,
+			Model:         in.Model,
+			MaxTokens:     in.MaxTokens,
+			ContextWindow: in.ContextWindow,
+			CreatedAt:     now,
+			UpdatedAt:     now,
 		}
 		if in.APIKey != nil {
 			newProv.APIKey = strings.TrimSpace(*in.APIKey)
@@ -282,6 +295,10 @@ func (s *ClientVault) ListHostMemories() ([]HostMemory, error) {
 		cp := m
 		cp.KeyServices = slices.Clone(m.KeyServices)
 		cp.DeployPaths = slices.Clone(m.DeployPaths)
+		if m.MonitorSyncedAt != nil {
+			t := *m.MonitorSyncedAt
+			cp.MonitorSyncedAt = &t
+		}
 		out[i] = cp
 	}
 	return out, nil
@@ -300,13 +317,19 @@ func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP stri
 	dedupStrings := func(items []string) []string {
 		out := make([]string, 0, len(items))
 		for _, item := range items {
-			t := strings.TrimSpace(item)
+			t := RedactSensitiveText(strings.TrimSpace(item))
 			if t != "" && !slices.Contains(out, t) {
 				out = append(out, t)
 			}
 		}
 		return out
 	}
+
+	cleanSummary := RedactSensitiveText(strings.TrimSpace(in.Summary))
+	cleanOSArch := RedactSensitiveText(strings.TrimSpace(in.OSArch))
+	cleanPortsNote := RedactSensitiveText(strings.TrimSpace(in.PortsNote))
+	cleanConstraints := RedactSensitiveText(strings.TrimSpace(in.Constraints))
+	cleanNotes := RedactSensitiveText(strings.TrimSpace(in.Notes))
 
 	var outMem HostMemory
 	err := s.mutateLocked(func(st *VaultState) error {
@@ -324,17 +347,28 @@ func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP stri
 			if st.HostMemories[i].ServerID == in.ServerID {
 				cur := st.HostMemories[i]
 				cur.ServerName = srvName
-				if strings.TrimSpace(in.Summary) != "" {
-					cur.Summary = strings.TrimSpace(in.Summary)
+				if cleanSummary != "" || !isAuto {
+					cur.Summary = cleanSummary
 				}
-				if strings.TrimSpace(in.OSArch) != "" {
-					cur.OSArch = strings.TrimSpace(in.OSArch)
+				if cleanOSArch != "" || !isAuto {
+					cur.OSArch = cleanOSArch
 				}
-				if strings.TrimSpace(in.PortsNote) != "" {
-					cur.PortsNote = strings.TrimSpace(in.PortsNote)
+				if cleanPortsNote != "" || !isAuto {
+					cur.PortsNote = cleanPortsNote
 				}
-				if strings.TrimSpace(in.Notes) != "" || !isAuto {
-					cur.Notes = strings.TrimSpace(in.Notes)
+				if cleanConstraints != "" || !isAuto {
+					if isAuto && cur.Constraints != "" && !strings.Contains(cur.Constraints, cleanConstraints) {
+						cur.Constraints = cur.Constraints + "\n" + cleanConstraints
+					} else {
+						cur.Constraints = cleanConstraints
+					}
+				}
+				if cleanNotes != "" || !isAuto {
+					if isAuto && cur.Notes != "" && !strings.Contains(cur.Notes, cleanNotes) {
+						cur.Notes = cur.Notes + "\n" + cleanNotes
+					} else {
+						cur.Notes = cleanNotes
+					}
 				}
 				if isAuto {
 					cur.KeyServices = dedupStrings(append(cur.KeyServices, in.KeyServices...))
@@ -357,18 +391,22 @@ func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP stri
 		created := HostMemory{
 			ServerID:    in.ServerID,
 			ServerName:  srvName,
-			Summary:     strings.TrimSpace(in.Summary),
-			OSArch:      strings.TrimSpace(in.OSArch),
+			Summary:     cleanSummary,
+			OSArch:      cleanOSArch,
 			KeyServices: dedupStrings(in.KeyServices),
 			DeployPaths: dedupStrings(in.DeployPaths),
-			PortsNote:   strings.TrimSpace(in.PortsNote),
-			Notes:       strings.TrimSpace(in.Notes),
+			PortsNote:   cleanPortsNote,
+			Constraints: cleanConstraints,
+			Notes:       cleanNotes,
 			UpdatedAt:   now,
 		}
 		if isAuto {
 			created.AutoUpdatedCount = 1
 		}
 		st.HostMemories = append(st.HostMemories, created)
+		if !isAuto {
+			appendAuditLocked(st, "ai.memory_edit", srvName, "人工录入主机环境画像记忆", clientIP, true)
+		}
 		outMem = created
 		return nil
 	})
@@ -404,7 +442,6 @@ func (s *ClientVault) ListRunbooks() ([]AIRunbook, error) {
 	if s.state == nil {
 		return nil, ErrVaultLocked
 	}
-	EnsureStateDefaults(s.state)
 	out := make([]AIRunbook, len(s.state.Runbooks))
 	for i, rb := range s.state.Runbooks {
 		cp := rb
@@ -556,6 +593,19 @@ func cloneSession(cs AIChatSession) AIChatSession {
 		rc.FixCommands = slices.Clone(rp.FixCommands)
 		cp.RunbookProposals[i] = rc
 	}
+	cp.AgentsMDProposals = make([]AIAgentsMDProposal, len(cs.AgentsMDProposals))
+	for i, ap := range cs.AgentsMDProposals {
+		ac := ap
+		if ap.ResolvedAt != nil {
+			t := *ap.ResolvedAt
+			ac.ResolvedAt = &t
+		}
+		cp.AgentsMDProposals[i] = ac
+	}
+	if cs.CompactedAt != nil {
+		t := *cs.CompactedAt
+		cp.CompactedAt = &t
+	}
 	return cp
 }
 
@@ -622,16 +672,17 @@ func (s *ClientVault) CreateAISession(title, scope string, serverIDs []string, m
 
 		now := time.Now().UTC()
 		sess := AIChatSession{
-			ID:               uuid.NewString(),
-			Title:            t,
-			Scope:            sc,
-			ServerIDs:        slices.Clone(sids),
-			Mode:             md,
-			Messages:         []AIChatMessage{},
-			PendingApprovals: []AIPendingApproval{},
-			RunbookProposals: []AIRunbookProposal{},
-			CreatedAt:        now,
-			UpdatedAt:        now,
+			ID:                uuid.NewString(),
+			Title:             t,
+			Scope:             sc,
+			ServerIDs:         slices.Clone(sids),
+			Mode:              md,
+			Messages:          []AIChatMessage{},
+			PendingApprovals:  []AIPendingApproval{},
+			RunbookProposals:  []AIRunbookProposal{},
+			AgentsMDProposals: []AIAgentsMDProposal{},
+			CreatedAt:         now,
+			UpdatedAt:         now,
 		}
 		st.AISessions = append([]AIChatSession{sess}, st.AISessions...)
 		if len(st.AISessions) > maxAISessions {
@@ -786,10 +837,25 @@ func (s *ClientVault) GetPatrolConfigSecret() (*PatrolConfig, error) {
 	if s.state == nil {
 		return nil, ErrVaultLocked
 	}
-	EnsureStateDefaults(s.state)
 	cp := s.state.AISettings.Patrol
+	if cp.IntervalMinutes <= 0 {
+		def := DefaultPatrolConfig()
+		cp.IntervalMinutes = def.IntervalMinutes
+		cp.CPUWarnPercent = def.CPUWarnPercent
+		cp.MemWarnPercent = def.MemWarnPercent
+		cp.DiskWarnPercent = def.DiskWarnPercent
+		cp.SSHFailWarnCount = def.SSHFailWarnCount
+		cp.CheckListeningPorts = def.CheckListeningPorts
+		cp.CheckPrivilegedUsers = def.CheckPrivilegedUsers
+	}
 	cp.ServerIDs = slices.Clone(s.state.AISettings.Patrol.ServerIDs)
+	if cp.ServerIDs == nil {
+		cp.ServerIDs = []string{}
+	}
 	cp.Webhooks = slices.Clone(s.state.AISettings.Patrol.Webhooks)
+	if cp.Webhooks == nil {
+		cp.Webhooks = []WebhookChannel{}
+	}
 	return &cp, nil
 }
 

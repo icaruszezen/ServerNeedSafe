@@ -814,6 +814,10 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 				if osLabel != "" {
 					st.Servers[srvIdx].LastOSInfo = osLabel
 				}
+				EnsureStateDefaults(st)
+				if st.AISettings.MemoryConfig.AutoSyncMonitorToMemory {
+					mergeMonitorSnapshotIntoHostMemoryLocked(st, incoming, now)
+				}
 			}
 
 			// Persist latest snapshot & compact ring-buffered sample

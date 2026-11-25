@@ -1,7 +1,11 @@
 import type {
+  AgentsMDConfig,
+  AIAgentsMDProposal,
   AIChatSession,
   AIChatSessionSummary,
   AIExecutionMode,
+  AIMemoryConfig,
+  AIMemoryEntry,
   AIOverviewResponse,
   AIProtocol,
   AIProviderView,
@@ -10,6 +14,7 @@ import type {
   AppSettings,
   AuthStatusResponse,
   BatchExecResult,
+  CompactionInfo,
   CredentialView,
   EncryptionInfo,
   HostKeyUntrustedInfo,
@@ -28,6 +33,7 @@ import type {
   ServerMutationPayload,
   ServerProbeResult,
   ServerView,
+  SessionContextInspection,
   SFTPListResponse,
   Snippet,
   SyncSummary,
@@ -729,6 +735,7 @@ export const api = {
     api_key?: string;
     model: string;
     max_tokens?: number;
+    context_window?: number;
     set_active?: boolean;
   }) =>
     requestJSON<{ provider: AIProviderView; active_provider_id: string }>(
@@ -763,6 +770,23 @@ export const api = {
       payload
     ),
 
+  updateAgentsMD: (payload: { enabled: boolean; content: string; reset_default?: boolean }) =>
+    requestJSON<{ ok: boolean; agents_md: AgentsMDConfig }>('PUT', '/api/ai/agents-md', payload),
+
+  updateAIMemoryConfig: (payload: AIMemoryConfig) =>
+    requestJSON<{ ok: boolean; memory_config: AIMemoryConfig }>(
+      'PUT',
+      '/api/ai/memory-config',
+      payload
+    ),
+
+  resolveAgentsMDProposal: (proposal_id: string, accept: boolean) =>
+    requestJSON<{ ok: boolean; agents_md: AgentsMDConfig; proposal: AIAgentsMDProposal }>(
+      'POST',
+      '/api/ai/agents-md-proposals/resolve',
+      { proposal_id, accept }
+    ),
+
   listAISessions: (scope = '') =>
     requestJSON<{ sessions: AIChatSessionSummary[] }>(
       'GET',
@@ -791,6 +815,20 @@ export const api = {
 
   deleteAISession: (id: string) =>
     requestJSON<{ ok: boolean }>('DELETE', `/api/ai/sessions/${encodeURIComponent(id)}`),
+
+  inspectAISessionContext: (id: string) =>
+    requestJSON<{ context: SessionContextInspection }>(
+      'GET',
+      `/api/ai/sessions/${encodeURIComponent(id)}/context`
+    ),
+
+  compactAISession: (id: string, reset = false) =>
+    requestJSON<{
+      ok: boolean;
+      session: AIChatSession;
+      compaction: CompactionInfo;
+      context: SessionContextInspection;
+    }>('POST', `/api/ai/sessions/${encodeURIComponent(id)}/compact`, { reset }),
 
   streamAIChat: (
     sessionId: string,
@@ -843,6 +881,22 @@ export const api = {
       'DELETE',
       `/api/ai/host-memory/${encodeURIComponent(serverId)}`
     ),
+
+  syncHostMemoryFromMonitor: (server_id = '') =>
+    requestJSON<{ ok: boolean; synced_count: number; host_memories: HostMemory[] }>(
+      'POST',
+      '/api/ai/host-memory/sync-monitor',
+      { server_id }
+    ),
+
+  listAIMemories: () =>
+    requestJSON<{ memories: AIMemoryEntry[] }>('GET', '/api/ai/memories'),
+
+  upsertAIMemory: (payload: Partial<AIMemoryEntry>) =>
+    requestJSON<{ memory: AIMemoryEntry }>('POST', '/api/ai/memories', payload),
+
+  deleteAIMemory: (id: string) =>
+    requestJSON<{ ok: boolean }>('DELETE', `/api/ai/memories/${encodeURIComponent(id)}`),
 
   resolveRunbookProposal: (proposalId: string, accept: boolean, sync_snippet = false) =>
     requestJSON<{ ok: boolean; runbook?: AIRunbook }>(

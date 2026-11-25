@@ -391,19 +391,35 @@ func (s *Service) enrichPatrolWithLLM(ctx context.Context, prov vault.AIProvider
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
+	serverIDs := make([]string, 0, len(rec.Findings))
+	for _, f := range rec.Findings {
+		if f.ServerID != "" {
+			serverIDs = append(serverIDs, f.ServerID)
+		}
+	}
+	patrolCtx := s.BuildPatrolContextBlock(serverIDs)
+
 	evidenceBytes, _ := json.MarshalIndent(rec.Findings, "", "  ")
 	sysPrompt := `你是 ServerNeedSafe 的资深 Linux SRE 与主机安全分析专家。
-后台只读巡检刚刚采集到受管服务器的遥测与安全基线比对数据。请直接输出严格的 JSON 对象（不要使用 Markdown 代码块包裹），格式如下：
+后台只读巡检刚刚采集到受管服务器的遥测与安全基线比对数据。请结合提供的全局 AGENTS.md 运维规范、受检主机环境画像（含已知端口用途与避坑红线）及长期运维记忆进行研判，避免将已知正常业务端口或预期缓存内存误报为异常。
+请严格仅输出一个合法的 JSON 对象（不要使用 Markdown 代码块包裹，不要附加任何解释性前后缀），格式如下：
 {
   "summary": "一句话总结本次巡检的核心健康或风险结论（80字以内）",
-  "root_cause": "结合异常指标、新增端口、SSH失败次数或失败服务，分析最可能的根因与风险影响",
+  "root_cause": "结合异常指标、主机画像、历史变更记忆与安全基线，分析最可能的根因与风险影响",
   "recommendations": ["具体可执行的只读核查或安全修复建议 1", "建议 2", "建议 3"]
 }`
+
+	var userBody strings.Builder
+	if patrolCtx != "" {
+		userBody.WriteString(patrolCtx)
+		userBody.WriteString("\n\n")
+	}
+	userBody.WriteString(fmt.Sprintf("巡检总体状态: %s\n各主机巡检证据 JSON:\n%s", rec.Status, string(evidenceBytes)))
 
 	turn, err := s.llm.StreamChat(ctx, prov, sysPrompt, []vault.AIChatMessage{
 		{
 			Role:    "user",
-			Content: fmt.Sprintf("巡检总体状态: %s\n各主机巡检证据 JSON:\n%s", rec.Status, string(evidenceBytes)),
+			Content: userBody.String(),
 		},
 	}, nil, nil)
 	if err != nil || turn == nil {

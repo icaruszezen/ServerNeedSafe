@@ -7,14 +7,20 @@ import {
   Sparkles,
   TerminalSquare,
   ShieldCheck,
+  Layers,
+  Minimize2,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
   AIChatSession,
   AIExecutionMode,
   AIToolCallRecord,
+  SessionContextInspection,
 } from '../types';
 import {
+  AgentsMDProposalCard,
+  CompactionDivider,
+  ContextInspectorModal,
   FormattedMarkdownText,
   HITLApprovalCard,
   RunbookProposalCard,
@@ -50,7 +56,28 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   const [streaming, setStreaming] = useState(false);
   const [streamDelta, setStreamDelta] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
+  const [contextInspection, setContextInspection] = useState<SessionContextInspection | null>(null);
+  const [showInspector, setShowInspector] = useState(false);
+  const [loadingContext, setLoadingContext] = useState(false);
+  const [compacting, setCompacting] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshContext = useCallback(async (sid?: string) => {
+    const targetId = sid ?? session?.id;
+    if (!targetId) {
+      setContextInspection(null);
+      return;
+    }
+    setLoadingContext(true);
+    try {
+      const { context } = await api.inspectAISessionContext(targetId);
+      setContextInspection(context);
+    } catch {
+      // ignore transient
+    } finally {
+      setLoadingContext(false);
+    }
+  }, [session?.id]);
 
   const loadBoundSession = useCallback(async () => {
     try {
@@ -77,6 +104,14 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   }, [loadBoundSession]);
 
   useEffect(() => {
+    if (session?.id) {
+      void refreshContext(session.id);
+    } else {
+      setContextInspection(null);
+    }
+  }, [session?.id, session?.messages.length, session?.compaction_count, refreshContext]);
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session?.messages.length, streamDelta, streamTools.length]);
 
@@ -93,6 +128,27 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     } catch (err: any) {
       onNotify(err?.message || '创建终端副驾驶会话失败');
       return null;
+    }
+  };
+
+  const handleCompact = async (reset = false) => {
+    if (!session || compacting) return;
+    setCompacting(true);
+    try {
+      const res = await api.compactAISession(session.id, reset);
+      setSession(res.session);
+      setContextInspection(res.context);
+      onNotify(
+        reset
+          ? '已清空终端副驾驶滚动摘要'
+          : res.compaction.triggered
+          ? `无损滚动压缩完成（${res.compaction.estimated_tokens_before} → ${res.compaction.estimated_tokens_after} tokens）`
+          : '当前轮次较少，暂无需压缩'
+      );
+    } catch (err: any) {
+      onNotify(err?.message || '上下文压缩失败');
+    } finally {
+      setCompacting(false);
     }
   };
 
@@ -118,6 +174,25 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         case 'tool_result':
           if (ev.tool) {
             setStreamTools((prev) => prev.map((t) => (t.id === ev.tool.id ? ev.tool : t)));
+          }
+          break;
+        case 'memory_updated':
+          if (ev.memory) onNotify(`AI 已自动更新「${ev.memory.server_name}」主机画像`);
+          break;
+        case 'memory_saved':
+          if (ev.memory_entry) onNotify(`已沉淀长期运维记忆《${ev.memory_entry.title}》`);
+          break;
+        case 'runbook_proposed':
+          if (ev.proposal) onNotify(`AI 已提炼排障技能草案《${ev.proposal.title}》`);
+          break;
+        case 'agents_md_proposed':
+          if (ev.agents_md_proposal) {
+            onNotify(`AI 提议修订全局 AGENTS.md：《${ev.agents_md_proposal.summary}》`);
+          }
+          break;
+        case 'context_compacted':
+          if (ev.compaction?.triggered) {
+            onNotify(`终端副驾驶已自动无损压缩前 ${ev.compaction.compacted_until_count} 条历史`);
           }
           break;
         case 'session_sync':
@@ -240,6 +315,36 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
             ))}
           </div>
 
+          {session && (
+            <button
+              type="button"
+              id="copilot-context-inspector-btn"
+              className={`ai-ctx-pill-btn compact ${contextInspection?.needs_compaction ? 'warn' : ''}`}
+              onClick={() => {
+                setShowInspector(true);
+                void refreshContext(session.id);
+              }}
+              title="透视终端副驾驶注入的 AGENTS.md、记忆、监控快照与上下文占用"
+            >
+              <Layers size={11.5} />
+              {contextInspection ? (
+                <span className="mono">{contextInspection.usage_percent.toFixed(0)}%</span>
+              ) : (
+                <span>透视</span>
+              )}
+            </button>
+          )}
+          {session && session.messages.length >= 4 && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm btn-icon"
+              disabled={compacting || streaming}
+              onClick={() => void handleCompact(false)}
+              title="无损滚动压缩当前副驾驶会话历史"
+            >
+              <Minimize2 size={13} />
+            </button>
+          )}
           <button
             type="button"
             className="btn btn-ghost btn-sm btn-icon"
@@ -343,9 +448,9 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         ) : !session || session.messages.length === 0 ? (
           <div className="empty-state" style={{ padding: '36px 14px' }}>
             <TerminalSquare size={22} style={{ marginBottom: 8, color: 'var(--accent-teal)' }} />
-            <h3>同屏感知终端上下文</h3>
+            <h3>同屏感知终端上下文与记忆</h3>
             <p>
-              可直接询问命令写法、一键解析左侧 PTY 终端报错，或将 AI 生成的 Shell 命令一键注入当前终端执行。
+              自动共享全局 AGENTS.md、当前主机画像与长期记忆，可一键解析左侧 PTY 终端报错并将命令注入当前终端。
             </p>
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11.5, color: 'var(--accent-teal)' }}>
               <ShieldCheck size={13} /> 当前模式：{mode === 'suggest' ? '参谋模式' : mode === 'standard' ? '标准受控' : '自治执行'}
@@ -353,18 +458,36 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           </div>
         ) : (
           <>
-            {session.messages
-              .filter((m) => m.role === 'user' || m.role === 'assistant')
-              .map((msg) => {
+            {(() => {
+              const compactedUntil = session.compacted_until_count || 0;
+              const visibleItems = session.messages
+                .map((msg, rawIdx) => ({ msg, rawIdx }))
+                .filter((x) => x.msg.role === 'user' || x.msg.role === 'assistant');
+              let dividerShown = false;
+
+              return visibleItems.map(({ msg, rawIdx }) => {
+                const showDividerBefore =
+                  !dividerShown && compactedUntil > 0 && rawIdx >= compactedUntil;
+                if (showDividerBefore) dividerShown = true;
+
                 if (msg.role === 'user') {
                   // Hide verbose attached PTY block in compact bubble display
                   const cleanUserText = msg.content.split('\n\n[附：当前活跃 SSH 终端最近输出回显]')[0];
                   return (
-                    <div key={msg.id} className="ai-msg-row user" style={{ maxWidth: '88%' }}>
-                      <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '8px 12px' }}>
-                        {cleanUserText}
+                    <React.Fragment key={msg.id}>
+                      {showDividerBefore && (
+                        <CompactionDivider
+                          compactedUntilCount={compactedUntil}
+                          compactionCount={session.compaction_count}
+                          onInspect={() => setShowInspector(true)}
+                        />
+                      )}
+                      <div className="ai-msg-row user" style={{ maxWidth: '88%' }}>
+                        <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '8px 12px' }}>
+                          {cleanUserText}
+                        </div>
                       </div>
-                    </div>
+                    </React.Fragment>
                   );
                 }
 
@@ -374,44 +497,67 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                 const snippets = extractShellSnippets(msg.content || '');
 
                 return (
-                  <div key={msg.id} className="ai-msg-row assistant">
-                    {msg.tool_calls && msg.tool_calls.length > 0 && (
-                      <div className="ai-tool-trace-list">
-                        {msg.tool_calls.map((tc) => (
-                          <ToolTraceStep key={tc.id} tool={tc} />
-                        ))}
-                      </div>
-                    )}
-                    {msg.content && (
-                      <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '9px 12px' }}>
-                        <FormattedMarkdownText text={msg.content} />
-                      </div>
-                    )}
-                    {snippets.length > 0 && (
-                      <ShellSnippetActionBar
-                        commands={snippets}
-                        onInject={(cmd) => {
-                          onInjectCommand(cmd);
-                          onNotify('已将命令注入左侧当前终端');
-                        }}
-                        onNotify={onNotify}
+                  <React.Fragment key={msg.id}>
+                    {showDividerBefore && (
+                      <CompactionDivider
+                        compactedUntilCount={compactedUntil}
+                        compactionCount={session.compaction_count}
+                        onInspect={() => setShowInspector(true)}
                       />
                     )}
-                    {linkedApprovals.map((ap) => (
-                      <HITLApprovalCard
-                        key={ap.id}
-                        approval={ap}
-                        busy={streaming}
-                        onDecide={(id, ok) => void handleApproval(id, ok)}
-                        onInjectTerminal={(cmd) => {
-                          onInjectCommand(cmd);
-                          onNotify('已将待执行命令发送至当前终端');
-                        }}
-                      />
-                    ))}
-                  </div>
+                    <div className="ai-msg-row assistant">
+                      {msg.tool_calls && msg.tool_calls.length > 0 && (
+                        <div className="ai-tool-trace-list">
+                          {msg.tool_calls.map((tc) => (
+                            <ToolTraceStep key={tc.id} tool={tc} />
+                          ))}
+                        </div>
+                      )}
+                      {msg.content && (
+                        <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '9px 12px' }}>
+                          <FormattedMarkdownText text={msg.content} />
+                        </div>
+                      )}
+                      {snippets.length > 0 && (
+                        <ShellSnippetActionBar
+                          commands={snippets}
+                          onInject={(cmd) => {
+                            onInjectCommand(cmd);
+                            onNotify('已将命令注入左侧当前终端');
+                          }}
+                          onNotify={onNotify}
+                        />
+                      )}
+                      {linkedApprovals.map((ap) => (
+                        <HITLApprovalCard
+                          key={ap.id}
+                          approval={ap}
+                          busy={streaming}
+                          onDecide={(id, ok) => void handleApproval(id, ok)}
+                          onInjectTerminal={(cmd) => {
+                            onInjectCommand(cmd);
+                            onNotify('已将待执行命令发送至当前终端');
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </React.Fragment>
                 );
-              })}
+              });
+            })()}
+
+            {(session.agents_md_proposals || []).map((prop) => (
+              <AgentsMDProposalCard
+                key={prop.id}
+                proposal={prop}
+                busy={streaming}
+                onResolve={async (id, accept) => {
+                  await api.resolveAgentsMDProposal(id, accept);
+                  onNotify(accept ? '已合入全局 AGENTS.md' : '已忽略 AGENTS.md 修订建议');
+                  await loadBoundSession();
+                }}
+              />
+            ))}
 
             {(session.runbook_proposals || []).map((prop) => (
               <RunbookProposalCard
@@ -468,6 +614,18 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           <Send size={13} />
         </button>
       </form>
+
+      {showInspector && (
+        <ContextInspectorModal
+          inspection={contextInspection}
+          loading={loadingContext}
+          compacting={compacting}
+          onRefresh={() => void refreshContext(session?.id)}
+          onCompact={(reset) => void handleCompact(Boolean(reset))}
+          onClose={() => setShowInspector(false)}
+          onOpenAgentsMD={onNavigateAIConfig}
+        />
+      )}
     </div>
   );
 };
