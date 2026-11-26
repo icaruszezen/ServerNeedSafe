@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -51,106 +50,25 @@ func doWithHeaders(t *testing.T, client *http.Client, method, target string, bod
 	return res.StatusCode
 }
 
-// The HttpOnly admin cookie must only authenticate same-origin requests (CSRF from sibling
-// sub-domains / other ports is not stopped by SameSite=Strict). Bearer tokens stay usable cross-origin.
-func TestCookieSessionCSRFGuard(t *testing.T) {
-	srv, ts := newTestServerInstance(t, t.TempDir(), 8*time.Hour)
-	defer ts.Close()
-	defer srv.Close()
-
-	cookieClient := newCookieHTTPClient()
-	token := setupAdminForRegression(t, ts, cookieClient, "CsrfGuardAdmin#2026!")
-
-	target := ts.URL + "/api/vault/security"
-	cases := []struct {
-		name    string
-		headers map[string]string
-		want    int
-	}{
-		{"no-origin (non-browser / same-origin GET)", nil, http.StatusOK},
-		{"same-origin", map[string]string{"Origin": ts.URL, "Sec-Fetch-Site": "same-origin"}, http.StatusOK},
-		{"cross-origin Origin", map[string]string{"Origin": "https://evil.example"}, http.StatusUnauthorized},
-		{"same-site sibling (Sec-Fetch-Site)", map[string]string{"Sec-Fetch-Site": "same-site"}, http.StatusUnauthorized},
-		{"cross-site (Sec-Fetch-Site)", map[string]string{"Sec-Fetch-Site": "cross-site"}, http.StatusUnauthorized},
-		{"opaque null origin", map[string]string{"Origin": "null"}, http.StatusUnauthorized},
-	}
-	for _, tc := range cases {
-		if got := doWithHeaders(t, cookieClient, http.MethodGet, target, nil, tc.headers); got != tc.want {
-			t.Fatalf("%s: expected %d, got %d", tc.name, tc.want, got)
-		}
-	}
-
-	// A state-changing cross-origin "simple" POST riding on the cookie must be rejected.
-	if got := doWithHeaders(t, cookieClient, http.MethodPost, ts.URL+"/api/auth/lock", []byte(`{}`), map[string]string{"Origin": "https://evil.example", "Sec-Fetch-Site": "same-site"}); got != http.StatusUnauthorized {
-		t.Fatalf("cross-origin cookie POST /api/auth/lock: expected 401, got %d", got)
-	}
-
-	// Bearer tokens (remote zero-knowledge sync clients) keep working cross-origin.
-	if got := doWithHeaders(t, &http.Client{}, http.MethodGet, target, nil, map[string]string{"Origin": "https://sync-client.example", "Authorization": "Bearer " + token}); got != http.StatusOK {
-		t.Fatalf("bearer cross-origin: expected 200, got %d", got)
-	}
-}
-
-func TestProxyHeaderTrust(t *testing.T) {
+// Reverse-proxy friendly client IP extraction for trusted intranet / reverse proxy deployments.
+func TestExtractClientIPFriendlyProxyHeaders(t *testing.T) {
 	mk := func(remote string, hdr map[string]string) *http.Request {
-		r := httptest.NewRequest(http.MethodGet, "http://sns.example/api/health", nil)
+		r := httptest.NewRequest(http.MethodGet, "http://sns.internal/api/health", nil)
 		r.RemoteAddr = remote
 		for k, v := range hdr {
 			r.Header.Set(k, v)
 		}
 		return r
 	}
-	// Direct public client cannot spoof its audit IP.
-	if ip := extractClientIP(mk("203.0.113.9:5555", map[string]string{"X-Forwarded-For": "1.2.3.4", "X-Real-IP": "5.6.7.8"})); ip != "203.0.113.9" {
-		t.Fatalf("spoofed proxy headers trusted from public peer: %s", ip)
+	if ip := extractClientIP(mk("10.0.0.5:4000", map[string]string{"X-Real-IP": "192.168.1.42"})); ip != "192.168.1.42" {
+		t.Fatalf("expected X-Real-IP, got %s", ip)
 	}
-	// Local reverse proxy: X-Real-IP, then the RIGHTMOST X-Forwarded-For hop.
-	if ip := extractClientIP(mk("127.0.0.1:4000", map[string]string{"X-Real-IP": "198.51.100.7"})); ip != "198.51.100.7" {
-		t.Fatalf("X-Real-IP from local proxy not used: %s", ip)
+	if ip := extractClientIP(mk("172.18.0.1:4000", map[string]string{"X-Forwarded-For": "198.51.100.8, 10.0.0.2"})); ip != "198.51.100.8" {
+		t.Fatalf("expected first valid X-Forwarded-For hop, got %s", ip)
 	}
-	if ip := extractClientIP(mk("172.18.0.1:4000", map[string]string{"X-Forwarded-For": "6.6.6.6, 198.51.100.8"})); ip != "198.51.100.8" {
-		t.Fatalf("expected rightmost XFF hop, got %s", ip)
+	if ip := extractClientIP(mk("10.0.0.9:5555", map[string]string{"X-Real-IP": "not-an-ip"})); ip != "10.0.0.9" {
+		t.Fatalf("invalid header must fall back to RemoteAddr host, got %s", ip)
 	}
-
-	// X-Forwarded-Host is only honoured from a trusted local proxy peer.
-	if !isSameOriginRequest(mk("127.0.0.1:4000", map[string]string{"X-Forwarded-Host": "panel.example.com"}), "https://panel.example.com") {
-		t.Fatalf("X-Forwarded-Host from local proxy should be accepted")
-	}
-	if isSameOriginRequest(mk("203.0.113.9:5555", map[string]string{"X-Forwarded-Host": "evil.example"}), "https://evil.example") {
-		t.Fatalf("X-Forwarded-Host from public peer must be ignored")
-	}
-	if isSameOriginRequest(mk("203.0.113.9:5555", nil), "file://") {
-		t.Fatalf("host-less origin must not be treated as same-origin")
-	}
-}
-
-func TestPasswordKDFSlotsBounded(t *testing.T) {
-	srv, ts := newTestServerInstance(t, t.TempDir(), 8*time.Hour)
-	defer ts.Close()
-	defer srv.Close()
-
-	var releases []func()
-	for i := 0; i < maxConcurrentPasswordKDF; i++ {
-		rel, ok := srv.acquirePasswordKDFSlot(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/auth/login", nil))
-		if !ok {
-			t.Fatalf("slot %d should be available", i)
-		}
-		releases = append(releases, rel)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil).WithContext(ctx)
-	if _, ok := srv.acquirePasswordKDFSlot(httptest.NewRecorder(), req); ok {
-		t.Fatalf("expected KDF slots to be exhausted")
-	}
-	for _, rel := range releases {
-		rel()
-	}
-	rel, ok := srv.acquirePasswordKDFSlot(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/auth/login", nil))
-	if !ok {
-		t.Fatalf("slot should be free again after release")
-	}
-	rel()
 }
 
 // Stored (masked) AI API keys must never be sent to a caller-chosen endpoint via "test connection".

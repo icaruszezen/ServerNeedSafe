@@ -12,8 +12,9 @@ import {
   Cloud,
   ArrowUpRight,
   ArrowDownLeft,
-  Cpu,
-  Sliders,
+  Database,
+  ShieldCheck,
+  Activity,
 } from 'lucide-react';
 import { api } from '../api';
 import type { AppSettings, VaultSecurityOverview } from '../types';
@@ -25,32 +26,12 @@ interface VaultSecurityProps {
   onNotify: (msg: string) => void;
 }
 
-const KDF_PROFILES = [
-  {
-    memoryKiB: 16384,
-    time: 2,
-    threads: 2,
-    label: '16 MiB · 极速轻量档（低配云主机 / 快速验证）',
-  },
-  {
-    memoryKiB: 32768,
-    time: 3,
-    threads: 4,
-    label: '32 MiB · 均衡档（兼顾低内存与高抗暴力破解）',
-  },
-  {
-    memoryKiB: 65536,
-    time: 3,
-    threads: 4,
-    label: '64 MiB · 标准安全档（默认推荐，Go 原生 ~45ms）',
-  },
-  {
-    memoryKiB: 131072,
-    time: 4,
-    threads: 4,
-    label: '128 MiB · 金融级高强抗 GPU 爆破档',
-  },
-];
+function formatBytes(n?: number): string {
+  const v = n || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  return `${(v / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   onSettingsChanged,
@@ -61,7 +42,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   const [data, setData] = useState<VaultSecurityOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [settingsForm, setSettingsForm] = useState<AppSettings>({
-    auto_lock_minutes: 30,
+    auto_lock_minutes: 0,
     host_key_policy: 'tofu',
     terminal_font_size: 14,
     terminal_scrollback: 5000,
@@ -69,27 +50,28 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     remote_sync_url: '',
   });
 
-  // Argon2id KDF Profile Tuning
-  const [selectedKdfMem, setSelectedKdfMem] = useState<number>(65536);
-  const [kdfPassword, setKdfPassword] = useState('');
-  const [updatingKdf, setUpdatingKdf] = useState(false);
-
-  // Password Rotation
+  // Admin Login Password Update
   const [oldPass, setOldPass] = useState('');
   const [newPass, setNewPass] = useState('');
   const [confirmPass, setConfirmPass] = useState('');
-  const [rotating, setRotating] = useState(false);
+  const [updatingPass, setUpdatingPass] = useState(false);
+
+  // Portable Encrypted Backup Export
+  const [exportPass, setExportPass] = useState('');
+  const [exportPassConfirm, setExportPassConfirm] = useState('');
+  const [exportIncludeRuntime, setExportIncludeRuntime] = useState(true);
+  const [exporting, setExporting] = useState(false);
 
   // Import Backup
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPass, setImportPass] = useState('');
-  const [importCurrentPass, setImportCurrentPass] = useState('');
+  const [importIncludeRuntime, setImportIncludeRuntime] = useState(true);
   const [importing, setImporting] = useState(false);
 
-  // Remote Cloud Sync
+  // Cross-Instance Sync (Desktop <-> Server)
   const [syncUrl, setSyncUrl] = useState('');
   const [syncRemotePass, setSyncRemotePass] = useState('');
-  const [syncLocalPass, setSyncLocalPass] = useState('');
+  const [syncIncludeRuntime, setSyncIncludeRuntime] = useState(false);
   const [syncing, setSyncing] = useState<'push' | 'pull' | null>(null);
 
   const loadOverview = useCallback(async () => {
@@ -98,12 +80,9 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       const res = await api.getVaultSecurity();
       setData(res);
       setSettingsForm(res.settings);
-      if (res.encryption?.kdf_memory_kib) {
-        setSelectedKdfMem(res.encryption.kdf_memory_kib);
-      }
       setSyncUrl((prev) => prev || res.settings.remote_sync_url || '');
     } catch (err: any) {
-      onNotify(err?.message || '读取安全中心状态失败');
+      onNotify(err?.message || '读取安全与存储中心状态失败');
     } finally {
       setLoading(false);
     }
@@ -122,42 +101,14 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       };
       const res = await api.updateSettings(nextSettings);
       onSettingsChanged(res.settings);
-      onNotify('会话超时策略与终端偏好已加密保存');
+      onNotify('会话策略与终端偏好已加密保存');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '保存设置失败');
     }
   };
 
-  const handleUpdateKdf = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!kdfPassword) {
-      onNotify('请输入当前管理员密码以验证并重封装密钥');
-      return;
-    }
-    const profile =
-      KDF_PROFILES.find((p) => p.memoryKiB === selectedKdfMem) || KDF_PROFILES[2];
-    setUpdatingKdf(true);
-    try {
-      await api.updateVaultKDF({
-        password: kdfPassword,
-        kdf_memory_kib: profile.memoryKiB,
-        kdf_time: profile.time,
-        kdf_threads: profile.threads,
-      });
-      setKdfPassword('');
-      onNotify(
-        `已切换 Argon2id 强度至 ${Math.round(profile.memoryKiB / 1024)} MiB 并同步更新自动挂载密钥`
-      );
-      await loadOverview();
-    } catch (err: any) {
-      onNotify(err?.message || '调整 Argon2id 档位失败');
-    } finally {
-      setUpdatingKdf(false);
-    }
-  };
-
-  const handleRotatePassword = async (e: React.FormEvent) => {
+  const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (newPass.length < 8) {
       onNotify('新管理员密码长度至少需要 8 位');
@@ -167,24 +118,34 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       onNotify('两次输入的新密码不一致');
       return;
     }
-    setRotating(true);
+    setUpdatingPass(true);
     try {
       await api.changePassword(oldPass, newPass);
       setOldPass('');
       setNewPass('');
       setConfirmPass('');
-      onNotify('管理员主密码、DEK 与 .vault.key 已完成原子轮换，其他设备会话已注销');
+      onNotify('管理员登录密码已更新，其他设备会话已注销（7×24 监控与巡检不受影响）');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '修改管理员密码失败');
     } finally {
-      setRotating(false);
+      setUpdatingPass(false);
     }
   };
 
-  const handleExport = async () => {
+  const handleExport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (exportPass.length < 8) {
+      onNotify('请设置至少 8 位的备份加密口令');
+      return;
+    }
+    if (exportPass !== exportPassConfirm) {
+      onNotify('两次输入的备份口令不一致');
+      return;
+    }
+    setExporting(true);
     try {
-      const { blob, filename } = await api.exportVaultBlob();
+      const { blob, filename } = await api.exportVaultBlob(exportPass, exportIncludeRuntime);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -193,29 +154,36 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      onNotify('已导出纯密码保护加密备份包 (.sns)');
+      setExportPass('');
+      setExportPassConfirm('');
+      onNotify(
+        exportIncludeRuntime
+          ? '已导出口令加密全量备份 (.sns)'
+          : '已导出口令加密核心配置与 AI 记忆备份 (.sns)'
+      );
+      await loadOverview();
     } catch (err: any) {
-      onNotify(err?.message || '导出失败');
+      onNotify(err?.message || '导出加密备份失败');
+    } finally {
+      setExporting(false);
     }
   };
 
   const handleImport = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!importFile || !importPass) {
-      onNotify('请选择 .sns 备份文件并输入对应密码');
+      onNotify('请选择 .sns 备份文件并输入对应的备份口令');
       return;
     }
     setImporting(true);
     try {
       const res = await api.importVault(importFile, importPass, {
-        currentAdminPassword: importCurrentPass || undefined,
-        clearAnchor: true,
+        includeRuntime: importIncludeRuntime,
       });
       onSettingsChanged(res.settings);
       setImportFile(null);
       setImportPass('');
-      setImportCurrentPass('');
-      onNotify('加密备份已校验恢复并自动更新 7×24 挂载密钥');
+      onNotify('加密备份已校验恢复（当前管理员密码与 7×24 后台服务保持运行）');
       await loadOverview();
     } catch (err: any) {
       onNotify(err?.message || '恢复备份失败');
@@ -225,39 +193,48 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   };
 
   const handleSyncPush = async () => {
-    if (!syncUrl.trim()) {
-      onNotify('请输入远端同步服务地址 (例如 https://vault.example.com)');
+    if (!syncUrl.trim() || !syncRemotePass.trim()) {
+      onNotify('请填写远端服务地址与远端管理员密码');
       return;
     }
     setSyncing('push');
     try {
-      const { summary } = await api.syncPush(syncUrl.trim(), syncRemotePass);
+      const { summary } = await api.syncPush(
+        syncUrl.trim(),
+        syncRemotePass,
+        syncIncludeRuntime
+      );
       setSyncRemotePass('');
       onNotify(
-        `已推送加密容器至远端 (Rev #${summary.revision}, ${(summary.bytes / 1024).toFixed(1)} KB)`
+        `已推送至远端 (${summary.include_runtime ? '含运行数据' : '仅核心配置与 AI 记忆'} · Rev #${summary.revision}, ${formatBytes(summary.bytes)})`
       );
       await loadOverview();
     } catch (err: any) {
-      onNotify(err?.message || '推送密文同步失败');
+      onNotify(err?.message || '推送同步失败');
     } finally {
       setSyncing(null);
     }
   };
 
   const handleSyncPull = async () => {
-    if (!syncUrl.trim()) {
-      onNotify('请输入远端同步服务地址');
+    if (!syncUrl.trim() || !syncRemotePass.trim()) {
+      onNotify('请填写远端服务地址与远端管理员密码');
       return;
     }
     setSyncing('pull');
     try {
-      const { summary } = await api.syncPull(syncUrl.trim(), syncRemotePass, syncLocalPass);
+      const { summary } = await api.syncPull(
+        syncUrl.trim(),
+        syncRemotePass,
+        syncIncludeRuntime
+      );
       setSyncRemotePass('');
-      setSyncLocalPass('');
-      onNotify(`已从远端拉取并合并加密容器 (Rev #${summary.revision})`);
+      onNotify(
+        `已从远端拉取合并 (${summary.include_runtime ? '含运行数据' : '仅核心配置与 AI 记忆'} · Rev #${summary.revision})`
+      );
       await loadOverview();
     } catch (err: any) {
-      onNotify(err?.message || '从远端拉取密文失败');
+      onNotify(err?.message || '拉取同步失败');
     } finally {
       setSyncing(null);
     }
@@ -273,36 +250,34 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     }
   };
 
+  const ttlDays = Math.max(1, Math.round((data?.session_ttl_hours || 168) / 24));
+
   return (
     <div className="workspace-surface" id="vault-security-view">
       <div className="page-header">
         <div className="page-header-title">
-          <h2>安全保险库、密钥档位与审计中心</h2>
+          <h2>安全存储、备份同步与审计中心</h2>
           <p>
-            XChaCha20-Poly1305 落盘加密 (<code className="mono">vault.sns</code>) + 7×24 守护进程自动挂载密钥 (
-            <code className="mono">.vault.key</code>)
+            敏感凭据独立加密 (<code className="mono">secrets.enc</code>) + 高频运行态分文件防抖落盘（7×24 后台零锁定）
           </p>
         </div>
         <div className="page-header-actions">
           <button type="button" className="btn" onClick={() => void loadOverview()}>
             <RefreshCw size={14} /> 刷新状态
           </button>
-          <button type="button" className="btn btn-teal" onClick={() => void handleExport()}>
-            <Download size={14} /> 导出加密备份 (.sns)
-          </button>
           <button
             type="button"
             className="btn"
             onClick={() => void onLogoutSession()}
-            title="仅退出当前浏览器会话，后台 7×24 监控与 AI 巡检保持运行"
+            title="仅退出当前浏览器会话，后台 7×24 监控与 AI 巡检不受影响"
           >
-            <Lock size={14} /> 锁定当前会话
+            <Lock size={14} /> 退出当前会话
           </button>
           <button
             type="button"
             className="btn btn-danger"
             onClick={() => void onRevokeAllSessions()}
-            title="注销所有设备上的已登录管理会话，后台 7×24 守护继续运行"
+            title="注销所有设备上的已登录管理会话并断开交互终端，后台 7×24 监控与巡检持续运行"
           >
             <Lock size={14} /> 注销全部设备会话
           </button>
@@ -311,11 +286,11 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
 
       <div className="page-body">
         {loading && !data ? (
-          <div className="empty-state">正在读取保险库加密元数据与审计记录...</div>
+          <div className="empty-state">正在读取分层加密存储状态与审计记录...</div>
         ) : (
           <>
-            {/* Dual-Key Encrypted Storage & 7x24 Daemon Overview Banner */}
-            <section className="sec-panel" style={{ marginBottom: 18 }} id="zk-isolation-proof-panel">
+            {/* Split-Storage & 7x24 Decoupled Architecture Overview */}
+            <section className="sec-panel" style={{ marginBottom: 18 }} id="split-storage-overview-panel">
               <div
                 style={{
                   display: 'flex',
@@ -327,84 +302,59 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                 }}
               >
                 <h3 style={{ margin: 0 }}>
-                  <Cpu size={16} style={{ color: 'var(--accent-teal)' }} />
-                  7×24 守护加密架构状态 (SNSVAULT v{data?.encryption.format_version || 2})
+                  <Database size={16} style={{ color: 'var(--accent-teal)' }} />
+                  分层加密与 7×24 免锁架构状态 (v{data?.encryption.format_version || 3})
                 </h3>
                 <span className="tag-chip teal">
-                  重启 &lt;1ms 自动挂载 · HttpOnly 安全会话 · 备份纯密码封装
+                  <Activity size={12} style={{ marginRight: 4 }} />
+                  监控/巡检与加密完全解耦 · 启动自动挂载 · 永不锁定
                 </span>
               </div>
               <p className="sec-panel-desc" style={{ marginBottom: 12 }}>
-                <code className="mono">vault.sns</code> 全程使用管理员密码派生的 KEK 与 XChaCha20-Poly1305 加密；本地{' '}
-                <code className="mono">0600</code> 权限的 <code className="mono">.vault.key</code>（或环境变量{' '}
-                <code className="mono">SNS_MASTER_KEY</code>）支撑容器重启无感恢复 7×24 监控与巡检，且绝不进入导出的{' '}
-                <code className="mono">.sns</code> 备份文件。
+                SSH 密码/私钥、凭据库、AI API Key 与 Webhook 密钥独立使用{' '}
+                <code className="mono">XChaCha20-Poly1305</code> 加密落盘于{' '}
+                <code className="mono">secrets.enc</code>，主密钥与管理员登录密码完全解耦；高频监控时序、告警、AI 对话、巡检记录与审计日志拆分到独立普通 JSON 文件防抖持久化，采集写入绝不触发凭据重加密。本平台建议部署在内网或受控安全主机。
               </p>
               <div className="security-grid" style={{ marginBottom: 0 }}>
                 <div className="kv-list">
                   <div className="kv-row">
-                    <span className="kv-key">保险库唯一标识 (Vault ID)</span>
-                    <span className="kv-val mono" style={{ fontSize: 12 }}>
-                      {data?.encryption.vault_id || '—'}
-                    </span>
-                  </div>
-                  <div className="kv-row">
-                    <span className="kv-key">加密容器路径 / 版本号</span>
+                    <span className="kv-key">敏感凭据加密库 (secrets.enc)</span>
                     <span className="kv-val mono" style={{ color: 'var(--accent-teal)' }}>
-                      {data?.vault_path} · Rev #{data?.encryption.revision ?? 1}
+                      {formatBytes(data?.storage?.secrets_size_bytes)} · Rev #{data?.encryption.revision ?? 1}
                     </span>
                   </div>
                   <div className="kv-row">
-                    <span className="kv-key">Ed25519 签名公钥指纹</span>
-                    <span className="kv-val mono" style={{ fontSize: 11.5 }}>
-                      {data?.encryption.auth_pubkey_sha256
-                        ? `${data.encryption.auth_pubkey_sha256.slice(0, 24)}…`
-                        : '—'}
+                    <span className="kv-key">数据加密主密钥来源</span>
+                    <span className="kv-val mono" style={{ fontSize: 12 }}>
+                      {data?.storage?.master_key_mode === 'env'
+                        ? '环境变量 SNS_MASTER_KEY（与数据目录分离）'
+                        : `本地自动密钥 ${data?.storage?.master_key_path || 'master.key'} (0600)`}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">加密套件与登录密码哈希</span>
+                    <span className="kv-val">
+                      XChaCha20-Poly1305 · Argon2id (16 MiB 轻量快速)
                     </span>
                   </div>
                 </div>
                 <div className="kv-list">
                   <div className="kv-row">
-                    <span className="kv-key">7×24 自动挂载密钥状态</span>
-                    <span className="kv-val mono" style={{ fontSize: 11.5, color: 'var(--accent-teal)' }}>
-                      {data?.auto_unlock_enabled
-                        ? `已就绪 (${data.key_seal_path || '.vault.key'})`
-                        : '待生成'}
-                    </span>
-                  </div>
-                  {data?.auto_unlock_enabled && data?.auto_unlock_mode && (
-                    <div className="kv-row">
-                      <span className="kv-key">自动挂载密钥封装方式</span>
-                      <span
-                        className="kv-val"
-                        style={{
-                          fontSize: 12,
-                          color: data.auto_unlock_mode === 'env' ? 'var(--accent-teal)' : 'var(--amber-text)',
-                        }}
-                        title={
-                          data.auto_unlock_mode === 'env'
-                            ? '.vault.key 仅含密文，解封主密钥来自进程环境变量 SNS_MASTER_KEY'
-                            : '解封主密钥与 DEK 同存于 .vault.key，仅受 0600 文件权限保护：数据目录整体泄露即可解密保险库'
-                        }
-                      >
-                        {data.auto_unlock_mode === 'env'
-                          ? '外部主密钥 SNS_MASTER_KEY（与数据目录分离）'
-                          : '⚠ 文件内主密钥（数据目录泄露即可解密，建议配置 SNS_MASTER_KEY）'}
-                      </span>
-                    </div>
-                  )}
-                  <div className="kv-row">
-                    <span className="kv-key">密码学套件 (KDF / AEAD)</span>
-                    <span className="kv-val">
-                      Argon2id ({Math.round((data?.encryption.kdf_memory_kib || 65536) / 1024)} MiB /{' '}
-                      {data?.encryption.kdf_time || 3} 轮) · XChaCha20-Poly1305
+                    <span className="kv-key">7×24 后台监控与巡检状态</span>
+                    <span className="kv-val" style={{ color: 'var(--accent-teal)', fontWeight: 550 }}>
+                      {data?.daemon_running ? '持续运行中（与 Web 登录/改密完全解耦）' : '初始化中'}
                     </span>
                   </div>
                   <div className="kv-row">
-                    <span className="kv-key">存储体积 / 活跃会话与终端</span>
+                    <span className="kv-key">独立运行态分文件体积</span>
+                    <span className="kv-val mono" style={{ fontSize: 12 }}>
+                      监控 {formatBytes(data?.storage?.monitor_size_bytes)} · AI {formatBytes(data?.storage?.aiops_size_bytes)} · 审计 {formatBytes(data?.storage?.audit_size_bytes)}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">数据目录 / 活跃会话与终端</span>
                     <span className="kv-val">
-                      {((data?.encryption.vault_size_bytes || 0) / 1024).toFixed(1)} KB ·{' '}
-                      {data?.active_sessions ?? 1} 个管理会话 · {data?.active_ssh_tabs ?? 0} 个活跃终端
+                      <code className="mono" style={{ fontSize: 11.5 }}>{data?.data_dir}</code> · {data?.active_sessions ?? 1} 会话（{ttlDays} 天有效） · {data?.active_ssh_tabs ?? 0} 终端
                     </span>
                   </div>
                 </div>
@@ -412,14 +362,14 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
             </section>
 
             <div className="security-grid">
-              {/* Security Policy Settings */}
+              {/* Web Session & Terminal Preferences */}
               <section className="sec-panel">
                 <h3>
                   <Settings size={16} />
-                  Web 会话安全策略与终端偏好
+                  Web 会话策略与终端偏好
                 </h3>
                 <p className="sec-panel-desc">
-                  管理控制台单次会话最长 8 小时有效；空闲超时仅自动注销浏览器会话，不会中断后台 7×24 监控与 AI 定时巡检。
+                  管理控制台单次会话最长 {ttlDays} 天有效（可通过 <code className="mono">SNS_SESSION_TTL</code> 调整）；默认关闭空闲自动退出，亦可按需开启。会话过期绝不影响后台 7×24 监控与巡检。
                 </p>
                 <form onSubmit={handleSaveSettings}>
                   <div className="field-row">
@@ -435,11 +385,11 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                           })
                         }
                       >
-                        <option value={5}>5 分钟（高敏感环境）</option>
+                        <option value={0}>不启用空闲退出（默认，受 {ttlDays} 天会话有效期约束）</option>
                         <option value={15}>15 分钟</option>
-                        <option value={30}>30 分钟（默认推荐）</option>
+                        <option value={30}>30 分钟</option>
                         <option value={60}>60 分钟</option>
-                        <option value={0}>不启用空闲锁定（仅受 8h 会话上限约束）</option>
+                        <option value={120}>120 分钟</option>
                       </select>
                     </div>
                     <div className="field">
@@ -485,61 +435,16 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                 </form>
               </section>
 
-              {/* Argon2id KDF Strength Selector */}
-              <section className="sec-panel" id="vault-kdf-tuning-panel">
-                <h3>
-                  <Sliders size={16} style={{ color: 'var(--accent-teal)' }} />
-                  Argon2id 密钥派生强度档位调节
-                </h3>
-                <p className="sec-panel-desc">
-                  调整密码登录及导出备份包 <code className="mono">.sns</code> 的抗离线暴力破解强度。Go 原生多线程下{' '}
-                  <code className="mono">64 MiB</code> 仅需约 45ms。
-                </p>
-                <form onSubmit={handleUpdateKdf}>
-                  <div className="field">
-                    <label className="field-label">选择 Argon2id 内存与迭代档位</label>
-                    <select
-                      id="kdf-profile-select"
-                      className="select"
-                      value={selectedKdfMem}
-                      onChange={(e) => setSelectedKdfMem(Number(e.target.value))}
-                    >
-                      {KDF_PROFILES.map((p) => (
-                        <option key={p.memoryKiB} value={p.memoryKiB}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label className="field-label">输入当前管理员密码以重封装容器</label>
-                    <input
-                      id="kdf-password-input"
-                      type="password"
-                      className="input"
-                      placeholder="验证当前管理员密码后立即生效"
-                      value={kdfPassword}
-                      onChange={(e) => setKdfPassword(e.target.value)}
-                      required
-                    />
-                  </div>
-                  <button type="submit" className="btn btn-primary" disabled={updatingKdf}>
-                    {updatingKdf ? '正在重派生并原子更新密钥...' : '应用 Argon2id 强度档位'}
-                  </button>
-                </form>
-              </section>
-
-              {/* Rotate Master Password */}
-              <section className="sec-panel">
+              {/* Change Admin Login Password */}
+              <section className="sec-panel" id="admin-password-panel">
                 <h3>
                   <KeyRound size={16} />
-                  轮换管理员主密码与加密主密钥
+                  修改管理员登录密码
                 </h3>
                 <p className="sec-panel-desc">
-                  重新生成 256 位随机盐、全新 DEK 与 Ed25519 签名密钥对，同步更新 <code className="mono">vault.sns</code> 与{' '}
-                  <code className="mono">.vault.key</code> 并自动踢出其他会话。
+                  管理员密码仅用于 Web 控制台登录鉴权，与数据加密主密钥解耦。修改密码会即时注销其他设备的 Web 会话，但不会重加密凭据，也不中断后台监控与 AI 巡检。
                 </p>
-                <form onSubmit={handleRotatePassword}>
+                <form onSubmit={handleChangePassword}>
                   <div className="field">
                     <label className="field-label">当前管理员密码</label>
                     <input
@@ -573,53 +478,119 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                       />
                     </div>
                   </div>
-                  <button type="submit" className="btn btn-primary" disabled={rotating}>
-                    {rotating ? '正在重加密整个保险库...' : '更新密码并轮换全部密钥'}
+                  <button type="submit" className="btn btn-primary" disabled={updatingPass}>
+                    {updatingPass ? '正在更新密码哈希...' : '更新管理员登录密码'}
                   </button>
                 </form>
               </section>
 
-              {/* Remote Cloud Sync */}
-              <section className="sec-panel" id="zk-remote-sync-panel">
+              {/* Portable Password-Encrypted Backup Export */}
+              <section className="sec-panel" id="backup-export-panel">
                 <h3>
-                  <Cloud size={16} style={{ color: 'var(--accent-teal)' }} />
-                  跨端加密密文云同步
+                  <Download size={16} style={{ color: 'var(--accent-teal)' }} />
+                  导出口令加密备份包 (.sns)
                 </h3>
                 <p className="sec-panel-desc">
-                  在本地 Windows 桌面端与远端 <code className="mono">sns-server</code> 之间同步经过 Ed25519 签名的{' '}
-                  <code className="mono">SNSVAULT v2</code> 加密容器。
+                  使用您指定的临时或常用加密口令将主机凭据、密钥库、AI 供应商与 AI 记忆/Runbook 加密打包为便携 <code className="mono">.sns</code> 文件（不含本地 <code className="mono">master.key</code>），可安全跨机迁移。
+                </p>
+                <form onSubmit={handleExport}>
+                  <div className="field-row">
+                    <div className="field">
+                      <label className="field-label">备份加密口令（至少 8 位）</label>
+                      <input
+                        id="backup-export-password"
+                        type="password"
+                        className="input"
+                        placeholder="设置本次备份包加密口令"
+                        value={exportPass}
+                        onChange={(e) => setExportPass(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div className="field">
+                      <label className="field-label">确认备份口令</label>
+                      <input
+                        id="backup-export-password-confirm"
+                        type="password"
+                        className="input"
+                        placeholder="再次输入备份口令"
+                        value={exportPassConfirm}
+                        onChange={(e) => setExportPassConfirm(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      fontSize: 12.5,
+                      color: 'var(--text-secondary)',
+                      marginBottom: 12,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={exportIncludeRuntime}
+                      onChange={(e) => setExportIncludeRuntime(e.target.checked)}
+                    />
+                    同时打包监控历史时序、告警、AI 对话与巡检记录（取消勾选可导出极小体积核心配置包）
+                  </label>
+                  <button type="submit" className="btn btn-teal" disabled={exporting}>
+                    <Download size={14} />
+                    {exporting ? '正在加密打包 .sns...' : '导出口令加密备份 (.sns)'}
+                  </button>
+                </form>
+              </section>
+
+              {/* Simplified Cross-Instance Sync */}
+              <section className="sec-panel" id="remote-sync-panel">
+                <h3>
+                  <Cloud size={16} style={{ color: 'var(--accent-teal)' }} />
+                  跨端配置与记忆同步（桌面端 ↔ 服务端）
+                </h3>
+                <p className="sec-panel-desc">
+                  通过远端管理员密码直连鉴权同步主机配置、凭据、AI 记忆与 Runbook。默认<strong>不覆盖</strong>对端正在积累的 7×24 监控历史与巡检日志。
                 </p>
                 <div className="field">
                   <label className="field-label">远端 ServerNeedSafe 服务地址</label>
                   <input
                     className="input mono"
-                    placeholder="https://sns.example.com"
+                    placeholder="http://192.168.1.10:18899 或 https://sns.example.com"
                     value={syncUrl}
                     onChange={(e) => setSyncUrl(e.target.value)}
                   />
                 </div>
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">远端保险库密码（推送同源库可留空，拉取必填）</label>
-                    <input
-                      type="password"
-                      className="input"
-                      placeholder="输入远端加密保险库密码"
-                      value={syncRemotePass}
-                      onChange={(e) => setSyncRemotePass(e.target.value)}
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">本地原密码（仅拉取覆盖不同密码库时填）</label>
-                    <input
-                      type="password"
-                      className="input"
-                      placeholder="可选覆盖授权密码"
-                      value={syncLocalPass}
-                      onChange={(e) => setSyncLocalPass(e.target.value)}
-                    />
-                  </div>
+                <div className="field">
+                  <label className="field-label">远端实例管理员密码</label>
+                  <input
+                    type="password"
+                    className="input"
+                    placeholder="输入远端 ServerNeedSafe 的管理员登录密码"
+                    value={syncRemotePass}
+                    onChange={(e) => setSyncRemotePass(e.target.value)}
+                  />
                 </div>
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    fontSize: 12.5,
+                    color: 'var(--text-secondary)',
+                    marginBottom: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={syncIncludeRuntime}
+                    onChange={(e) => setSyncIncludeRuntime(e.target.checked)}
+                  />
+                  同时覆盖运行态数据（监控历史、告警、AI 对话与巡检记录；默认关闭以保护服务端 7×24 历史）
+                </label>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button
                     type="button"
@@ -628,7 +599,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     onClick={() => void handleSyncPush()}
                   >
                     <ArrowUpRight size={14} />
-                    {syncing === 'push' ? '正在推送加密容器...' : '推送密文至远端'}
+                    {syncing === 'push' ? '正在推送同步...' : '推送至远端'}
                   </button>
                   <button
                     type="button"
@@ -637,7 +608,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     onClick={() => void handleSyncPull()}
                   >
                     <ArrowDownLeft size={14} />
-                    {syncing === 'pull' ? '正在拉取并合并...' : '从远端拉取合并'}
+                    {syncing === 'pull' ? '正在拉取合并...' : '从远端拉取'}
                   </button>
                 </div>
               </section>
@@ -649,7 +620,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                   恢复 / 迁移加密备份包 (.sns)
                 </h3>
                 <p className="sec-panel-desc">
-                  支持在 Docker 服务端与 Windows 桌面端之间无缝迁移纯密码保护的 <code className="mono">.sns</code> 备份包（兼容 v1 / v2 格式），导入后自动刷新本地守护挂载密钥。
+                  支持导入新版口令加密备份包及老版 <code className="mono">SNSVAULT v1 / v2</code> 备份文件；导入后保留本机管理员密码，并立即生效于后台 7×24 监控与巡检。
                 </p>
                 <form onSubmit={handleImport}>
                   <div className="field-row">
@@ -664,30 +635,39 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                       />
                     </div>
                     <div className="field">
-                      <label className="field-label">备份包对应的管理员密码</label>
+                      <label className="field-label">备份包加密口令</label>
                       <input
                         type="password"
                         className="input"
                         value={importPass}
                         onChange={(e) => setImportPass(e.target.value)}
-                        placeholder="备份创建时的管理员密码"
-                      />
-                    </div>
-                    <div className="field">
-                      <label className="field-label">当前库原密码（密码相同时留空）</label>
-                      <input
-                        type="password"
-                        className="input"
-                        value={importCurrentPass}
-                        onChange={(e) => setImportCurrentPass(e.target.value)}
-                        placeholder="跨密码覆盖校验"
+                        placeholder="导出备份时设置的加密口令（老备份填原密码）"
                       />
                     </div>
                   </div>
-                  <button type="submit" className="btn" disabled={importing}>
-                    <Upload size={14} />
-                    {importing ? '正在解密校验并导入...' : '验证密码并导入覆盖'}
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        fontSize: 12.5,
+                        color: 'var(--text-secondary)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={importIncludeRuntime}
+                        onChange={(e) => setImportIncludeRuntime(e.target.checked)}
+                      />
+                      同时恢复备份中的监控历史、告警与 AI 对话/巡检记录
+                    </label>
+                    <button type="submit" className="btn" disabled={importing}>
+                      <Upload size={14} />
+                      {importing ? '正在解密校验并导入...' : '验证口令并恢复数据'}
+                    </button>
+                  </div>
                 </form>
               </section>
             </div>
@@ -699,7 +679,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                 已信任固定的 SSH 主机指纹 ({data?.known_hosts?.length || 0})
               </h3>
               <p className="sec-panel-desc">
-                主机公钥指纹加密保存在 <code className="mono">vault.sns</code> 内，每次 SSH 终端、SFTP、状态采集与 AI 巡检握手时强制校验，阻断中间人劫持。
+                主机公钥指纹加密保存在 <code className="mono">secrets.enc</code> 内，每次 SSH 终端、SFTP、状态采集与 AI 巡检握手时强制校验，阻断中间人劫持。
               </p>
               <div style={{ overflowX: 'auto' }}>
                 <table className="data-table">
@@ -754,14 +734,15 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
               </div>
             </section>
 
-            {/* Encrypted Security Audit Logs */}
+            {/* Security Audit Logs */}
             <section className="sec-panel">
               <h3>
                 <FileClock size={16} />
-                加密安全审计日志 (最近 {data?.audit_logs?.length || 0} 条)
+                操作与安全审计日志 (最近 {data?.audit_logs?.length || 0} 条)
               </h3>
               <p className="sec-panel-desc">
-                登录鉴权、密码与 KDF 轮换、SSH/SFTP 操作与备份导出均使用 XChaCha20-Poly1305 随保险库加密落盘。
+                登录鉴权、密码修改、主机与凭据变更、SSH/SFTP、巡检与备份同步操作独立写入{' '}
+                <code className="mono">audit_logs.json</code> 防抖持久化，不干扰敏感资产加密库。
               </p>
               <div style={{ maxHeight: 320, overflowY: 'auto', overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
                 <table className="data-table">
@@ -775,28 +756,37 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {(data?.audit_logs || []).map((log) => (
-                      <tr key={log.id}>
-                        <td
-                          className="mono"
-                          style={{ fontSize: 12, whiteSpace: 'nowrap', color: 'var(--text-muted)' }}
-                        >
-                          {new Date(log.timestamp).toLocaleString('zh-CN')}
-                        </td>
-                        <td>
-                          <span className={`tag-chip ${log.success ? 'teal' : 'amber'}`}>
-                            {log.action}
-                          </span>
-                        </td>
-                        <td className="mono" style={{ fontSize: 12 }}>
-                          {log.target || '—'}
-                        </td>
-                        <td style={{ fontSize: 12.5 }}>{log.detail}</td>
-                        <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                          {log.client_ip || '127.0.0.1'}
+                    {!data?.audit_logs?.length ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
+                          <ShieldCheck size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+                          暂无审计记录
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      data.audit_logs.map((log) => (
+                        <tr key={log.id}>
+                          <td
+                            className="mono"
+                            style={{ fontSize: 12, whiteSpace: 'nowrap', color: 'var(--text-muted)' }}
+                          >
+                            {new Date(log.timestamp).toLocaleString('zh-CN')}
+                          </td>
+                          <td>
+                            <span className={`tag-chip ${log.success ? 'teal' : 'amber'}`}>
+                              {log.action}
+                            </span>
+                          </td>
+                          <td className="mono" style={{ fontSize: 12 }}>
+                            {log.target || '—'}
+                          </td>
+                          <td style={{ fontSize: 12.5 }}>{log.detail}</td>
+                          <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                            {log.client_ip || '127.0.0.1'}
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>

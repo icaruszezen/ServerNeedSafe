@@ -8,13 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 )
@@ -29,22 +27,21 @@ func envOrDefault(key, fallback string) string {
 func main() {
 	defaultAddr := envOrDefault("SNS_ADDR", "0.0.0.0:8080")
 	defaultDataDir := envOrDefault("SNS_DATA_DIR", "./data")
-	defaultTTL := envOrDefault("SNS_SESSION_TTL", "8h")
+	defaultTTL := envOrDefault("SNS_SESSION_TTL", "168h")
 
 	addr := flag.String("addr", defaultAddr, "HTTP 监听地址 (例如 0.0.0.0:8080)")
-	dataDir := flag.String("data-dir", defaultDataDir, "加密保险库与自动挂载密钥持久化目录")
-	ttlStr := flag.String("session-ttl", defaultTTL, "Web 管理会话最长有效期")
+	dataDir := flag.String("data-dir", defaultDataDir, "数据持久化目录（secrets.enc + master.key + 运行态 JSON）")
+	ttlStr := flag.String("session-ttl", defaultTTL, "Web 管理会话最长有效期（默认 168h / 7 天）")
 	flag.Parse()
 
 	sessionTTL, err := time.ParseDuration(*ttlStr)
 	if err != nil || sessionTTL <= 0 {
-		sessionTTL = 8 * time.Hour
+		sessionTTL = auth.DefaultSessionTTL
 	}
 
-	vaultPath := filepath.Join(*dataDir, "vault.sns")
-	blindStore, err := vault.NewBlindStore(vaultPath)
+	store, err := vault.NewStore(*dataDir)
 	if err != nil {
-		log.Fatalf("[ServerNeedSafe] 初始化加密存储失败: %v", err)
+		log.Fatalf("[ServerNeedSafe] 初始化分层加密存储失败: %v", err)
 	}
 
 	authMgr, err := auth.NewManager(sessionTTL, false)
@@ -52,20 +49,15 @@ func main() {
 		log.Fatalf("[ServerNeedSafe] 初始化认证会话引擎失败: %v", err)
 	}
 
-	relayMgr := relay.NewManager(*addr)
-
 	staticFS, err := web.DistFS()
 	if err != nil {
 		log.Fatalf("[ServerNeedSafe] 加载内置 Web 静态资源失败: %v", err)
 	}
 
-	keyMgr := vault.NewServerKeyManager(*dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "server",
-		BlindStore: blindStore,
-		KeyMgr:     keyMgr,
+		Store:      store,
 		Auth:       authMgr,
-		Relay:      relayMgr,
 		StaticFS:   staticFS,
 	})
 
@@ -75,13 +67,19 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	keyDesc := store.MasterKeyPath() + " (0600 本地密钥)"
+	if store.MasterKeyMode() == vault.MasterKeyModeEnv {
+		keyDesc = "SNS_MASTER_KEY 环境变量注入"
+	}
+
 	go func() {
 		fmt.Printf("====================================================================\n")
-		fmt.Printf("  ServerNeedSafe — 多服务器安全管理与 7×24 智能巡检守护引擎\n")
+		fmt.Printf("  ServerNeedSafe — 多服务器运维管理与 7×24 智能监控巡检平台\n")
 		fmt.Printf("  监听地址: http://%s\n", *addr)
-		fmt.Printf("  加密存储: %s (XChaCha20-Poly1305 + Argon2id)\n", vaultPath)
-		fmt.Printf("  自动挂载: %s (0600 守护进程密钥，重启 <1ms 自动恢复)\n", keyMgr.KeyPath())
-		fmt.Printf("  后台能力: 7×24 SSH 状态监控 · AI 定时安全巡检 · 轻量极速 Web 控制台\n")
+		fmt.Printf("  敏感加密: %s (XChaCha20-Poly1305)\n", store.SecretsPath())
+		fmt.Printf("  主密钥源: %s（启动即自动挂载，永不锁定后台任务）\n", keyDesc)
+		fmt.Printf("  运行存储: %s/{monitor,aiops,audit}_runtime.json（独立防抖落盘）\n", store.DataDir())
+		fmt.Printf("  会话周期: %s（建议部署于内网或安全受控主机）\n", sessionTTL)
 		fmt.Printf("====================================================================\n")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[ServerNeedSafe] HTTP 服务异常退出: %v", err)
@@ -92,7 +90,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("[ServerNeedSafe] 收到停止信号，正在注销 Web 会话并安全停止 7×24 守护协程...")
+	log.Println("[ServerNeedSafe] 收到停止信号，正在同步刷盘运行态数据并停止 7×24 守护协程...")
 	authMgr.RevokeAll()
 	apiServer.Close()
 

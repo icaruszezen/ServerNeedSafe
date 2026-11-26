@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   # ============================================================================
-  # 1. 前端构建检查 + Go 零知识加密与 SSH/SFTP 安全集成测试
+  # 1. 前端构建检查 + Go 分层加密与 SSH/SFTP 安全集成测试
   # ============================================================================
   test:
     name: Security & Integration Tests
@@ -38,7 +38,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Install & Build Frontend Bundle (with SRI)
+      - name: Install & Build Frontend Bundle
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
@@ -198,7 +198,7 @@ jobs:
           fi
           curl -fsS http://127.0.0.1:18080/api/health | grep -q '"daemon_mode":true'
           curl -fsS http://127.0.0.1:18080/api/auth/status | grep -q '"deploy_mode":"server"'
-          curl -fsS http://127.0.0.1:18080/ | grep -q 'integrity="sha384-'
+          curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'
 
       - name: Log in to GitHub Container Registry (GHCR)
         if: github.event_name != 'pull_request'
@@ -380,7 +380,7 @@ jobs:
                 - TZ=Asia/Shanghai
                 - SNS_ADDR=0.0.0.0:8080
                 - SNS_DATA_DIR=/data
-                - SNS_SESSION_TTL=8h
+                - SNS_SESSION_TTL=168h
               volumes:
                 - ${DEPLOY_DIR}/data:/data
               security_opt:
@@ -398,7 +398,7 @@ jobs:
               -e TZ=Asia/Shanghai \
               -e SNS_ADDR=0.0.0.0:8080 \
               -e SNS_DATA_DIR=/data \
-              -e SNS_SESSION_TTL=8h \
+              -e SNS_SESSION_TTL=168h \
               -v "${DEPLOY_DIR}/data:/data" \
               --security-opt no-new-privileges:true \
               "${IMAGE}"
@@ -429,7 +429,7 @@ jobs:
 
           fetch_local "http://${LISTEN_ADDR}/api/health" | grep -q '"daemon_mode":true'
           fetch_local "http://${LISTEN_ADDR}/api/auth/status" | grep -q '"deploy_mode":"server"'
-          fetch_local "http://${LISTEN_ADDR}/" | grep -q 'integrity="sha384-'
+          fetch_local "http://${LISTEN_ADDR}/" | grep -q '<div id="root">'
           docker exec serverneedsafe test -w /data
 
           PORT_BINDING=$(docker port serverneedsafe 8080/tcp)

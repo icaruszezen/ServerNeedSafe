@@ -5,28 +5,33 @@
 **面向 Vibe Coding 时代的 7×24 全天候多服务器安全管理、状态监控与 AI 智能运维平台**
 
 `ServerNeedSafe` 提供极速响应的 **7×24 原生 Go 后台守护引擎 + 轻量 Web 管理台** 架构，同时支持 **Docker 服务端网页部署** 与 **Windows 纯本地独立桌面应用** 两种形态：
-- **首屏 `<50ms` 秒开**：彻底移除浏览器端重型 WASM 运行时，静态资源配合 `SHA-384 SRI` 完整性校验与长效不可变缓存，打开页面即刻进入工作台。
-- **7×24 不间断监控与 AI 巡检**：通过 `SNSVAULT v2`（`XChaCha20-Poly1305`）加密容器与受限权限（`0600`）本地封装密钥 `.vault.key` 实现进程/容器重启 `<1ms` 自动挂载，SSH 状态采集与 AI 定时安全巡检全天候在后台守护运行，与浏览器是否打开彻底解耦。
-- **独立 Web 管理门禁与可移植加密备份**：未认证请求零元数据暴露；支持 `HttpOnly; SameSite=Strict` 会话 Cookie、8 小时最大有效期与可配空闲超时；导出的 `.sns` 备份文件保持 100% 纯密码封装格式（不含 `.vault.key`），跨机器恢复与远端云同步安全便携。
+- **配置加密与运行数据彻底解耦**：仅对凭据、SSH 私钥/密码、API Key、Webhook 等核心敏感配置使用 `XChaCha20-Poly1305` 加密写入 `secrets.enc`；高频监控时序、告警、AI 会话与巡检记录独立异步落盘至纯 JSON 运行态文件，监控、巡检与后台任务完全零锁阻塞、零重加密开销。
+- **7×24 永不锁死的后台守护**：静态数据主密钥（`master.key` / `SNS_MASTER_KEY`）与 Web 管理员登录口令完全解耦。进程/容器重启即刻自动就绪，浏览器退出登录、会话超时或在线修改管理员密码均**绝不中断**后台监控采集与 AI 定时巡检。
+- **清爽低摩擦的内网/受控主机体验**：Web 管理台默认保持 **7 天（168h）** `HttpOnly; SameSite=Lax` 登录会话且默认关闭空闲踢出（可按需开启），原生兼容常见反向代理与内网直连。
+
+> [!TIP]
+> **部署环境建议**：本项目设计面向**内网机器、VPN/WireGuard 私有网络或已做好 HTTPS/防火墙加固的受控公网宿主机**。项目优先保障 7×24 运维监控稳定性、单文件跨平台便携性（`CGO_ENABLED=0`）与静态凭据保护，而非面向不可信多租户宿主机对抗。
 
 ---
 
-## 核心安全与双轨存储架构 (`SNSVAULT v2` + `.vault.key`)
+## 核心加密与分层存储架构
 
-| 安全机制 | 实现细节 | 运行时效果 |
+| 层次 | 存储文件 / 机制 | 说明 |
 | :--- | :--- | :--- |
-| **`SNSVAULT v2` 落盘全量认证加密** | 所有主机配置、SSH 密码/私钥、口令、`KnownHosts` 指纹、监控快照与 AI 记忆经压缩与 `4 KiB` 随机块对齐填充后，通过 `XChaCha20-Poly1305` 加密写入 `/data/vault.sns`，完整头部绑定为 `AAD` | 磁盘与导出的 `.sns` 备份零明文落盘，篡改任意比特立即被 AEAD 认证拦截 |
-| **本地快速启动密钥 (`.vault.key`)** | 首次初始化或老版本首次密码登录时，自动在 `/data/.vault.key`（严格 `0600` 权限，支持通过环境变量 `SNS_MASTER_KEY` 外部注入）以 `AES-256-GCM` 封装 `DEK` | 容器或桌面进程重启后 `<1ms` 自动挂载保险库并恢复 7×24 监控与 AI 巡检；存量老版本 `vault.sns` 首次输入管理员密码后自动无感平滑迁移 |
-| **可调档 `Argon2id` 密码派生** | 原生多线程 Go `Argon2id`（默认 `64 MiB / t=3 / p=4`，实测约 `45ms`）+ `HKDF-SHA256` 双域隔离派生 `KEK` 与 `Ed25519` 认证密钥；安全中心内置 `16 / 32 / 64 / 128 MiB` 四档在线切换 | 兼顾服务端/桌面端极速口令核验与导出的 `.sns` 离线备份抗暴力破解强度 |
-| **会话与后台任务完全解耦** | `HttpOnly` 会话默认最长 8 小时 + 30 分钟无操作自动锁定；按下 `Ctrl + Shift + L`、点击「退出登录」或「吊销全部会话」仅收回 Web 访问权 | 浏览器关闭或管理台锁定后，后台 7×24 SSH 状态监控与 AI 异常巡检告警不受任何影响 |
+| **敏感配置与凭据密文层** | `/data/secrets.enc` (`XChaCha20-Poly1305` + gzip) | 仅存储主机连接信息、SSH 密码/私钥、凭据库、AI Provider API Key、告警/巡检 Webhook、系统设置与管理员登录哈希；仅在配置变更时原子重写，高频监控采集与巡检绝不触发加密落盘 |
+| **独立数据加密主密钥** | `/data/master.key` (`0600`) 或环境变量 `SNS_MASTER_KEY` | 首次启动自动生成 256-bit 随机主密钥（支持随时通过环境变量注入外部密钥并自动无缝迁移重封装）。进程/容器重启 `<1ms` 自动就绪，**修改管理员密码永不轮换主密钥、永不暂停后台任务** |
+| **高频运行态独立分片** | `monitor_runtime.json` / `aiops_runtime.json` / `audit_logs.json` | 监控快照、时序历史、告警与端口基线、节点延迟/OS 元信息、AI 会话/HostMemory/Runbook/巡检记录、审计日志与敏感配置分锁隔离，通过后台 `2s` 防抖异步原子落盘，进程退出时自动同步刷盘 |
+| **轻量登录门禁与便携备份** | 固定轻量 `Argon2id` (`16 MiB`) + `.sns` v3 备份 | 管理员密码仅用于 Web 登录鉴权（保留 5 次输错防爆破冷却）；支持导出用户自定义备份密码加密的 `.sns` 便携备份（可选是否附带运行态数据）及一键跨端认证同步（默认仅同步核心配置与 AI 记忆，不覆盖对端 7×24 监控历史） |
+
+> **老版本无缝升级**：若 `/data` 目录存在旧版 `vault.sns` + `.vault.key`，新版本启动时自动无人值守完成迁移拆分（原密码无缝保留，旧文件归档为 `vault.sns.migrated.bak`）；若仅存在旧版 `vault.sns`，首次输入原管理员密码登录即自动完成一次性永久迁移。
 
 ---
 
 ## 核心功能特性
 
-1. **双模式无缝部署 + 跨端密文云同步**
-   - **Docker / Linux Web 服务端**：极简非 Root 容器镜像，挂载 `/data` 即可提供 7×24 守护监控、Web 终端与加密存储。
-   - **Windows 纯本地独立桌面应用 (`ServerNeedSafe-windows-amd64.exe`)**：单一无黑框原生 GUI 可执行文件，仅绑定 `127.0.0.1` 随机回环端口并启用进程级 Cookie 隔离守卫，完全离线可用；内置**跨端 `SNSVAULT v2` 签名密文云同步**，可随时将本地加密容器推送/拉取至远端 `sns-server`。
+1. **双模式无缝部署 + 跨端认证同步**
+   - **Docker / Linux Web 服务端**：极简非 Root 容器镜像，挂载 `/data` 即可提供 7×24 守护监控、Web 终端与分层加密存储。
+   - **Windows 纯本地独立桌面应用 (`ServerNeedSafe-windows-amd64.exe`)**：单一无黑框原生 GUI 可执行文件，仅绑定 `127.0.0.1` 随机回环端口并启用进程级 Cookie 隔离守卫，完全离线可用；内置**跨实例配置与 AI 知识同步**，默认推送/拉取核心配置与 AI 记忆而保留对端 7×24 监控历史（可选全量同步）。
 2. **多服务器资产、多级跳板机 (`ProxyJump`) 与实时探测**
    - 支持分组管理、星标置顶、多维检索、密码/私钥/凭据库三种认证方式，以及通过任意受管堡垒机建立多级 `ProxyJump` 隧道直达内网主机。
 3. **多标签 WebSocket 原生终端 + 同屏 SFTP 安全文件管理**
@@ -65,15 +70,7 @@ mkdir -p data && chown -R 10001:10001 data
 docker compose up -d --build
 ```
 
-> **反向代理与外部主密钥建议**：生产环境推荐容器仅绑定 `127.0.0.1:18899`，外部通过域名 Nginx 开启 HTTPS（TLS）与 `/api/ws/` WebSocket 反向代理访问（完整配置模板见 [`deploy/nginx-reverse-proxy.conf.example`](deploy/nginx-reverse-proxy.conf.example)）。如需将快速启动主密钥与 `/data` 目录分离，可额外注入环境变量 `SNS_MASTER_KEY=<32字节以上随机高熵密钥>`。
-
-> [!WARNING]
-> **`.vault.key` 威胁模型说明**
-> - **文件模式（未配置 `SNS_MASTER_KEY`，默认）**：封装主密钥与被封装的 `DEK` 同存于 `/data/.vault.key`，仅依赖 `0600` 文件权限保护。**获得整个 `/data` 目录（或宿主机 root）的攻击者可直接解密 `vault.sns`**；导出的 `.sns` 备份不含 `.vault.key`，仍只能凭管理员密码解密。服务端模式启动时会打印安全提示，安全中心接口 `auto_unlock_mode` 字段显示 `file`。
-> - **外部主密钥模式（推荐）**：注入 `SNS_MASTER_KEY`（**至少 32 字节**随机值，如 `openssl rand -base64 48`；过短会被拒绝），`.vault.key` 仅含密文，单独泄露 `/data` 无法解密。已启用外部主密钥的 `.vault.key` 在环境变量缺失时**不会被静默降级**为文件模式（需手动删除 `.vault.key` 后重新登录方可降级）。
-> - 远端轮换密码或导入其他保险库后，失效的 `.vault.key` 会被自动清除，下次管理员密码登录时重新生成。
->
-> **其他加固约束**：会话 Cookie 仅对同源请求生效（反向代理须保留 `Host` 或传递 `X-Forwarded-Host`）；`X-Real-IP` / `X-Forwarded-For` 仅在直连对端为本机/内网反向代理时采信；未认证的服务端 `Argon2id` 口令校验并发上限为 2（繁忙时返回 `429 KDF_BUSY`）；加密容器 KDF 参数上限为 `1 GiB / t=32 / p=64`，超限的备份或远端容器将被拒绝以防内存耗尽。
+> **反向代理与外部主密钥建议**：推荐在内网或反向代理（Nginx/Caddy 开启 HTTPS 与 `/api/ws/` WebSocket 转发，参考 [`deploy/nginx-reverse-proxy.conf.example`](deploy/nginx-reverse-proxy.conf.example)）后运行。如需将主密钥与 `/data` 目录分离存放，可注入环境变量 `SNS_MASTER_KEY=<≥32字节随机密钥>`；通过 `SNS_SESSION_TTL` 可自定义登录有效期（默认 `168h` 即 7 天）。
 
 ### 方式二：Windows 纯本地桌面应用（直接双击运行）
 
@@ -94,23 +91,21 @@ docker compose up -d --build
 ```text
 ServerNeedSafe/
 ├── cmd/
-│   ├── server/          # 7×24 守护 Web 服务端入口（自动挂载加密保险库、监控与 AI 巡检）
+│   ├── server/          # 7×24 守护 Web 服务端入口（自动加载 secrets.enc、监控与 AI 巡检）
 │   └── desktop/         # Windows 纯本地原生桌面 GUI 应用入口 (WebView2 + 回环进程守卫)
 ├── internal/
-│   ├── vault/           # SNSVAULT v2 加密容器 + ServerKeyManager (.vault.key <1ms 自动解锁与平滑迁移)
-│   ├── auth/            # HttpOnly 会话管理（最大 TTL + 空闲超时）、指数退避防爆破与 Ed25519 同步鉴权
-│   ├── relay/           # 零元数据保留的 WebSocket ↔ TCP 二进制流中继器
+│   ├── vault/           # 分层存储引擎：secrets.enc (XChaCha20-Poly1305) + 独立异步防抖运行态 JSON + 便携备份/老版迁移
+│   ├── auth/            # 7 天默认 HttpOnly 会话管理、防爆破冷却与桌面回环守卫
 │   ├── sshmanager/      # 原生 SSHv2 拨号、ProxyJump、PTY 终端、流式 SFTP 与密钥生成
 │   ├── monitor/         # 7×24 无 Agent 全维状态采集、定时巡检调度、18 项告警与报表导出
 │   ├── aiops/           # AI 运维 ReAct 引擎、风险分类器、Unified Diff、混合记忆与巡检推送
-│   ├── zkclient/        # 跨实例 SNSVAULT v2 CAS 自动合并与远端密文云同步引擎
-│   └── api/             # REST + SSE + 二进制 WebSocket PTY 路由与安全集成测试套件
-└── web/                 # 轻量 React + TypeScript + Xterm + SVG 时序图表 + SHA-384 SRI 前端
+│   └── api/             # REST + SSE + 二进制 WebSocket PTY 路由、跨端同步与集成测试套件
+└── web/                 # 轻量 React + TypeScript + Xterm + SVG 时序图表前端
 ```
 
 ---
 
-## 构建与安全集成测试
+## 构建与集成测试
 
 ```bash
 cd web && npm ci && npm run build && cd ..

@@ -23,7 +23,6 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -909,13 +908,12 @@ func main() {
 	}
 	defer stopLLM()
 
-	vaultPath := filepath.Join(tmpDir, "vault.sns")
-	blindStore, err := vault.NewBlindStore(vaultPath)
+	store, err := vault.NewStore(tmpDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "blind store failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "store init failed: %v\n", err)
 		os.Exit(1)
 	}
-	authMgr, err := auth.NewManager(8*time.Hour, false)
+	authMgr, err := auth.NewManager(auth.DefaultSessionTTL, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "auth mgr failed: %v\n", err)
 		os.Exit(1)
@@ -927,15 +925,11 @@ func main() {
 		os.Exit(1)
 	}
 	listenAddr := httpLn.Addr().String()
-	relayMgr := relay.NewManager(listenAddr)
 
-	keyMgr := vault.NewServerKeyManager(tmpDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "server",
-		BlindStore: blindStore,
-		KeyMgr:     keyMgr,
+		Store:      store,
 		Auth:       authMgr,
-		Relay:      relayMgr,
 		StaticFS:   os.DirFS(resolvedDist),
 	})
 

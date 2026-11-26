@@ -63,13 +63,12 @@ func TestLegacyVaultUpgradeAndAgentsMDGovernance(t *testing.T) {
 		t.Fatalf("EnsureStateDefaults clobbered intentional user-disabled AgentsMD: %+v", legacy.AISettings.AgentsMD)
 	}
 
-	// 3. End-to-end vault persistence, revisioning, reset template, and proposal accept/dismiss
-	vaultFile := filepath.Join(t.TempDir(), "vault.sns")
-	bs, err := NewBlindStore(vaultFile)
+	// 3. End-to-end store persistence, revisioning, reset template, and proposal accept/dismiss
+	store, err := NewStore(t.TempDir())
 	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
-	store := newFastTestClient(t, bs)
+	defer store.Close()
 	if err := store.Setup("StrongMasterPass!2026", "127.0.0.1"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -150,12 +149,12 @@ func TestLegacyVaultUpgradeAndAgentsMDGovernance(t *testing.T) {
 }
 
 func TestAIMemoryCRUDDedupMonitorSyncAndZeroPlaintext(t *testing.T) {
-	vaultFile := filepath.Join(t.TempDir(), "vault.sns")
-	bs, err := NewBlindStore(vaultFile)
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
 	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
-	store := newFastTestClient(t, bs)
+	defer store.Close()
 	if err := store.Setup("StrongMasterPass!2026", "127.0.0.1"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -280,20 +279,29 @@ func TestAIMemoryCRUDDedupMonitorSyncAndZeroPlaintext(t *testing.T) {
 		t.Fatalf("expected 1 memory with UseCount=1, got %+v err=%v", listed, err)
 	}
 
-	// 4. Verify ZERO plaintext leakage of AGENTS.md, HostMemory.Constraints, or AIMemoryEntry on raw vault.sns
-	rawDisk, err := os.ReadFile(vaultFile)
+	// 4. Verify secrets.enc encrypts SSH password & AGENTS.md, and aiops_runtime.json never leaks secrets
+	if err := store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+	rawDisk, err := os.ReadFile(store.SecretsPath())
 	if err != nil {
-		t.Fatalf("ReadFile vault.sns: %v", err)
+		t.Fatalf("ReadFile secrets.enc: %v", err)
 	}
 	for _, secretText := range []string{
-		"核心账务 PostgreSQL 主库",
-		"绝对禁止在工作日",
-		"连接池打满根因",
-		"default_pool_size=80",
 		"PgSshSecret#2026",
+		"db-postgres-01",
 	} {
 		if bytes.Contains(rawDisk, []byte(secretText)) {
-			t.Fatalf("SECURITY FAILURE: raw vault.sns leaked plaintext %q", secretText)
+			t.Fatalf("SECURITY FAILURE: raw secrets.enc leaked plaintext %q", secretText)
+		}
+	}
+	rawRT, err := os.ReadFile(filepath.Join(dataDir, aiopsRuntimeFileName))
+	if err != nil || len(rawRT) == 0 {
+		t.Fatalf("ReadFile aiops_runtime.json: %v", err)
+	}
+	for _, secretText := range []string{"PgSshSecret#2026", "sk-proj-shouldneverbeleaked123456"} {
+		if bytes.Contains(rawRT, []byte(secretText)) {
+			t.Fatalf("SECURITY FAILURE: aiops_runtime.json leaked secret %q", secretText)
 		}
 	}
 

@@ -396,21 +396,17 @@ export const api = {
       { old_password, new_password }
     ),
 
-  updateVaultKDF: (payload: {
-    password: string;
-    kdf_memory_kib: number;
-    kdf_time?: number;
-    kdf_threads?: number;
-  }) =>
-    requestJSON<{ ok: boolean; token: string; encryption: EncryptionInfo }>(
-      'POST',
-      '/api/vault/kdf',
-      payload
-    ),
-
-  exportVaultBlob: async (): Promise<{ blob: Blob; filename: string }> => {
+  exportVaultBlob: async (
+    backupPassword: string,
+    includeRuntime = false
+  ): Promise<{ blob: Blob; filename: string }> => {
     const res = await fetch('/api/vault/export', {
-      method: 'GET',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        backup_password: backupPassword,
+        include_runtime: includeRuntime,
+      }),
       credentials: 'same-origin',
     });
     if (!res.ok) {
@@ -424,7 +420,7 @@ export const api = {
   importVault: async (
     file: File,
     password: string,
-    opts?: { currentAdminPassword?: string; clearAnchor?: boolean }
+    opts?: { currentAdminPassword?: string; includeRuntime?: boolean }
   ) => {
     const form = new FormData();
     form.append('file', file);
@@ -432,8 +428,8 @@ export const api = {
     if (opts?.currentAdminPassword) {
       form.append('current_admin_password', opts.currentAdminPassword);
     }
-    if (opts?.clearAnchor) {
-      form.append('clear_anchor', 'true');
+    if (opts?.includeRuntime !== undefined) {
+      form.append('include_runtime', opts.includeRuntime ? 'true' : 'false');
     }
     const res = await fetch('/api/vault/import/file', {
       method: 'POST',
@@ -462,17 +458,18 @@ export const api = {
       `/api/vault/known-hosts?address=${encodeURIComponent(address)}`
     ),
 
-  syncPush: (remote_url: string, remote_password = '') =>
+  syncPush: (remote_url: string, remote_password: string, include_runtime = false) =>
     requestJSON<{ summary: SyncSummary }>('POST', '/api/vault/sync/push', {
       remote_url,
       remote_password,
+      include_runtime,
     }),
 
-  syncPull: (remote_url: string, remote_password = '', current_local_password = '') =>
+  syncPull: (remote_url: string, remote_password: string, include_runtime = false) =>
     requestJSON<{ summary: SyncSummary }>('POST', '/api/vault/sync/pull', {
       remote_url,
       remote_password,
-      current_local_password,
+      include_runtime,
     }),
 
   // Single-RTT Workspace Bootstrap & Server/Group CRUD

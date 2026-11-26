@@ -475,32 +475,45 @@ CPU=cpu 205 0 85 1810 0 0 0 0
 		t.Fatalf("expected webhook notifications to be delivered")
 	}
 
-	// Verify ZERO-KNOWLEDGE disk encryption: raw vault.sns must contain ZERO plaintext telemetry secrets!
-	rawBytes, err := os.ReadFile(vaultPath)
+	// Verify secrets.enc keeps SSH passwords & Webhook URLs strictly encrypted,
+	// while high-frequency telemetry flushes cleanly to monitor_runtime.json without locking!
+	if err := store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+	rawSecrets, err := os.ReadFile(store.SecretsPath())
 	if err != nil {
-		t.Fatalf("ReadFile vault.sns: %v", err)
+		t.Fatalf("ReadFile secrets.enc: %v", err)
 	}
-	forbiddenLeaks := []string{
-		"prod-db-secret-node",
-		"canary-secret-host-alpha",
-		"postgres-secret-worker",
-		"rogue-miner",
-		"203.0.113.77",
+	for _, secretNeedle := range []string{
+		"MonitorSecretPass!2026",
 		webhookSrv.URL,
-	}
-	for _, needle := range forbiddenLeaks {
-		if bytes.Contains(rawBytes, []byte(needle)) {
-			t.Fatalf("SECURITY VIOLATION: plaintext monitor data %q leaked in vault.sns!", needle)
+		"prod-db-secret-node",
+	} {
+		if bytes.Contains(rawSecrets, []byte(secretNeedle)) {
+			t.Fatalf("SECURITY VIOLATION: plaintext secret %q leaked in secrets.enc!", secretNeedle)
 		}
 	}
 
-	// Verify Vault Lock immediately scrubs memory & pauses engine
-	store.Lock("unit test lock", "127.0.0.1")
-	stLocked := engine.Status()
-	if stLocked.VaultUnlocked || stLocked.NextSweepAt != nil {
-		t.Fatalf("expected engine paused with nil NextSweepAt when vault locked, got %+v", stLocked)
+	// Verify runtime monitor file exists & never contains SSH password or webhook URL
+	rawRT, err := os.ReadFile(filepath.Join(tmpDir, "monitor_runtime.json"))
+	if err != nil || len(rawRT) == 0 {
+		t.Fatalf("expected monitor_runtime.json on disk, err=%v", err)
 	}
-	if _, err := store.GetMonitorOverview(); !errors.Is(err, vault.ErrVaultLocked) {
-		t.Fatalf("expected ErrVaultLocked when reading monitor overview while locked, got %v", err)
+	for _, secretNeedle := range []string{"MonitorSecretPass!2026", webhookSrv.URL} {
+		if bytes.Contains(rawRT, []byte(secretNeedle)) {
+			t.Fatalf("SECURITY VIOLATION: runtime monitor json leaked secret %q!", secretNeedle)
+		}
+	}
+
+	// Verify changing admin password does NOT lock or pause background monitoring!
+	if err := store.ChangePassword("StrongMonitorPass#2026", "RotatedMonitorPass#2026", "127.0.0.1"); err != nil {
+		t.Fatalf("ChangePassword during monitoring: %v", err)
+	}
+	stAfterRotate := engine.Status()
+	if !stAfterRotate.VaultUnlocked {
+		t.Fatalf("expected monitor engine to remain active after password change, got %+v", stAfterRotate)
+	}
+	if _, err := store.GetMonitorOverview(); err != nil {
+		t.Fatalf("expected monitor overview readable after password change, got %v", err)
 	}
 }

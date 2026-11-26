@@ -65,7 +65,7 @@ func (s *Service) patrolSchedulerLoop() {
 		case <-ticker.C:
 		}
 
-		if s.store.Status() != vault.StatusUnlocked {
+		if !s.store.IsReady() {
 			continue
 		}
 		cfg, err := s.store.GetPatrolConfigSecret()
@@ -119,9 +119,9 @@ func (s *Service) NotifyPatrolConfigUpdated() {
 	}
 }
 
-// GetPatrolStatus returns current background patrol scheduler status (which stays active across UI screen-locks).
+// GetPatrolStatus returns current background patrol scheduler status (which stays active across Web logins/logouts).
 func (s *Service) GetPatrolStatus() PatrolStatusView {
-	vaultReady := s.store.Status() == vault.StatusUnlocked
+	vaultReady := s.store.IsReady()
 	var unread int
 	if vaultReady {
 		_, unread, _ = s.store.ListPatrolRecords(1, false)
@@ -147,7 +147,7 @@ func (s *Service) GetPatrolStatus() PatrolStatusView {
 // RunPatrolNow executes a strictly read-only inspection across configured servers,
 // invokes the active LLM on-demand if anomalies exist (or forceAI is true), and dispatches webhooks.
 func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool) (*vault.PatrolRecord, error) {
-	if s.store.Status() != vault.StatusUnlocked {
+	if !s.store.IsReady() {
 		return nil, vault.ErrVaultLocked
 	}
 	cfg, err := s.store.GetPatrolConfigSecret()

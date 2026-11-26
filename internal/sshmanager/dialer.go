@@ -81,15 +81,10 @@ type Manager struct {
 }
 
 func NewManager(store *vault.Store) *Manager {
-	m := &Manager{
+	return &Manager{
 		store:          store,
 		activeSessions: make(map[string]*TerminalSession),
 	}
-	// Automatically terminate all active SSH terminals if the client vault is locked!
-	store.RegisterOnLock(func() {
-		m.CloseAllSessions()
-	})
-	return m
 }
 
 // SetDialTCPFunc configures a custom raw TCP transport (such as the zero-knowledge WebSocket TCP relay).

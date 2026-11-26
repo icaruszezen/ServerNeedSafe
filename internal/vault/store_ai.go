@@ -14,41 +14,6 @@ const (
 	maxAISessions    = 100
 )
 
-// VerifyPassword validates password against the currently unlocked ClientVault's wrapped DEK
-// in constant time without altering state or interrupting background SSH/Monitor/Patrol routines.
-func (s *ClientVault) VerifyPassword(password string) error {
-	if password == "" {
-		return ErrInvalidPassword
-	}
-	s.mu.RLock()
-	if len(s.dek) == 0 || s.state == nil || s.header == nil {
-		s.mu.RUnlock()
-		return ErrVaultLocked
-	}
-	hdr := *s.header
-	hdr.KDFSalt = slices.Clone(s.header.KDFSalt)
-	hdr.WrappedDEK = slices.Clone(s.header.WrappedDEK)
-	hdr.WrappedDEKNonce = slices.Clone(s.header.WrappedDEKNonce)
-	hdr.AuthPublicKey = slices.Clone(s.header.AuthPublicKey)
-	expectedDEK := slices.Clone(s.dek)
-	minMem := s.minMemoryKiB
-	s.mu.RUnlock()
-	defer zeroBytes(expectedDEK)
-
-	verifiedDEK, verifiedPriv, err := unwrapDEKV2(password, &hdr, minMem)
-	if err != nil {
-		return ErrInvalidPassword
-	}
-	matched := constantTimeEqual(verifiedDEK, expectedDEK)
-	zeroBytes(verifiedDEK)
-	zeroBytes(verifiedPriv)
-	if !matched {
-		return ErrInvalidPassword
-	}
-	s.TouchActivity()
-	return nil
-}
-
 // AIProviderMutationInput represents create/update request fields for an LLM provider.
 type AIProviderMutationInput struct {
 	ID            string     `json:"id"`
@@ -63,56 +28,56 @@ type AIProviderMutationInput struct {
 }
 
 // GetAISettingsView returns redacted AI settings, provider list, and patrol config.
-func (s *ClientVault) GetAISettingsView() (activeProviderID string, defaultMode AIExecutionMode, providers []AIProviderView, patrol PatrolConfigView, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetAISettingsView() (activeProviderID string, defaultMode AIExecutionMode, providers []AIProviderView, patrol PatrolConfigView, err error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return "", "", nil, PatrolConfigView{}, ErrVaultLocked
 	}
-	defaultMode = s.state.AISettings.DefaultMode
+	defaultMode = s.secrets.AISettings.DefaultMode
 	if defaultMode == "" {
 		defaultMode = AIModeStandard
 	}
-	providers = make([]AIProviderView, len(s.state.AISettings.Providers))
-	for i, p := range s.state.AISettings.Providers {
+	providers = make([]AIProviderView, len(s.secrets.AISettings.Providers))
+	for i, p := range s.secrets.AISettings.Providers {
 		providers[i] = p.ToView()
 	}
-	patrolCfg := s.state.AISettings.Patrol
+	patrolCfg := s.secrets.AISettings.Patrol
 	if patrolCfg.IntervalMinutes <= 0 {
 		patrolCfg = DefaultPatrolConfig()
 	}
-	return s.state.AISettings.ActiveProviderID, defaultMode, providers, patrolCfg.ToView(), nil
+	return s.secrets.AISettings.ActiveProviderID, defaultMode, providers, patrolCfg.ToView(), nil
 }
 
 // GetActiveAIProviderSecret returns a copy of the currently active AIProviderConfig including APIKey.
-func (s *ClientVault) GetActiveAIProviderSecret() (*AIProviderConfig, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetActiveAIProviderSecret() (*AIProviderConfig, error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return nil, ErrVaultLocked
 	}
-	activeID := s.state.AISettings.ActiveProviderID
-	for _, p := range s.state.AISettings.Providers {
+	activeID := s.secrets.AISettings.ActiveProviderID
+	for _, p := range s.secrets.AISettings.Providers {
 		if p.ID == activeID {
 			cp := p
 			return &cp, nil
 		}
 	}
-	if len(s.state.AISettings.Providers) > 0 {
-		cp := s.state.AISettings.Providers[0]
+	if len(s.secrets.AISettings.Providers) > 0 {
+		cp := s.secrets.AISettings.Providers[0]
 		return &cp, nil
 	}
 	return nil, ErrNotFound
 }
 
 // GetAIProviderSecret returns a copy of a specific AIProviderConfig by ID including APIKey.
-func (s *ClientVault) GetAIProviderSecret(id string) (*AIProviderConfig, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetAIProviderSecret(id string) (*AIProviderConfig, error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return nil, ErrVaultLocked
 	}
-	for _, p := range s.state.AISettings.Providers {
+	for _, p := range s.secrets.AISettings.Providers {
 		if p.ID == id {
 			cp := p
 			return &cp, nil
@@ -121,8 +86,8 @@ func (s *ClientVault) GetAIProviderSecret(id string) (*AIProviderConfig, error) 
 	return nil, ErrNotFound
 }
 
-// UpsertAIProvider creates or updates an encrypted LLM provider configuration.
-func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP string) (*AIProviderView, string, error) {
+// UpsertAIProvider creates or updates an encrypted LLM provider configuration inside secrets.enc.
+func (s *Store) UpsertAIProvider(in AIProviderMutationInput, clientIP string) (*AIProviderView, string, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	in.BaseURL = strings.TrimSpace(in.BaseURL)
 	in.Model = strings.TrimSpace(in.Model)
@@ -142,28 +107,22 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 		in.ContextWindow = 0
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, "", ErrVaultLocked
-	}
-
 	var outView AIProviderView
 	var outActive string
+	auditAction := "ai.provider_create"
+	auditDetail := ""
 
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
+	err := s.mutateSecrets(func(sec *SecretsState) error {
 		now := time.Now().UTC()
 		if in.ID != "" {
-			for i := range st.AISettings.Providers {
-				if st.AISettings.Providers[i].ID == in.ID {
-					existing := st.AISettings.Providers[i]
+			for i := range sec.AISettings.Providers {
+				if sec.AISettings.Providers[i].ID == in.ID {
+					existing := sec.AISettings.Providers[i]
 					newKey := ""
 					if in.APIKey != nil {
 						newKey = strings.TrimSpace(*in.APIKey)
 					}
-					// Never silently re-point a stored (masked) API key to a different endpoint or protocol:
-					// a hijacked session could otherwise exfiltrate the plaintext key to its own server.
+					// Guard against silently re-pointing a stored masked API key to another endpoint.
 					if newKey == "" && existing.APIKey != "" && (!SameEndpointURL(existing.BaseURL, in.BaseURL) || normalizeAIProtocol(existing.Protocol) != in.Protocol) {
 						return fmt.Errorf("%w: 更换接口地址或协议时必须重新填写 API Key", ErrInvalidInput)
 					}
@@ -177,13 +136,14 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 					if newKey != "" {
 						existing.APIKey = newKey
 					}
-					st.AISettings.Providers[i] = existing
-					if in.SetActive || st.AISettings.ActiveProviderID == "" {
-						st.AISettings.ActiveProviderID = existing.ID
+					sec.AISettings.Providers[i] = existing
+					if in.SetActive || sec.AISettings.ActiveProviderID == "" {
+						sec.AISettings.ActiveProviderID = existing.ID
 					}
-					appendAuditLocked(st, "ai.provider_update", existing.Name, fmt.Sprintf("更新大模型配置 (%s / %s)", existing.Protocol, existing.Model), clientIP, true)
+					auditAction = "ai.provider_update"
+					auditDetail = fmt.Sprintf("更新大模型配置 (%s / %s)", existing.Protocol, existing.Model)
 					outView = existing.ToView()
-					outActive = st.AISettings.ActiveProviderID
+					outActive = sec.AISettings.ActiveProviderID
 					return nil
 				}
 			}
@@ -203,74 +163,71 @@ func (s *ClientVault) UpsertAIProvider(in AIProviderMutationInput, clientIP stri
 		if in.APIKey != nil {
 			newProv.APIKey = strings.TrimSpace(*in.APIKey)
 		}
-		st.AISettings.Providers = append(st.AISettings.Providers, newProv)
-		if in.SetActive || st.AISettings.ActiveProviderID == "" || len(st.AISettings.Providers) == 1 {
-			st.AISettings.ActiveProviderID = newProv.ID
+		sec.AISettings.Providers = append(sec.AISettings.Providers, newProv)
+		if in.SetActive || sec.AISettings.ActiveProviderID == "" || len(sec.AISettings.Providers) == 1 {
+			sec.AISettings.ActiveProviderID = newProv.ID
 		}
-		appendAuditLocked(st, "ai.provider_create", newProv.Name, fmt.Sprintf("新增大模型配置 (%s / %s)", newProv.Protocol, newProv.Model), clientIP, true)
+		auditDetail = fmt.Sprintf("新增大模型配置 (%s / %s)", newProv.Protocol, newProv.Model)
 		outView = newProv.ToView()
-		outActive = st.AISettings.ActiveProviderID
+		outActive = sec.AISettings.ActiveProviderID
 		return nil
 	})
 	if err != nil {
 		return nil, "", err
 	}
+	s.RecordAudit(auditAction, outView.Name, auditDetail, clientIP, true)
 	return &outView, outActive, nil
 }
 
 // SetActiveAIProvider updates the global single active model and default execution mode.
-func (s *ClientVault) SetActiveAIProvider(providerID string, defaultMode AIExecutionMode, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return ErrVaultLocked
-	}
-	return s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
+func (s *Store) SetActiveAIProvider(providerID string, defaultMode AIExecutionMode, clientIP string) error {
+	var switchedName string
+	err := s.mutateSecrets(func(sec *SecretsState) error {
 		if providerID != "" {
 			found := false
-			var name string
-			for _, p := range st.AISettings.Providers {
+			for _, p := range sec.AISettings.Providers {
 				if p.ID == providerID {
 					found = true
-					name = p.Name + " (" + p.Model + ")"
+					switchedName = p.Name + " (" + p.Model + ")"
 					break
 				}
 			}
 			if !found {
 				return ErrNotFound
 			}
-			st.AISettings.ActiveProviderID = providerID
-			appendAuditLocked(st, "ai.provider_switch", name, "切换全局激活大模型", clientIP, true)
+			sec.AISettings.ActiveProviderID = providerID
 		}
 		if defaultMode == AIModeSuggest || defaultMode == AIModeStandard || defaultMode == AIModeAutonomous {
-			st.AISettings.DefaultMode = defaultMode
+			sec.AISettings.DefaultMode = defaultMode
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if switchedName != "" {
+		s.RecordAudit("ai.provider_switch", switchedName, "切换全局激活大模型", clientIP, true)
+	}
+	return nil
 }
 
 // DeleteAIProvider deletes an AI provider and reassigns ActiveProviderID if needed.
-func (s *ClientVault) DeleteAIProvider(id, clientIP string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return "", ErrVaultLocked
-	}
+func (s *Store) DeleteAIProvider(id, clientIP string) (string, error) {
 	var outActive string
-	err := s.mutateLocked(func(st *VaultState) error {
-		for i, p := range st.AISettings.Providers {
+	var deletedName string
+	err := s.mutateSecrets(func(sec *SecretsState) error {
+		for i, p := range sec.AISettings.Providers {
 			if p.ID == id {
-				st.AISettings.Providers = slices.Delete(st.AISettings.Providers, i, i+1)
-				if st.AISettings.ActiveProviderID == id {
-					if len(st.AISettings.Providers) > 0 {
-						st.AISettings.ActiveProviderID = st.AISettings.Providers[0].ID
+				deletedName = p.Name
+				sec.AISettings.Providers = slices.Delete(sec.AISettings.Providers, i, i+1)
+				if sec.AISettings.ActiveProviderID == id {
+					if len(sec.AISettings.Providers) > 0 {
+						sec.AISettings.ActiveProviderID = sec.AISettings.Providers[0].ID
 					} else {
-						st.AISettings.ActiveProviderID = ""
+						sec.AISettings.ActiveProviderID = ""
 					}
 				}
-				appendAuditLocked(st, "ai.provider_delete", p.Name, "删除大模型供应商配置", clientIP, true)
-				outActive = st.AISettings.ActiveProviderID
+				outActive = sec.AISettings.ActiveProviderID
 				return nil
 			}
 		}
@@ -279,40 +236,42 @@ func (s *ClientVault) DeleteAIProvider(id, clientIP string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	s.RecordAudit("ai.provider_delete", deletedName, "删除大模型供应商配置", clientIP, true)
 	return outActive, nil
 }
 
-// --- Host Memories (Objective Server Profiles) ---
+// --- Host Memories (Objective Server Profiles — stored in aiops_runtime.json) ---
 
-func (s *ClientVault) ListHostMemories() ([]HostMemory, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) ListHostMemories() ([]HostMemory, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	out := make([]HostMemory, len(s.state.HostMemories))
-	for i, m := range s.state.HostMemories {
-		cp := m
-		cp.KeyServices = slices.Clone(m.KeyServices)
-		cp.DeployPaths = slices.Clone(m.DeployPaths)
-		if m.MonitorSyncedAt != nil {
-			t := *m.MonitorSyncedAt
-			cp.MonitorSyncedAt = &t
-		}
-		out[i] = cp
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return []HostMemory{}, nil
 	}
-	return out, nil
+	return cloneHostMemories(s.aiopsRT.HostMemories), nil
 }
 
-func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP string) (*HostMemory, error) {
+func (s *Store) UpsertHostMemory(in HostMemory, isAuto bool, clientIP string) (*HostMemory, error) {
 	if strings.TrimSpace(in.ServerID) == "" {
 		return nil, ErrInvalidInput
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
+	srvName := in.ServerName
+	for _, srv := range s.secrets.Servers {
+		if srv.ID == in.ServerID {
+			srvName = srv.Name
+			break
+		}
+	}
+	s.secMu.RUnlock()
 
 	dedupStrings := func(items []string) []string {
 		out := make([]string, 0, len(items))
@@ -331,63 +290,60 @@ func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP stri
 	cleanConstraints := RedactSensitiveText(strings.TrimSpace(in.Constraints))
 	cleanNotes := RedactSensitiveText(strings.TrimSpace(in.Notes))
 
+	now := time.Now().UTC()
 	var outMem HostMemory
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		srvName := in.ServerName
-		for _, srv := range st.Servers {
-			if srv.ID == in.ServerID {
-				srvName = srv.Name
-				break
-			}
-		}
 
-		now := time.Now().UTC()
-		for i := range st.HostMemories {
-			if st.HostMemories[i].ServerID == in.ServerID {
-				cur := st.HostMemories[i]
-				cur.ServerName = srvName
-				if cleanSummary != "" || !isAuto {
-					cur.Summary = cleanSummary
-				}
-				if cleanOSArch != "" || !isAuto {
-					cur.OSArch = cleanOSArch
-				}
-				if cleanPortsNote != "" || !isAuto {
-					cur.PortsNote = cleanPortsNote
-				}
-				if cleanConstraints != "" || !isAuto {
-					if isAuto && cur.Constraints != "" && !strings.Contains(cur.Constraints, cleanConstraints) {
-						cur.Constraints = cur.Constraints + "\n" + cleanConstraints
-					} else {
-						cur.Constraints = cleanConstraints
-					}
-				}
-				if cleanNotes != "" || !isAuto {
-					if isAuto && cur.Notes != "" && !strings.Contains(cur.Notes, cleanNotes) {
-						cur.Notes = cur.Notes + "\n" + cleanNotes
-					} else {
-						cur.Notes = cleanNotes
-					}
-				}
-				if isAuto {
-					cur.KeyServices = dedupStrings(append(cur.KeyServices, in.KeyServices...))
-					cur.DeployPaths = dedupStrings(append(cur.DeployPaths, in.DeployPaths...))
-					cur.AutoUpdatedCount++
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	found := false
+	for i := range s.aiopsRT.HostMemories {
+		if s.aiopsRT.HostMemories[i].ServerID == in.ServerID {
+			cur := s.aiopsRT.HostMemories[i]
+			cur.ServerName = srvName
+			if cleanSummary != "" || !isAuto {
+				cur.Summary = cleanSummary
+			}
+			if cleanOSArch != "" || !isAuto {
+				cur.OSArch = cleanOSArch
+			}
+			if cleanPortsNote != "" || !isAuto {
+				cur.PortsNote = cleanPortsNote
+			}
+			if cleanConstraints != "" || !isAuto {
+				if isAuto && cur.Constraints != "" && !strings.Contains(cur.Constraints, cleanConstraints) {
+					cur.Constraints = cur.Constraints + "\n" + cleanConstraints
 				} else {
-					cur.KeyServices = dedupStrings(in.KeyServices)
-					cur.DeployPaths = dedupStrings(in.DeployPaths)
+					cur.Constraints = cleanConstraints
 				}
-				cur.UpdatedAt = now
-				st.HostMemories[i] = cur
-				if !isAuto {
-					appendAuditLocked(st, "ai.memory_edit", srvName, "人工编辑主机环境画像记忆", clientIP, true)
-				}
-				outMem = cur
-				return nil
 			}
+			if cleanNotes != "" || !isAuto {
+				if isAuto && cur.Notes != "" && !strings.Contains(cur.Notes, cleanNotes) {
+					cur.Notes = cur.Notes + "\n" + cleanNotes
+				} else {
+					cur.Notes = cleanNotes
+				}
+			}
+			if isAuto {
+				cur.KeyServices = dedupStrings(append(cur.KeyServices, in.KeyServices...))
+				cur.DeployPaths = dedupStrings(append(cur.DeployPaths, in.DeployPaths...))
+				cur.AutoUpdatedCount++
+			} else {
+				cur.KeyServices = dedupStrings(in.KeyServices)
+				cur.DeployPaths = dedupStrings(in.DeployPaths)
+			}
+			cur.UpdatedAt = now
+			s.aiopsRT.HostMemories[i] = cur
+			if !isAuto {
+				s.appendAuditRuntimeLocked("ai.memory_edit", srvName, "人工编辑主机环境画像记忆", clientIP, true)
+			}
+			outMem = cur
+			found = true
+			break
 		}
-
+	}
+	if !found {
 		created := HostMemory{
 			ServerID:    in.ServerID,
 			ServerName:  srvName,
@@ -403,71 +359,61 @@ func (s *ClientVault) UpsertHostMemory(in HostMemory, isAuto bool, clientIP stri
 		if isAuto {
 			created.AutoUpdatedCount = 1
 		}
-		st.HostMemories = append(st.HostMemories, created)
+		s.aiopsRT.HostMemories = append(s.aiopsRT.HostMemories, created)
 		if !isAuto {
-			appendAuditLocked(st, "ai.memory_edit", srvName, "人工录入主机环境画像记忆", clientIP, true)
+			s.appendAuditRuntimeLocked("ai.memory_edit", srvName, "人工录入主机环境画像记忆", clientIP, true)
 		}
 		outMem = created
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return &outMem, nil
 }
 
-func (s *ClientVault) DeleteHostMemory(serverID, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) DeleteHostMemory(serverID, clientIP string) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		for i, m := range st.HostMemories {
-			if m.ServerID == serverID {
-				st.HostMemories = slices.Delete(st.HostMemories, i, i+1)
-				appendAuditLocked(st, "ai.memory_delete", m.ServerName, "清除主机环境画像记忆", clientIP, true)
-				return nil
-			}
-		}
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.rtMu.Unlock()
 		return ErrNotFound
-	})
+	}
+	for i, m := range s.aiopsRT.HostMemories {
+		if m.ServerID == serverID {
+			s.aiopsRT.HostMemories = slices.Delete(s.aiopsRT.HostMemories, i, i+1)
+			s.dirtyAIOps = true
+			s.appendAuditRuntimeLocked("ai.memory_delete", m.ServerName, "清除主机环境画像记忆", clientIP, true)
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return nil
+		}
+	}
+	s.rtMu.Unlock()
+	return ErrNotFound
 }
 
-// --- AI Runbooks ---
+// --- AI Runbooks (stored in aiops_runtime.json; linked Snippet synced to secrets.enc only when requested) ---
 
-func (s *ClientVault) ListRunbooks() ([]AIRunbook, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) ListRunbooks() ([]AIRunbook, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	out := make([]AIRunbook, len(s.state.Runbooks))
-	for i, rb := range s.state.Runbooks {
-		cp := rb
-		cp.Tags = slices.Clone(rb.Tags)
-		cp.DiagnosticSteps = slices.Clone(rb.DiagnosticSteps)
-		cp.FixCommands = slices.Clone(rb.FixCommands)
-		out[i] = cp
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return []AIRunbook{}, nil
 	}
-	return out, nil
+	return cloneRunbooks(s.aiopsRT.Runbooks), nil
 }
 
-func upsertRunbookInState(st *VaultState, in AIRunbook, syncSnippet bool, clientIP string) (AIRunbook, error) {
-	EnsureStateDefaults(st)
-	now := time.Now().UTC()
-	if in.Tags == nil {
-		in.Tags = []string{}
+func (s *Store) syncRunbookSnippet(in *AIRunbook, now time.Time) error {
+	if len(in.FixCommands) == 0 {
+		return nil
 	}
-	if in.DiagnosticSteps == nil {
-		in.DiagnosticSteps = []string{}
-	}
-	if in.FixCommands == nil {
-		in.FixCommands = []string{}
-	}
-
-	if syncSnippet && len(in.FixCommands) > 0 {
-		cmdJoined := strings.Join(in.FixCommands, " && ")
+	cmdJoined := strings.Join(in.FixCommands, " && ")
+	return s.mutateSecrets(func(sec *SecretsState) error {
 		snip := Snippet{
 			ID:          in.LinkedSnippetID,
 			Title:       "[Runbook] " + in.Title,
@@ -479,10 +425,10 @@ func upsertRunbookInState(st *VaultState, in AIRunbook, syncSnippet bool, client
 		}
 		updatedExisting := false
 		if snip.ID != "" {
-			for idx := range st.Snippets {
-				if st.Snippets[idx].ID == snip.ID {
-					snip.CreatedAt = st.Snippets[idx].CreatedAt
-					st.Snippets[idx] = snip
+			for idx := range sec.Snippets {
+				if sec.Snippets[idx].ID == snip.ID {
+					snip.CreatedAt = sec.Snippets[idx].CreatedAt
+					sec.Snippets[idx] = snip
 					updatedExisting = true
 					break
 				}
@@ -490,32 +436,51 @@ func upsertRunbookInState(st *VaultState, in AIRunbook, syncSnippet bool, client
 		}
 		if !updatedExisting {
 			snip.ID = uuid.NewString()
-			st.Snippets = append(st.Snippets, snip)
+			sec.Snippets = append(sec.Snippets, snip)
 		}
 		in.LinkedSnippetID = snip.ID
-	}
+		return nil
+	})
+}
 
+func (s *Store) upsertRunbookRuntimeLocked(in AIRunbook, now time.Time, clientIP string) AIRunbook {
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	if in.Tags == nil {
+		in.Tags = []string{}
+	}
+	if in.DiagnosticSteps == nil {
+		in.DiagnosticSteps = []string{}
+	}
+	if in.FixCommands == nil {
+		in.FixCommands = []string{}
+	}
 	if in.ID != "" {
-		for i := range st.Runbooks {
-			if st.Runbooks[i].ID == in.ID {
-				in.CreatedAt = st.Runbooks[i].CreatedAt
+		for i := range s.aiopsRT.Runbooks {
+			if s.aiopsRT.Runbooks[i].ID == in.ID {
+				in.CreatedAt = s.aiopsRT.Runbooks[i].CreatedAt
 				in.UpdatedAt = now
-				st.Runbooks[i] = in
-				appendAuditLocked(st, "ai.runbook_update", in.Title, "更新 AI 排障技能 Runbook", clientIP, true)
-				return in, nil
+				s.aiopsRT.Runbooks[i] = in
+				s.dirtyAIOps = true
+				s.appendAuditRuntimeLocked("ai.runbook_update", in.Title, "更新 AI 排障技能 Runbook", clientIP, true)
+				return in
 			}
 		}
 	}
-
 	in.ID = uuid.NewString()
 	in.CreatedAt = now
 	in.UpdatedAt = now
-	st.Runbooks = append([]AIRunbook{in}, st.Runbooks...)
-	appendAuditLocked(st, "ai.runbook_create", in.Title, "沉淀新增 AI 排障技能 Runbook", clientIP, true)
-	return in, nil
+	s.aiopsRT.Runbooks = append([]AIRunbook{in}, s.aiopsRT.Runbooks...)
+	s.dirtyAIOps = true
+	s.appendAuditRuntimeLocked("ai.runbook_create", in.Title, "沉淀新增 AI 排障技能 Runbook", clientIP, true)
+	return in
 }
 
-func (s *ClientVault) UpsertRunbook(in AIRunbook, syncSnippet bool, clientIP string) (*AIRunbook, error) {
+func (s *Store) UpsertRunbook(in AIRunbook, syncSnippet bool, clientIP string) (*AIRunbook, error) {
+	if !s.IsReady() {
+		return nil, ErrVaultLocked
+	}
 	in.Title = strings.TrimSpace(in.Title)
 	in.Category = strings.TrimSpace(in.Category)
 	if in.Category == "" {
@@ -525,46 +490,44 @@ func (s *ClientVault) UpsertRunbook(in AIRunbook, syncSnippet bool, clientIP str
 		return nil, fmt.Errorf("%w: Runbook 标题不能为空", ErrInvalidInput)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, ErrVaultLocked
+	now := time.Now().UTC()
+	if syncSnippet {
+		if err := s.syncRunbookSnippet(&in, now); err != nil {
+			return nil, err
+		}
 	}
 
-	var outRB AIRunbook
-	err := s.mutateLocked(func(st *VaultState) error {
-		rb, uErr := upsertRunbookInState(st, in, syncSnippet, clientIP)
-		if uErr != nil {
-			return uErr
-		}
-		outRB = rb
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
+	s.rtMu.Lock()
+	outRB := s.upsertRunbookRuntimeLocked(in, now, clientIP)
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return &outRB, nil
 }
 
-func (s *ClientVault) DeleteRunbook(id, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) DeleteRunbook(id, clientIP string) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		for i, rb := range st.Runbooks {
-			if rb.ID == id {
-				st.Runbooks = slices.Delete(st.Runbooks, i, i+1)
-				appendAuditLocked(st, "ai.runbook_delete", rb.Title, "删除 AI 排障技能 Runbook", clientIP, true)
-				return nil
-			}
-		}
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.rtMu.Unlock()
 		return ErrNotFound
-	})
+	}
+	for i, rb := range s.aiopsRT.Runbooks {
+		if rb.ID == id {
+			s.aiopsRT.Runbooks = slices.Delete(s.aiopsRT.Runbooks, i, i+1)
+			s.dirtyAIOps = true
+			s.appendAuditRuntimeLocked("ai.runbook_delete", rb.Title, "删除 AI 排障技能 Runbook", clientIP, true)
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return nil
+		}
+	}
+	s.rtMu.Unlock()
+	return ErrNotFound
 }
 
-// --- AI Chat Sessions & Proposals ---
+// --- AI Chat Sessions & Proposals (stored in aiops_runtime.json, never touches secrets.enc) ---
 
 func cloneSession(cs AIChatSession) AIChatSession {
 	cp := cs
@@ -609,14 +572,17 @@ func cloneSession(cs AIChatSession) AIChatSession {
 	return cp
 }
 
-func (s *ClientVault) ListAISessions(scope string) ([]AIChatSessionSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) ListAISessions(scope string) ([]AIChatSessionSummary, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	out := make([]AIChatSessionSummary, 0, len(s.state.AISessions))
-	for _, cs := range s.state.AISessions {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return []AIChatSessionSummary{}, nil
+	}
+	out := make([]AIChatSessionSummary, 0, len(s.aiopsRT.AISessions))
+	for _, cs := range s.aiopsRT.AISessions {
 		if scope != "" && cs.Scope != scope {
 			continue
 		}
@@ -625,13 +591,16 @@ func (s *ClientVault) ListAISessions(scope string) ([]AIChatSessionSummary, erro
 	return out, nil
 }
 
-func (s *ClientVault) GetAISession(id string) (*AIChatSession, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetAISession(id string) (*AIChatSession, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	for _, cs := range s.state.AISessions {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return nil, ErrNotFound
+	}
+	for _, cs := range s.aiopsRT.AISessions {
 		if cs.ID == id {
 			cp := cloneSession(cs)
 			return &cp, nil
@@ -640,139 +609,152 @@ func (s *ClientVault) GetAISession(id string) (*AIChatSession, error) {
 	return nil, ErrNotFound
 }
 
-func (s *ClientVault) CreateAISession(title, scope string, serverIDs []string, mode AIExecutionMode) (*AIChatSession, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) CreateAISession(title, scope string, serverIDs []string, mode AIExecutionMode) (*AIChatSession, error) {
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
+	defaultMode := s.secrets.AISettings.DefaultMode
+	s.secMu.RUnlock()
 
-	var outSess AIChatSession
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		sc := scope
-		if sc != "terminal" {
-			sc = "center"
-		}
-		md := mode
-		if md != AIModeSuggest && md != AIModeStandard && md != AIModeAutonomous {
-			md = st.AISettings.DefaultMode
-			if md == "" {
-				md = AIModeStandard
-			}
-		}
-		t := strings.TrimSpace(title)
-		if t == "" {
-			t = "新建 AI 运维排障会话"
-		}
-		sids := serverIDs
-		if sids == nil {
-			sids = []string{}
-		}
-
-		now := time.Now().UTC()
-		sess := AIChatSession{
-			ID:                uuid.NewString(),
-			Title:             t,
-			Scope:             sc,
-			ServerIDs:         slices.Clone(sids),
-			Mode:              md,
-			Messages:          []AIChatMessage{},
-			PendingApprovals:  []AIPendingApproval{},
-			RunbookProposals:  []AIRunbookProposal{},
-			AgentsMDProposals: []AIAgentsMDProposal{},
-			CreatedAt:         now,
-			UpdatedAt:         now,
-		}
-		st.AISessions = append([]AIChatSession{sess}, st.AISessions...)
-		if len(st.AISessions) > maxAISessions {
-			st.AISessions = st.AISessions[:maxAISessions]
-		}
-		outSess = cloneSession(sess)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	sc := scope
+	if sc != "terminal" {
+		sc = "center"
 	}
-	return &outSess, nil
+	md := mode
+	if md != AIModeSuggest && md != AIModeStandard && md != AIModeAutonomous {
+		md = defaultMode
+		if md == "" {
+			md = AIModeStandard
+		}
+	}
+	t := strings.TrimSpace(title)
+	if t == "" {
+		t = "新建 AI 运维排障会话"
+	}
+	sids := serverIDs
+	if sids == nil {
+		sids = []string{}
+	}
+
+	now := time.Now().UTC()
+	sess := AIChatSession{
+		ID:                uuid.NewString(),
+		Title:             t,
+		Scope:             sc,
+		ServerIDs:         slices.Clone(sids),
+		Mode:              md,
+		Messages:          []AIChatMessage{},
+		PendingApprovals:  []AIPendingApproval{},
+		RunbookProposals:  []AIRunbookProposal{},
+		AgentsMDProposals: []AIAgentsMDProposal{},
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	s.aiopsRT.AISessions = append([]AIChatSession{sess}, s.aiopsRT.AISessions...)
+	if len(s.aiopsRT.AISessions) > maxAISessions {
+		s.aiopsRT.AISessions = s.aiopsRT.AISessions[:maxAISessions]
+	}
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
+
+	out := cloneSession(sess)
+	return &out, nil
 }
 
-func (s *ClientVault) SaveAISession(sess AIChatSession) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) SaveAISession(sess AIChatSession) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		sess.UpdatedAt = time.Now().UTC()
-		for i := range st.AISessions {
-			if st.AISessions[i].ID == sess.ID {
-				st.AISessions[i] = cloneSession(sess)
-				return nil
-			}
+	sess.UpdatedAt = time.Now().UTC()
+
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(sess.UpdatedAt)
+	}
+	updated := false
+	for i := range s.aiopsRT.AISessions {
+		if s.aiopsRT.AISessions[i].ID == sess.ID {
+			s.aiopsRT.AISessions[i] = cloneSession(sess)
+			updated = true
+			break
 		}
-		st.AISessions = append([]AIChatSession{cloneSession(sess)}, st.AISessions...)
-		if len(st.AISessions) > maxAISessions {
-			st.AISessions = st.AISessions[:maxAISessions]
+	}
+	if !updated {
+		s.aiopsRT.AISessions = append([]AIChatSession{cloneSession(sess)}, s.aiopsRT.AISessions...)
+		if len(s.aiopsRT.AISessions) > maxAISessions {
+			s.aiopsRT.AISessions = s.aiopsRT.AISessions[:maxAISessions]
 		}
-		return nil
-	})
+	}
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return nil
 }
 
-func (s *ClientVault) DeleteAISession(id, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) DeleteAISession(id, clientIP string) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		for i, cs := range st.AISessions {
-			if cs.ID == id {
-				st.AISessions = slices.Delete(st.AISessions, i, i+1)
-				appendAuditLocked(st, "ai.session_delete", cs.Title, "删除 AI 运维会话记录", clientIP, true)
-				return nil
-			}
-		}
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.rtMu.Unlock()
 		return ErrNotFound
-	})
+	}
+	for i, cs := range s.aiopsRT.AISessions {
+		if cs.ID == id {
+			s.aiopsRT.AISessions = slices.Delete(s.aiopsRT.AISessions, i, i+1)
+			s.dirtyAIOps = true
+			s.appendAuditRuntimeLocked("ai.session_delete", cs.Title, "删除 AI 运维会话记录", clientIP, true)
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return nil
+		}
+	}
+	s.rtMu.Unlock()
+	return ErrNotFound
 }
 
-func (s *ClientVault) ResolveRunbookProposal(proposalID string, accept bool, syncSnippet bool, clientIP string) (*AIRunbook, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) ResolveRunbookProposal(proposalID string, accept bool, syncSnippet bool, clientIP string) (*AIRunbook, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
 
-	var savedRB *AIRunbook
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		foundSessIdx := -1
-		foundPropIdx := -1
-		for si := range st.AISessions {
-			for pi := range st.AISessions[si].RunbookProposals {
-				if st.AISessions[si].RunbookProposals[pi].ID == proposalID {
-					foundSessIdx = si
-					foundPropIdx = pi
+	// Step 1: Locate proposal under rtMu.RLock
+	s.rtMu.RLock()
+	var prop AIRunbookProposal
+	found := false
+	if s.aiopsRT != nil {
+		for _, cs := range s.aiopsRT.AISessions {
+			for _, rp := range cs.RunbookProposals {
+				if rp.ID == proposalID {
+					prop = rp
+					prop.DiagnosticSteps = slices.Clone(rp.DiagnosticSteps)
+					prop.FixCommands = slices.Clone(rp.FixCommands)
+					found = true
 					break
 				}
 			}
-			if foundSessIdx >= 0 {
+			if found {
 				break
 			}
 		}
-		if foundSessIdx < 0 {
-			return ErrNotFound
-		}
+	}
+	s.rtMu.RUnlock()
+	if !found {
+		return nil, ErrNotFound
+	}
 
-		prop := st.AISessions[foundSessIdx].RunbookProposals[foundPropIdx]
-		if !accept {
-			prop.Status = "dismissed"
-			st.AISessions[foundSessIdx].RunbookProposals[foundPropIdx] = prop
-			savedRB = nil
-			return nil
-		}
-
+	now := time.Now().UTC()
+	var rbIn AIRunbook
+	if accept {
 		title := strings.TrimSpace(prop.Title)
 		if title == "" {
 			title = "AI 提炼运维 SOP"
@@ -781,7 +763,7 @@ func (s *ClientVault) ResolveRunbookProposal(proposalID string, accept bool, syn
 		if cat == "" {
 			cat = "排障技能"
 		}
-		rb, uErr := upsertRunbookInState(st, AIRunbook{
+		rbIn = AIRunbook{
 			Title:           title,
 			Category:        cat,
 			Tags:            []string{"AI提炼"},
@@ -791,30 +773,57 @@ func (s *ClientVault) ResolveRunbookProposal(proposalID string, accept bool, syn
 			FixCommands:     prop.FixCommands,
 			Verification:    prop.Verification,
 			SourceSessionID: prop.SessionID,
-		}, syncSnippet, clientIP)
-		if uErr != nil {
-			return uErr
 		}
-		prop.Status = "accepted"
-		prop.SavedRunbookID = rb.ID
-		st.AISessions[foundSessIdx].RunbookProposals[foundPropIdx] = prop
-		savedRB = &rb
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		if syncSnippet {
+			if err := s.syncRunbookSnippet(&rbIn, now); err != nil {
+				return nil, err
+			}
+		}
 	}
+
+	// Step 2: Update runtime state
+	s.rtMu.Lock()
+	foundSessIdx, foundPropIdx := -1, -1
+	for si := range s.aiopsRT.AISessions {
+		for pi := range s.aiopsRT.AISessions[si].RunbookProposals {
+			if s.aiopsRT.AISessions[si].RunbookProposals[pi].ID == proposalID {
+				foundSessIdx, foundPropIdx = si, pi
+				break
+			}
+		}
+		if foundSessIdx >= 0 {
+			break
+		}
+	}
+	if foundSessIdx < 0 {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
+	}
+
+	var savedRB *AIRunbook
+	if !accept {
+		s.aiopsRT.AISessions[foundSessIdx].RunbookProposals[foundPropIdx].Status = "dismissed"
+		s.dirtyAIOps = true
+	} else {
+		rb := s.upsertRunbookRuntimeLocked(rbIn, now, clientIP)
+		s.aiopsRT.AISessions[foundSessIdx].RunbookProposals[foundPropIdx].Status = "accepted"
+		s.aiopsRT.AISessions[foundSessIdx].RunbookProposals[foundPropIdx].SavedRunbookID = rb.ID
+		s.dirtyAIOps = true
+		savedRB = &rb
+	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return savedRB, nil
 }
 
-// --- Background Patrol Config, Baselines & Records ---
+// --- Background Patrol Config (secrets.enc), Baselines & Records (aiops_runtime.json) ---
 
 type WebhookMutationInput struct {
 	ID      string  `json:"id"`
 	Name    string  `json:"name"`
 	Kind    string  `json:"kind"`
-	URL     *string `json:"url,omitempty"`    // nil or empty on update preserves existing URL
-	Secret  *string `json:"secret,omitempty"` // nil on update preserves existing Secret
+	URL     *string `json:"url,omitempty"`
+	Secret  *string `json:"secret,omitempty"`
 	Enabled bool    `json:"enabled"`
 }
 
@@ -831,13 +840,13 @@ type PatrolConfigMutationInput struct {
 	Webhooks             []WebhookMutationInput `json:"webhooks"`
 }
 
-func (s *ClientVault) GetPatrolConfigSecret() (*PatrolConfig, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetPatrolConfigSecret() (*PatrolConfig, error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return nil, ErrVaultLocked
 	}
-	cp := s.state.AISettings.Patrol
+	cp := s.secrets.AISettings.Patrol
 	if cp.IntervalMinutes <= 0 {
 		def := DefaultPatrolConfig()
 		cp.IntervalMinutes = def.IntervalMinutes
@@ -848,18 +857,18 @@ func (s *ClientVault) GetPatrolConfigSecret() (*PatrolConfig, error) {
 		cp.CheckListeningPorts = def.CheckListeningPorts
 		cp.CheckPrivilegedUsers = def.CheckPrivilegedUsers
 	}
-	cp.ServerIDs = slices.Clone(s.state.AISettings.Patrol.ServerIDs)
+	cp.ServerIDs = slices.Clone(s.secrets.AISettings.Patrol.ServerIDs)
 	if cp.ServerIDs == nil {
 		cp.ServerIDs = []string{}
 	}
-	cp.Webhooks = slices.Clone(s.state.AISettings.Patrol.Webhooks)
+	cp.Webhooks = slices.Clone(s.secrets.AISettings.Patrol.Webhooks)
 	if cp.Webhooks == nil {
 		cp.Webhooks = []WebhookChannel{}
 	}
 	return &cp, nil
 }
 
-func (s *ClientVault) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string) (*PatrolConfigView, error) {
+func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string) (*PatrolConfigView, error) {
 	if in.IntervalMinutes < 5 || in.IntervalMinutes > 1440 {
 		in.IntervalMinutes = 60
 	}
@@ -876,17 +885,10 @@ func (s *ClientVault) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP 
 		in.SSHFailWarnCount = 15
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, ErrVaultLocked
-	}
-
 	var outView PatrolConfigView
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
+	err := s.mutateSecrets(func(sec *SecretsState) error {
 		existingByID := make(map[string]WebhookChannel)
-		for _, w := range st.AISettings.Patrol.Webhooks {
+		for _, w := range sec.AISettings.Patrol.Webhooks {
 			existingByID[w.ID] = w
 		}
 
@@ -930,7 +932,7 @@ func (s *ClientVault) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP 
 			sids = []string{}
 		}
 
-		st.AISettings.Patrol = PatrolConfig{
+		sec.AISettings.Patrol = PatrolConfig{
 			Enabled:              in.Enabled,
 			IntervalMinutes:      in.IntervalMinutes,
 			ServerIDs:            slices.Clone(sids),
@@ -942,23 +944,26 @@ func (s *ClientVault) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP 
 			CheckPrivilegedUsers: in.CheckPrivilegedUsers,
 			Webhooks:             mergedWebhooks,
 		}
-		appendAuditLocked(st, "ai.patrol_config", "patrol", fmt.Sprintf("更新后台定时巡检策略 (启用=%v, 周期=%d分钟)", in.Enabled, in.IntervalMinutes), clientIP, true)
-		outView = st.AISettings.Patrol.ToView()
+		outView = sec.AISettings.Patrol.ToView()
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	s.RecordAudit("ai.patrol_config", "patrol", fmt.Sprintf("更新后台定时巡检策略 (启用=%v, 周期=%d分钟)", in.Enabled, in.IntervalMinutes), clientIP, true)
 	return &outView, nil
 }
 
-func (s *ClientVault) GetPatrolBaseline(serverID string) (*ServerBaselineSnapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetPatrolBaseline(serverID string) (*ServerBaselineSnapshot, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	for _, b := range s.state.PatrolBaselines {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return nil, nil
+	}
+	for _, b := range s.aiopsRT.PatrolBaselines {
 		if b.ServerID == serverID {
 			cp := b
 			cp.ListeningPorts = slices.Clone(b.ListeningPorts)
@@ -969,59 +974,70 @@ func (s *ClientVault) GetPatrolBaseline(serverID string) (*ServerBaselineSnapsho
 	return nil, nil
 }
 
-func (s *ClientVault) SavePatrolBaseline(snap ServerBaselineSnapshot) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) SavePatrolBaseline(snap ServerBaselineSnapshot) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		snap.UpdatedAt = time.Now().UTC()
-		for i := range st.PatrolBaselines {
-			if st.PatrolBaselines[i].ServerID == snap.ServerID {
-				st.PatrolBaselines[i] = snap
-				return nil
-			}
+	snap.UpdatedAt = time.Now().UTC()
+
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(snap.UpdatedAt)
+	}
+	updated := false
+	for i := range s.aiopsRT.PatrolBaselines {
+		if s.aiopsRT.PatrolBaselines[i].ServerID == snap.ServerID {
+			s.aiopsRT.PatrolBaselines[i] = snap
+			updated = true
+			break
 		}
-		st.PatrolBaselines = append(st.PatrolBaselines, snap)
-		return nil
-	})
+	}
+	if !updated {
+		s.aiopsRT.PatrolBaselines = append(s.aiopsRT.PatrolBaselines, snap)
+	}
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return nil
 }
 
-func (s *ClientVault) AppendPatrolRecord(rec PatrolRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) AppendPatrolRecord(rec PatrolRecord) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		st.PatrolRecords = append([]PatrolRecord{rec}, st.PatrolRecords...)
-		if len(st.PatrolRecords) > maxPatrolRecords {
-			st.PatrolRecords = st.PatrolRecords[:maxPatrolRecords]
-		}
-		appendAuditLocked(
-			st,
-			"ai.patrol_run",
-			fmt.Sprintf("%d 台服务器", rec.TotalServers),
-			fmt.Sprintf("执行%s巡检: 状态=%s (异常=%d, 严重=%d)", map[string]string{"scheduled": "后台定时", "manual": "手动即时"}[rec.Trigger], rec.Status, rec.WarningCount, rec.CriticalCount),
-			"client-zk",
-			true,
-		)
-		return nil
-	})
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(time.Now().UTC())
+	}
+	s.aiopsRT.PatrolRecords = append([]PatrolRecord{rec}, s.aiopsRT.PatrolRecords...)
+	if len(s.aiopsRT.PatrolRecords) > maxPatrolRecords {
+		s.aiopsRT.PatrolRecords = s.aiopsRT.PatrolRecords[:maxPatrolRecords]
+	}
+	s.dirtyAIOps = true
+	s.appendAuditRuntimeLocked(
+		"ai.patrol_run",
+		fmt.Sprintf("%d 台服务器", rec.TotalServers),
+		fmt.Sprintf("执行%s巡检: 状态=%s (异常=%d, 严重=%d)", map[string]string{"scheduled": "后台定时", "manual": "手动即时"}[rec.Trigger], rec.Status, rec.WarningCount, rec.CriticalCount),
+		"patrol-daemon",
+		true,
+	)
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return nil
 }
 
-func (s *ClientVault) ListPatrolRecords(limit int, markRead bool) ([]PatrolRecord, int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) ListPatrolRecords(limit int, markRead bool) ([]PatrolRecord, int, error) {
+	if !s.IsReady() {
 		return nil, 0, ErrVaultLocked
+	}
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.rtMu.Unlock()
+		return []PatrolRecord{}, 0, nil
 	}
 	unread := 0
 	hasUnread := false
-	for _, r := range s.state.PatrolRecords {
+	for _, r := range s.aiopsRT.PatrolRecords {
 		if r.Unread {
 			hasUnread = true
 			if !markRead {
@@ -1030,23 +1046,19 @@ func (s *ClientVault) ListPatrolRecords(limit int, markRead bool) ([]PatrolRecor
 		}
 	}
 	if markRead && hasUnread {
-		_ = s.mutateLocked(func(st *VaultState) error {
-			for i := range st.PatrolRecords {
-				st.PatrolRecords[i].Unread = false
-			}
-			return nil
-		})
+		for i := range s.aiopsRT.PatrolRecords {
+			s.aiopsRT.PatrolRecords[i].Unread = false
+		}
+		s.dirtyAIOps = true
 	}
-	n := len(s.state.PatrolRecords)
+	n := len(s.aiopsRT.PatrolRecords)
 	if limit > 0 && limit < n {
 		n = limit
 	}
-	out := make([]PatrolRecord, n)
-	for i := 0; i < n; i++ {
-		cp := s.state.PatrolRecords[i]
-		cp.Findings = slices.Clone(s.state.PatrolRecords[i].Findings)
-		cp.AIRecommendations = slices.Clone(s.state.PatrolRecords[i].AIRecommendations)
-		out[i] = cp
+	out := clonePatrolRecords(s.aiopsRT.PatrolRecords[:n])
+	s.rtMu.Unlock()
+	if markRead && hasUnread {
+		s.triggerFlush()
 	}
 	return out, unread, nil
 }

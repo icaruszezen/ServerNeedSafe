@@ -1,11 +1,11 @@
 {
   "name": "serverneedsafe-web",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/inject-sri.mjs",
+    "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test:e2e": "node e2e/mobile-responsive.test.mjs"
   },

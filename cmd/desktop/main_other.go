@@ -10,13 +10,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 )
@@ -26,13 +24,12 @@ func main() {
 	if dataDir == "" {
 		dataDir = "./data-local"
 	}
-	vaultPath := filepath.Join(dataDir, "vault.sns")
-	blindStore, err := vault.NewBlindStore(vaultPath)
+	store, err := vault.NewStore(dataDir)
 	if err != nil {
-		log.Fatalf("init blind vault: %v", err)
+		log.Fatalf("init store: %v", err)
 	}
 
-	authMgr, err := auth.NewManager(12*time.Hour, true)
+	authMgr, err := auth.NewManager(auth.DefaultSessionTTL, true)
 	if err != nil {
 		log.Fatalf("init auth: %v", err)
 	}
@@ -51,14 +48,10 @@ func main() {
 		log.Fatalf("listen loopback: %v", err)
 	}
 
-	relayMgr := relay.NewManager(ln.Addr().String())
-	keyMgr := vault.NewServerKeyManager(dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
-		BlindStore: blindStore,
-		KeyMgr:     keyMgr,
+		Store:      store,
 		Auth:       authMgr,
-		Relay:      relayMgr,
 		StaticFS:   staticFS,
 	})
 

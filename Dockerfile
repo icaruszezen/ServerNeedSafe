@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ==============================================================================
-# Stage 1: Build Frontend Static Assets + SHA-384 Subresource Integrity (SRI)
+# Stage 1: Build Frontend Static Assets
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
 WORKDIR /src/web
@@ -45,7 +45,7 @@ WORKDIR /data
 
 ENV SNS_ADDR="0.0.0.0:8080" \
     SNS_DATA_DIR="/data" \
-    SNS_SESSION_TTL="8h"
+    SNS_SESSION_TTL="168h"
 
 VOLUME ["/data"]
 EXPOSE 8080

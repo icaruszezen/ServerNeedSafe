@@ -349,7 +349,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
             <h3>{servers.length === 0 ? '尚未添加任何 SSH 服务器' : '没有匹配的服务器结果'}</h3>
             <p>
               {servers.length === 0
-                ? '添加您的第一台云服务器或内网节点，所有连接地址、账号及密钥均由管理员主密码进行零知识加密存储。'
+                ? '添加您的第一台云服务器或内网节点，所有连接地址、账号、密码及私钥均通过独立主密钥加密保存于 secrets.enc。'
                 : '请尝试切换分组或清空搜索条件。'}
             </p>
             {servers.length === 0 && (

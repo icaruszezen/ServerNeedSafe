@@ -4,19 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
-	"log"
-	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -27,30 +22,21 @@ const (
 )
 
 // Config holds dependencies for the ServerNeedSafe HTTP/WebSocket daemon.
-// Store, KeyMgr, SSH, Monitor, and AI run natively in-process 7x24 so web pages load
-// in <50ms without WASM downloads and background SSH monitoring + AI patrol run unattended.
+// Store, SSH, Monitor, and AI run natively in-process 7x24 with split encrypted secrets +
+// non-encrypted runtime storage so background monitoring & patrol never lock or stall.
 type Config struct {
 	DeployMode string // "server" or "desktop"
-	BlindStore *vault.BlindStore
-	Store      *vault.ClientVault
-	KeyMgr     *vault.ServerKeyManager
+	Store      *vault.Store
 	SSH        *sshmanager.Manager
 	Monitor    *monitor.Engine
 	AI         *aiops.Service
 	Auth       *auth.Manager
-	Relay      *relay.Manager
 	StaticFS   fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
 }
 
 type Server struct {
 	cfg Config
 	mux *http.ServeMux
-
-	stateMu          sync.RWMutex
-	migrationPending bool
-
-	// kdfSlots bounds concurrent server-side Argon2id password derivations on unauthenticated endpoints.
-	kdfSlots chan struct{}
 }
 
 func NewServer(cfg Config) *Server {
@@ -58,18 +44,7 @@ func NewServer(cfg Config) *Server {
 		cfg.DeployMode = "server"
 	}
 	if cfg.Auth == nil {
-		cfg.Auth, _ = auth.NewManager(8*time.Hour, false)
-	}
-	if cfg.Relay == nil {
-		cfg.Relay = relay.NewManager("")
-	}
-	if cfg.BlindStore != nil {
-		if cfg.Store == nil {
-			cfg.Store = vault.NewClientVault(vault.NewBlindStoreBackend(cfg.BlindStore))
-		}
-		if cfg.KeyMgr == nil {
-			cfg.KeyMgr = vault.NewServerKeyManager(filepath.Dir(cfg.BlindStore.FilePath()))
-		}
+		cfg.Auth, _ = auth.NewManager(auth.DefaultSessionTTL, false)
 	}
 	if cfg.Store != nil {
 		if cfg.SSH == nil {
@@ -83,23 +58,9 @@ func NewServer(cfg Config) *Server {
 		}
 	}
 
-	var migPending bool
-	if cfg.KeyMgr != nil && cfg.Store != nil && cfg.BlindStore != nil {
-		var unlockErr error
-		_, migPending, unlockErr = cfg.KeyMgr.TryAutoUnlock(cfg.Store, cfg.BlindStore)
-		if unlockErr != nil {
-			log.Printf("[ServerNeedSafe] 自动挂载加密保险库失败，需管理员密码登录一次完成挂载：%v", unlockErr)
-		}
-		if cfg.DeployMode == "server" && cfg.KeyMgr.HasLocalKey() && cfg.KeyMgr.SealMode() == vault.SealModeFile {
-			log.Printf("[ServerNeedSafe] 安全提示：%s 以文件内主密钥方式封装（数据目录整体泄露即可解密保险库），生产环境建议配置 SNS_MASTER_KEY 将封装主密钥与数据目录分离", cfg.KeyMgr.KeyPath())
-		}
-	}
-
 	s := &Server{
-		cfg:              cfg,
-		mux:              http.NewServeMux(),
-		migrationPending: migPending,
-		kdfSlots:         make(chan struct{}, maxConcurrentPasswordKDF),
+		cfg: cfg,
+		mux: http.NewServeMux(),
 	}
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Start()
@@ -118,25 +79,13 @@ func (s *Server) Close() {
 	if s.cfg.SSH != nil {
 		s.cfg.SSH.CloseAllSessions()
 	}
-	if s.cfg.Relay != nil {
-		s.cfg.Relay.CloseAll()
+	if s.cfg.Store != nil {
+		s.cfg.Store.Close()
 	}
 }
 
-func (s *Server) isMigrationPending() bool {
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	return s.migrationPending
-}
-
-func (s *Server) setMigrationPending(v bool) {
-	s.stateMu.Lock()
-	s.migrationPending = v
-	s.stateMu.Unlock()
-}
-
-func (s *Server) isDaemonUnlocked() bool {
-	return s.cfg.Store != nil && s.cfg.Store.Status() == vault.StatusUnlocked
+func (s *Server) isDaemonReady() bool {
+	return s.cfg.Store != nil && s.cfg.Store.IsReady()
 }
 
 func (s *Server) Handler() http.Handler {
@@ -148,7 +97,6 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http: https: ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
 
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -158,8 +106,8 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 					writeError(w, http.StatusForbidden, "FORBIDDEN_ORIGIN", "本地桌面安全隔离策略已拦截外部未授权进程访问")
 					return
 				}
-			} else if origin := r.Header.Get("Origin"); origin != "" && !isSameOriginRequest(r, origin) {
-				// Allow token/signature-based Remote Vault Sync preflights across origins (never with credentials/cookies)
+			} else if origin := r.Header.Get("Origin"); origin != "" && !isSameHostOrigin(r, origin) {
+				// Support cross-origin bearer-authenticated sync/API requests cleanly.
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -174,7 +122,7 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func isSameOriginRequest(r *http.Request, origin string) bool {
+func isSameHostOrigin(r *http.Request, origin string) bool {
 	if origin == "" {
 		return true
 	}
@@ -185,9 +133,7 @@ func isSameOriginRequest(r *http.Request, origin string) bool {
 	if strings.EqualFold(u.Host, r.Host) {
 		return true
 	}
-	// Reverse proxies that rewrite Host (e.g. proxy_pass to 127.0.0.1 without "proxy_set_header Host")
-	// usually forward the public host here; only believe it when the peer is our own local proxy.
-	if fwdHost := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); fwdHost != "" && isTrustedProxyPeer(r.RemoteAddr) {
+	if fwdHost := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); fwdHost != "" {
 		return strings.EqualFold(u.Host, fwdHost)
 	}
 	return false
@@ -202,32 +148,28 @@ func (s *Server) registerRoutes() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":             true,
 			"mode":           s.cfg.DeployMode,
-			"initialized":    s.cfg.BlindStore.IsInitialized(),
+			"initialized":    s.cfg.Store != nil && s.cfg.Store.IsInitialized(),
 			"daemon_mode":    true,
-			"daemon_running": s.isDaemonUnlocked() || !s.cfg.BlindStore.IsInitialized(),
+			"daemon_running": s.isDaemonReady() || (s.cfg.Store != nil && !s.cfg.Store.IsInitialized()),
 		})
 	})
 
-	// Authentication, Session Lifecycle & KDF Tuning
+	// Authentication & Session Lifecycle
 	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
-	s.mux.HandleFunc("POST /api/auth/challenge", s.handleAuthChallenge)
-	s.mux.HandleFunc("POST /api/auth/verify", s.handleAuthVerify)
 	s.mux.HandleFunc("POST /api/auth/logout", s.requireAuth(s.handleAuthLogout))
 	s.mux.HandleFunc("POST /api/auth/lock", s.requireAuth(s.handleAuthLock))
 	s.mux.HandleFunc("POST /api/auth/password", s.requireAuth(s.handleChangePassword))
-	s.mux.HandleFunc("POST /api/vault/kdf", s.requireAuth(s.handleUpdateVaultKDF))
 
-	// Vault Security Settings, Backup Export/Import & Cross-Instance Sync
+	// Vault Security Settings, Password-Encrypted Backup Export/Import & Simplified Cross-Instance Sync
 	s.mux.HandleFunc("GET /api/vault/security", s.requireAuth(s.handleGetVaultSecurity))
 	s.mux.HandleFunc("PUT /api/vault/settings", s.requireAuth(s.handleUpdateVaultSettings))
 	s.mux.HandleFunc("DELETE /api/vault/known-hosts", s.requireAuth(s.handleDeleteKnownHost))
-	s.mux.HandleFunc("GET /api/vault/blob", s.requireAuth(s.handleGetVaultBlob))
-	s.mux.HandleFunc("PUT /api/vault/blob", s.requireAuth(s.handlePutVaultBlob))
-	s.mux.HandleFunc("GET /api/vault/export", s.requireAuth(s.handleExportVaultBlob))
-	s.mux.HandleFunc("POST /api/vault/import", s.handleImportVaultBlob)
+	s.mux.HandleFunc("POST /api/vault/export", s.requireAuth(s.handleExportVaultBackup))
 	s.mux.HandleFunc("POST /api/vault/import/file", s.handleImportVaultFile)
+	s.mux.HandleFunc("GET /api/vault/sync/snapshot", s.requireAuth(s.handleVaultSyncSnapshot))
+	s.mux.HandleFunc("POST /api/vault/sync/apply", s.requireAuth(s.handleVaultSyncApply))
 	s.mux.HandleFunc("POST /api/vault/sync/push", s.requireAuth(s.handleVaultSyncPush))
 	s.mux.HandleFunc("POST /api/vault/sync/pull", s.requireAuth(s.handleVaultSyncPull))
 
@@ -310,12 +252,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/ai/patrol/run", s.requireAuth(s.handleRunPatrolNow))
 	s.mux.HandleFunc("POST /api/ai/test-webhook", s.requireAuth(s.handleTestAIWebhook))
 
-	// Native WebSocket Interactive SSH PTY Terminal + Legacy Relay Compatibility
+	// Native WebSocket Interactive SSH PTY Terminal
 	s.mux.HandleFunc("GET /api/ws/terminal", s.requireAuth(s.handleWebSocketTerminal))
-	s.mux.HandleFunc("POST /api/ws/ticket", s.requireAuth(s.handleIssueRelayTicket))
-	s.mux.HandleFunc("GET /api/ws/tcp-relay", s.handleWebSocketTCPRelay)
 
-	// Embedded Lightweight Single-Page Web Application (zero WASM bundle)
+	// Embedded Lightweight Single-Page Web Application
 	if s.cfg.StaticFS != nil {
 		fileServer := http.FileServer(http.FS(s.cfg.StaticFS))
 		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -354,10 +294,6 @@ func extractSessionToken(r *http.Request) string {
 			return tok
 		}
 	}
-	// HttpOnly cookie sessions are ONLY accepted for same-origin requests (CSRF protection).
-	if !isCookieSessionRequestAllowed(r) {
-		return ""
-	}
 	if c, err := r.Cookie(adminSessionCookieName); err == nil && strings.TrimSpace(c.Value) != "" {
 		return strings.TrimSpace(c.Value)
 	}
@@ -379,7 +315,7 @@ func (s *Server) setAdminSessionCookie(w http.ResponseWriter, r *http.Request, t
 		MaxAge:   int(s.cfg.Auth.SessionTTL().Seconds()),
 		HttpOnly: true,
 		Secure:   isRequestHTTPS(r),
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 	})
 }
 
@@ -391,48 +327,12 @@ func (s *Server) clearAdminSessionCookie(w http.ResponseWriter, r *http.Request)
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   isRequestHTTPS(r),
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func extractClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil || host == "" {
-		host = r.RemoteAddr
-	}
-	// Proxy headers are attacker-controlled unless the direct peer is our own local reverse proxy.
-	if !isTrustedProxyPeer(r.RemoteAddr) {
-		return host
-	}
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" && net.ParseIP(realIP) != nil {
-		return realIP
-	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		// The RIGHTMOST hop is the one appended by the trusted proxy ($proxy_add_x_forwarded_for);
-		// leftmost entries can be forged by the client.
-		parts := strings.Split(xff, ",")
-		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" && net.ParseIP(last) != nil {
-			return last
-		}
-	}
-	return host
-}
-
-func (s *Server) currentAuthPubFingerprint() string {
-	if s.isDaemonUnlocked() {
-		if enc, err := s.cfg.Store.EncryptionInfo(); err == nil && enc.AuthPubKeySHA256 != "" {
-			return enc.AuthPubKeySHA256
-		}
-	}
-	if !s.cfg.BlindStore.IsInitialized() {
-		return ""
-	}
-	info := s.cfg.BlindStore.EncryptionInfo(true)
-	return info.AuthPubKeySHA256
-}
-
 func (s *Server) currentSessionIdleTimeout() time.Duration {
-	if s.isDaemonUnlocked() {
+	if s.isDaemonReady() {
 		if settings, err := s.cfg.Store.GetSettings(); err == nil {
 			if settings.AutoLockMinutes <= 0 {
 				return 0
@@ -440,19 +340,19 @@ func (s *Server) currentSessionIdleTimeout() time.Duration {
 			return time.Duration(settings.AutoLockMinutes) * time.Minute
 		}
 	}
-	return 30 * time.Minute
+	return 0
 }
 
 func (s *Server) validateRequestSession(r *http.Request, touch bool) (*auth.Session, bool) {
-	if !s.cfg.BlindStore.IsInitialized() {
+	if s.cfg.Store == nil || !s.cfg.Store.IsReady() {
 		return nil, false
 	}
 	tok := extractSessionToken(r)
 	if tok == "" {
 		return nil, false
 	}
-	pubFP := s.currentAuthPubFingerprint()
-	sess, err := s.cfg.Auth.ValidateSessionWithIdle(tok, pubFP, s.currentSessionIdleTimeout(), touch)
+	authVer := s.cfg.Store.AuthVersion()
+	sess, err := s.cfg.Auth.ValidateSessionWithIdle(tok, authVer, s.currentSessionIdleTimeout(), touch)
 	if err != nil {
 		return nil, false
 	}
@@ -461,7 +361,7 @@ func (s *Server) validateRequestSession(r *http.Request, touch bool) (*auth.Sess
 
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.cfg.BlindStore.IsInitialized() {
+		if s.cfg.Store == nil || !s.cfg.Store.IsInitialized() {
 			writeError(w, http.StatusUnauthorized, "VAULT_NOT_INIT", vault.ErrVaultNotInit.Error())
 			return
 		}
@@ -478,15 +378,6 @@ func decodeJSON(r *http.Request, dst any, maxBytes int64) error {
 		maxBytes = 16 * 1024 * 1024
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBytes))
-	return dec.Decode(dst)
-}
-
-func decodeStrictJSON(r *http.Request, dst any, maxBytes int64) error {
-	if maxBytes <= 0 {
-		maxBytes = 72 * 1024 * 1024
-	}
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBytes))
-	dec.DisallowUnknownFields()
 	return dec.Decode(dst)
 }
 
@@ -517,14 +408,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 	case errors.Is(err, vault.ErrVaultAlreadyInit):
 		writeError(w, http.StatusConflict, "VAULT_ALREADY_INIT", err.Error())
 	case errors.Is(err, vault.ErrVaultLocked):
-		writeError(w, http.StatusConflict, "DAEMON_MIGRATION_REQUIRED", "服务端保险库尚未挂载主密钥，请先使用管理员密码登录一次完成自动挂载")
-	case errors.Is(err, vault.ErrRevisionConflict):
-		writeError(w, http.StatusConflict, "REVISION_CONFLICT", err.Error())
-	case errors.Is(err, vault.ErrRollbackDetected):
-		writeError(w, http.StatusConflict, "ROLLBACK_DETECTED", err.Error())
-	case errors.Is(err, vault.ErrKDFDowngrade):
-		writeError(w, http.StatusConflict, "KDF_DOWNGRADE", err.Error())
-	case errors.Is(err, vault.ErrInvalidPassword), errors.Is(err, vault.ErrInvalidSignature):
+		writeError(w, http.StatusConflict, "LEGACY_MIGRATION_REQUIRED", err.Error())
+	case errors.Is(err, vault.ErrInvalidPassword):
 		writeError(w, http.StatusUnauthorized, "INVALID_PASSWORD", err.Error())
 	case errors.Is(err, vault.ErrWeakPassword), errors.Is(err, vault.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, "INVALID_INPUT", err.Error())

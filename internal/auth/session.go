@@ -10,42 +10,27 @@ import (
 	"time"
 )
 
-const maxPendingChallenges = 512
+const DefaultSessionTTL = 7 * 24 * time.Hour
 
 var (
-	ErrUnauthorized = errors.New("未通过零知识身份验证或会话已过期")
-	ErrRateLimited  = errors.New("验证失败次数过多，请稍后再试")
+	ErrUnauthorized = errors.New("未登录管理后台或会话已过期")
+	ErrRateLimited  = errors.New("密码验证失败次数过多，请稍后再试")
 )
 
 type Session struct {
-	Token         string
-	AuthPubSHA256 string
-	CreatedAt     time.Time
-	LastSeenAt    time.Time
-	ClientIP      string
-	UserAgent     string
+	Token       string
+	AuthVersion uint64
+	CreatedAt   time.Time
+	LastSeenAt  time.Time
+	ClientIP    string
+	UserAgent   string
 }
 
-type AuthChallenge struct {
-	ID        string
-	Nonce     string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-}
-
-type oneTimeTicket struct {
-	Purpose       string
-	AuthPubSHA256 string
-	ExpiresAt     time.Time
-}
-
-// Manager manages zero-knowledge challenge nonces, authenticated sessions bound to AuthPubSHA256,
-// metadata-free one-time TCP relay tickets, brute-force rate limiting, and local desktop instance protection.
+// Manager manages authenticated Web sessions bound to AuthVersion, brute-force rate limiting,
+// and local Windows desktop instance loopback isolation.
 type Manager struct {
 	mu              sync.Mutex
 	sessions        map[string]*Session
-	challenges      map[string]*AuthChallenge
-	tickets         map[string]*oneTimeTicket
 	sessionTTL      time.Duration
 	failedCount     int
 	lockedUntil     time.Time
@@ -55,12 +40,10 @@ type Manager struct {
 
 func NewManager(sessionTTL time.Duration, enableDesktopGuard bool) (*Manager, error) {
 	if sessionTTL <= 0 {
-		sessionTTL = 8 * time.Hour
+		sessionTTL = DefaultSessionTTL
 	}
 	m := &Manager{
 		sessions:   make(map[string]*Session),
-		challenges: make(map[string]*AuthChallenge),
-		tickets:    make(map[string]*oneTimeTicket),
 		sessionTTL: sessionTTL,
 	}
 	if enableDesktopGuard {
@@ -112,7 +95,7 @@ func (m *Manager) VerifyDesktopCookie(val string) bool {
 	return subtle.ConstantTimeCompare([]byte(val), []byte(m.desktopCookie)) == 1
 }
 
-// CheckRateLimit verifies whether authentication is currently throttled.
+// CheckRateLimit verifies whether login attempts are currently throttled.
 func (m *Manager) CheckRateLimit() (retryAfterSec int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,7 +127,7 @@ func (m *Manager) RecordAuthFailure() (failedCount int, lockedForSec int) {
 	return m.failedCount, 0
 }
 
-// ResetAuthFailures clears brute-force counters after valid zero-knowledge verification.
+// ResetAuthFailures clears brute-force counters after a successful login.
 func (m *Manager) ResetAuthFailures() {
 	m.mu.Lock()
 	m.failedCount = 0
@@ -152,79 +135,20 @@ func (m *Manager) ResetAuthFailures() {
 	m.mu.Unlock()
 }
 
-// IssueChallenge generates a single-use 256-bit zero-knowledge authentication challenge with a 60s TTL.
-func (m *Manager) IssueChallenge() (*AuthChallenge, error) {
-	id, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	nonce, err := randomHex(32)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().UTC()
-	ch := &AuthChallenge{
-		ID:        id,
-		Nonce:     nonce,
-		CreatedAt: now,
-		ExpiresAt: now.Add(60 * time.Second),
-	}
-
-	m.mu.Lock()
-	m.pruneExpiredLocked(now)
-	if len(m.challenges) >= maxPendingChallenges {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range m.challenges {
-			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-			}
-		}
-		if oldestKey != "" {
-			delete(m.challenges, oldestKey)
-		}
-	}
-	m.challenges[id] = ch
-	m.mu.Unlock()
-
-	cp := *ch
-	return &cp, nil
-}
-
-// ConsumeChallenge atomically validates and deletes a single-use challenge, preventing replay attacks.
-func (m *Manager) ConsumeChallenge(challengeID string) (nonce string, err error) {
-	if challengeID == "" {
-		return "", ErrUnauthorized
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ch, ok := m.challenges[challengeID]
-	delete(m.challenges, challengeID)
-	if !ok {
-		return "", ErrUnauthorized
-	}
-	if time.Now().UTC().After(ch.ExpiresAt) {
-		return "", ErrUnauthorized
-	}
-	return ch.Nonce, nil
-}
-
-// CreateSession issues a new cryptographically random 256-bit bearer token bound to authPubSHA256.
-func (m *Manager) CreateSession(authPubSHA256, clientIP, userAgent string) (*Session, error) {
+// CreateSession issues a new cryptographically random 256-bit session token bound to authVersion.
+func (m *Manager) CreateSession(authVersion uint64, clientIP, userAgent string) (*Session, error) {
 	tok, err := randomHex(32)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()
 	sess := &Session{
-		Token:         tok,
-		AuthPubSHA256: authPubSHA256,
-		CreatedAt:     now,
-		LastSeenAt:    now,
-		ClientIP:      clientIP,
-		UserAgent:     userAgent,
+		Token:       tok,
+		AuthVersion: authVersion,
+		CreatedAt:   now,
+		LastSeenAt:  now,
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
 	}
 	m.mu.Lock()
 	m.pruneExpiredLocked(now)
@@ -238,15 +162,15 @@ func (m *Manager) SessionTTL() time.Duration {
 	return m.sessionTTL
 }
 
-// ValidateSession verifies a bearer/cookie token against max sessionTTL and expectedAuthPubSHA256.
-func (m *Manager) ValidateSession(token, expectedAuthPubSHA256 string) (*Session, error) {
-	return m.ValidateSessionWithIdle(token, expectedAuthPubSHA256, 0, true)
+// ValidateSession verifies a bearer/cookie token against max sessionTTL and expectedAuthVersion.
+func (m *Manager) ValidateSession(token string, expectedAuthVersion uint64) (*Session, error) {
+	return m.ValidateSessionWithIdle(token, expectedAuthVersion, 0, true)
 }
 
-// ValidateSessionWithIdle enforces BOTH maximum session lifetime (CreatedAt + sessionTTL, e.g. 8h)
-// AND optional idle inactivity timeout (LastSeenAt + idleTimeout, e.g. 30m from AutoLockMinutes).
-// Web session expiration ONLY invalidates the web session token; background 7x24 daemon tasks stay running.
-func (m *Manager) ValidateSessionWithIdle(token, expectedAuthPubSHA256 string, idleTimeout time.Duration, touch bool) (*Session, error) {
+// ValidateSessionWithIdle enforces BOTH maximum session lifetime (CreatedAt + sessionTTL, default 7d)
+// AND optional idle inactivity timeout (LastSeenAt + idleTimeout, default 0/disabled).
+// Web session expiration ONLY invalidates the web session token; background 7x24 tasks stay running.
+func (m *Manager) ValidateSessionWithIdle(token string, expectedAuthVersion uint64, idleTimeout time.Duration, touch bool) (*Session, error) {
 	if token == "" {
 		return nil, ErrUnauthorized
 	}
@@ -266,7 +190,7 @@ func (m *Manager) ValidateSessionWithIdle(token, expectedAuthPubSHA256 string, i
 		delete(m.sessions, token)
 		return nil, ErrUnauthorized
 	}
-	if expectedAuthPubSHA256 != "" && sess.AuthPubSHA256 != expectedAuthPubSHA256 {
+	if expectedAuthVersion > 0 && sess.AuthVersion != expectedAuthVersion {
 		delete(m.sessions, token)
 		return nil, ErrUnauthorized
 	}
@@ -284,12 +208,10 @@ func (m *Manager) RevokeSession(token string) {
 	m.mu.Unlock()
 }
 
-// RevokeAll invalidates every active session, challenge, and ticket (used when locking vault or rotating password).
+// RevokeAll invalidates every active Web session (used when locking console or changing password).
 func (m *Manager) RevokeAll() {
 	m.mu.Lock()
 	clear(m.sessions)
-	clear(m.challenges)
-	clear(m.tickets)
 	m.mu.Unlock()
 }
 
@@ -301,63 +223,10 @@ func (m *Manager) ActiveSessionCount() int {
 	return len(m.sessions)
 }
 
-// IssueTicket creates a single-use 60-second ticket carrying ZERO target server or path metadata.
-func (m *Manager) IssueTicket(purpose, authPubSHA256 string) (string, error) {
-	code, err := randomHex(24)
-	if err != nil {
-		return "", err
-	}
-	now := time.Now().UTC()
-	m.mu.Lock()
-	m.pruneExpiredLocked(now)
-	m.tickets[code] = &oneTimeTicket{
-		Purpose:       purpose,
-		AuthPubSHA256: authPubSHA256,
-		ExpiresAt:     now.Add(60 * time.Second),
-	}
-	m.mu.Unlock()
-	return code, nil
-}
-
-// ConsumeTicket atomically validates and deletes a single-use ticket.
-func (m *Manager) ConsumeTicket(code, expectedPurpose, expectedAuthPubSHA256 string) error {
-	if code == "" {
-		return ErrUnauthorized
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	t, ok := m.tickets[code]
-	delete(m.tickets, code)
-	if !ok {
-		return ErrUnauthorized
-	}
-	if time.Now().UTC().After(t.ExpiresAt) {
-		return ErrUnauthorized
-	}
-	if t.Purpose != expectedPurpose {
-		return ErrUnauthorized
-	}
-	if expectedAuthPubSHA256 != "" && t.AuthPubSHA256 != expectedAuthPubSHA256 {
-		return ErrUnauthorized
-	}
-	return nil
-}
-
 func (m *Manager) pruneExpiredLocked(now time.Time) {
 	for k, s := range m.sessions {
 		if now.Sub(s.CreatedAt) > m.sessionTTL {
 			delete(m.sessions, k)
-		}
-	}
-	for k, ch := range m.challenges {
-		if now.After(ch.ExpiresAt) {
-			delete(m.challenges, k)
-		}
-	}
-	for k, t := range m.tickets {
-		if now.After(t.ExpiresAt) {
-			delete(m.tickets, k)
 		}
 	}
 }
