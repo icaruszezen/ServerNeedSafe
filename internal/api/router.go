@@ -11,6 +11,7 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
+	"github.com/icaruszezen/ServerNeedSafe/internal/mcp"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
@@ -35,8 +36,10 @@ type Config struct {
 }
 
 type Server struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg         Config
+	mux         *http.ServeMux
+	mcpServer   *mcp.Server
+	mcpLoopback *desktopMCPLoopback
 }
 
 func NewServer(cfg Config) *Server {
@@ -59,17 +62,30 @@ func NewServer(cfg Config) *Server {
 	}
 
 	s := &Server{
-		cfg: cfg,
-		mux: http.NewServeMux(),
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		mcpServer:   mcp.NewServer(cfg.Store, cfg.SSH, cfg.Monitor, cfg.AI),
+		mcpLoopback: newDesktopMCPLoopback(),
 	}
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Start()
+	}
+	if s.cfg.Store != nil && s.cfg.DeployMode == "desktop" {
+		s.cfg.Store.RegisterOnReady(func() {
+			s.syncDesktopMCPLoopback()
+		})
+		if s.cfg.Store.IsReady() {
+			s.syncDesktopMCPLoopback()
+		}
 	}
 	s.registerRoutes()
 	return s
 }
 
 func (s *Server) Close() {
+	if s.mcpLoopback != nil {
+		s.mcpLoopback.Close()
+	}
 	if s.cfg.AI != nil {
 		s.cfg.AI.Close()
 	}
@@ -106,15 +122,17 @@ func (s *Server) securityHeadersMiddleware(next http.Handler) http.Handler {
 					writeError(w, http.StatusForbidden, "FORBIDDEN_ORIGIN", "本地桌面安全隔离策略已拦截外部未授权进程访问")
 					return
 				}
-			} else if origin := r.Header.Get("Origin"); origin != "" && !isSameHostOrigin(r, origin) {
-				// Support cross-origin bearer-authenticated sync/API requests cleanly.
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				if r.Method == http.MethodOptions {
-					w.WriteHeader(http.StatusNoContent)
-					return
+			} else if r.URL.Path != "/api/mcp" {
+				if origin := r.Header.Get("Origin"); origin != "" && !isSameHostOrigin(r, origin) {
+					// Support cross-origin bearer-authenticated sync/API requests cleanly.
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Vary", "Origin")
+					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+					if r.Method == http.MethodOptions {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
 				}
 			}
 		}
@@ -251,6 +269,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/ai/patrol/records", s.requireAuth(s.handleListPatrolRecords))
 	s.mux.HandleFunc("POST /api/ai/patrol/run", s.requireAuth(s.handleRunPatrolNow))
 	s.mux.HandleFunc("POST /api/ai/test-webhook", s.requireAuth(s.handleTestAIWebhook))
+
+	// External AI Takeover (MCP Streamable HTTP Gateway, Persistent Scoped Tokens & External HITL Approvals)
+	s.mux.HandleFunc("GET /api/ai/mcp/overview", s.requireAuth(s.handleGetMCPOverview))
+	s.mux.HandleFunc("PUT /api/ai/mcp/config", s.requireAuth(s.handleUpdateMCPConfig))
+	s.mux.HandleFunc("POST /api/ai/mcp/tokens", s.requireAuth(s.handleCreateMCPToken))
+	s.mux.HandleFunc("PUT /api/ai/mcp/tokens/{id}", s.requireAuth(s.handleUpdateMCPToken))
+	s.mux.HandleFunc("DELETE /api/ai/mcp/tokens/{id}", s.requireAuth(s.handleDeleteMCPToken))
+	s.mux.HandleFunc("GET /api/ai/external-approvals", s.requireAuth(s.handleListExternalApprovals))
+	s.mux.HandleFunc("POST /api/ai/external-approvals/{id}/resolve", s.requireAuth(s.handleResolveExternalApproval))
+
+	// Built-in MCP Streamable HTTP endpoint (authenticates strictly via scoped MCP Bearer Token, never admin session)
+	if s.mcpServer != nil {
+		s.mux.Handle("/api/mcp", s.mcpServer.HTTPHandler(false))
+	}
 
 	// Native WebSocket Interactive SSH PTY Terminal
 	s.mux.HandleFunc("GET /api/ws/terminal", s.requireAuth(s.handleWebSocketTerminal))

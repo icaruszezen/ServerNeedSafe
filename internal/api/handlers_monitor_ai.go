@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
+	"github.com/icaruszezen/ServerNeedSafe/internal/mcp"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -263,21 +264,30 @@ func (s *Server) handleGetAIOverview(w http.ResponseWriter, r *http.Request) {
 	patrolStatus := s.cfg.AI.GetPatrolStatus()
 	patrolStatus.UnreadAlerts = unread
 
+	mcpCfg, _ := s.cfg.Store.GetMCPConfigView()
+	mcpRuntime := s.buildMCPRuntimeStatus(r, mcpCfg)
+	extApprovals, pendingExtAp, _ := s.cfg.Store.ListExternalApprovals("all", 60)
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active_provider_id": activeID,
-		"default_mode":       defaultMode,
-		"providers":          providers,
-		"presets":            aiops.BuiltinProviderPresets(),
-		"agents_md":          agentsMD,
-		"agents_md_template": vault.DefaultAgentsMDTemplate(),
-		"memory_config":      memoryCfg,
-		"patrol_config":      patrolCfg,
-		"patrol_status":      patrolStatus,
-		"patrol_records":     records,
-		"host_memories":      hostMemories,
-		"memories":           longMemories,
-		"runbooks":           runbooks,
-		"sessions":           sessions,
+		"active_provider_id":         activeID,
+		"default_mode":               defaultMode,
+		"providers":                  providers,
+		"presets":                    aiops.BuiltinProviderPresets(),
+		"agents_md":                  agentsMD,
+		"agents_md_template":         vault.DefaultAgentsMDTemplate(),
+		"memory_config":              memoryCfg,
+		"patrol_config":              patrolCfg,
+		"patrol_status":              patrolStatus,
+		"patrol_records":             records,
+		"mcp_config":                 mcpCfg,
+		"mcp_runtime":                mcpRuntime,
+		"external_approvals":         extApprovals,
+		"pending_external_approvals": pendingExtAp,
+		"skill_markdown":             mcp.StandardPatrolSkillMarkdown(mcpRuntime.EffectiveEndpointURL),
+		"host_memories":              hostMemories,
+		"memories":                   longMemories,
+		"runbooks":                   runbooks,
+		"sessions":                   sessions,
 	})
 }
 

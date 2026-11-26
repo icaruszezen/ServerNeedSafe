@@ -42,8 +42,9 @@
 5. **7×24 全维无 Agent 服务器状态监控与时序归档**
    - 无需在远端服务器安装任何 Agent，后台原生 Go 巡检引擎通过加密 SSH 通道持续采集 **12 大全方位监控维度**（连通性/系统画像、250ms 双采样真实 CPU 分解、物理内存/Swap/句柄/OOM、全分区容量/Inode/磁盘 IOPS、多网卡速率与 TCP/UDP Socket 状态、Top CPU/RSS 进程、监听端口与公网暴露端口基线、Systemd 服务、Docker 容器及防火墙/SSH 爆破安全态势）。
    - 内置 **18 项多维告警规则**（防抖、自动销警恢复、手动确认与 Webhook 推送），支持一键导出 CSV（含 UTF-8 BOM）/ JSON 历史报表。
-6. **AI 智能运维、混合记忆与后台定时安全巡检**
+6. **AI 智能运维、混合记忆、定时安全巡检与外部 AI 接管 (MCP)**
    - 原生兼容 **OpenAI Chat Completions** 与 **Anthropic Messages** 两大流式 Tool-Calling 协议（内置 DeepSeek、通义千问、Claude、OpenAI、SiliconFlow 及本地 **Ollama** 预设），受管主机 SSH 密码/私钥严格物理隔离、绝不进入大模型上下文。
+   - **原生内置 MCP Streamable HTTP 网关 (`/api/mcp`)**：支持 **Claude Code、Codex、Antigravity、Cursor** 等本地 AI 软件通过持久化作用域令牌直接接管 AI 巡检——认领后台异常巡检队列、执行只读白名单 SSH/SFTP 深度取证、回写结构化报告并触发飞书/钉钉/企微 Webhook、增量更新主机画像与记忆；支持「内置模型 / 纯外部 AI 接管 / 外部优先+超时回退内置」三模式切换，以及受控变更提案（强制落入 Web 端 HITL Diff 审批队列，绝不盲目自动执行）；Windows 桌面版默认保持强隔离，支持按需开启 `127.0.0.1:18900` 独立 MCP 回环端口。
    - 支持 **独立 AI 诊断中心 + SSH 终端同屏副驾驶**、`参谋 / 标准受控 / 自治执行` 三级审批（含 Git Unified Diff 对比卡片）、`HostMemory` 主机画像记忆、`Runbook` 技能沉淀，以及异常按需唤醒大模型并推送至飞书/钉钉/企业微信/HMAC Webhook 的 7×24 后台定时巡检。
 
 ---

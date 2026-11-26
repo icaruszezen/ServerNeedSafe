@@ -28,15 +28,18 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 		firingAlerts = monOv.KPI.FiringAlerts
 	}
 	_, patrolUnread, _ := s.cfg.Store.ListPatrolRecords(1, false)
+	pendingExtPatrols, pendingExtApprovals := s.cfg.Store.CountExternalPending()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"servers":         servers,
-		"groups":          groups,
-		"credentials":     creds,
-		"snippets":        snippets,
-		"active_sessions": s.cfg.SSH.ListActiveSessions(),
-		"firing_alerts":   firingAlerts,
-		"patrol_unread":   patrolUnread,
+		"servers":                    servers,
+		"groups":                     groups,
+		"credentials":                creds,
+		"snippets":                   snippets,
+		"active_sessions":            s.cfg.SSH.ListActiveSessions(),
+		"firing_alerts":              firingAlerts,
+		"patrol_unread":              patrolUnread + pendingExtApprovals,
+		"pending_external_patrols":   pendingExtPatrols,
+		"pending_external_approvals": pendingExtApprovals,
 	})
 }
 

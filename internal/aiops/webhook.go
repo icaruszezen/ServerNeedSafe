@@ -39,6 +39,17 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 	md.WriteString(fmt.Sprintf("### [ServerNeedSafe] AI 巡检%s\n", statusLabel))
 	md.WriteString(fmt.Sprintf("- **巡检时间**：%s\n", rec.CompletedAt.Local().Format("2006-01-02 15:04:05")))
 	md.WriteString(fmt.Sprintf("- **主机统计**：共 %d 台（正常 %d · 预警 %d · 严重 %d）\n", rec.TotalServers, rec.HealthyCount, rec.WarningCount, rec.CriticalCount))
+	if rec.AnalysisState == "pending_external" || rec.AnalysisState == "claimed" {
+		md.WriteString("- **AI 研判状态**：原始异常速报（已进入待研判队列，等待外部 AI 通过 MCP 深度取证回写）\n")
+	} else if rec.AISource == "external_mcp" && rec.AIAnalyzed {
+		srcName := nonEmpty(rec.ExternalClient, "外部 AI (MCP)")
+		if rec.AIModel != "" {
+			srcName = fmt.Sprintf("%s · %s", srcName, rec.AIModel)
+		}
+		md.WriteString(fmt.Sprintf("- **AI 研判来源**：外部 AI 接管 (`%s`)\n", srcName))
+	} else if rec.AnalysisState == "fallback_completed" && rec.AIAnalyzed {
+		md.WriteString(fmt.Sprintf("- **AI 研判来源**：外部 AI 超时未认领，已由内置模型兜底 (`%s`)\n", nonEmpty(rec.AIModel, "内置模型")))
+	}
 
 	for _, f := range rec.Findings {
 		if len(f.Anomalies) == 0 && f.Reachable {
@@ -48,6 +59,18 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 	}
 	if rec.AISummary != "" {
 		md.WriteString(fmt.Sprintf("\n**AI 根因研判**：%s\n", rec.AISummary))
+	}
+	if rec.AIRootCause != "" {
+		md.WriteString(fmt.Sprintf("\n**根因分析**：%s\n", truncateStr(rec.AIRootCause, 600)))
+	}
+	if len(rec.DeepEvidence) > 0 {
+		md.WriteString("\n**深度取证线索**：\n")
+		for i, ev := range rec.DeepEvidence {
+			if i >= 4 {
+				break
+			}
+			md.WriteString(fmt.Sprintf("- %s\n", ev))
+		}
 	}
 	if len(rec.AIRecommendations) > 0 {
 		md.WriteString("\n**处置建议（只读巡检未自动变更线上）**：\n")
@@ -60,6 +83,103 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 	}
 	markdownText := md.String()
 
+	titleText := fmt.Sprintf("ServerNeedSafe · AI 巡检%s", statusLabel)
+	if rec.AISource == "external_mcp" && rec.AIAnalyzed {
+		titleText = fmt.Sprintf("ServerNeedSafe · %s 深度巡检报告 (%s)", nonEmpty(rec.ExternalClient, "外部 AI"), statusLabel)
+	}
+	colorTemplate := map[string]string{"critical": "red", "warning": "orange", "healthy": "turquoise"}[rec.Status]
+	if colorTemplate == "" {
+		colorTemplate = "blue"
+	}
+
+	customPayload := map[string]any{
+		"source":          "ServerNeedSafe",
+		"event":           "aiops.patrol_alert",
+		"patrol_id":       rec.ID,
+		"status":          rec.Status,
+		"analysis_state":  rec.AnalysisState,
+		"ai_source":       rec.AISource,
+		"external_client": rec.ExternalClient,
+		"timestamp":       rec.CompletedAt.Format(time.RFC3339),
+		"total_servers":   rec.TotalServers,
+		"warning_count":   rec.WarningCount,
+		"critical_count":  rec.CriticalCount,
+		"ai_summary":      rec.AISummary,
+		"ai_root_cause":   rec.AIRootCause,
+		"deep_evidence":   rec.DeepEvidence,
+		"recommendations": rec.AIRecommendations,
+		"findings":        rec.Findings,
+		"markdown":        markdownText,
+	}
+
+	return sendFormattedWebhook(ctx, transport, ch, titleText, colorTemplate, markdownText, customPayload)
+}
+
+// SendExternalApprovalWebhook notifies operators via Webhook when an external MCP AI submits a HITL mutation proposal.
+func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, ch vault.WebhookChannel, ap vault.ExternalApproval) error {
+	if strings.TrimSpace(ch.URL) == "" {
+		return fmt.Errorf("Webhook URL 不能为空")
+	}
+	if transport == nil {
+		transport = newDefaultHTTPTransport()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
+	opLabel := "远程命令执行"
+	if ap.ToolName == "sftp_write_file" {
+		opLabel = "远程配置文件修改"
+	}
+
+	var md strings.Builder
+	md.WriteString("### [ServerNeedSafe] 外部 AI 提交变更审批请求\n")
+	md.WriteString(fmt.Sprintf("- **提交来源**：%s (令牌: `%s`)\n", nonEmpty(ap.ClientName, "外部 MCP AI"), nonEmpty(ap.TokenName, ap.TokenID)))
+	md.WriteString(fmt.Sprintf("- **变更类型**：%s（风险等级: `%s`）\n", opLabel, nonEmpty(ap.RiskLevel, "high")))
+	md.WriteString(fmt.Sprintf("- **目标主机**：%s\n", nonEmpty(strings.Join(ap.ServerNames, ", "), strings.Join(ap.ServerIDs, ", "))))
+	if ap.PatrolRecordID != "" {
+		md.WriteString(fmt.Sprintf("- **关联巡检单**：`%s`\n", ap.PatrolRecordID))
+	}
+	md.WriteString(fmt.Sprintf("- **变更原因**：%s\n", ap.Reason))
+	if ap.Command != "" {
+		md.WriteString(fmt.Sprintf("- **拟执行命令**：`%s`\n", truncateStr(ap.Command, 240)))
+	}
+	if ap.FilePath != "" {
+		md.WriteString(fmt.Sprintf("- **拟修改文件**：`%s`\n", ap.FilePath))
+	}
+	md.WriteString("\n> 该变更处于 **等待管理员审批** 状态，尚未在远端服务器执行。请登录 ServerNeedSafe 控制台「AI 智能运维 → 外部 AI 接管 (MCP)」审阅 Diff 并决定批准或拒绝。\n")
+
+	markdownText := md.String()
+	titleText := fmt.Sprintf("ServerNeedSafe · 待审批外部 AI 变更 (%s)", nonEmpty(ap.ClientName, "MCP"))
+	customPayload := map[string]any{
+		"source":           "ServerNeedSafe",
+		"event":            "aiops.external_approval_pending",
+		"approval_id":      ap.ID,
+		"patrol_record_id": ap.PatrolRecordID,
+		"client_name":      ap.ClientName,
+		"token_name":       ap.TokenName,
+		"tool_name":        ap.ToolName,
+		"risk_level":       ap.RiskLevel,
+		"server_ids":       ap.ServerIDs,
+		"server_names":     ap.ServerNames,
+		"reason":           ap.Reason,
+		"command":          ap.Command,
+		"file_path":        ap.FilePath,
+		"created_at":       ap.CreatedAt.Format(time.RFC3339),
+		"markdown":         markdownText,
+	}
+
+	return sendFormattedWebhook(ctx, transport, ch, titleText, "orange", markdownText, customPayload)
+}
+
+func sendFormattedWebhook(
+	ctx context.Context,
+	transport HTTPTransport,
+	ch vault.WebhookChannel,
+	titleText string,
+	feishuColor string,
+	markdownText string,
+	customPayload map[string]any,
+) error {
 	targetURL := strings.TrimSpace(ch.URL)
 	var bodyMap any
 	var customSig string
@@ -72,9 +192,9 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 				"header": map[string]any{
 					"title": map[string]any{
 						"tag":     "plain_text",
-						"content": fmt.Sprintf("ServerNeedSafe · AI 巡检%s", statusLabel),
+						"content": titleText,
 					},
-					"template": map[string]string{"critical": "red", "warning": "orange", "healthy": "turquoise"}[rec.Status],
+					"template": feishuColor,
 				},
 				"elements": []map[string]any{
 					{
@@ -109,7 +229,7 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 		bodyMap = map[string]any{
 			"msgtype": "markdown",
 			"markdown": map[string]string{
-				"title": fmt.Sprintf("ServerNeedSafe AI 巡检%s", statusLabel),
+				"title": titleText,
 				"text":  markdownText,
 			},
 		}
@@ -123,20 +243,7 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 		}
 
 	default:
-		bodyMap = map[string]any{
-			"source":          "ServerNeedSafe",
-			"event":           "aiops.patrol_alert",
-			"status":          rec.Status,
-			"timestamp":       rec.CompletedAt.Format(time.RFC3339),
-			"total_servers":   rec.TotalServers,
-			"warning_count":   rec.WarningCount,
-			"critical_count":  rec.CriticalCount,
-			"ai_summary":      rec.AISummary,
-			"ai_root_cause":   rec.AIRootCause,
-			"recommendations": rec.AIRecommendations,
-			"findings":        rec.Findings,
-			"markdown":        markdownText,
-		}
+		bodyMap = customPayload
 	}
 
 	rawBody, err := json.Marshal(bodyMap)

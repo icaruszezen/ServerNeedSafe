@@ -283,12 +283,14 @@ type MonitorRuntimeState struct {
 
 // AIOpsRuntimeState is persisted asynchronously to aiops_runtime.json without encryption overhead.
 type AIOpsRuntimeState struct {
-	HostMemories    []HostMemory             `json:"host_memories"`
-	AIMemories      []AIMemoryEntry          `json:"ai_memories"`
-	Runbooks        []AIRunbook              `json:"runbooks"`
-	AISessions      []AIChatSession          `json:"ai_sessions"`
-	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines"`
-	PatrolRecords   []PatrolRecord           `json:"patrol_records"`
+	HostMemories      []HostMemory                    `json:"host_memories"`
+	AIMemories        []AIMemoryEntry                 `json:"ai_memories"`
+	Runbooks          []AIRunbook                     `json:"runbooks"`
+	AISessions        []AIChatSession                 `json:"ai_sessions"`
+	PatrolBaselines   []ServerBaselineSnapshot        `json:"patrol_baselines"`
+	PatrolRecords     []PatrolRecord                  `json:"patrol_records"`
+	ExternalApprovals []ExternalApproval              `json:"external_approvals,omitempty"`
+	MCPTokenUsage     map[string]MCPTokenRuntimeUsage `json:"mcp_token_usage,omitempty"`
 }
 
 // AuditRuntimeState is persisted asynchronously to audit_logs.json without encryption overhead.
@@ -320,11 +322,12 @@ type AIKnowledgeSnapshot struct {
 
 // RuntimeDataSnapshot carries optional operational history (monitoring, AI chats, patrol, audit).
 type RuntimeDataSnapshot struct {
-	Monitor         *MonitorRuntimeState     `json:"monitor,omitempty"`
-	AISessions      []AIChatSession          `json:"ai_sessions,omitempty"`
-	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines,omitempty"`
-	PatrolRecords   []PatrolRecord           `json:"patrol_records,omitempty"`
-	AuditLogs       []AuditEntry             `json:"audit_logs,omitempty"`
+	Monitor           *MonitorRuntimeState     `json:"monitor,omitempty"`
+	AISessions        []AIChatSession          `json:"ai_sessions,omitempty"`
+	PatrolBaselines   []ServerBaselineSnapshot `json:"patrol_baselines,omitempty"`
+	PatrolRecords     []PatrolRecord           `json:"patrol_records,omitempty"`
+	ExternalApprovals []ExternalApproval       `json:"external_approvals,omitempty"`
+	AuditLogs         []AuditEntry             `json:"audit_logs,omitempty"`
 }
 
 // BackupBundle is the structured payload inside v3 password-encrypted .sns backups and cross-instance sync.
@@ -445,6 +448,7 @@ func DefaultVaultState() *VaultState {
 			DefaultMode:  AIModeStandard,
 			Providers:    []AIProviderConfig{},
 			Patrol:       DefaultPatrolConfig(),
+			MCP:          DefaultMCPConfig(),
 			AgentsMD:     DefaultAgentsMDConfig(now),
 			MemoryConfig: DefaultAIMemoryConfig(),
 		},
@@ -471,12 +475,14 @@ func DefaultMonitorRuntimeState() *MonitorRuntimeState {
 
 func DefaultAIOpsRuntimeState(now time.Time) *AIOpsRuntimeState {
 	return &AIOpsRuntimeState{
-		HostMemories:    []HostMemory{},
-		AIMemories:      []AIMemoryEntry{},
-		Runbooks:        DefaultStarterRunbooks(now),
-		AISessions:      []AIChatSession{},
-		PatrolBaselines: []ServerBaselineSnapshot{},
-		PatrolRecords:   []PatrolRecord{},
+		HostMemories:      []HostMemory{},
+		AIMemories:        []AIMemoryEntry{},
+		Runbooks:          DefaultStarterRunbooks(now),
+		AISessions:        []AIChatSession{},
+		PatrolBaselines:   []ServerBaselineSnapshot{},
+		PatrolRecords:     []PatrolRecord{},
+		ExternalApprovals: []ExternalApproval{},
+		MCPTokenUsage:     make(map[string]MCPTokenRuntimeUsage),
 	}
 }
 

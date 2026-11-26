@@ -23,6 +23,8 @@ import {
   X,
   Layers,
   Minimize2,
+  PlugZap,
+  Clock,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -34,6 +36,7 @@ import type {
   AIProviderView,
   AIRunbook,
   AIToolCallRecord,
+  PatrolAnalysisMode,
   PatrolRecord,
   ProviderPreset,
   ServerView,
@@ -51,8 +54,9 @@ import {
   extractShellSnippets,
 } from './AIMessageWidgets';
 import { AIMemoryAgentsTab, type MemorySubSection } from './AIMemoryAgentsTab';
+import { ExternalAIMCPTab } from './ExternalAIMCPTab';
 
-type CenterTab = 'diagnosis' | 'patrol' | 'memory' | 'providers';
+type CenterTab = 'diagnosis' | 'patrol' | 'mcp' | 'memory' | 'providers';
 
 interface AIOpsCenterProps {
   servers: ServerView[];
@@ -136,6 +140,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [sshFailWarn, setSshFailWarn] = useState(15);
   const [checkPorts, setCheckPorts] = useState(true);
   const [checkPrivUsers, setCheckPrivUsers] = useState(true);
+  const [patrolAnalysisMode, setPatrolAnalysisMode] = useState<PatrolAnalysisMode>('builtin');
+  const [patrolFallbackMinutes, setPatrolFallbackMinutes] = useState(15);
+  const [notifyPendingApprovals, setNotifyPendingApprovals] = useState(true);
   const [webhookDrafts, setWebhookDrafts] = useState<WebhookDraft[]>([]);
   const [testingWebhookIdx, setTestingWebhookIdx] = useState<number | null>(null);
 
@@ -178,6 +185,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     setSshFailWarn(pc.ssh_fail_warn_count || 15);
     setCheckPorts(pc.check_listening_ports);
     setCheckPrivUsers(pc.check_privileged_users);
+    setPatrolAnalysisMode(pc.analysis_mode || 'builtin');
+    setPatrolFallbackMinutes(pc.external_fallback_minutes || 15);
+    setNotifyPendingApprovals(pc.notify_pending_approvals ?? true);
     setWebhookDrafts(
       (pc.webhooks || []).map((w) => ({
         id: w.id,
@@ -203,7 +213,10 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           (acc, s) => acc + (s.pending_approval_count || 0),
           0
         );
-        onBadgeChange?.((ov.patrol_status?.unread_alerts || 0) + pendingApprovalsCount);
+        const pendingExtApprovals = ov.pending_external_approvals || 0;
+        onBadgeChange?.(
+          (ov.patrol_status?.unread_alerts || 0) + pendingApprovalsCount + pendingExtApprovals
+        );
 
         const targetId =
           preferSessionId ||
@@ -634,6 +647,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         ssh_fail_warn_count: sshFailWarn,
         check_listening_ports: checkPorts,
         check_privileged_users: checkPrivUsers,
+        analysis_mode: patrolAnalysisMode,
+        external_fallback_minutes: patrolFallbackMinutes,
+        notify_pending_approvals: notifyPendingApprovals,
         webhooks: webhookDrafts.map((w) => ({
           id: w.id,
           name: w.name,
@@ -644,7 +660,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         })),
       });
       setShowPatrolConfigModal(false);
-      onNotify('后台定时巡检与告警通道配置已加密保存');
+      onNotify('后台定时巡检与外部 AI 研判策略已加密保存');
       await loadOverview(activeSessionId);
     } catch (err: any) {
       onNotify(err?.message || '保存巡检配置失败');
@@ -772,8 +788,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   return (
     <div className="workspace-surface" id="aiops-center-view">
       {/* Page Header */}
-      <div className="page-header">
-        <div className="page-header-title">
+      <div className="page-header" style={{ flexWrap: 'wrap', rowGap: 10 }}>
+        <div className="page-header-title" style={{ minWidth: 320 }}>
           <div
             style={{
               display: 'flex',
@@ -811,6 +827,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   {activeProvider.name} · {activeProvider.model}
                 </span>
               </button>
+            ) : overview?.mcp_config?.enabled || overview?.mcp_runtime?.desktop_loopback_running ? (
+              <button
+                type="button"
+                className="tag-chip teal"
+                style={{ border: 'none', cursor: 'pointer', maxWidth: '100%', minWidth: 0, flexShrink: 1 }}
+                onClick={() => setSubTab('mcp')}
+                title="外部 AI (MCP) 网关已启用，点击管理令牌与客户端配置"
+              >
+                <PlugZap size={11.5} style={{ marginRight: 4, flexShrink: 0 }} />
+                外部 AI (MCP) 已接入 · 可选配内置模型
+              </button>
             ) : (
               <button
                 type="button"
@@ -845,6 +872,21 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             <Radar size={14} /> 后台巡检与告警
             {(overview?.patrol_status?.unread_alerts || 0) > 0 && (
               <span className="nav-badge live">{overview?.patrol_status?.unread_alerts}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            id="ai-tab-mcp"
+            className={`ai-subnav-btn ${subTab === 'mcp' ? 'active' : ''}`}
+            onClick={() => setSubTab('mcp')}
+          >
+            <PlugZap size={14} /> 外部 AI 接管 (MCP)
+            {((overview?.pending_external_approvals || 0) +
+              (overview?.patrol_status?.pending_external_count || 0)) > 0 && (
+              <span className="nav-badge live">
+                {(overview?.pending_external_approvals || 0) +
+                  (overview?.patrol_status?.pending_external_count || 0)}
+              </span>
             )}
           </button>
           <button
@@ -1332,9 +1374,30 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       : '后台定时巡检当前未开启'}
                   </strong>
                   <span className="tag-chip teal">只读安全探针 · 零自动变更</span>
+                  <span
+                    className={`tag-chip ${
+                      overview?.patrol_config.analysis_mode &&
+                      overview.patrol_config.analysis_mode !== 'builtin'
+                        ? 'amber'
+                        : ''
+                    }`}
+                  >
+                    <PlugZap size={11} style={{ marginRight: 3 }} />
+                    {overview?.patrol_config.analysis_mode === 'external'
+                      ? '研判引擎：外部 AI 接管 (MCP)'
+                      : overview?.patrol_config.analysis_mode === 'external_with_fallback'
+                      ? `研判引擎：外部 AI 优先 (${overview.patrol_config.external_fallback_minutes || 15}m 兜底)`
+                      : '研判引擎：内置大模型'}
+                  </span>
+                  {(overview?.patrol_status?.pending_external_count || 0) > 0 && (
+                    <span className="tag-chip amber">
+                      <Clock size={11} style={{ marginRight: 3 }} />
+                      {overview?.patrol_status?.pending_external_count} 条待外部 AI 研判
+                    </span>
+                  )}
                 </div>
                 <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 2 }}>
-                  前端界面锁定（Ctrl+Shift+L）后后台巡检与告警推送继续运行；仅在「彻底封存保险库」擦除内存密钥时停止。
+                  后台 7×24 守护运行，支持由本地 Claude Code / Codex / Antigravity / Cursor 通过 MCP 接管深度研判。
                   {overview?.patrol_status.last_run_at && (
                     <span style={{ marginLeft: 10 }}>
                       上次巡检：{new Date(overview.patrol_status.last_run_at).toLocaleString('zh-CN')}
@@ -1348,9 +1411,16 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               <button
                 type="button"
                 className="btn"
+                onClick={() => setSubTab('mcp')}
+              >
+                <PlugZap size={14} /> 外部 AI 接入 (MCP)
+              </button>
+              <button
+                type="button"
+                className="btn"
                 onClick={() => setShowPatrolConfigModal(true)}
               >
-                <Sliders size={14} /> 巡检阈值与告警通道 ({overview?.patrol_config.webhooks?.length || 0})
+                <Sliders size={14} /> 巡检策略与告警通道 ({overview?.patrol_config.webhooks?.length || 0})
               </button>
               <button
                 type="button"
@@ -1372,7 +1442,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               </div>
               <h3>暂无历史安全巡检报告</h3>
               <p>
-                点击右上角「立即执行全量巡检」即可对集群执行只读健康与入侵指标扫描（CPU/内存/磁盘、监听端口基线突变、SSH 爆破激增、UID=0 特权账号），并在发现异常时唤醒大模型输出根因报告。
+                点击右上角「立即执行全量巡检」即可对集群执行只读健康与入侵指标扫描（CPU/内存/磁盘、监听端口基线突变、SSH 爆破激增、UID=0 特权账号），并由内置大模型或外部 MCP AI 输出根因报告。
               </p>
             </div>
           ) : (
@@ -1410,8 +1480,32 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           : '集群全量健康通过'}
                       </strong>
                       <span className="tag-chip">
-                        {rec.trigger === 'scheduled' ? '后台定时触发' : '管理员手动触发'}
+                        {rec.trigger === 'scheduled'
+                          ? '后台定时触发'
+                          : rec.trigger === 'external_mcp'
+                          ? '外部 AI 主动触发 (MCP)'
+                          : '管理员手动触发'}
                       </span>
+                      {rec.ai_source === 'external_mcp' && rec.ai_analyzed && (
+                        <span className="tag-chip teal">
+                          <PlugZap size={11} style={{ marginRight: 3 }} />
+                          由 {rec.external_client || '外部 AI'} 深度研判
+                          {rec.ai_model && rec.ai_model !== rec.external_client ? ` · ${rec.ai_model}` : ''}
+                        </span>
+                      )}
+                      {rec.analysis_state === 'pending_external' && (
+                        <span className="tag-chip amber">
+                          <Clock size={11} style={{ marginRight: 3 }} /> 等待外部 AI 接管研判
+                        </span>
+                      )}
+                      {rec.analysis_state === 'claimed' && (
+                        <span className="tag-chip teal">
+                          <Sparkles size={11} style={{ marginRight: 3 }} /> {rec.claimed_by || '外部 AI'} 钻取排查中
+                        </span>
+                      )}
+                      {rec.analysis_state === 'fallback_completed' && (
+                        <span className="tag-chip">外部超时 · 内置模型兜底</span>
+                      )}
                       <span className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                         {new Date(rec.completed_at).toLocaleString('zh-CN')}
                       </span>
@@ -1424,7 +1518,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       </span>
                       {rec.webhook_notified && (
                         <span className="tag-chip teal">
-                          <Bell size={11} style={{ marginRight: 3 }} /> 已推送告警
+                          <Bell size={11} style={{ marginRight: 3 }} />
+                          {rec.ai_webhook_notified ? '已推深度报告' : '已推送告警'}
                         </span>
                       )}
                       {rec.status !== 'healthy' && (
@@ -1517,6 +1612,32 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                     ))}
                   </div>
 
+                  {/* Pending External AI Queue Callout */}
+                  {(rec.analysis_state === 'pending_external' || rec.analysis_state === 'claimed') &&
+                    !rec.ai_summary && (
+                      <div className="mcp-patrol-pending-box">
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+                          <span>
+                            {rec.analysis_state === 'claimed'
+                              ? `外部 AI (${rec.claimed_by || 'MCP'}) 已认领此巡检单（ID: ${rec.id.slice(0, 8)}），正在通过只读 SSH/SFTP 钻取日志与进程取证...`
+                              : `此巡检单（ID: ${rec.id.slice(0, 8)}）已进入外部 AI 待研判队列。在 Claude Code / Codex / Antigravity / Cursor 中运行 patrol_triage 即可接管深度分析并回写报告。`}
+                            {rec.external_deadline_at && (
+                              <span className="mono" style={{ marginLeft: 8, opacity: 0.85 }}>
+                                超时自动兜底：{new Date(rec.external_deadline_at).toLocaleTimeString('zh-CN')}
+                              </span>
+                            )}
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            onClick={() => setSubTab('mcp')}
+                          >
+                            <PlugZap size={12} /> 查看 MCP 接入指南
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
                   {/* On-demand AI Root Cause Summary */}
                   {rec.ai_summary && (
                     <div
@@ -1532,12 +1653,39 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         wordBreak: 'break-word',
                       }}
                     >
-                      <div style={{ fontWeight: 620, marginBottom: 4, color: 'var(--accent-teal)' }}>
-                        AI 根因诊断摘要：{rec.ai_summary}
+                      <div style={{ fontWeight: 620, marginBottom: 4, color: 'var(--accent-teal)', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span>
+                          {rec.ai_source === 'external_mcp'
+                            ? `${rec.external_client || '外部 AI'} 深度研判摘要：`
+                            : 'AI 根因诊断摘要：'}
+                          {rec.ai_summary}
+                        </span>
                       </div>
                       {rec.ai_root_cause && (
                         <div style={{ color: 'var(--text-secondary)', marginBottom: 6 }}>
                           {rec.ai_root_cause}
+                        </div>
+                      )}
+                      {rec.deep_evidence && rec.deep_evidence.length > 0 && (
+                        <div
+                          style={{
+                            marginBottom: 8,
+                            padding: '7px 10px',
+                            borderRadius: 6,
+                            background: 'var(--bg-surface)',
+                            border: '1px solid var(--border-subtle)',
+                          }}
+                        >
+                          <div style={{ fontSize: 11.5, fontWeight: 620, color: 'var(--text-secondary)', marginBottom: 3 }}>
+                            只读钻取关键取证线索：
+                          </div>
+                          <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, color: 'var(--text-primary)' }}>
+                            {rec.deep_evidence.map((ev, idx) => (
+                              <li key={idx} className="mono" style={{ fontSize: 11.5 }}>
+                                {ev}
+                              </li>
+                            ))}
+                          </ul>
                         </div>
                       )}
                       {rec.ai_recommendations && rec.ai_recommendations.length > 0 && (
@@ -1554,6 +1702,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* TAB 2.5: External AI Takeover (MCP Gateway, Persistent Scoped Tokens & External HITL Queue) */}
+      {subTab === 'mcp' && (
+        <ExternalAIMCPTab
+          overview={overview}
+          servers={servers}
+          onReloadOverview={() => loadOverview(activeSessionId)}
+          onJumpPatrol={() => setSubTab('patrol')}
+          onNotify={onNotify}
+        />
       )}
 
       {/* TAB 3: Integrated Global AGENTS.md & Memory Center */}
@@ -1962,6 +2121,36 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
                 <div className="field-row">
                   <div className="field">
+                    <label className="field-label">AI 巡检研判引擎模式</label>
+                    <select
+                      id="patrol-analysis-mode-select"
+                      className="select"
+                      value={patrolAnalysisMode}
+                      onChange={(e) => setPatrolAnalysisMode(e.target.value as PatrolAnalysisMode)}
+                    >
+                      <option value="builtin">内置 HTTP 大模型（按需唤醒配置供应商）</option>
+                      <option value="external">纯外部 AI 接管 (MCP · 异常先推速报并入队，零内置 API 消耗)</option>
+                      <option value="external_with_fallback">外部 AI 优先 + 超时自动回退内置模型</option>
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label className="field-label">
+                      外部 AI 超时兜底等待时间 (分钟){patrolAnalysisMode !== 'external_with_fallback' ? '（仅兜底模式生效）' : ''}
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1440}
+                      className="input mono"
+                      disabled={patrolAnalysisMode !== 'external_with_fallback'}
+                      value={patrolFallbackMinutes}
+                      onChange={(e) => setPatrolFallbackMinutes(Number(e.target.value) || 15)}
+                    />
+                  </div>
+                </div>
+
+                <div className="field-row">
+                  <div className="field">
                     <label className="field-label">CPU 负载预警阈值 (%)</label>
                     <input
                       type="number"
@@ -2018,6 +2207,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       onChange={(e) => setCheckPrivUsers(e.target.checked)}
                     />
                     审计非 root 的 UID=0 隐藏特权账号
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+                    <input
+                      type="checkbox"
+                      checked={notifyPendingApprovals}
+                      onChange={(e) => setNotifyPendingApprovals(e.target.checked)}
+                    />
+                    外部 AI 提交待审批变更提案时推送 Webhook 提醒
                   </label>
                 </div>
 
