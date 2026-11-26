@@ -15,6 +15,7 @@ import (
 type rawCounterSample struct {
 	uptimeSec float64
 	cpuFields []uint64
+	cpuPct    []float64 // Direct percentage sample fallback (e.g., macOS top/iostat: total user sys iowait steal)
 	ctxt      uint64
 	netByDev  map[string]rawNetDev
 	bioByDev  map[string]rawBlockDev
@@ -94,6 +95,21 @@ func parseSampleLine(line string, dst *rawCounterSample) {
 			}
 			dst.cpuFields = nums
 		}
+	case "CPU_PCT":
+		fields := strings.Fields(v)
+		if len(fields) >= 3 {
+			vals := make([]float64, 0, len(fields))
+			for _, f := range fields {
+				n, err := strconv.ParseFloat(f, 64)
+				if err != nil {
+					break
+				}
+				vals = append(vals, n)
+			}
+			if len(vals) >= 3 {
+				dst.cpuPct = vals
+			}
+		}
 	case "NET":
 		f := strings.Fields(v)
 		if len(f) >= 9 {
@@ -143,10 +159,16 @@ func sumBlockDevices(bio map[string]rawBlockDev) (readBytes, writeBytes, ioOps i
 }
 
 func isCountedNIC(name string) bool {
-	if name == "" || name == "lo" {
+	if name == "" || name == "lo" || name == "lo0" {
 		return false
 	}
 	if strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "virbr") {
+		return false
+	}
+	// Exclude macOS/BSD internal virtual/tunnel/bridge interfaces from aggregate uplink totals
+	if strings.HasPrefix(name, "gif") || strings.HasPrefix(name, "stf") || strings.HasPrefix(name, "awdl") ||
+		strings.HasPrefix(name, "llw") || strings.HasPrefix(name, "anpi") || strings.HasPrefix(name, "XHC") ||
+		strings.HasPrefix(name, "pktap") || strings.HasPrefix(name, "iptap") || strings.HasPrefix(name, "bridge") {
 		return false
 	}
 	return true
@@ -170,9 +192,13 @@ func parseHostPortEndpoint(ep string) (bindAddr string, port int, publicExposed 
 		return "", 0, false, false
 	}
 	addr := ep[:lastColon]
-	// Strip interface scope suffix like 127.0.0.53%lo or [::]%eth0
+	// Strip interface scope suffix like 127.0.0.53%lo, [::]%eth0, or [fe80::1%lo0]
 	if pctIdx := strings.IndexByte(addr, '%'); pctIdx > 0 {
+		hasBracket := strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]")
 		addr = addr[:pctIdx]
+		if hasBracket && !strings.HasSuffix(addr, "]") {
+			addr += "]"
+		}
 	}
 	cleanAddr := strings.Trim(addr, "[]")
 	isPublic := cleanAddr == "0.0.0.0" || cleanAddr == "*" || cleanAddr == "::" || cleanAddr == ""
@@ -356,6 +382,25 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 			snap.CPUIowaitPct = roundOne(iowaitD * 100.0 / totD)
 			snap.CPUStealPct = roundOne(stealD * 100.0 / totD)
 		}
+	} else {
+		pctSrc := t1.cpuPct
+		if len(pctSrc) < 3 {
+			pctSrc = t0.cpuPct
+		}
+		if len(pctSrc) >= 3 {
+			clampPct := func(v float64) float64 {
+				return roundOne(math.Max(0, math.Min(100, v)))
+			}
+			snap.CPUPercent = clampPct(pctSrc[0])
+			snap.CPUUserPct = clampPct(pctSrc[1])
+			snap.CPUSystemPct = clampPct(pctSrc[2])
+			if len(pctSrc) >= 4 {
+				snap.CPUIowaitPct = clampPct(pctSrc[3])
+			}
+			if len(pctSrc) >= 5 {
+				snap.CPUStealPct = clampPct(pctSrc[4])
+			}
+		}
 	}
 	if t1.ctxt > t0.ctxt && dt > 0 {
 		snap.ContextSwSec = int64(float64(t1.ctxt-t0.ctxt) / dt)
@@ -534,7 +579,7 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 
 	devNames := make([]string, 0, len(t1.netByDev))
 	for name := range t1.netByDev {
-		if name == "lo" || strings.HasPrefix(name, "veth") {
+		if name == "lo" || name == "lo0" || strings.HasPrefix(name, "veth") {
 			continue
 		}
 		devNames = append(devNames, name)

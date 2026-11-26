@@ -583,11 +583,17 @@ func mergeMonitorSnapshotIntoHostMemorySlice(memories *[]HostMemory, snap *Serve
 
 func formatSnapshotOSArch(snap *ServerMonitorSnapshot) string {
 	parts := make([]string, 0, 3)
-	if s := strings.TrimSpace(snap.OS); s != "" {
-		parts = append(parts, s)
+	osStr := strings.TrimSpace(snap.OS)
+	if osStr != "" {
+		parts = append(parts, osStr)
 	}
 	if k := strings.TrimSpace(snap.Kernel); k != "" {
-		parts = append(parts, "Linux "+k)
+		lowOS := strings.ToLower(osStr)
+		kernelPrefix := "Linux "
+		if strings.Contains(lowOS, "macos") || strings.Contains(lowOS, "darwin") {
+			kernelPrefix = "Darwin "
+		}
+		parts = append(parts, kernelPrefix+k)
 	}
 	if a := strings.TrimSpace(snap.Arch); a != "" {
 		parts = append(parts, a)

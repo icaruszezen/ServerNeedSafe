@@ -1896,10 +1896,14 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                     {detailTab === 'services_security' && snap && (
                       <div className="mon-two-col">
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                          {/* Systemd Services */}
+                          {/* Systemd / Launchd Services */}
                           <div className="mon-panel-card">
                             <div className="mon-panel-head">
-                              <h4>Systemd 守护服务状态</h4>
+                              <h4>
+                                {/macos|darwin/i.test(snap.os || '')
+                                  ? 'Launchd / 守护服务状态'
+                                  : 'Systemd 守护服务状态'}
+                              </h4>
                               <span
                                 className={`tag-chip ${
                                   snap.systemd_failed_count > 0 ? 'danger' : 'teal'
@@ -1907,6 +1911,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               >
                                 {snap.systemd_failed_count > 0
                                   ? `${snap.systemd_failed_count} 个故障单元`
+                                  : /macos|darwin/i.test(snap.os || '')
+                                  ? '无异常服务'
                                   : '无 Failed 单元'}
                               </span>
                             </div>
@@ -1940,7 +1946,9 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               </div>
                             ) : (
                               <div className="mon-empty-inline">
-                                未检测到 Systemd 服务列表（容器环境或非 systemd 发行版）
+                                {/macos|darwin/i.test(snap.os || '')
+                                  ? '未检测到受管 Launchd / Homebrew 服务'
+                                  : '未检测到 Systemd 服务列表（容器环境或非 systemd 发行版）'}
                               </div>
                             )}
                           </div>

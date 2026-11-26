@@ -33,26 +33,73 @@ type ServerProbeResult struct {
 }
 
 const telemetryShellScript = `
+SNS_OS=$(uname -s 2>/dev/null || echo Linux)
 printf "HOSTNAME=%s\n" "$(hostname 2>/dev/null || uname -n)"
-OS_NAME=""
-if [ -r /etc/os-release ]; then
-  OS_NAME=$(. /etc/os-release && printf "%s" "${PRETTY_NAME:-$NAME}")
+if [ "$SNS_OS" = "Darwin" ]; then
+  OS_P=$(sw_vers -productName 2>/dev/null || echo "macOS")
+  OS_V=$(sw_vers -productVersion 2>/dev/null || true)
+  OS_B=$(sw_vers -buildVersion 2>/dev/null || true)
+  if [ -n "$OS_V" ] && [ -n "$OS_B" ]; then
+    printf "OS=%s %s (%s)\n" "$OS_P" "$OS_V" "$OS_B"
+  elif [ -n "$OS_V" ]; then
+    printf "OS=%s %s\n" "$OS_P" "$OS_V"
+  else
+    printf "OS=%s\n" "$SNS_OS"
+  fi
+  printf "KERNEL=%s\n" "$(uname -r 2>/dev/null)"
+  printf "ARCH=%s\n" "$(uname -m 2>/dev/null)"
+  printf "CORES=%s\n" "$(sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/, ""); if(NF>=3) printf "LOAD=%s / %s / %s\n", $1, $2, $3}'
+  BOOT_SEC=$(sysctl -n kern.boottime 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(($i=="sec" || $i=="{sec") && $(i+1)=="="){v=$(i+2); gsub(/[^0-9]/,"",v); if(v ~ /^[0-9]+$/){print v; exit}}}')
+  NOW_SEC=$(date +%s 2>/dev/null || echo 0)
+  if [ -n "$BOOT_SEC" ] && [ "$BOOT_SEC" -gt 0 ] 2>/dev/null && [ "$NOW_SEC" -ge "$BOOT_SEC" ] 2>/dev/null; then
+    awk -v sec="$((NOW_SEC - BOOT_SEC))" 'BEGIN {d=int(sec/86400); h=int((sec%86400)/3600); m=int((sec%3600)/60); if(d>0) printf "UPTIME=%dd %dh %dm\n",d,h,m; else printf "UPTIME=%dh %dm\n",h,m}'
+  fi
+  MEM_TOTAL_B=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  PAGE_SZ=$(sysctl -n hw.pagesize 2>/dev/null || pagesize 2>/dev/null || echo 4096)
+  vm_stat 2>/dev/null | awk -v total_b="$MEM_TOTAL_B" -v pgsz="$PAGE_SZ" '
+    BEGIN { if (pgsz+0 <= 0) pgsz = 4096; }
+    /page size of [0-9]+ bytes/ { s=$0; sub(/.*page size of /, "", s); sub(/ bytes.*/, "", s); if (s+0 > 0) pgsz = s+0; }
+    /^Pages active:/ { gsub(/[^0-9]/, "", $NF); p_active = $NF+0 }
+    /^Pages wired down:/ { gsub(/[^0-9]/, "", $NF); p_wired = $NF+0 }
+    /^Pages purgeable:/ { gsub(/[^0-9]/, "", $NF); p_purge = $NF+0 }
+    /^Anonymous pages:/ { gsub(/[^0-9]/, "", $NF); p_anon = $NF+0; has_anon = 1 }
+    /^Pages occupied by compressor:/ { gsub(/[^0-9]/, "", $NF); p_comp = $NF+0 }
+    END {
+      t = int((total_b+0) / 1024);
+      if (t <= 0) exit;
+      if (has_anon) { app = p_anon - p_purge; if (app < 0) app = 0; up = app + p_wired + p_comp; }
+      else { up = p_active + p_wired + p_comp; }
+      u = int(up * pgsz / 1024);
+      if (u > t) u = t;
+      printf "MEM_KB=%.0f %.0f\n", u, t;
+    }'
+  (df -Pk / 2>/dev/null || df -Pk . 2>/dev/null) | awk 'NR==2 && NF>=5 {
+    t=$2+0; u=$3+0; a=$4+0;
+    if (t>0 && a>=0 && (t-a)>u) u = t-a;
+    printf "DISK_KB=%.0f %.0f\n", u, t;
+  }'
+else
+  OS_NAME=""
+  if [ -r /etc/os-release ]; then
+    OS_NAME=$(. /etc/os-release && printf "%s" "${PRETTY_NAME:-$NAME}")
+  fi
+  [ -z "$OS_NAME" ] && OS_NAME=$(uname -s)
+  printf "OS=%s\n" "$OS_NAME"
+  printf "KERNEL=%s\n" "$(uname -r 2>/dev/null)"
+  printf "ARCH=%s\n" "$(uname -m 2>/dev/null)"
+  printf "CORES=%s\n" "$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)"
+  if [ -r /proc/loadavg ]; then
+    awk '{printf "LOAD=%s / %s / %s\n", $1, $2, $3}' /proc/loadavg
+  fi
+  if [ -r /proc/uptime ]; then
+    awk '{sec=int($1); d=int(sec/86400); h=int((sec%86400)/3600); m=int((sec%3600)/60); if(d>0) printf "UPTIME=%dd %dh %dm\n",d,h,m; else printf "UPTIME=%dh %dm\n",h,m}' /proc/uptime
+  fi
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {if(t>0){u=t-a; printf "MEM_KB=%d %d\n", u, t}}' /proc/meminfo
+  fi
+  (df -Pk . 2>/dev/null || df -Pk / 2>/dev/null) | awk 'NR==2 && NF>=5 {printf "DISK_KB=%s %s\n", $(NF-3), $(NF-4)}'
 fi
-[ -z "$OS_NAME" ] && OS_NAME=$(uname -s)
-printf "OS=%s\n" "$OS_NAME"
-printf "KERNEL=%s\n" "$(uname -r 2>/dev/null)"
-printf "ARCH=%s\n" "$(uname -m 2>/dev/null)"
-printf "CORES=%s\n" "$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)"
-if [ -r /proc/loadavg ]; then
-  awk '{printf "LOAD=%s / %s / %s\n", $1, $2, $3}' /proc/loadavg
-fi
-if [ -r /proc/uptime ]; then
-  awk '{sec=int($1); d=int(sec/86400); h=int((sec%86400)/3600); m=int((sec%3600)/60); if(d>0) printf "UPTIME=%dd %dh %dm\n",d,h,m; else printf "UPTIME=%dh %dm\n",h,m}' /proc/uptime
-fi
-if [ -r /proc/meminfo ]; then
-  awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {if(t>0){u=t-a; printf "MEM_KB=%d %d\n", u, t}}' /proc/meminfo
-fi
-(df -Pk . 2>/dev/null || df -Pk / 2>/dev/null) | awk 'NR==2 && NF>=5 {printf "DISK_KB=%s %s\n", $(NF-3), $(NF-4)}'
 `
 
 // ProbeServer tests SSH connectivity, verifies host key, and collects live system telemetry.

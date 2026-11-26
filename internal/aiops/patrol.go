@@ -27,33 +27,84 @@ type PatrolStatusView struct {
 }
 
 const patrolReadOnlyShellScript = `
-CORES=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
-LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
-MEM_LINE=$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {if(t>0){printf "%.1f", (t-a)*100/t} else {print "0"}}' /proc/meminfo 2>/dev/null || echo 0)
-DISK_LINE=$((df -Pk / 2>/dev/null || df -Pk . 2>/dev/null) | awk 'NR==2 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-1)}' || echo 0)
-printf "METRIC_CORES=%s\nMETRIC_LOAD1=%s\nMETRIC_MEM=%s\nMETRIC_DISK=%s\n" "$CORES" "$LOAD1" "$MEM_LINE" "$DISK_LINE"
+SNS_OS=$(uname -s 2>/dev/null || echo Linux)
+if [ "$SNS_OS" = "Darwin" ]; then
+  PATH="$PATH:/opt/homebrew/sbin:/opt/homebrew/bin:$HOME/.orbstack/bin:/Applications/Docker.app/Contents/Resources/bin"
+  export PATH
+  CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+  LOAD1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/, ""); print ($1 != "" ? $1 : "0")}')
+  MEM_TOTAL_B=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+  PAGE_SZ=$(sysctl -n hw.pagesize 2>/dev/null || pagesize 2>/dev/null || echo 4096)
+  MEM_LINE=$(vm_stat 2>/dev/null | awk -v total_b="$MEM_TOTAL_B" -v pgsz="$PAGE_SZ" '
+    BEGIN { if (pgsz+0 <= 0) pgsz = 4096; }
+    /page size of [0-9]+ bytes/ { s=$0; sub(/.*page size of /, "", s); sub(/ bytes.*/, "", s); if (s+0 > 0) pgsz = s+0; }
+    /^Pages active:/ { gsub(/[^0-9]/, "", $NF); p_active = $NF+0 }
+    /^Pages wired down:/ { gsub(/[^0-9]/, "", $NF); p_wired = $NF+0 }
+    /^Pages purgeable:/ { gsub(/[^0-9]/, "", $NF); p_purge = $NF+0 }
+    /^Anonymous pages:/ { gsub(/[^0-9]/, "", $NF); p_anon = $NF+0; has_anon = 1 }
+    /^Pages occupied by compressor:/ { gsub(/[^0-9]/, "", $NF); p_comp = $NF+0 }
+    END {
+      t = int((total_b+0) / 1024);
+      if (t <= 0) { print "0"; exit }
+      if (has_anon) { app = p_anon - p_purge; if (app < 0) app = 0; up = app + p_wired + p_comp; }
+      else { up = p_active + p_wired + p_comp; }
+      u = int(up * pgsz / 1024);
+      if (u > t) u = t;
+      printf "%.1f", u * 100.0 / t;
+    }' || echo 0)
+  DISK_LINE=$( (df -Pk / 2>/dev/null || df -Pk . 2>/dev/null) | awk 'NR==2 && NF>=5 {
+    t=$2+0; u=$3+0; a=$4+0;
+    if (t>0 && a>=0 && (t-a)>u) u = t-a;
+    if (t>0) printf "%.1f", u * 100.0 / t; else print "0";
+  }' || echo 0)
+  printf "METRIC_CORES=%s\nMETRIC_LOAD1=%s\nMETRIC_MEM=%s\nMETRIC_DISK=%s\n" "${CORES:-1}" "${LOAD1:-0}" "${MEM_LINE:-0}" "${DISK_LINE:-0}"
 
-SSH_FAILS=0
-if command -v journalctl >/dev/null 2>&1; then
-  SSH_FAILS=$(journalctl -u ssh -u sshd --since "1 hour ago" --no-pager 2>/dev/null | grep -Ec "Failed password|Invalid user|authentication failure" || true)
-elif [ -r /var/log/auth.log ]; then
-  SSH_FAILS=$(tail -n 400 /var/log/auth.log 2>/dev/null | grep -Ec "Failed password|Invalid user" || true)
-elif [ -r /var/log/secure ]; then
-  SSH_FAILS=$(tail -n 400 /var/log/secure 2>/dev/null | grep -Ec "Failed password|Invalid user" || true)
+  SSH_FAILS=0
+  if command -v log >/dev/null 2>&1; then
+    SSH_FAILS=$(log show --style syslog --last 1h --predicate '(processImagePath ENDSWITH "/sshd" OR processImagePath ENDSWITH "/sshd-session") AND (eventMessage CONTAINS "Failed password" OR eventMessage CONTAINS "Invalid user" OR eventMessage CONTAINS "authentication failure")' 2>/dev/null | grep -c . || true)
+  fi
+  printf "METRIC_SSH_FAILS=%s\n" "${SSH_FAILS:-0}"
+
+  UID0=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 == 0 {print $1}' | tr '\n' ',' | sed 's/,$//')
+  if [ -z "$UID0" ] && [ -r /etc/passwd ]; then
+    UID0=$(awk -F: '!/^#/ && $3 == "0" {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+  fi
+  printf "METRIC_UID0=%s\n" "$UID0"
+
+  PORTS=$( (netstat -an -p tcp 2>/dev/null | awk '$1 ~ /^tcp/ && $6 == "LISTEN" {print $4}'; netstat -an -p udp 2>/dev/null | awk '$1 ~ /^udp/ && $5 == "*.*" {print $4}') | awk '{n=split($0, a, "."); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) print p}' | sort -u | tr '\n' ',' | sed 's/,$//' )
+  printf "METRIC_PORTS=%s\n" "$PORTS"
+
+  FAILED_UNITS=$(launchctl list 2>/dev/null | awk '$1 == "-" && $2 ~ /^[1-9][0-9]*$/ && $3 ~ /^homebrew\.mxcl\./ {n=$3; sub(/^homebrew\.mxcl\./, "", n); print n}' | head -n 5 | tr '\n' ',' | sed 's/,$//')
+  printf "METRIC_FAILED_UNITS=%s\n" "$FAILED_UNITS"
+else
+  CORES=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+  LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+  MEM_LINE=$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {if(t>0){printf "%.1f", (t-a)*100/t} else {print "0"}}' /proc/meminfo 2>/dev/null || echo 0)
+  DISK_LINE=$( (df -Pk / 2>/dev/null || df -Pk . 2>/dev/null) | awk 'NR==2 && NF>=5 {gsub(/%/,"",$(NF-1)); print $(NF-1)}' || echo 0)
+  printf "METRIC_CORES=%s\nMETRIC_LOAD1=%s\nMETRIC_MEM=%s\nMETRIC_DISK=%s\n" "$CORES" "$LOAD1" "$MEM_LINE" "$DISK_LINE"
+
+  SSH_FAILS=0
+  if command -v journalctl >/dev/null 2>&1; then
+    SSH_FAILS=$(journalctl -u ssh -u sshd --since "1 hour ago" --no-pager 2>/dev/null | grep -Ec "Failed password|Invalid user|authentication failure" || true)
+  elif [ -r /var/log/auth.log ]; then
+    SSH_FAILS=$(tail -n 400 /var/log/auth.log 2>/dev/null | grep -Ec "Failed password|Invalid user" || true)
+  elif [ -r /var/log/secure ]; then
+    SSH_FAILS=$(tail -n 400 /var/log/secure 2>/dev/null | grep -Ec "Failed password|Invalid user" || true)
+  fi
+  printf "METRIC_SSH_FAILS=%s\n" "${SSH_FAILS:-0}"
+
+  UID0=$(awk -F: '($3 == 0) {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+  printf "METRIC_UID0=%s\n" "$UID0"
+
+  PORTS=$( (ss -tulnH 2>/dev/null || netstat -tuln 2>/dev/null | awk 'NR>2') | awk '{print $1 ":" $5}' | sed 's/.*:\([0-9][0-9]*\)$/\1/' | sort -u | tr '\n' ',' | sed 's/,$//' )
+  printf "METRIC_PORTS=%s\n" "$PORTS"
+
+  FAILED_UNITS=""
+  if command -v systemctl >/dev/null 2>&1; then
+    FAILED_UNITS=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | head -n 5 | tr '\n' ',' | sed 's/,$//')
+  fi
+  printf "METRIC_FAILED_UNITS=%s\n" "$FAILED_UNITS"
 fi
-printf "METRIC_SSH_FAILS=%s\n" "${SSH_FAILS:-0}"
-
-UID0=$(awk -F: '($3 == 0) {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-printf "METRIC_UID0=%s\n" "$UID0"
-
-PORTS=$( (ss -tulnH 2>/dev/null || netstat -tuln 2>/dev/null | awk 'NR>2') | awk '{print $1 ":" $5}' | sed 's/.*:\([0-9][0-9]*\)$/\1/' | sort -u | tr '\n' ',' | sed 's/,$//' )
-printf "METRIC_PORTS=%s\n" "$PORTS"
-
-FAILED_UNITS=""
-if command -v systemctl >/dev/null 2>&1; then
-  FAILED_UNITS=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | head -n 5 | tr '\n' ',' | sed 's/,$//')
-fi
-printf "METRIC_FAILED_UNITS=%s\n" "$FAILED_UNITS"
 `
 
 func (s *Service) patrolSchedulerLoop() {
@@ -474,7 +525,7 @@ func (s *Service) evaluateServerPatrol(
 
 	if len(failedUnits) > 0 {
 		bumpSeverity("warning")
-		finding.Anomalies = append(finding.Anomalies, fmt.Sprintf("存在异常退出的 systemd 服务: %s", strings.Join(failedUnits, ", ")))
+		finding.Anomalies = append(finding.Anomalies, fmt.Sprintf("存在异常退出的系统服务: %s", strings.Join(failedUnits, ", ")))
 	}
 
 	baseline, _ := s.store.GetPatrolBaseline(srv.ID)
