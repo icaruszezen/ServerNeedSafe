@@ -307,6 +307,7 @@ export type AlertStatus = 'firing' | 'acknowledged' | 'resolved';
 export interface MonitorSettings {
   enabled: boolean;
   interval_sec: number;
+  slow_interval_sec: number;
   timeout_sec: number;
   concurrency: number;
   retention_points: number;
@@ -315,17 +316,23 @@ export interface MonitorSettings {
   collect_ports_and_services: boolean;
   collect_security: boolean;
   detect_port_drift: boolean;
+  use_ssh_connection_pool: boolean;
+  reuse_ai_patrol_webhooks: boolean;
+  include_remote_mounts: boolean;
   unattended_while_unlocked: boolean;
   webhook_url?: string;
+  policy_version?: number;
 }
 
 export interface MonitorAlertRule {
   kind: string;
+  category?: string;
   name: string;
   description: string;
   unit?: string;
   enabled: boolean;
   state_based: boolean;
+  lower_is_worse?: boolean;
   warning_threshold: number;
   critical_threshold: number;
   consecutive_count: number;
@@ -337,9 +344,13 @@ export interface MonitorRuntimeStatus {
   vault_unlocked: boolean;
   enabled: boolean;
   interval_sec: number;
+  slow_interval_sec?: number;
   in_flight_count: number;
+  pooled_connections?: number;
   last_sweep_at?: string;
   next_sweep_at?: string;
+  last_webhook_at?: string;
+  last_webhook_error?: string;
 }
 
 export interface DiskPartitionStat {
@@ -385,6 +396,7 @@ export interface ListeningPortStat {
   bind_addr: string;
   port: number;
   public_exposed: boolean;
+  exposure_scope?: string;
   watched: boolean;
   pid?: number;
   process?: string;
@@ -408,9 +420,12 @@ export interface ContainerStat {
 
 export interface DockerSummary {
   installed: boolean;
+  daemon_down?: boolean;
   running: number;
   stopped: number;
   unhealthy: number;
+  exited_abnormal?: number;
+  truncated?: boolean;
   containers?: ContainerStat[];
 }
 
@@ -419,6 +434,37 @@ export interface LoggedInUserStat {
   tty: string;
   from_ip?: string;
   login_time?: string;
+}
+
+export interface SuspiciousProcStat {
+  pid: number;
+  user: string;
+  reason: string;
+  severity: string;
+  command: string;
+  exe_path?: string;
+}
+
+export interface OutboundConnStat {
+  remote_ip: string;
+  remote_port: number;
+  pid?: number;
+  process?: string;
+  reason?: string;
+}
+
+export interface SSHLoginEvent {
+  user: string;
+  from_ip: string;
+  method?: string;
+  timestamp?: string;
+}
+
+export interface ServerSecurityBaseline {
+  file_hashes?: Record<string, string>;
+  persistence_hash?: string;
+  known_ssh_login_ips?: string[];
+  updated_at?: string;
 }
 
 export interface SecurityPostureStat {
@@ -431,6 +477,15 @@ export interface SecurityPostureStat {
   uid_zero_users?: string[];
   reboot_required: boolean;
   pending_updates: number;
+  file_hashes?: Record<string, string>;
+  file_drifts?: string[];
+  persistence_hash?: string;
+  persistence_drifts?: string[];
+  suspicious_procs?: SuspiciousProcStat[];
+  suspicious_outbound?: OutboundConnStat[];
+  recent_ssh_logins?: SSHLoginEvent[];
+  new_ssh_login_ips?: string[];
+  ssh_weak_configs?: string[];
 }
 
 export interface MonitorSamplePoint {
@@ -476,14 +531,20 @@ export interface ServerMonitorSnapshot {
   host: string;
   port: number;
   collected_at: string;
+  last_slow_collected_at?: string;
+  collection_tier?: string;
   duration_ms: number;
   reachable: boolean;
   health_level: MonitorHealthLevel;
   health_score: number;
   error?: string;
+  partial_error?: string;
+  host_key_changed?: boolean;
+  host_key_mismatch_detail?: string;
   fingerprint?: string;
   route_label?: string;
   route_fallback?: boolean;
+  connection_reused?: boolean;
 
   hostname?: string;
   os?: string;
@@ -494,10 +555,12 @@ export interface ServerMonitorSnapshot {
   virtualization?: string;
   uptime?: string;
   uptime_sec?: number;
+  unexpected_reboot?: boolean;
   boot_time?: string;
   server_time?: string;
   timezone?: string;
   ntp_synced: boolean;
+  clock_offset_sec?: number;
 
   latency_ms: number;
   cpu_percent: number;
@@ -525,6 +588,9 @@ export interface ServerMonitorSnapshot {
   fd_max: number;
   fd_percent: number;
   oom_kills: number;
+  oom_kills_delta?: number;
+  kernel_error_count?: number;
+  kernel_errors?: string[];
 
   disk_total_gb: number;
   disk_used_gb: number;
@@ -533,6 +599,11 @@ export interface ServerMonitorSnapshot {
   max_part_percent: number;
   max_inode_mount?: string;
   max_inode_percent: number;
+  disk_full_forecast_hours?: number;
+  disk_full_forecast_mount?: string;
+  read_only_mounts?: string[];
+  remote_mounts?: string[];
+  raid_degraded?: string[];
   disk_read_bps: number;
   disk_write_bps: number;
   disk_iops: number;
@@ -543,6 +614,7 @@ export interface ServerMonitorSnapshot {
   net_rx_total_bytes: number;
   net_tx_total_bytes: number;
   net_packet_errors: number;
+  net_packet_errors_delta?: number;
   tcp_established: number;
   tcp_syn_recv: number;
   tcp_time_wait: number;
@@ -559,6 +631,7 @@ export interface ServerMonitorSnapshot {
   top_cpu_procs?: ProcessStat[];
   top_mem_procs?: ProcessStat[];
   listening_ports?: ListeningPortStat[];
+  ports_truncated?: boolean;
   services?: ServiceStat[];
   systemd_failed_count: number;
   systemd_failed_units?: string[];
@@ -646,6 +719,7 @@ export interface ServerMonitorDetail {
   series: MonitorSamplePoint[];
   sla: ServerSLASummary;
   port_baseline: string[];
+  security_baseline?: ServerSecurityBaseline;
   alerts: MonitorAlert[];
 }
 

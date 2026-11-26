@@ -107,6 +107,56 @@ func (s *Server) handleAcceptPortBaseline(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (s *Server) handleAcceptSecurityBaseline(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := decodeJSON(r, &req, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "安全基线请求格式错误")
+		return
+	}
+	base, err := s.cfg.Store.AcceptServerSecurityBaseline(req.ID, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"security_baseline": base,
+	})
+}
+
+func (s *Server) handleTestMonitorWebhook(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WebhookURL            string `json:"webhook_url"`
+		ReuseAIPatrolWebhooks *bool  `json:"reuse_ai_patrol_webhooks"`
+	}
+	if err := decodeJSON(r, &req, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "Webhook 测试参数格式错误")
+		return
+	}
+	urlVal := strings.TrimSpace(req.WebhookURL)
+	reuseAI := false
+	if req.ReuseAIPatrolWebhooks != nil {
+		reuseAI = *req.ReuseAIPatrolWebhooks
+	} else if stored, _, err := s.cfg.Store.GetMonitorPolicy(); err == nil {
+		reuseAI = stored.ReuseAIPatrolWebhooks
+		if urlVal == "" {
+			urlVal = stored.WebhookURL
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	if err := s.cfg.Monitor.TestWebhook(ctx, urlVal, reuseAI, extractClientIP(r)); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"runtime": s.cfg.Monitor.Status(),
+	})
+}
+
 func (s *Server) handleListMonitorAlerts(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
@@ -181,7 +231,7 @@ func (s *Server) handleUpdateMonitorPolicy(w http.ResponseWriter, r *http.Reques
 		writeDomainError(w, err)
 		return
 	}
-	s.cfg.Monitor.Wake()
+	s.cfg.Monitor.OnPolicyUpdated(settings)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"settings": settings,

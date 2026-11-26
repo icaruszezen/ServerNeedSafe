@@ -2,6 +2,7 @@ package vault
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"sort"
@@ -13,27 +14,27 @@ import (
 
 // FleetMonitorKPI summarizes cluster-wide health and telemetry across all managed servers.
 type FleetMonitorKPI struct {
-	TotalServers     int     `json:"total_servers"`
-	MonitoredServers int     `json:"monitored_servers"`
-	OnlineServers    int     `json:"online_servers"`
-	HealthyServers   int     `json:"healthy_servers"`
-	WarningServers   int     `json:"warning_servers"`
-	CriticalServers  int     `json:"critical_servers"`
-	OfflineServers   int     `json:"offline_servers"`
-	UnknownServers   int     `json:"unknown_servers"`
-	AvgHealthScore   int     `json:"avg_health_score"`
-	AvgCPUPercent    float64 `json:"avg_cpu_percent"`
-	AvgMemPercent    float64 `json:"avg_mem_percent"`
-	AvgDiskPercent   float64 `json:"avg_disk_percent"`
-	AvgLatencyMs     int64   `json:"avg_latency_ms"`
-	TotalNetRxBps    int64   `json:"total_net_rx_bps"`
-	TotalNetTxBps    int64   `json:"total_net_tx_bps"`
-	TotalDiskReadBps int64   `json:"total_disk_read_bps"`
-	TotalDiskWriteBps int64  `json:"total_disk_write_bps"`
-	FiringAlerts     int     `json:"firing_alerts"`
-	CriticalAlerts   int     `json:"critical_alerts"`
-	WarningAlerts    int     `json:"warning_alerts"`
-	TotalSamples     int     `json:"total_samples"`
+	TotalServers      int     `json:"total_servers"`
+	MonitoredServers  int     `json:"monitored_servers"`
+	OnlineServers     int     `json:"online_servers"`
+	HealthyServers    int     `json:"healthy_servers"`
+	WarningServers    int     `json:"warning_servers"`
+	CriticalServers   int     `json:"critical_servers"`
+	OfflineServers    int     `json:"offline_servers"`
+	UnknownServers    int     `json:"unknown_servers"`
+	AvgHealthScore    int     `json:"avg_health_score"`
+	AvgCPUPercent     float64 `json:"avg_cpu_percent"`
+	AvgMemPercent     float64 `json:"avg_mem_percent"`
+	AvgDiskPercent    float64 `json:"avg_disk_percent"`
+	AvgLatencyMs      int64   `json:"avg_latency_ms"`
+	TotalNetRxBps     int64   `json:"total_net_rx_bps"`
+	TotalNetTxBps     int64   `json:"total_net_tx_bps"`
+	TotalDiskReadBps  int64   `json:"total_disk_read_bps"`
+	TotalDiskWriteBps int64   `json:"total_disk_write_bps"`
+	FiringAlerts      int     `json:"firing_alerts"`
+	CriticalAlerts    int     `json:"critical_alerts"`
+	WarningAlerts     int     `json:"warning_alerts"`
+	TotalSamples      int     `json:"total_samples"`
 }
 
 // ServerMonitorCardItem pairs a ServerView with its latest snapshot, sparkline history, SLA, and active alert count.
@@ -53,14 +54,15 @@ type MonitorOverviewData struct {
 	Alerts   []MonitorAlert          `json:"alerts"`
 }
 
-// ServerMonitorDetail holds full historical time-series, deep latest snapshot, SLA, and alerts for one server.
+// ServerMonitorDetail holds full historical time-series, deep latest snapshot, SLA, baselines, and alerts for one server.
 type ServerMonitorDetail struct {
-	Server       ServerView             `json:"server"`
-	Snapshot     *ServerMonitorSnapshot `json:"snapshot,omitempty"`
-	Series       []MonitorSamplePoint   `json:"series"`
-	SLA          ServerSLASummary       `json:"sla"`
-	PortBaseline []string               `json:"port_baseline"`
-	Alerts       []MonitorAlert          `json:"alerts"`
+	Server           ServerView              `json:"server"`
+	Snapshot         *ServerMonitorSnapshot  `json:"snapshot,omitempty"`
+	Series           []MonitorSamplePoint    `json:"series"`
+	SLA              ServerSLASummary        `json:"sla"`
+	PortBaseline     []string                `json:"port_baseline"`
+	SecurityBaseline *ServerSecurityBaseline `json:"security_baseline,omitempty"`
+	Alerts           []MonitorAlert          `json:"alerts"`
 }
 
 // CandidateBreach represents a single detected rule violation during snapshot evaluation.
@@ -81,6 +83,16 @@ func sanitizeMonitorSettings(in MonitorSettings) MonitorSettings {
 		in.IntervalSec = 10
 	} else if in.IntervalSec > 86400 {
 		in.IntervalSec = 86400
+	}
+	if in.SlowIntervalSec <= 0 {
+		in.SlowIntervalSec = 300
+	} else if in.SlowIntervalSec < 60 {
+		in.SlowIntervalSec = 60
+	} else if in.SlowIntervalSec > 3600 {
+		in.SlowIntervalSec = 3600
+	}
+	if in.SlowIntervalSec < in.IntervalSec {
+		in.SlowIntervalSec = min(3600, max(60, in.IntervalSec))
 	}
 	if in.TimeoutSec < 5 {
 		in.TimeoutSec = 5
@@ -103,7 +115,37 @@ func sanitizeMonitorSettings(in MonitorSettings) MonitorSettings {
 		in.MaxAlertRecords = 2000
 	}
 	in.WebhookURL = strings.TrimSpace(in.WebhookURL)
+	in.PolicyVersion = CurrentMonitorPolicyVersion
 	return in
+}
+
+func validateMonitorAlertRules(rules []MonitorAlertRule) error {
+	defaults := DefaultMonitorAlertRules()
+	defByKind := make(map[string]MonitorAlertRule, len(defaults))
+	for _, d := range defaults {
+		defByKind[d.Kind] = d
+	}
+	for _, r := range rules {
+		def, ok := defByKind[r.Kind]
+		if !ok || def.StateBased {
+			continue
+		}
+		if r.WarningThreshold < 0 || r.CriticalThreshold < 0 {
+			return fmt.Errorf("%w: 规则「%s」的阈值不能为负数", ErrInvalidInput, def.Name)
+		}
+		if r.WarningThreshold > 0 && r.CriticalThreshold > 0 {
+			if def.LowerIsWorse {
+				if r.CriticalThreshold > r.WarningThreshold {
+					return fmt.Errorf("%w: 规则「%s」的严重阈值 (%.1f%s) 不能高于警告阈值 (%.1f%s)",
+						ErrInvalidInput, def.Name, r.CriticalThreshold, def.Unit, r.WarningThreshold, def.Unit)
+				}
+			} else if r.WarningThreshold > r.CriticalThreshold {
+				return fmt.Errorf("%w: 规则「%s」的警告阈值 (%.1f%s) 不能高于严重阈值 (%.1f%s)",
+					ErrInvalidInput, def.Name, r.WarningThreshold, def.Unit, r.CriticalThreshold, def.Unit)
+			}
+		}
+	}
+	return nil
 }
 
 func mergeMonitorAlertRules(existing []MonitorAlertRule) []MonitorAlertRule {
@@ -118,14 +160,31 @@ func mergeMonitorAlertRules(existing []MonitorAlertRule) []MonitorAlertRule {
 	merged := make([]MonitorAlertRule, 0, len(defaults))
 	for _, def := range defaults {
 		if ex, ok := existingByKind[def.Kind]; ok {
+			ex.Category = def.Category
 			ex.Name = def.Name
 			ex.Description = def.Description
 			ex.Unit = def.Unit
 			ex.StateBased = def.StateBased
+			ex.LowerIsWorse = def.LowerIsWorse
 			if ex.ConsecutiveCount < 1 {
 				ex.ConsecutiveCount = 1
 			} else if ex.ConsecutiveCount > 20 {
 				ex.ConsecutiveCount = 20
+			}
+			if !def.StateBased {
+				if ex.WarningThreshold < 0 {
+					ex.WarningThreshold = 0
+				}
+				if ex.CriticalThreshold < 0 {
+					ex.CriticalThreshold = 0
+				}
+				if ex.WarningThreshold > 0 && ex.CriticalThreshold > 0 {
+					if def.LowerIsWorse && ex.CriticalThreshold > ex.WarningThreshold {
+						ex.WarningThreshold = ex.CriticalThreshold
+					} else if !def.LowerIsWorse && ex.WarningThreshold > ex.CriticalThreshold {
+						ex.CriticalThreshold = ex.WarningThreshold
+					}
+				}
 			}
 			merged = append(merged, ex)
 		} else {
@@ -147,6 +206,13 @@ func ensureMonitorInitialized(state *VaultState) {
 	if m.Settings.IntervalSec == 0 && m.Settings.RetentionPoints == 0 {
 		m.Settings = DefaultMonitorSettings()
 	} else {
+		if m.Settings.PolicyVersion < CurrentMonitorPolicyVersion {
+			if m.Settings.SlowIntervalSec <= 0 {
+				m.Settings.SlowIntervalSec = 300
+			}
+			m.Settings.UseSSHConnectionPool = true
+			m.Settings.PolicyVersion = CurrentMonitorPolicyVersion
+		}
 		m.Settings = sanitizeMonitorSettings(m.Settings)
 	}
 	if m.LatestSnapshots == nil {
@@ -164,7 +230,23 @@ func ensureMonitorInitialized(state *VaultState) {
 	if m.PortBaselines == nil {
 		m.PortBaselines = make(map[string][]string)
 	}
+	if m.SecurityBaselines == nil {
+		m.SecurityBaselines = make(map[string]ServerSecurityBaseline)
+	}
 	m.Rules = mergeMonitorAlertRules(m.Rules)
+}
+
+func cloneSecurityBaseline(in ServerSecurityBaseline) ServerSecurityBaseline {
+	cp := ServerSecurityBaseline{
+		PersistenceHash:  in.PersistenceHash,
+		KnownSSHLoginIPs: slices.Clone(in.KnownSSHLoginIPs),
+		UpdatedAt:        in.UpdatedAt,
+	}
+	if in.FileHashes != nil {
+		cp.FileHashes = make(map[string]string, len(in.FileHashes))
+		maps.Copy(cp.FileHashes, in.FileHashes)
+	}
+	return cp
 }
 
 func cloneSnapshot(in *ServerMonitorSnapshot) *ServerMonitorSnapshot {
@@ -172,7 +254,16 @@ func cloneSnapshot(in *ServerMonitorSnapshot) *ServerMonitorSnapshot {
 		return nil
 	}
 	cp := *in
+	if in.LastSlowCollectedAt != nil {
+		t := *in.LastSlowCollectedAt
+		cp.LastSlowCollectedAt = &t
+	}
+	cp.RawCPUTicks = slices.Clone(in.RawCPUTicks)
 	cp.Disks = slices.Clone(in.Disks)
+	cp.ReadOnlyMounts = slices.Clone(in.ReadOnlyMounts)
+	cp.RemoteMounts = slices.Clone(in.RemoteMounts)
+	cp.RAIDDegraded = slices.Clone(in.RAIDDegraded)
+	cp.KernelErrors = slices.Clone(in.KernelErrors)
 	cp.Interfaces = slices.Clone(in.Interfaces)
 	cp.TopCPUProcs = slices.Clone(in.TopCPUProcs)
 	cp.TopMemProcs = slices.Clone(in.TopMemProcs)
@@ -183,6 +274,17 @@ func cloneSnapshot(in *ServerMonitorSnapshot) *ServerMonitorSnapshot {
 	cp.Security.ActiveUsers = slices.Clone(in.Security.ActiveUsers)
 	cp.Security.TopFailedIPs = slices.Clone(in.Security.TopFailedIPs)
 	cp.Security.UIDZeroUsers = slices.Clone(in.Security.UIDZeroUsers)
+	if in.Security.FileHashes != nil {
+		cp.Security.FileHashes = make(map[string]string, len(in.Security.FileHashes))
+		maps.Copy(cp.Security.FileHashes, in.Security.FileHashes)
+	}
+	cp.Security.FileDrifts = slices.Clone(in.Security.FileDrifts)
+	cp.Security.PersistenceDrifts = slices.Clone(in.Security.PersistenceDrifts)
+	cp.Security.SuspiciousProcs = slices.Clone(in.Security.SuspiciousProcs)
+	cp.Security.SuspiciousOutbound = slices.Clone(in.Security.SuspiciousOutbound)
+	cp.Security.RecentSSHLogins = slices.Clone(in.Security.RecentSSHLogins)
+	cp.Security.NewSSHLoginIPs = slices.Clone(in.Security.NewSSHLoginIPs)
+	cp.Security.SSHWeakConfigs = slices.Clone(in.Security.SSHWeakConfigs)
 	return &cp
 }
 
@@ -191,13 +293,14 @@ func cloneMonitorVaultData(in *MonitorVaultData) *MonitorVaultData {
 		return nil
 	}
 	cp := &MonitorVaultData{
-		Settings:        in.Settings,
-		Rules:           slices.Clone(in.Rules),
-		LatestSnapshots: make(map[string]*ServerMonitorSnapshot, len(in.LatestSnapshots)),
-		HistoryByServer: make(map[string][]MonitorSamplePoint, len(in.HistoryByServer)),
-		Alerts:          make([]MonitorAlert, len(in.Alerts)),
-		BreachStreaks:   make(map[string]int, len(in.BreachStreaks)),
-		PortBaselines:   make(map[string][]string, len(in.PortBaselines)),
+		Settings:          in.Settings,
+		Rules:             slices.Clone(in.Rules),
+		LatestSnapshots:   make(map[string]*ServerMonitorSnapshot, len(in.LatestSnapshots)),
+		HistoryByServer:   make(map[string][]MonitorSamplePoint, len(in.HistoryByServer)),
+		Alerts:            make([]MonitorAlert, len(in.Alerts)),
+		BreachStreaks:     make(map[string]int, len(in.BreachStreaks)),
+		PortBaselines:     make(map[string][]string, len(in.PortBaselines)),
+		SecurityBaselines: make(map[string]ServerSecurityBaseline, len(in.SecurityBaselines)),
 	}
 	for k, v := range in.LatestSnapshots {
 		cp.LatestSnapshots[k] = cloneSnapshot(v)
@@ -222,6 +325,9 @@ func cloneMonitorVaultData(in *MonitorVaultData) *MonitorVaultData {
 	}
 	for k, v := range in.PortBaselines {
 		cp.PortBaselines[k] = slices.Clone(v)
+	}
+	for k, v := range in.SecurityBaselines {
+		cp.SecurityBaselines[k] = cloneSecurityBaseline(v)
 	}
 	return cp
 }
@@ -270,8 +376,74 @@ func computeSLA(points []MonitorSamplePoint) ServerSLASummary {
 	return sla
 }
 
+// computeDiskWillFillForecast performs deterministic OLS linear regression on recent reachable
+// disk history points to estimate hours until 100% capacity with zero remote SSH overhead.
+func computeDiskWillFillForecast(history []MonitorSamplePoint, curPoint MonitorSamplePoint) float64 {
+	if !curPoint.Reachable || curPoint.DiskPercent < 50.0 || curPoint.DiskPercent >= 100.0 {
+		return 0
+	}
+	cutoff := curPoint.Timestamp.Add(-6 * time.Hour)
+	pts := make([]MonitorSamplePoint, 0, min(len(history)+1, 128))
+	for _, p := range history {
+		if p.Reachable && p.DiskPercent > 0 && !p.Timestamp.Before(cutoff) && !p.Timestamp.After(curPoint.Timestamp) {
+			pts = append(pts, p)
+		}
+	}
+	pts = append(pts, curPoint)
+	if len(pts) < 10 {
+		return 0
+	}
+	firstTS := pts[0].Timestamp
+	spanHours := curPoint.Timestamp.Sub(firstTS).Hours()
+	if spanHours < (10.0 / 60.0) { // require >= 10 minutes span to prevent burst noise
+		return 0
+	}
+
+	var sumX, sumY float64
+	n := float64(len(pts))
+	xs := make([]float64, len(pts))
+	ys := make([]float64, len(pts))
+	for i, p := range pts {
+		x := p.Timestamp.Sub(firstTS).Hours()
+		y := p.DiskPercent
+		xs[i] = x
+		ys[i] = y
+		sumX += x
+		sumY += y
+	}
+	meanX := sumX / n
+	meanY := sumY / n
+
+	var sxx, sxy, syy float64
+	for i := range xs {
+		dx := xs[i] - meanX
+		dy := ys[i] - meanY
+		sxx += dx * dx
+		sxy += dx * dy
+		syy += dy * dy
+	}
+	if sxx <= 1e-9 || syy <= 1e-9 {
+		return 0
+	}
+	slopePerHour := sxy / sxx
+	if slopePerHour < 0.5 { // ignore negligible <0.5%/hour drift
+		return 0
+	}
+	r2 := (sxy * sxy) / (sxx * syy)
+	if r2 < 0.5 { // require steady upward trend rather than random oscillations
+		return 0
+	}
+	remaining := 100.0 - curPoint.DiskPercent
+	hours := remaining / slopePerHour
+	if hours <= 0 || math.IsNaN(hours) || math.IsInf(hours, 0) || hours > 720 {
+		return 0
+	}
+	return round1(hours)
+}
+
 // ComputeSnapshotHealth calculates the 0-100 health score and classification for a snapshot.
-func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, breaches []CandidateBreach) {
+// Callers must pass only debounced/effective breaches so HealthLevel aligns strictly with active alerts.
+func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, effectiveBreaches []CandidateBreach) {
 	if snap == nil {
 		return
 	}
@@ -288,6 +460,9 @@ func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, breaches []CandidateBrea
 	}
 	if snap.CPUIowaitPct > 15 {
 		score -= (snap.CPUIowaitPct - 15) * 0.6
+	}
+	if snap.CPUStealPct > 10 {
+		score -= (snap.CPUStealPct - 10) * 0.6
 	}
 	if snap.LoadPerCore > 1.0 {
 		score -= math.Min(25, (snap.LoadPerCore-1.0)*8.0)
@@ -311,11 +486,23 @@ func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, breaches []CandidateBrea
 	if snap.ProcsZombie > 0 {
 		score -= math.Min(12, float64(snap.ProcsZombie)*1.2)
 	}
+	if snap.ProcsBlocked > 2 {
+		score -= math.Min(15, float64(snap.ProcsBlocked-2)*2.0)
+	}
 	if snap.SystemdFailedCount > 0 {
 		score -= math.Min(20, float64(snap.SystemdFailedCount)*7)
 	}
-	if snap.Docker.Unhealthy > 0 {
-		score -= math.Min(18, float64(snap.Docker.Unhealthy)*8)
+	if snap.Docker.Unhealthy > 0 || snap.Docker.ExitedAbnormal > 0 {
+		score -= math.Min(18, float64(snap.Docker.Unhealthy+snap.Docker.ExitedAbnormal)*8)
+	}
+	if snap.Docker.DaemonDown {
+		score -= 20
+	}
+	if len(snap.ReadOnlyMounts) > 0 || len(snap.RAIDDegraded) > 0 {
+		score -= 30
+	}
+	if snap.OOMKillsDelta > 0 {
+		score -= 20
 	}
 	if snap.LatencyMs > 300 {
 		score -= math.Min(12, float64(snap.LatencyMs-300)/80.0)
@@ -323,7 +510,7 @@ func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, breaches []CandidateBrea
 
 	hasCrit := false
 	hasWarn := false
-	for _, b := range breaches {
+	for _, b := range effectiveBreaches {
 		if b.Severity == SeverityCritical {
 			hasCrit = true
 			score -= 12
@@ -373,15 +560,32 @@ func extractPublicPortKeys(ports []ListeningPortStat) []string {
 	return out
 }
 
+func isRuleSuppressedByCollectionToggles(ruleKind string, settings MonitorSettings) bool {
+	switch ruleKind {
+	case "zombie_procs", "blocked_procs":
+		return !settings.CollectProcesses
+	case "systemd_failed", "docker_unhealthy", "watched_port_down":
+		return !settings.CollectPortsAndServices
+	case "port_drift":
+		return !settings.CollectPortsAndServices || !settings.DetectPortDrift
+	case "ssh_bruteforce", "uid_zero_backdoor", "firewall_inactive", "security_file_drift",
+		"suspicious_process", "suspicious_outbound", "ssh_new_login_ip":
+		return !settings.CollectSecurity
+	default:
+		return false
+	}
+}
+
 func evaluateSnapshotRules(
 	snap *ServerMonitorSnapshot,
 	srv ServerConfig,
+	settings MonitorSettings,
 	rules []MonitorAlertRule,
 	driftedPorts []ListeningPortStat,
 ) []CandidateBreach {
 	ruleMap := make(map[string]MonitorAlertRule, len(rules))
 	for _, r := range rules {
-		if r.Enabled {
+		if r.Enabled && !isRuleSuppressedByCollectionToggles(r.Kind, settings) {
 			ruleMap[r.Kind] = r
 		}
 	}
@@ -394,21 +598,41 @@ func evaluateSnapshotRules(
 		}
 		var sev AlertSeverity
 		var thresh float64
-		if r.CriticalThreshold > 0 && val >= r.CriticalThreshold {
-			sev = SeverityCritical
-			thresh = r.CriticalThreshold
-		} else if r.WarningThreshold > 0 && val >= r.WarningThreshold {
-			sev = SeverityWarning
-			thresh = r.WarningThreshold
+		if r.LowerIsWorse {
+			if val <= 0 {
+				return
+			}
+			if r.CriticalThreshold > 0 && val <= r.CriticalThreshold {
+				sev = SeverityCritical
+				thresh = r.CriticalThreshold
+			} else if r.WarningThreshold > 0 && val <= r.WarningThreshold {
+				sev = SeverityWarning
+				thresh = r.WarningThreshold
+			} else {
+				return
+			}
 		} else {
-			return
+			if r.CriticalThreshold > 0 && val >= r.CriticalThreshold {
+				sev = SeverityCritical
+				thresh = r.CriticalThreshold
+			} else if r.WarningThreshold > 0 && val >= r.WarningThreshold {
+				sev = SeverityWarning
+				thresh = r.WarningThreshold
+			} else {
+				return
+			}
 		}
+
 		dedup := fmt.Sprintf("%s|%s|%s", srv.ID, kind, subKey)
+		op := ">="
+		if r.LowerIsWorse {
+			op = "<="
+		}
 		metricTxt := fmt.Sprintf("%.1f%s", val, r.Unit)
-		threshTxt := fmt.Sprintf(">= %.1f%s", thresh, r.Unit)
-		if r.Unit == "ms" || r.Unit == "个" || r.Unit == "次" {
+		threshTxt := fmt.Sprintf("%s %.1f%s", op, thresh, r.Unit)
+		if r.Unit == "ms" || r.Unit == "个" || r.Unit == "次" || r.Unit == "包" || r.Unit == "条" || r.Unit == "s" {
 			metricTxt = fmt.Sprintf("%.0f %s", val, r.Unit)
-			threshTxt = fmt.Sprintf(">= %.0f %s", thresh, r.Unit)
+			threshTxt = fmt.Sprintf("%s %.0f %s", op, thresh, r.Unit)
 		}
 		out = append(out, CandidateBreach{
 			DedupKey:       dedup,
@@ -424,8 +648,35 @@ func evaluateSnapshotRules(
 	}
 
 	if !snap.Reachable {
+		if snap.HostKeyChanged {
+			if r, ok := ruleMap["host_key_changed"]; ok {
+				detail := snap.HostKeyMismatchDetail
+				if detail == "" {
+					detail = snap.Error
+				}
+				if detail == "" {
+					detail = fmt.Sprintf("主机 %s:%d 的 SSH 主机指纹发生异常变更，已拦截连接", srv.Host, srv.Port)
+				}
+				out = append(out, CandidateBreach{
+					DedupKey:       fmt.Sprintf("%s|host_key_changed|", srv.ID),
+					RuleKind:       "host_key_changed",
+					RuleName:       r.Name,
+					Severity:       SeverityCritical,
+					Title:          fmt.Sprintf("高危：[%s] SSH 主机密钥指纹发生变更", srv.Name),
+					Detail:         detail,
+					MetricText:     "指纹突变",
+					ThresholdText:  "匹配已知指纹",
+					ConsecutiveReq: max(1, r.ConsecutiveCount),
+				})
+			}
+			return out
+		}
+
 		if r, ok := ruleMap["offline"]; ok {
 			errMsg := snap.Error
+			if errMsg == "" {
+				errMsg = snap.PartialError
+			}
 			if errMsg == "" {
 				errMsg = "SSH 连接超时或不可达"
 			}
@@ -435,7 +686,7 @@ func evaluateSnapshotRules(
 				RuleName:       r.Name,
 				Severity:       SeverityCritical,
 				Title:          fmt.Sprintf("主机 [%s] 离线不可达", srv.Name),
-				Detail:         fmt.Sprintf("定时状态采集无法连接 %s:%d — %s", srv.Host, srv.Port, errMsg),
+				Detail:         fmt.Sprintf("定时状态采集无法完成 %s:%d — %s", srv.Host, srv.Port, errMsg),
 				MetricText:     "离线",
 				ThresholdText:  "SSH 可达",
 				ConsecutiveReq: max(1, r.ConsecutiveCount),
@@ -444,11 +695,38 @@ func evaluateSnapshotRules(
 		return out
 	}
 
-	// 1. CPU, IOWait, Normalized Load
+	// 1. Availability: Unexpected Reboot & Latency
+	if snap.UnexpectedReboot {
+		if r, ok := ruleMap["unexpected_reboot"]; ok {
+			out = append(out, CandidateBreach{
+				DedupKey:       fmt.Sprintf("%s|unexpected_reboot|", srv.ID),
+				RuleKind:       "unexpected_reboot",
+				RuleName:       r.Name,
+				Severity:       SeverityWarning,
+				Title:          fmt.Sprintf("[%s] 检测到主机发生非预期重启", srv.Name),
+				Detail:         fmt.Sprintf("目标主机当前运行时间回落至 %s（BootTime: %s），请核实是否宕机或内核崩溃", snap.Uptime, snap.BootTime),
+				MetricText:     snap.Uptime,
+				ThresholdText:  "Uptime 持续递增",
+				ConsecutiveReq: max(1, r.ConsecutiveCount),
+			})
+		}
+	}
+	addThresholdBreach("latency_high", float64(snap.LatencyMs), "",
+		fmt.Sprintf("[%s] SSH 探测响应延迟 %d ms", srv.Name, snap.LatencyMs),
+		fmt.Sprintf("目标节点 %s:%d 握手或保活探测耗时偏高", srv.Host, srv.Port),
+	)
+
+	// 2. Compute: CPU, Steal, IOWait, Load
 	addThresholdBreach("cpu_high", snap.CPUPercent, "",
 		fmt.Sprintf("[%s] CPU 总使用率达到 %.1f%%", srv.Name, snap.CPUPercent),
-		fmt.Sprintf("User %.1f%% / Sys %.1f%% / IOWait %.1f%%", snap.CPUUserPct, snap.CPUSystemPct, snap.CPUIowaitPct),
+		fmt.Sprintf("User %.1f%% / Sys %.1f%% / IOWait %.1f%% / Steal %.1f%%", snap.CPUUserPct, snap.CPUSystemPct, snap.CPUIowaitPct, snap.CPUStealPct),
 	)
+	if snap.CPUStealPct > 0 {
+		addThresholdBreach("cpu_steal_high", snap.CPUStealPct, "",
+			fmt.Sprintf("[%s] 云主机 CPU Steal 抢占达到 %.1f%%", srv.Name, snap.CPUStealPct),
+			fmt.Sprintf("虚拟化宿主机算力竞争严重（Steal %.1f%%，总 CPU %.1f%%）", snap.CPUStealPct, snap.CPUPercent),
+		)
+	}
 	addThresholdBreach("iowait_high", snap.CPUIowaitPct, "",
 		fmt.Sprintf("[%s] 磁盘 I/O 等待率达到 %.1f%%", srv.Name, snap.CPUIowaitPct),
 		fmt.Sprintf("当前磁盘读 %d B/s，写 %d B/s，阻塞进程 %d 个", snap.DiskReadBps, snap.DiskWriteBps, snap.ProcsBlocked),
@@ -460,7 +738,7 @@ func evaluateSnapshotRules(
 		)
 	}
 
-	// 2. Memory, Swap, File Descriptors
+	// 3. Memory, Swap, OOM Kill, File Descriptors, Processes, Temp
 	addThresholdBreach("mem_high", snap.MemPercent, "",
 		fmt.Sprintf("[%s] 物理内存占用达到 %.1f%%", srv.Name, snap.MemPercent),
 		fmt.Sprintf("已用 %d MB / 总计 %d MB (可用 %d MB)", snap.MemUsedMB, snap.MemTotalMB, snap.MemAvailableMB),
@@ -471,14 +749,34 @@ func evaluateSnapshotRules(
 			fmt.Sprintf("Swap 已用 %d MB / 总计 %d MB", snap.SwapUsedMB, snap.SwapTotalMB),
 		)
 	}
+	if snap.OOMKillsDelta > 0 {
+		addThresholdBreach("oom_kill", float64(snap.OOMKillsDelta), "",
+			fmt.Sprintf("[%s] 内核触发 %d 次 OOM Killer 进程击杀", srv.Name, snap.OOMKillsDelta),
+			fmt.Sprintf("本周期新增 OOM Kill %d 次（累计 %d 次），当前内存占用 %.1f%%", snap.OOMKillsDelta, snap.OOMKills, snap.MemPercent),
+		)
+	}
 	if snap.FDMax > 0 {
 		addThresholdBreach("fd_high", snap.FDPercent, "",
 			fmt.Sprintf("[%s] 内核文件句柄使用率 %.1f%%", srv.Name, snap.FDPercent),
 			fmt.Sprintf("已分配 %d / 上限 %d", snap.FDUsed, snap.FDMax),
 		)
 	}
+	addThresholdBreach("zombie_procs", float64(snap.ProcsZombie), "",
+		fmt.Sprintf("[%s] 存在 %d 个僵尸进程 (Zombie)", srv.Name, snap.ProcsZombie),
+		fmt.Sprintf("总进程 %d，运行中 %d，阻塞 %d，僵尸 %d", snap.ProcsTotal, snap.ProcsRunning, snap.ProcsBlocked, snap.ProcsZombie),
+	)
+	addThresholdBreach("blocked_procs", float64(snap.ProcsBlocked), "",
+		fmt.Sprintf("[%s] 存在 %d 个不可中断阻塞进程 (D 态)", srv.Name, snap.ProcsBlocked),
+		fmt.Sprintf("总进程 %d，D 态阻塞 %d 个，可能由磁盘故障或 NFS 远端挂载卡死引发", snap.ProcsTotal, snap.ProcsBlocked),
+	)
+	if snap.CPUTempC > 0 {
+		addThresholdBreach("temp_high", snap.CPUTempC, "",
+			fmt.Sprintf("[%s] CPU 硬件温度达到 %.1f°C", srv.Name, snap.CPUTempC),
+			"物理热传感器温度偏高，请检查机房散热或风扇状态",
+		)
+	}
 
-	// 3. Disk Partitions & Inodes
+	// 4. Storage Capacity, Inodes, Read-Only Remount, Disk Will Fill, RAID, Kernel Errors
 	diskChecked := false
 	for _, d := range snap.Disks {
 		diskChecked = true
@@ -499,39 +797,64 @@ func evaluateSnapshotRules(
 			fmt.Sprintf("已用 %.1f GB / 总计 %.1f GB", snap.DiskUsedGB, snap.DiskTotalGB),
 		)
 	}
+	if r, ok := ruleMap["disk_readonly"]; ok && len(snap.ReadOnlyMounts) > 0 {
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|disk_readonly|", srv.ID),
+			RuleKind:       "disk_readonly",
+			RuleName:       r.Name,
+			Severity:       SeverityCritical,
+			Title:          fmt.Sprintf("[%s] 检测到 %d 个文件系统重挂载为只读 (RO)", srv.Name, len(snap.ReadOnlyMounts)),
+			Detail:         fmt.Sprintf("只读挂载点：%s（通常由底层磁盘 I/O 错误或文件系统损坏触发，业务写入将失败）", strings.Join(snap.ReadOnlyMounts, ", ")),
+			MetricText:     fmt.Sprintf("%d 只读", len(snap.ReadOnlyMounts)),
+			ThresholdText:  "可读写 (RW)",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if snap.DiskFullForecastHours > 0 {
+		mnt := snap.DiskFullForecastMount
+		if mnt == "" {
+			mnt = "/"
+		}
+		addThresholdBreach("disk_will_fill", snap.DiskFullForecastHours, "",
+			fmt.Sprintf("[%s] 分区 %s 预计约 %.1f 小时后耗尽", srv.Name, mnt, snap.DiskFullForecastHours),
+			fmt.Sprintf("根据近期磁盘使用率增长趋势线性预测，当前最高分区占用 %.1f%%，请及时清理日志或扩容", max(snap.MaxPartPercent, snap.DiskPercent)),
+		)
+	}
+	if r, ok := ruleMap["raid_degraded"]; ok && len(snap.RAIDDegraded) > 0 {
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|raid_degraded|", srv.ID),
+			RuleKind:       "raid_degraded",
+			RuleName:       r.Name,
+			Severity:       SeverityCritical,
+			Title:          fmt.Sprintf("[%s] 软 RAID 阵列降级故障", srv.Name),
+			Detail:         fmt.Sprintf("异常阵列状态：%s", strings.Join(snap.RAIDDegraded, "；")),
+			MetricText:     fmt.Sprintf("%d 阵列异常", len(snap.RAIDDegraded)),
+			ThresholdText:  "全部在线",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if snap.KernelErrorCount > 0 {
+		sampleErr := strings.Join(snap.KernelErrors[:min(3, len(snap.KernelErrors))], " | ")
+		addThresholdBreach("kernel_error", float64(snap.KernelErrorCount), "",
+			fmt.Sprintf("[%s] 内核日志检测到 %d 条严重硬件/存储/NFS 错误", srv.Name, snap.KernelErrorCount),
+			sampleErr,
+		)
+	}
 
-	// 4. Latency, Zombies, TCP Socket Accumulation, SSH Brute-Force, Temperature
-	addThresholdBreach("latency_high", float64(snap.LatencyMs), "",
-		fmt.Sprintf("[%s] SSH 探测响应延迟 %d ms", srv.Name, snap.LatencyMs),
-		fmt.Sprintf("目标节点 %s:%d 握手与指令采样耗时偏高", srv.Host, srv.Port),
-	)
-	addThresholdBreach("zombie_procs", float64(snap.ProcsZombie), "",
-		fmt.Sprintf("[%s] 存在 %d 个僵尸进程 (Zombie)", srv.Name, snap.ProcsZombie),
-		fmt.Sprintf("总进程 %d，运行中 %d，阻塞 %d，僵尸 %d", snap.ProcsTotal, snap.ProcsRunning, snap.ProcsBlocked, snap.ProcsZombie),
-	)
+	// 5. Network Sockets, Errors & Listening Ports
 	abnormalTCP := snap.TCPCloseWait + snap.TCPSynRecv
 	addThresholdBreach("tcp_close_wait", float64(abnormalTCP), "",
 		fmt.Sprintf("[%s] TCP 半关闭/半连接套接字堆积 (%d 个)", srv.Name, abnormalTCP),
 		fmt.Sprintf("CLOSE_WAIT=%d, SYN_RECV=%d, ESTABLISHED=%d, TIME_WAIT=%d", snap.TCPCloseWait, snap.TCPSynRecv, snap.TCPEstablished, snap.TCPTimeWait),
 	)
-	if snap.Security.SSHFailedRecent > 0 {
-		ipHint := ""
-		if len(snap.Security.TopFailedIPs) > 0 {
-			ipHint = "，高频来源: " + strings.Join(snap.Security.TopFailedIPs, ", ")
-		}
-		addThresholdBreach("ssh_bruteforce", float64(snap.Security.SSHFailedRecent), "",
-			fmt.Sprintf("[%s] 检测到 %d 次 SSH 登录失败尝试", srv.Name, snap.Security.SSHFailedRecent),
-			fmt.Sprintf("近期安全认证日志捕获频繁失败记录%s", ipHint),
-		)
-	}
-	if snap.CPUTempC > 0 {
-		addThresholdBreach("temp_high", snap.CPUTempC, "",
-			fmt.Sprintf("[%s] CPU 硬件温度达到 %.1f°C", srv.Name, snap.CPUTempC),
-			"物理热传感器温度偏高，请检查机房散热或风扇状态",
+	if snap.NetPacketErrorsDelta > 0 {
+		addThresholdBreach("net_errors_spike", float64(snap.NetPacketErrorsDelta), "",
+			fmt.Sprintf("[%s] 网卡本周期新增 %d 个错包/丢包", srv.Name, snap.NetPacketErrorsDelta),
+			fmt.Sprintf("累计错包/丢包 %d，请检查网卡链路、MTU 或交换机端口", snap.NetPacketErrors),
 		)
 	}
 
-	// 5. Systemd Failed Units & Explicitly Watched Services
+	// 6. Systemd Failed Units & Explicitly Watched Services (INDEPENDENT checks — no else-if masking!)
 	if r, ok := ruleMap["systemd_failed"]; ok {
 		var downWatched []string
 		for _, svc := range snap.Services {
@@ -551,7 +874,8 @@ func evaluateSnapshotRules(
 				ThresholdText:  "全部 active",
 				ConsecutiveReq: max(1, r.ConsecutiveCount),
 			})
-		} else if snap.SystemdFailedCount > 0 {
+		}
+		if snap.SystemdFailedCount > 0 {
 			units := strings.Join(snap.SystemdFailedUnits, ", ")
 			if units == "" {
 				units = fmt.Sprintf("%d 个单元故障", snap.SystemdFailedCount)
@@ -570,29 +894,45 @@ func evaluateSnapshotRules(
 		}
 	}
 
-	// 6. Docker Unhealthy / Restarting Containers
-	if r, ok := ruleMap["docker_unhealthy"]; ok && snap.Docker.Installed && snap.Docker.Unhealthy > 0 {
-		var badNames []string
-		for _, c := range snap.Docker.Containers {
-			if c.Health == "unhealthy" || c.State == "restarting" || c.State == "dead" {
-				badNames = append(badNames, fmt.Sprintf("%s(%s)", c.Name, c.Status))
-			}
+	// 7. Docker Daemon Down & Unhealthy / Restarting / Exited-Abnormal Containers
+	if r, ok := ruleMap["docker_unhealthy"]; ok && snap.Docker.Installed {
+		if snap.Docker.DaemonDown {
+			out = append(out, CandidateBreach{
+				DedupKey:       fmt.Sprintf("%s|docker_unhealthy|daemon", srv.ID),
+				RuleKind:       "docker_unhealthy",
+				RuleName:       r.Name,
+				Severity:       SeverityCritical,
+				Title:          fmt.Sprintf("[%s] Docker 守护进程 (dockerd) 无响应或已停止", srv.Name),
+				Detail:         "目标主机已安装 Docker，但本周期无法通过 docker ps/info 获取容器状态，请检查 docker 服务或权限",
+				MetricText:     "Daemon 异常",
+				ThresholdText:  "Daemon 运行中",
+				ConsecutiveReq: max(1, r.ConsecutiveCount),
+			})
 		}
-		out = append(out, CandidateBreach{
-			DedupKey:       fmt.Sprintf("%s|docker_unhealthy|", srv.ID),
-			RuleKind:       "docker_unhealthy",
-			RuleName:       r.Name,
-			Severity:       SeverityWarning,
-			Title:          fmt.Sprintf("[%s] %d 个 Docker 容器状态异常", srv.Name, snap.Docker.Unhealthy),
-			Detail:         fmt.Sprintf("异常容器: %s", strings.Join(badNames, ", ")),
-			MetricText:     fmt.Sprintf("%d 异常", snap.Docker.Unhealthy),
-			ThresholdText:  "全部健康",
-			ConsecutiveReq: max(1, r.ConsecutiveCount),
-		})
+		totalBad := snap.Docker.Unhealthy + snap.Docker.ExitedAbnormal
+		if totalBad > 0 {
+			var badNames []string
+			for _, c := range snap.Docker.Containers {
+				if isAbnormalContainer(c) {
+					badNames = append(badNames, fmt.Sprintf("%s(%s)", c.Name, c.Status))
+				}
+			}
+			out = append(out, CandidateBreach{
+				DedupKey:       fmt.Sprintf("%s|docker_unhealthy|", srv.ID),
+				RuleKind:       "docker_unhealthy",
+				RuleName:       r.Name,
+				Severity:       SeverityWarning,
+				Title:          fmt.Sprintf("[%s] %d 个 Docker 容器状态异常", srv.Name, totalBad),
+				Detail:         fmt.Sprintf("异常或非 0 退出容器: %s", strings.Join(badNames, ", ")),
+				MetricText:     fmt.Sprintf("%d 异常", totalBad),
+				ThresholdText:  "全部健康",
+				ConsecutiveReq: max(1, r.ConsecutiveCount),
+			})
+		}
 	}
 
-	// 7. Explicitly Watched Ports
-	if r, ok := ruleMap["watched_port_down"]; ok && len(srv.WatchedPorts) > 0 && len(snap.ListeningPorts) > 0 {
+	// 8. Explicitly Watched Ports (protected against truncated port lists)
+	if r, ok := ruleMap["watched_port_down"]; ok && len(srv.WatchedPorts) > 0 && len(snap.ListeningPorts) > 0 && !snap.PortsTruncated {
 		listeningSet := make(map[int]bool, len(snap.ListeningPorts))
 		for _, lp := range snap.ListeningPorts {
 			listeningSet[lp.Port] = true
@@ -618,7 +958,7 @@ func evaluateSnapshotRules(
 		}
 	}
 
-	// 8. Newly Exposed Public Listening Ports (Baseline Drift)
+	// 9. Newly Exposed Listening Ports (Baseline Drift — deduplicated across tcp/tcp6)
 	if r, ok := ruleMap["port_drift"]; ok && len(driftedPorts) > 0 {
 		var desc []string
 		for _, dp := range driftedPorts {
@@ -626,14 +966,18 @@ func evaluateSnapshotRules(
 			if proc == "" {
 				proc = "未知进程"
 			}
-			desc = append(desc, fmt.Sprintf("%s/%d (%s)", dp.Proto, dp.Port, proc))
+			scopeHint := dp.BindAddr
+			if dp.ExposureScope == "public_ip" {
+				scopeHint = dp.BindAddr + "/公网IP"
+			}
+			desc = append(desc, fmt.Sprintf("%s/%d@%s (%s)", dp.Proto, dp.Port, scopeHint, proc))
 		}
 		out = append(out, CandidateBreach{
 			DedupKey:       fmt.Sprintf("%s|port_drift|", srv.ID),
 			RuleKind:       "port_drift",
 			RuleName:       r.Name,
 			Severity:       SeverityWarning,
-			Title:          fmt.Sprintf("[%s] 发现 %d 个新暴露公网端口", srv.Name, len(driftedPorts)),
+			Title:          fmt.Sprintf("[%s] 发现 %d 个新暴露监听端口", srv.Name, len(driftedPorts)),
 			Detail:         fmt.Sprintf("相较安全基线新增对外监听端口: %s（若属正常变更可在监控详情采纳基线）", strings.Join(desc, ", ")),
 			MetricText:     fmt.Sprintf("+%d 端口", len(driftedPorts)),
 			ThresholdText:  "匹配端口基线",
@@ -641,7 +985,151 @@ func evaluateSnapshotRules(
 		})
 	}
 
+	// 10. Security Posture & Zero-AI Intrusion Detection (L1 + L3)
+	if snap.Security.SSHFailedRecent > 0 {
+		ipHint := ""
+		if len(snap.Security.TopFailedIPs) > 0 {
+			ipHint = "，高频来源: " + strings.Join(snap.Security.TopFailedIPs, ", ")
+		}
+		addThresholdBreach("ssh_bruteforce", float64(snap.Security.SSHFailedRecent), "",
+			fmt.Sprintf("[%s] 近 15 分钟检测到 %d 次 SSH 登录失败尝试", srv.Name, snap.Security.SSHFailedRecent),
+			fmt.Sprintf("精准时间窗内认证日志捕获频繁失败记录%s", ipHint),
+		)
+	}
+	if r, ok := ruleMap["uid_zero_backdoor"]; ok {
+		var nonRootUID0 []string
+		for _, u := range snap.Security.UIDZeroUsers {
+			if u != "" && u != "root" {
+				nonRootUID0 = append(nonRootUID0, u)
+			}
+		}
+		if len(nonRootUID0) > 0 {
+			out = append(out, CandidateBreach{
+				DedupKey:       fmt.Sprintf("%s|uid_zero_backdoor|", srv.ID),
+				RuleKind:       "uid_zero_backdoor",
+				RuleName:       r.Name,
+				Severity:       SeverityCritical,
+				Title:          fmt.Sprintf("高危：[%s] 发现非 root 的 UID=0 超级特权账户 (%s)", srv.Name, strings.Join(nonRootUID0, ", ")),
+				Detail:         fmt.Sprintf("/etc/passwd 或目录服务中检测到非 root 的 UID=0 账户：%s，疑似提权后门", strings.Join(nonRootUID0, ", ")),
+				MetricText:     strings.Join(nonRootUID0, ", "),
+				ThresholdText:  "仅 root 为 UID=0",
+				ConsecutiveReq: max(1, r.ConsecutiveCount),
+			})
+		}
+	}
+	if r, ok := ruleMap["firewall_inactive"]; ok && strings.EqualFold(snap.Security.FirewallStatus, "inactive") {
+		fwName := snap.Security.FirewallDetail
+		if fwName == "" {
+			fwName = "主机防火墙"
+		}
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|firewall_inactive|", srv.ID),
+			RuleKind:       "firewall_inactive",
+			RuleName:       r.Name,
+			Severity:       SeverityWarning,
+			Title:          fmt.Sprintf("[%s] 防火墙 (%s) 处于关闭状态", srv.Name, fwName),
+			Detail:         fmt.Sprintf("检测到已安装的 %s 明确处于 inactive 状态，请核实是否为误关闭或安全基线变更", fwName),
+			MetricText:     "inactive",
+			ThresholdText:  "active",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if r, ok := ruleMap["security_file_drift"]; ok && (len(snap.Security.FileDrifts) > 0 || len(snap.Security.PersistenceDrifts) > 0) {
+		var parts []string
+		if len(snap.Security.FileDrifts) > 0 {
+			parts = append(parts, "敏感文件变更: "+strings.Join(snap.Security.FileDrifts, ", "))
+		}
+		if len(snap.Security.PersistenceDrifts) > 0 {
+			parts = append(parts, "持久化项变更: "+strings.Join(snap.Security.PersistenceDrifts, ", "))
+		}
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|security_file_drift|", srv.ID),
+			RuleKind:       "security_file_drift",
+			RuleName:       r.Name,
+			Severity:       SeverityCritical,
+			Title:          fmt.Sprintf("高危：[%s] 关键安全文件或持久化配置基线发生漂移", srv.Name),
+			Detail:         fmt.Sprintf("%s（若属正常变更可在节点详情页点击「采纳安全基线」）", strings.Join(parts, "；")),
+			MetricText:     fmt.Sprintf("%d 项漂移", len(snap.Security.FileDrifts)+len(snap.Security.PersistenceDrifts)),
+			ThresholdText:  "匹配安全基线",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if r, ok := ruleMap["suspicious_process"]; ok && len(snap.Security.SuspiciousProcs) > 0 {
+		sev := SeverityWarning
+		var items []string
+		for _, sp := range snap.Security.SuspiciousProcs {
+			if sp.Severity == string(SeverityCritical) {
+				sev = SeverityCritical
+			}
+			items = append(items, fmt.Sprintf("PID %d(%s:%s %s)", sp.PID, sp.User, sp.Reason, sp.Command))
+		}
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|suspicious_process|", srv.ID),
+			RuleKind:       "suspicious_process",
+			RuleName:       r.Name,
+			Severity:       sev,
+			Title:          fmt.Sprintf("[%s] 检测到 %d 个可疑进程特征", srv.Name, len(snap.Security.SuspiciousProcs)),
+			Detail:         fmt.Sprintf("疑似异常进程：%s", strings.Join(items[:min(5, len(items))], "；")),
+			MetricText:     fmt.Sprintf("%d 进程", len(snap.Security.SuspiciousProcs)),
+			ThresholdText:  "0 可疑进程",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if r, ok := ruleMap["suspicious_outbound"]; ok && len(snap.Security.SuspiciousOutbound) > 0 {
+		var conns []string
+		for _, oc := range snap.Security.SuspiciousOutbound {
+			proc := oc.Process
+			if proc == "" {
+				proc = "unknown"
+			}
+			conns = append(conns, fmt.Sprintf("%s:%d(%s)", oc.RemoteIP, oc.RemotePort, proc))
+		}
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|suspicious_outbound|", srv.ID),
+			RuleKind:       "suspicious_outbound",
+			RuleName:       r.Name,
+			Severity:       SeverityWarning,
+			Title:          fmt.Sprintf("[%s] 检测到 %d 条高危端口外联连接", srv.Name, len(snap.Security.SuspiciousOutbound)),
+			Detail:         fmt.Sprintf("外联目标：%s", strings.Join(conns[:min(6, len(conns))], ", ")),
+			MetricText:     fmt.Sprintf("%d 连接", len(snap.Security.SuspiciousOutbound)),
+			ThresholdText:  "无高危外联",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if r, ok := ruleMap["ssh_new_login_ip"]; ok && len(snap.Security.NewSSHLoginIPs) > 0 {
+		out = append(out, CandidateBreach{
+			DedupKey:       fmt.Sprintf("%s|ssh_new_login_ip|", srv.ID),
+			RuleKind:       "ssh_new_login_ip",
+			RuleName:       r.Name,
+			Severity:       SeverityWarning,
+			Title:          fmt.Sprintf("[%s] 检测到新来源 IP 成功登录 SSH: %s", srv.Name, strings.Join(snap.Security.NewSSHLoginIPs, ", ")),
+			Detail:         fmt.Sprintf("不在已知登录基线中的来源 IP 已成功通过 SSH 认证：%s（如为本人操作可点击「采纳安全基线」）", strings.Join(snap.Security.NewSSHLoginIPs, ", ")),
+			MetricText:     fmt.Sprintf("+%d 新IP", len(snap.Security.NewSSHLoginIPs)),
+			ThresholdText:  "匹配已知登录 IP",
+			ConsecutiveReq: max(1, r.ConsecutiveCount),
+		})
+	}
+	if absOff := math.Abs(float64(snap.ClockOffsetSec)); absOff > 0 {
+		addThresholdBreach("clock_ntp_drift", absOff, "",
+			fmt.Sprintf("[%s] 主机时钟偏移 %.0f 秒", srv.Name, absOff),
+			fmt.Sprintf("目标机时间与监控端 UTC 偏差 %+d 秒（NTP 同步状态: %v）", snap.ClockOffsetSec, snap.NTPSynced),
+		)
+	}
+
 	return out
+}
+
+func isAbnormalContainer(c ContainerStat) bool {
+	if c.Health == "unhealthy" || c.State == "restarting" || c.State == "dead" {
+		return true
+	}
+	if c.State == "exited" {
+		low := strings.ToLower(c.Status)
+		if strings.Contains(low, "exited (") && !strings.Contains(low, "exited (0)") {
+			return true
+		}
+	}
+	return false
 }
 
 // ListAllServerConfigs returns deep copies of all ServerConfigs and monitor settings for scheduled monitoring.
@@ -655,11 +1143,28 @@ func (s *Store) ListAllServerConfigs() ([]ServerConfig, MonitorSettings, error) 
 	for i, srv := range s.secrets.Servers {
 		cp := srv
 		cp.Tags = slices.Clone(srv.Tags)
+		cp.JumpServerIDs = slices.Clone(srv.EffectiveJumpServerIDs())
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 		out[i] = cp
 	}
 	return out, s.secrets.MonitorSettings, nil
+}
+
+// GetEnabledAIPatrolWebhooks returns enabled AI patrol WebhookChannels so monitor alerts can optionally reuse them.
+func (s *Store) GetEnabledAIPatrolWebhooks() []WebhookChannel {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
+		return nil
+	}
+	var out []WebhookChannel
+	for _, wh := range s.secrets.AISettings.Patrol.Webhooks {
+		if wh.Enabled && strings.TrimSpace(wh.URL) != "" {
+			out = append(out, wh)
+		}
+	}
+	return out
 }
 
 // GetPreviousMonitorSnapshot returns a copy of the last recorded snapshot for rate delta calculation.
@@ -675,7 +1180,135 @@ func (s *Store) GetPreviousMonitorSnapshot(serverID string) (*ServerMonitorSnaps
 	return cloneSnapshot(s.monitorRT.LatestSnapshots[serverID]), nil
 }
 
-// RecordMonitorSnapshots persists collected server snapshots, time-series samples, alerts, port baselines,
+// mergeSlowTierFromPrev copies cached slow-tier static & security fields from prev into a fast-tier snapshot
+// so LatestSnapshot stays complete and slow-tier alerts never flap or false-resolve between slow sweeps.
+func mergeSlowTierFromPrev(incoming, prev *ServerMonitorSnapshot) {
+	if incoming == nil || prev == nil || !prev.Reachable {
+		return
+	}
+	if incoming.Hostname == "" {
+		incoming.Hostname = prev.Hostname
+	}
+	if incoming.OS == "" {
+		incoming.OS = prev.OS
+	}
+	if incoming.Kernel == "" {
+		incoming.Kernel = prev.Kernel
+	}
+	if incoming.Arch == "" {
+		incoming.Arch = prev.Arch
+	}
+	if incoming.CPUModel == "" {
+		incoming.CPUModel = prev.CPUModel
+	}
+	if incoming.CPUCores <= 0 {
+		incoming.CPUCores = prev.CPUCores
+	}
+	if incoming.Virtualization == "" {
+		incoming.Virtualization = prev.Virtualization
+	}
+	if incoming.Timezone == "" {
+		incoming.Timezone = prev.Timezone
+	}
+	if incoming.LastSlowCollectedAt == nil && prev.LastSlowCollectedAt != nil {
+		t := *prev.LastSlowCollectedAt
+		incoming.LastSlowCollectedAt = &t
+	}
+	if !incoming.NTPSynced && prev.NTPSynced {
+		incoming.NTPSynced = prev.NTPSynced
+	}
+	if incoming.ClockOffsetSec == 0 && prev.ClockOffsetSec != 0 {
+		incoming.ClockOffsetSec = prev.ClockOffsetSec
+	}
+	if len(incoming.RAIDDegraded) == 0 && len(prev.RAIDDegraded) > 0 {
+		incoming.RAIDDegraded = slices.Clone(prev.RAIDDegraded)
+	}
+	if incoming.KernelErrorCount == 0 && prev.KernelErrorCount > 0 {
+		incoming.KernelErrorCount = prev.KernelErrorCount
+		incoming.KernelErrors = slices.Clone(prev.KernelErrors)
+	}
+	// Preserve cached IPv4 per interface when fast-tier omits `ip -4 addr`
+	if len(prev.Interfaces) > 0 && len(incoming.Interfaces) > 0 {
+		prevIP := make(map[string]string, len(prev.Interfaces))
+		for _, nic := range prev.Interfaces {
+			if nic.IPv4 != "" {
+				prevIP[nic.Name] = nic.IPv4
+			}
+		}
+		for i := range incoming.Interfaces {
+			if incoming.Interfaces[i].IPv4 == "" {
+				incoming.Interfaces[i].IPv4 = prevIP[incoming.Interfaces[i].Name]
+			}
+		}
+	}
+	// Preserve slow-tier security posture fields
+	if incoming.Security.FirewallStatus == "" || incoming.Security.FirewallStatus == "unknown" {
+		if prev.Security.FirewallStatus != "" {
+			incoming.Security.FirewallStatus = prev.Security.FirewallStatus
+			incoming.Security.FirewallDetail = prev.Security.FirewallDetail
+		}
+	}
+	if incoming.Security.MACFramework == "" {
+		incoming.Security.MACFramework = prev.Security.MACFramework
+	}
+	if len(incoming.Security.UIDZeroUsers) == 0 {
+		incoming.Security.UIDZeroUsers = slices.Clone(prev.Security.UIDZeroUsers)
+	}
+	if !incoming.Security.RebootRequired && prev.Security.RebootRequired {
+		incoming.Security.RebootRequired = prev.Security.RebootRequired
+	}
+	if incoming.Security.PendingUpdates == 0 {
+		incoming.Security.PendingUpdates = prev.Security.PendingUpdates
+	}
+	if len(incoming.Security.ActiveUsers) == 0 {
+		incoming.Security.ActiveUsers = slices.Clone(prev.Security.ActiveUsers)
+	}
+	if incoming.Security.SSHFailedRecent == 0 && prev.Security.SSHFailedRecent > 0 {
+		incoming.Security.SSHFailedRecent = prev.Security.SSHFailedRecent
+		incoming.Security.TopFailedIPs = slices.Clone(prev.Security.TopFailedIPs)
+	}
+	if len(incoming.Security.FileHashes) == 0 && len(prev.Security.FileHashes) > 0 {
+		incoming.Security.FileHashes = make(map[string]string, len(prev.Security.FileHashes))
+		maps.Copy(incoming.Security.FileHashes, prev.Security.FileHashes)
+	}
+	if incoming.Security.PersistenceHash == "" {
+		incoming.Security.PersistenceHash = prev.Security.PersistenceHash
+	}
+	if len(incoming.Security.SuspiciousProcs) == 0 {
+		incoming.Security.SuspiciousProcs = slices.Clone(prev.Security.SuspiciousProcs)
+	}
+	if len(incoming.Security.SuspiciousOutbound) == 0 {
+		incoming.Security.SuspiciousOutbound = slices.Clone(prev.Security.SuspiciousOutbound)
+	}
+	if len(incoming.Security.RecentSSHLogins) == 0 {
+		incoming.Security.RecentSSHLogins = slices.Clone(prev.Security.RecentSSHLogins)
+	}
+	if len(incoming.Security.SSHWeakConfigs) == 0 {
+		incoming.Security.SSHWeakConfigs = slices.Clone(prev.Security.SSHWeakConfigs)
+	}
+}
+
+func collectCurrentLoginIPs(sec SecurityPostureStat) []string {
+	seen := make(map[string]struct{})
+	for _, ev := range sec.RecentSSHLogins {
+		if ip := strings.TrimSpace(ev.FromIP); ip != "" {
+			seen[ip] = struct{}{}
+		}
+	}
+	for _, u := range sec.ActiveUsers {
+		if ip := strings.TrimSpace(u.FromIP); ip != "" {
+			seen[ip] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for ip := range seen {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RecordMonitorSnapshots persists collected server snapshots, time-series samples, alerts, port & security baselines,
 // and per-server runtime metadata strictly into non-secret runtime state (monitor_runtime.json) with
 // debounced atomic flushing. It NEVER rewrites secrets.enc or blocks credential operations.
 func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (triggered []MonitorAlert, resolved []MonitorAlert, webhookURL string, err error) {
@@ -699,6 +1332,11 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		srvByID[srv.ID] = cp
 	}
 	s.secMu.RUnlock()
+
+	ruleEnabledMap := make(map[string]bool, len(rules))
+	for _, r := range rules {
+		ruleEnabledMap[r.Kind] = r.Enabled && !isRuleSuppressedByCollectionToggles(r.Kind, monSettings)
+	}
 
 	webhookURL = monSettings.WebhookURL
 	now := time.Now().UTC()
@@ -725,6 +1363,7 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		if !exists {
 			continue
 		}
+		prevSnap := mon.LatestSnapshots[srvCfg.ID]
 		incoming := cloneSnapshot(rawIncoming)
 		incoming.ServerName = srvCfg.Name
 		incoming.Group = srvCfg.Group
@@ -732,6 +1371,37 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		incoming.Port = srvCfg.Port
 		if incoming.CollectedAt.IsZero() {
 			incoming.CollectedAt = now
+		}
+
+		// Fast-tier snapshots reuse cached slow-tier static & security fields
+		if incoming.Reachable && incoming.CollectionTier == "fast" && prevSnap != nil {
+			mergeSlowTierFromPrev(incoming, prevSnap)
+		}
+
+		// Compute cross-snapshot deltas for reboot, OOM kills & NIC errors
+		if incoming.Reachable && prevSnap != nil && prevSnap.Reachable {
+			if prevSnap.UptimeSec > 120 && incoming.UptimeSec > 0 && incoming.UptimeSec+60 < prevSnap.UptimeSec {
+				incoming.UnexpectedReboot = true
+			}
+			if incoming.OOMKills >= prevSnap.OOMKills {
+				incoming.OOMKillsDelta = incoming.OOMKills - prevSnap.OOMKills
+			}
+			if incoming.NetPacketErrors >= prevSnap.NetPacketErrors {
+				incoming.NetPacketErrorsDelta = incoming.NetPacketErrors - prevSnap.NetPacketErrors
+			}
+		}
+
+		// Zero-overhead deterministic disk time-to-full forecast from retained time-series
+		if incoming.Reachable {
+			curPt := incoming.ToSamplePoint()
+			if hrs := computeDiskWillFillForecast(mon.HistoryByServer[srvCfg.ID], curPt); hrs > 0 {
+				incoming.DiskFullForecastHours = hrs
+				if incoming.MaxPartMount != "" {
+					incoming.DiskFullForecastMount = incoming.MaxPartMount
+				} else {
+					incoming.DiskFullForecastMount = "/"
+				}
+			}
 		}
 
 		// Mark watched ports on incoming snapshot
@@ -743,7 +1413,7 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			}
 		}
 
-		// Port baseline comparison
+		// Port baseline comparison (deduplicated across tcp/tcp6 & udp/udp6)
 		var driftedPorts []ListeningPortStat
 		if incoming.Reachable && monSettings.CollectPortsAndServices && len(incoming.ListeningPorts) > 0 {
 			curPublicKeys := extractPublicPortKeys(incoming.ListeningPorts)
@@ -755,6 +1425,7 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 				for _, k := range baseKeys {
 					baseSet[k] = true
 				}
+				seenDrift := make(map[string]bool)
 				for _, lp := range incoming.ListeningPorts {
 					if !lp.PublicExposed || lp.Port <= 0 {
 						continue
@@ -764,16 +1435,147 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 						proto = "udp"
 					}
 					key := fmt.Sprintf("%s/%d", proto, lp.Port)
-					if !baseSet[key] {
+					if !baseSet[key] && !seenDrift[key] {
+						seenDrift[key] = true
 						driftedPorts = append(driftedPorts, lp)
 					}
 				}
 			}
 		}
 
-		// Evaluate breaches & health score
-		breaches := evaluateSnapshotRules(incoming, srvCfg, rules, driftedPorts)
-		ComputeSnapshotHealth(incoming, breaches)
+		// Security baseline comparison (FIM file hashes, crontab/systemd persistence hash, known SSH login IPs)
+		if incoming.Reachable && monSettings.CollectSecurity {
+			secBase, hasSecBase := mon.SecurityBaselines[srvCfg.ID]
+			baseUpdated := false
+
+			if len(incoming.Security.FileHashes) > 0 {
+				if len(secBase.FileHashes) == 0 {
+					secBase.FileHashes = make(map[string]string, len(incoming.Security.FileHashes))
+					maps.Copy(secBase.FileHashes, incoming.Security.FileHashes)
+					baseUpdated = true
+				} else {
+					var drifts []string
+					for path, baseHash := range secBase.FileHashes {
+						curHash, ok := incoming.Security.FileHashes[path]
+						if !ok {
+							drifts = append(drifts, path+" (缺失/不可读)")
+						} else if curHash != baseHash {
+							drifts = append(drifts, path+" (内容已变更)")
+						}
+					}
+					for path := range incoming.Security.FileHashes {
+						if _, ok := secBase.FileHashes[path]; !ok {
+							drifts = append(drifts, path+" (新增)")
+						}
+					}
+					sort.Strings(drifts)
+					incoming.Security.FileDrifts = drifts
+				}
+			}
+
+			if incoming.Security.PersistenceHash != "" {
+				if secBase.PersistenceHash == "" {
+					secBase.PersistenceHash = incoming.Security.PersistenceHash
+					baseUpdated = true
+				} else if incoming.Security.PersistenceHash != secBase.PersistenceHash {
+					incoming.Security.PersistenceDrifts = []string{"crontab / systemd 持久化配置指纹变化"}
+				}
+			}
+
+			if len(incoming.Security.RecentSSHLogins) > 0 || len(incoming.Security.ActiveUsers) > 0 {
+				curIPs := collectCurrentLoginIPs(incoming.Security)
+				if !hasSecBase && len(secBase.KnownSSHLoginIPs) == 0 {
+					secBase.KnownSSHLoginIPs = curIPs
+					baseUpdated = true
+				} else if len(incoming.Security.RecentSSHLogins) > 0 {
+					knownSet := make(map[string]bool, len(secBase.KnownSSHLoginIPs))
+					for _, ip := range secBase.KnownSSHLoginIPs {
+						knownSet[ip] = true
+					}
+					var newIPs []string
+					for _, ev := range incoming.Security.RecentSSHLogins {
+						ip := strings.TrimSpace(ev.FromIP)
+						if ip != "" && !knownSet[ip] && !slices.Contains(newIPs, ip) {
+							newIPs = append(newIPs, ip)
+						}
+					}
+					sort.Strings(newIPs)
+					incoming.Security.NewSSHLoginIPs = newIPs
+				}
+			}
+
+			if baseUpdated {
+				secBase.UpdatedAt = incoming.CollectedAt
+				mon.SecurityBaselines[srvCfg.ID] = secBase
+			}
+		}
+
+		// Evaluate candidate breaches
+		breaches := evaluateSnapshotRules(incoming, srvCfg, monSettings, rules, driftedPorts)
+
+		// Update breach streaks, apply strict consecutive debounce, handle escalation & de-escalation
+		activeBreachMap := make(map[string]CandidateBreach, len(breaches))
+		effectiveBreaches := make([]CandidateBreach, 0, len(breaches))
+		for _, b := range breaches {
+			activeBreachMap[b.DedupKey] = b
+			mon.BreachStreaks[b.DedupKey]++
+			if mon.BreachStreaks[b.DedupKey] < b.ConsecutiveReq {
+				continue
+			}
+			effectiveBreaches = append(effectiveBreaches, b)
+
+			foundExisting := false
+			for idx := range mon.Alerts {
+				al := &mon.Alerts[idx]
+				if al.DedupKey == b.DedupKey && al.Status != AlertStatusResolved {
+					al.LastSeenAt = incoming.CollectedAt
+					al.Occurrences++
+					al.ServerName = srvCfg.Name
+					al.Host = fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port)
+					al.Title = b.Title
+					al.Detail = b.Detail
+					al.MetricText = b.MetricText
+					al.ThresholdText = b.ThresholdText
+					if b.Severity == SeverityCritical && al.Severity != SeverityCritical {
+						// Escalate Warning -> Critical: reactivate even if acknowledged & notify webhook!
+						al.Severity = SeverityCritical
+						al.Status = AlertStatusFiring
+						al.AcknowledgedAt = nil
+						triggered = append(triggered, *al)
+					} else if b.Severity == SeverityWarning && al.Severity == SeverityCritical {
+						// De-escalate Critical -> Warning cleanly without duplicate webhook spam
+						al.Severity = SeverityWarning
+					}
+					foundExisting = true
+					break
+				}
+			}
+			if !foundExisting {
+				newAlert := MonitorAlert{
+					ID:            uuid.NewString(),
+					DedupKey:      b.DedupKey,
+					ServerID:      srvCfg.ID,
+					ServerName:    srvCfg.Name,
+					Host:          fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
+					RuleKind:      b.RuleKind,
+					RuleName:      b.RuleName,
+					Severity:      b.Severity,
+					Status:        AlertStatusFiring,
+					Title:         b.Title,
+					Detail:        b.Detail,
+					MetricText:    b.MetricText,
+					ThresholdText: b.ThresholdText,
+					Occurrences:   mon.BreachStreaks[b.DedupKey],
+					TriggeredAt:   incoming.CollectedAt,
+					LastSeenAt:    incoming.CollectedAt,
+				}
+				mon.Alerts = append([]MonitorAlert{newAlert}, mon.Alerts...)
+				triggered = append(triggered, newAlert)
+			}
+		}
+
+		// Compute snapshot health strictly using debounced effective breaches
+		ComputeSnapshotHealth(incoming, effectiveBreaches)
 		*rawIncoming = *cloneSnapshot(incoming)
 
 		// Update lightweight per-server runtime metadata strictly inside monitor_runtime.json
@@ -810,71 +1612,21 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		}
 		mon.HistoryByServer[srvCfg.ID] = series
 
-		// Update breach streaks & firing/resolved alerts for this server
-		activeBreachMap := make(map[string]CandidateBreach, len(breaches))
-		for _, b := range breaches {
-			activeBreachMap[b.DedupKey] = b
-			mon.BreachStreaks[b.DedupKey]++
-			if mon.BreachStreaks[b.DedupKey] < b.ConsecutiveReq {
-				continue
-			}
-
-			foundExisting := false
-			for idx := range mon.Alerts {
-				al := &mon.Alerts[idx]
-				if al.DedupKey == b.DedupKey && al.Status != AlertStatusResolved {
-					al.LastSeenAt = incoming.CollectedAt
-					al.Occurrences++
-					al.ServerName = srvCfg.Name
-					al.Host = fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port)
-					al.Title = b.Title
-					al.Detail = b.Detail
-					al.MetricText = b.MetricText
-					al.ThresholdText = b.ThresholdText
-					if b.Severity == SeverityCritical && al.Severity != SeverityCritical {
-						al.Severity = SeverityCritical
-					}
-					foundExisting = true
-					break
-				}
-			}
-			if !foundExisting {
-				newAlert := MonitorAlert{
-					ID:            uuid.NewString(),
-					DedupKey:      b.DedupKey,
-					ServerID:      srvCfg.ID,
-					ServerName:    srvCfg.Name,
-					Host:          fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
-					RuleKind:      b.RuleKind,
-					RuleName:      b.RuleName,
-					Severity:      b.Severity,
-					Status:        AlertStatusFiring,
-					Title:         b.Title,
-					Detail:        b.Detail,
-					MetricText:    b.MetricText,
-					ThresholdText: b.ThresholdText,
-					Occurrences:   mon.BreachStreaks[b.DedupKey],
-					TriggeredAt:   incoming.CollectedAt,
-					LastSeenAt:    incoming.CollectedAt,
-				}
-				mon.Alerts = append([]MonitorAlert{newAlert}, mon.Alerts...)
-				triggered = append(triggered, newAlert)
-			}
-		}
-
 		// Clear non-breached streaks for this server
 		prefix := srvCfg.ID + "|"
 		for k := range mon.BreachStreaks {
 			if strings.HasPrefix(k, prefix) {
 				if _, stillBreached := activeBreachMap[k]; !stillBreached {
-					if incoming.Reachable || strings.HasPrefix(k, srvCfg.ID+"|offline|") {
+					if incoming.Reachable ||
+						strings.HasPrefix(k, srvCfg.ID+"|offline|") ||
+						strings.HasPrefix(k, srvCfg.ID+"|host_key_changed|") {
 						delete(mon.BreachStreaks, k)
 					}
 				}
 			}
 		}
 
-		// Auto-resolve active alerts whose condition has recovered
+		// Auto-resolve active alerts whose condition has recovered (never resolve host metrics on unreachable/partial failure!)
 		for idx := range mon.Alerts {
 			al := &mon.Alerts[idx]
 			if al.ServerID != srvCfg.ID || al.Status == AlertStatusResolved {
@@ -883,14 +1635,17 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			if _, stillBreached := activeBreachMap[al.DedupKey]; stillBreached {
 				continue
 			}
-			if !incoming.Reachable && al.RuleKind != "offline" {
+			if !incoming.Reachable && al.RuleKind != "offline" && al.RuleKind != "host_key_changed" {
 				continue
 			}
 			resTime := incoming.CollectedAt
 			al.Status = AlertStatusResolved
 			al.ResolvedAt = &resTime
 			al.LastSeenAt = resTime
-			resolved = append(resolved, *al)
+			// Only send recovery notification if rule is actually enabled; disabled rules close silently
+			if ruleEnabledMap[al.RuleKind] {
+				resolved = append(resolved, *al)
+			}
 		}
 	}
 
@@ -924,6 +1679,39 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 	s.rtMu.Unlock()
 	s.triggerFlush()
 	return triggered, resolved, webhookURL, nil
+}
+
+// SilenceServerMonitorAlerts silently resolves active alerts and clears breach streaks for a disabled server.
+func (s *Store) SilenceServerMonitorAlerts(serverID string) {
+	if !s.IsReady() || serverID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	s.rtMu.Lock()
+	if s.monitorRT != nil {
+		changed := false
+		prefix := serverID + "|"
+		for k := range s.monitorRT.BreachStreaks {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.monitorRT.BreachStreaks, k)
+				changed = true
+			}
+		}
+		for i := range s.monitorRT.Alerts {
+			al := &s.monitorRT.Alerts[i]
+			if al.ServerID == serverID && al.Status != AlertStatusResolved {
+				al.Status = AlertStatusResolved
+				al.ResolvedAt = &now
+				al.LastSeenAt = now
+				changed = true
+			}
+		}
+		if changed {
+			s.dirtyMonitor = true
+		}
+	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
 }
 
 // GetMonitorOverview builds the fleet monitoring dashboard state by joining server configs with runtime telemetry.
@@ -1076,7 +1864,7 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 	}, nil
 }
 
-// GetServerMonitorDetail returns deep snapshot, time-filtered historical series, SLA, and alerts for one server.
+// GetServerMonitorDetail returns deep snapshot, time-filtered historical series, SLA, baselines, and alerts for one server.
 func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) (*ServerMonitorDetail, error) {
 	s.secMu.RLock()
 	if s.secrets == nil {
@@ -1140,13 +1928,20 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 		baseline = []string{}
 	}
 
+	var secBase *ServerSecurityBaseline
+	if sb, ok := mon.SecurityBaselines[serverID]; ok {
+		cp := cloneSecurityBaseline(sb)
+		secBase = &cp
+	}
+
 	return &ServerMonitorDetail{
-		Server:       *targetView,
-		Snapshot:     snap,
-		Series:       filtered,
-		SLA:          computeSLA(filtered),
-		PortBaseline: baseline,
-		Alerts:       srvAlerts,
+		Server:           *targetView,
+		Snapshot:         snap,
+		Series:           filtered,
+		SLA:              computeSLA(filtered),
+		PortBaseline:     baseline,
+		SecurityBaseline: secBase,
+		Alerts:           srvAlerts,
 	}, nil
 }
 
@@ -1160,8 +1955,15 @@ func (s *Store) GetMonitorPolicy() (MonitorSettings, []MonitorAlertRule, error) 
 	return s.secrets.MonitorSettings, slices.Clone(s.secrets.MonitorRules), nil
 }
 
-// UpdateMonitorPolicy validates and saves updated schedule settings and alert rules.
+// UpdateMonitorPolicy validates and saves updated schedule settings and alert rules,
+// and silently closes any active alerts belonging to newly disabled rules or dimensions.
 func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAlertRule, clientIP string) (MonitorSettings, []MonitorAlertRule, error) {
+	if len(rules) > 0 {
+		if err := validateMonitorAlertRules(rules); err != nil {
+			return MonitorSettings{}, nil, err
+		}
+	}
+
 	var outSettings MonitorSettings
 	var outRules []MonitorAlertRule
 	err := s.mutateSecrets(func(sec *SecretsState) error {
@@ -1177,21 +1979,46 @@ func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAle
 		return MonitorSettings{}, nil, err
 	}
 
-	// Trim existing runtime series if RetentionPoints was lowered
+	activeKinds := make(map[string]bool, len(outRules))
+	for _, r := range outRules {
+		activeKinds[r.Kind] = r.Enabled && !isRuleSuppressedByCollectionToggles(r.Kind, outSettings)
+	}
+
+	// Trim existing runtime series if RetentionPoints was lowered & silently close disabled rule alerts
+	now := time.Now().UTC()
 	s.rtMu.Lock()
 	if s.monitorRT != nil {
-		trimmed := false
+		dirty := false
 		for sid, pts := range s.monitorRT.HistoryByServer {
 			if len(pts) > outSettings.RetentionPoints {
 				s.monitorRT.HistoryByServer[sid] = slices.Clone(pts[len(pts)-outSettings.RetentionPoints:])
-				trimmed = true
+				dirty = true
 			}
 		}
-		if trimmed {
+		for k := range s.monitorRT.BreachStreaks {
+			parts := strings.SplitN(k, "|", 3)
+			if len(parts) >= 2 && !activeKinds[parts[1]] {
+				delete(s.monitorRT.BreachStreaks, k)
+				dirty = true
+			}
+		}
+		for i := range s.monitorRT.Alerts {
+			al := &s.monitorRT.Alerts[i]
+			if al.Status != AlertStatusResolved && !activeKinds[al.RuleKind] {
+				al.Status = AlertStatusResolved
+				al.ResolvedAt = &now
+				al.LastSeenAt = now
+				dirty = true
+			}
+		}
+		if dirty {
 			s.dirtyMonitor = true
 		}
 	}
-	s.appendAuditRuntimeLocked("monitor.policy_update", "monitor", fmt.Sprintf("更新状态监控策略 (周期 %ds, 保留 %d 点)", outSettings.IntervalSec, outSettings.RetentionPoints), clientIP, true)
+	s.appendAuditRuntimeLocked("monitor.policy_update", "monitor",
+		fmt.Sprintf("更新状态监控策略 (快层 %ds / 慢层 %ds / 保留 %d 点 / 连接池=%v)",
+			outSettings.IntervalSec, outSettings.SlowIntervalSec, outSettings.RetentionPoints, outSettings.UseSSHConnectionPool),
+		clientIP, true)
 	s.rtMu.Unlock()
 	s.triggerFlush()
 	return outSettings, outRules, nil
@@ -1297,7 +2124,7 @@ func (s *Store) ClearResolvedMonitorAlerts(clientIP string) (int, error) {
 	return removed, nil
 }
 
-// AcceptServerPortBaseline pins the server's current public listening ports as its trusted port baseline.
+// AcceptServerPortBaseline pins the server's current exposed listening ports as its trusted port baseline.
 func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked
@@ -1326,11 +2153,73 @@ func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, e
 		}
 	}
 	s.dirtyMonitor = true
-	s.appendAuditRuntimeLocked("monitor.port_baseline", snap.ServerName, fmt.Sprintf("确认并更新公网监听端口安全基线 (%d 个端口)", len(newBase)), clientIP, true)
+	s.appendAuditRuntimeLocked("monitor.port_baseline", snap.ServerName, fmt.Sprintf("确认并更新对外监听端口安全基线 (%d 个端口)", len(newBase)), clientIP, true)
 	outBase := slices.Clone(newBase)
 	s.rtMu.Unlock()
 	s.triggerFlush()
 	return outBase, nil
+}
+
+// AcceptServerSecurityBaseline pins the server's current critical file hashes, persistence hash, and SSH login IPs.
+func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*ServerSecurityBaseline, error) {
+	if !s.IsReady() {
+		return nil, ErrVaultLocked
+	}
+
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
+	}
+	ensureMonitorRuntimeDefaults(s.monitorRT)
+	snap := s.monitorRT.LatestSnapshots[serverID]
+	if snap == nil {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	existing := s.monitorRT.SecurityBaselines[serverID]
+	nextBase := cloneSecurityBaseline(existing)
+	if len(snap.Security.FileHashes) > 0 {
+		nextBase.FileHashes = make(map[string]string, len(snap.Security.FileHashes))
+		maps.Copy(nextBase.FileHashes, snap.Security.FileHashes)
+	}
+	if snap.Security.PersistenceHash != "" {
+		nextBase.PersistenceHash = snap.Security.PersistenceHash
+	}
+	for _, ip := range collectCurrentLoginIPs(snap.Security) {
+		if !slices.Contains(nextBase.KnownSSHLoginIPs, ip) {
+			nextBase.KnownSSHLoginIPs = append(nextBase.KnownSSHLoginIPs, ip)
+		}
+	}
+	sort.Strings(nextBase.KnownSSHLoginIPs)
+	nextBase.UpdatedAt = now
+
+	s.monitorRT.SecurityBaselines[serverID] = nextBase
+	snap.Security.FileDrifts = nil
+	snap.Security.PersistenceDrifts = nil
+	snap.Security.NewSSHLoginIPs = nil
+
+	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|security_file_drift|", serverID))
+	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|ssh_new_login_ip|", serverID))
+	for i := range s.monitorRT.Alerts {
+		al := &s.monitorRT.Alerts[i]
+		if al.ServerID == serverID &&
+			(al.RuleKind == "security_file_drift" || al.RuleKind == "ssh_new_login_ip") &&
+			al.Status != AlertStatusResolved {
+			al.Status = AlertStatusResolved
+			al.ResolvedAt = &now
+		}
+	}
+	s.dirtyMonitor = true
+	s.appendAuditRuntimeLocked("monitor.security_baseline", snap.ServerName,
+		fmt.Sprintf("确认并更新主机安全基线 (%d 个关键文件, %d 个已知登录 IP)", len(nextBase.FileHashes), len(nextBase.KnownSSHLoginIPs)),
+		clientIP, true)
+	out := cloneSecurityBaseline(nextBase)
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return &out, nil
 }
 
 // ClearMonitorHistory purges historical monitoring records for one server or all servers.
@@ -1357,4 +2246,3 @@ func (s *Store) ClearMonitorHistory(serverID, clientIP string) error {
 	s.triggerFlush()
 	return nil
 }
-

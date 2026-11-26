@@ -356,6 +356,7 @@ type MonitorRuntimeState struct {
 	Alerts                []MonitorAlert                    `json:"alerts"`
 	BreachStreaks         map[string]int                    `json:"breach_streaks"`
 	PortBaselines         map[string][]string               `json:"port_baselines"`
+	SecurityBaselines     map[string]ServerSecurityBaseline `json:"security_baselines,omitempty"`
 	ServerRuntime         map[string]ServerRuntimeMeta      `json:"server_runtime,omitempty"`
 	KnownHostLastVerified map[string]time.Time              `json:"known_host_last_verified,omitempty"`
 }
@@ -547,6 +548,7 @@ func DefaultMonitorRuntimeState() *MonitorRuntimeState {
 		Alerts:                []MonitorAlert{},
 		BreachStreaks:         make(map[string]int),
 		PortBaselines:         make(map[string][]string),
+		SecurityBaselines:     make(map[string]ServerSecurityBaseline),
 		ServerRuntime:         make(map[string]ServerRuntimeMeta),
 		KnownHostLastVerified: make(map[string]time.Time),
 	}

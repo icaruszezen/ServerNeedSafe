@@ -770,6 +770,20 @@ export const api = {
       id,
     }),
 
+  acceptSecurityBaseline: (id: string) =>
+    requestJSON<{ ok: boolean; security_baseline: import('./types').ServerSecurityBaseline }>(
+      'POST',
+      '/api/monitor/security-baseline',
+      { id }
+    ),
+
+  testMonitorWebhook: (webhook_url: string, reuse_ai_patrol_webhooks: boolean) =>
+    requestJSON<{ ok: boolean; runtime: MonitorRuntimeStatus }>(
+      'POST',
+      '/api/monitor/test-webhook',
+      { webhook_url, reuse_ai_patrol_webhooks }
+    ),
+
   listMonitorAlerts: (status = '', server_id = '', limit = 300) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     if (status) qs.set('status', status);

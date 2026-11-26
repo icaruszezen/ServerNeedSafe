@@ -106,6 +106,7 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.Monitor != nil {
+		s.cfg.Monitor.EvictServerConnection(id)
 		s.cfg.Monitor.Wake()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"server": srv})
@@ -118,6 +119,7 @@ func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.cfg.Monitor != nil {
+		s.cfg.Monitor.EvictServerConnection(id)
 		s.cfg.Monitor.Wake()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

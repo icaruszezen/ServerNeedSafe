@@ -6,6 +6,14 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
+// CollectionTier distinguishes lightweight frequent sweeps from periodic full static/security audits.
+type CollectionTier string
+
+const (
+	TierFast CollectionTier = "fast"
+	TierFull CollectionTier = "full"
+)
+
 var defaultProbeServices = []string{
 	"sshd", "ssh", "docker", "nginx", "caddy", "postgresql",
 	"mysql", "mariadb", "redis", "redis-server", "ufw", "firewalld", "fail2ban", "cron", "crond",
@@ -21,17 +29,53 @@ func sanitizeShellWord(s string) string {
 	return b.String()
 }
 
-// buildDeepTelemetryScript constructs a single-pass, POSIX-compatible, locale-neutral shell script
-// that collects all-around server metrics with dual-point rate sampling.
-// It preserves existing Linux (/proc, /sys, GNU) paths unchanged while automatically adapting to macOS (Darwin).
+// buildDeepTelemetryScript constructs a full-tier telemetry script (preserving compatibility with existing callers/tests).
 func buildDeepTelemetryScript(settings vault.MonitorSettings, watchedServices []string) string {
+	return buildTelemetryScript(settings, watchedServices, TierFull, false)
+}
+
+// buildTelemetryScript constructs a single-pass, POSIX-compatible, locale-neutral, production-safe shell script.
+// Key production protections:
+//   - Zero self-observation bias: when hasPrevCPU is true on Linux, captures single-point raw counters (no sleep);
+//     otherwise runs T0 -> immediate sleep -> T1 BEFORE heavy commands so script overhead never inflates CPU%.
+//   - Zero kernel socket-table lock on high-concurrency Linux: uses `ss -s` + kernel-filtered `ss -Htan state ...`
+//     instead of scanning `/proc/net/tcp`.
+//   - NFS D-state protection: `df -PTkl` / `df -Pil` (local only) unless IncludeRemoteMounts is explicitly enabled,
+//     plus zero-blocking `/proc/mounts` inspection for read-only remounts and remote mount inventory.
+//   - Remote timeout wrapper (`sns_to`) around all external binaries to prevent orphaned hung child processes.
+//   - Single batched `systemctl show` call instead of 30 sequential D-Bus round-trips.
+//   - Zero Python startup in firewall detection (checks systemd unit state / `/etc/ufw/ufw.conf`).
+//   - Fast/slow tiering: slow-tier static identity, 15m-window SSH logs, dmesg/RAID, FIM hashes, persistence,
+//     suspicious processes, and high-risk outbound connections run only on TierFull.
+//   - Integrity sentinel `===SNS_END===` at script tail so truncated/timed-out captures NEVER cause false alert resolution.
+func buildTelemetryScript(
+	settings vault.MonitorSettings,
+	watchedServices []string,
+	tier CollectionTier,
+	hasPrevCPU bool,
+) string {
+	isFull := tier != TierFast
 	var b strings.Builder
+
 	b.WriteString(`export LC_ALL=C LANG=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SNS_OS=$(uname -s 2>/dev/null || echo Linux)
 if [ "$SNS_OS" = "Darwin" ]; then
   PATH="$PATH:/opt/homebrew/sbin:/opt/homebrew/bin:$HOME/.orbstack/bin:/Applications/Docker.app/Contents/Resources/bin"
   export PATH
 fi
+SNS_TO_MODE=0
+if [ "$SNS_OS" != "Darwin" ] && command -v timeout >/dev/null 2>&1; then
+  if timeout -k 1 2 true >/dev/null 2>&1; then SNS_TO_MODE=1
+  elif timeout 2 true >/dev/null 2>&1; then SNS_TO_MODE=2
+  fi
+fi
+sns_to() {
+  _t="$1"; shift
+  if [ "$SNS_TO_MODE" = "1" ]; then timeout -k 1 "$_t" "$@" 2>/dev/null
+  elif [ "$SNS_TO_MODE" = "2" ]; then timeout "$_t" "$@" 2>/dev/null
+  else "$@" 2>/dev/null
+  fi
+}
 `)
 
 	const darwinCounterSampleBlock = `  NOW_TS=$(perl -MTime::HiRes=time -e 'printf "%.3f\n", time' 2>/dev/null || date +%s 2>/dev/null || echo 0)
@@ -58,22 +102,31 @@ fi
   }'
 `
 
-	// T0 Counter Sample (Uptime + CPU + Context Switches + Net Dev + Diskstats)
-	b.WriteString("echo \"===SNS_SEC:SAMPLE_T0===\"\n")
-	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
-	b.WriteString(darwinCounterSampleBlock)
-	b.WriteString(`else
-  [ -r /proc/uptime ] && awk '{printf "UP=%s\n", $1}' /proc/uptime
+	const linuxCounterSampleBlock = `  [ -r /proc/uptime ] && awk '{printf "UP=%s\n", $1}' /proc/uptime
   [ -r /proc/stat ] && awk '/^cpu / {print "CPU=" $0} /^ctxt / {print "CTXT=" $2}' /proc/stat
   [ -r /proc/net/dev ] && awk 'NR>2 {gsub(/:/, " "); printf "NET=%s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $10, $11, $12, $13}' /proc/net/dev
   [ -r /proc/diskstats ] && awk '$3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+|dm-[0-9]+)$/ {printf "BIO=%s %s %s %s %s\n", $3, $4, $6, $8, $10}' /proc/diskstats
-fi
-`)
+`
 
-	// System Identity, Load, Clock, Thermal
-	b.WriteString(`echo "===SNS_SEC:SYS==="
-printf "HOSTNAME=%s\n" "$(hostname 2>/dev/null || uname -n 2>/dev/null)"
-if [ "$SNS_OS" = "Darwin" ]; then
+	// 1. T0 Counter Sample (and isolated pure-sleep T1 on Linux when no prior CPU sample exists!)
+	b.WriteString("echo \"===SNS_SEC:SAMPLE_T0===\"\n")
+	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
+	b.WriteString(darwinCounterSampleBlock)
+	b.WriteString("else\n")
+	b.WriteString(linuxCounterSampleBlock)
+	if !hasPrevCPU {
+		// Run sleep & T1 immediately BEFORE any heavy commands to eliminate self-observation CPU inflation!
+		b.WriteString("  sleep 0.25 2>/dev/null || sleep 1\n")
+		b.WriteString("  echo \"===SNS_SEC:SAMPLE_T1===\"\n")
+		b.WriteString(linuxCounterSampleBlock)
+	}
+	b.WriteString("fi\n")
+
+	// 2. System Identity, Load, Clock, Thermal
+	b.WriteString("echo \"===SNS_SEC:SYS===\"\n")
+	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
+	if isFull {
+		b.WriteString(`  printf "HOSTNAME=%s\n" "$(hostname 2>/dev/null || uname -n 2>/dev/null)"
   OS_P=$(sw_vers -productName 2>/dev/null || echo "macOS")
   OS_V=$(sw_vers -productVersion 2>/dev/null || true)
   OS_B=$(sw_vers -buildVersion 2>/dev/null || true)
@@ -92,19 +145,25 @@ if [ "$SNS_OS" = "Darwin" ]; then
   [ -n "$CPU_M" ] && printf "CPU_MODEL=%s\n" "$CPU_M"
   HV_VMM=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)
   [ "$HV_VMM" = "1" ] && printf "VIRT=apple-vm\n"
-  BOOT_SEC=$(sysctl -n kern.boottime 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(($i=="sec" || $i=="{sec") && $(i+1)=="="){v=$(i+2); gsub(/[^0-9]/,"",v); if(v ~ /^[0-9]+$/){print v; exit}}}')
+  printf "TIMEZONE=%s\n" "$(date '+%Z' 2>/dev/null)"
+  if pgrep -x timed >/dev/null 2>&1; then printf "NTP=yes\n"; fi
+`)
+	}
+	b.WriteString(`  BOOT_SEC=$(sysctl -n kern.boottime 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(($i=="sec" || $i=="{sec") && $(i+1)=="="){v=$(i+2); gsub(/[^0-9]/,"",v); if(v ~ /^[0-9]+$/){print v; exit}}}')
   NOW_SEC=$(date +%s 2>/dev/null || echo 0)
+  if [ -n "$NOW_SEC" ] && [ "$NOW_SEC" -gt 0 ] 2>/dev/null; then printf "SERVER_EPOCH=%s\n" "$NOW_SEC"; fi
   if [ -n "$BOOT_SEC" ] && [ "$BOOT_SEC" -gt 0 ] 2>/dev/null && [ "$NOW_SEC" -ge "$BOOT_SEC" ] 2>/dev/null; then
     printf "UPTIME_SEC=%s\n" "$((NOW_SEC - BOOT_SEC))"
   fi
   sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/, ""); if(NF>=3) printf "LOAD=%s %s %s\n", $1, $2, $3}'
   printf "SERVER_TIME=%s\n" "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
-  printf "TIMEZONE=%s\n" "$(date '+%Z' 2>/dev/null)"
-  if pgrep -x timed >/dev/null 2>&1; then printf "NTP=yes\n"; fi
 else
+`)
+	if isFull {
+		b.WriteString(`  printf "HOSTNAME=%s\n" "$(hostname 2>/dev/null || uname -n 2>/dev/null)"
   OS_NAME=""
   if [ -r /etc/os-release ]; then
-    OS_NAME=$(. /etc/os-release 2>/dev/null && printf "%s" "${PRETTY_NAME:-$NAME}")
+    OS_NAME=$(awk -F= '/^(PRETTY_NAME|NAME)=/ {v=$2; gsub(/^["'\'']|["'\'']$/, "", v); if($1=="PRETTY_NAME") p=v; else n=v} END {print (p!=""?p:n)}' /etc/os-release 2>/dev/null)
   fi
   [ -z "$OS_NAME" ] && OS_NAME=$(uname -s 2>/dev/null)
   printf "OS=%s\n" "$OS_NAME"
@@ -115,14 +174,17 @@ else
     CPU_M=$(awk -F: '/model name|Processor|cpu model/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     [ -n "$CPU_M" ] && printf "CPU_MODEL=%s\n" "$CPU_M"
   fi
-  VIRT_T=$(systemd-detect-virt 2>/dev/null || true)
+  VIRT_T=$(sns_to 2 systemd-detect-virt || true)
   [ -n "$VIRT_T" ] && printf "VIRT=%s\n" "$VIRT_T"
-  [ -r /proc/uptime ] && awk '{printf "UPTIME_SEC=%s\n", $1}' /proc/uptime
+  printf "TIMEZONE=%s\n" "$(date '+%Z' 2>/dev/null)"
+  NTP_SYNC=$(sns_to 2 timedatectl show -p NTPSynchronized --value || true)
+  [ -n "$NTP_SYNC" ] && printf "NTP=%s\n" "$NTP_SYNC"
+`)
+	}
+	b.WriteString(`  [ -r /proc/uptime ] && awk '{printf "UPTIME_SEC=%s\n", $1}' /proc/uptime
   [ -r /proc/loadavg ] && awk '{printf "LOAD=%s %s %s %s\n", $1, $2, $3, $4}' /proc/loadavg
   printf "SERVER_TIME=%s\n" "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
-  printf "TIMEZONE=%s\n" "$(date '+%Z' 2>/dev/null)"
-  NTP_SYNC=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")
-  [ -n "$NTP_SYNC" ] && printf "NTP=%s\n" "$NTP_SYNC"
+  printf "SERVER_EPOCH=%s\n" "$(date +%s 2>/dev/null)"
   if ls /sys/class/thermal/thermal_zone*/temp >/dev/null 2>&1; then
     MAX_T=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk '$1+0 > m {m=$1+0} END {if(m>0) printf "%.1f", (m>1000 ? m/1000.0 : m)}')
     [ -n "$MAX_T" ] && printf "TEMP_C=%s\n" "$MAX_T"
@@ -130,7 +192,7 @@ else
 fi
 `)
 
-	// Memory, Swap, File Descriptors, OOM Kills
+	// 3. Memory, Swap, File Descriptors, OOM Kills
 	b.WriteString(`echo "===SNS_SEC:MEM==="
 if [ "$SNS_OS" = "Darwin" ]; then
   MEM_TOTAL_B=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
@@ -198,7 +260,13 @@ else
 fi
 `)
 
-	// Disk Mounts & Inodes
+	// 4. Local Disk Mounts, Inodes & Zero-Blocking /proc/mounts (Read-Only + Remote Mount Inventory)
+	dfFlags := "-PTkl"
+	dfInodeFlags := "-Pil"
+	if settings.IncludeRemoteMounts {
+		dfFlags = "-PTk"
+		dfInodeFlags = "-Pi"
+	}
 	b.WriteString(`echo "===SNS_SEC:DISK==="
 if [ "$SNS_OS" = "Darwin" ]; then
   (
@@ -247,11 +315,11 @@ if [ "$SNS_OS" = "Darwin" ]; then
       printf "FS=%s|%s|%.0f|%.0f|%.0f|%s|%s\n", dev, fst, tot, used, av, cap, mnt;
     }'
 else
-  df -PTk 2>/dev/null | awk 'NR>1 {
+  sns_to 3 df ` + dfFlags + ` | awk 'NR>1 {
     if (NF==6) { dev="none"; fst=$1; tot=$2; used=$3; av=$4; cap=$5; mnt=$6 }
     else if (NF>=7) { dev=$1; fst=$2; tot=$3; used=$4; av=$5; cap=$6; mnt=$7 }
     else next;
-    if (fst !~ /^(tmpfs|devtmpfs|squashfs|overlay|proc|sysfs|cgroup|cgroup2|nsfs|tracefs|efivarfs|autofs|mqueue|hugetlbfs|debugfs|pstore|securityfs|configfs|fusectl|fuse\.portal|ramfs)$/)
+    if (fst !~ /^(tmpfs|devtmpfs|squashfs|overlay|proc|sysfs|cgroup|cgroup2|nsfs|tracefs|efivarfs|autofs|mqueue|hugetlbfs|debugfs|pstore|securityfs|configfs|fusectl|fuse\.portal|ramfs|iso9660|udf)$/)
       printf "FS=%s|%s|%s|%s|%s|%s|%s\n", dev, fst, tot, used, av, cap, mnt
   }'
 fi
@@ -275,17 +343,33 @@ if [ "$SNS_OS" = "Darwin" ]; then
     }
   }'
 else
-  df -Pi 2>/dev/null | awk 'NR>1 {
+  sns_to 3 df ` + dfInodeFlags + ` | awk 'NR>1 {
     if (NF==5) printf "INODE=%s|%s\n", $5, $4;
     else if (NF>=6) printf "INODE=%s|%s\n", $6, $5;
   }'
 fi
+echo "===SNS_SEC:MOUNTS==="
+if [ "$SNS_OS" != "Darwin" ] && [ -r /proc/mounts ]; then
+  awk '{
+    mnt=$2; fst=$3; opts=$4;
+    if (fst ~ /^(nfs|nfs4|cifs|smb3|fuse\.sshfs|fuse\.s3fs|glusterfs|ceph)$/) {
+      printf "REMOTE_MNT=%s|%s\n", mnt, fst;
+    }
+    if (fst ~ /^(ext2|ext3|ext4|xfs|btrfs|zfs|jfs|reiserfs|f2fs)$/ && mnt !~ /^(\/boot\/efi|\/snap\/|\/etc\/|\/proc|\/sys|\/run\/)/) {
+      n = split(opts, o, ",");
+      for (i=1; i<=n; i++) {
+        if (o[i] == "ro") { printf "RO_MNT=%s|%s\n", mnt, fst; break }
+      }
+    }
+  }' /proc/mounts 2>/dev/null | head -n 40
+fi
 `)
 
-	// Interface IPv4 & Link States + Kernel TCP/UDP Socket State Matrix
-	b.WriteString(`echo "===SNS_SEC:IFACE==="
-if [ "$SNS_OS" = "Darwin" ]; then
-  ifconfig 2>/dev/null | awk '
+	// 5. Interface States & Zero-Lock Socket Matrix
+	b.WriteString("echo \"===SNS_SEC:IFACE===\"\n")
+	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
+	if isFull {
+		b.WriteString(`  ifconfig 2>/dev/null | awk '
     /^[a-zA-Z0-9._-]+:/ {
       if (dev != "") {
         printf "OPER=%s|%s\n", dev, (st != "" ? st : (up ? "up" : "down"));
@@ -307,9 +391,14 @@ if [ "$SNS_OS" = "Darwin" ]; then
         printf "OPER=%s|%s\n", dev, (st != "" ? st : (up ? "up" : "down"));
       }
     }'
-else
-  ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); printf "IP4=%s|%s\n", $2, a[1]}'
-  for devp in /sys/class/net/*; do
+`)
+	}
+	b.WriteString("else\n")
+	if isFull {
+		b.WriteString(`  sns_to 2 ip -4 -o addr show | awk '{split($4,a,"/"); printf "IP4=%s|%s\n", $2, a[1]}'
+`)
+	}
+	b.WriteString(`  for devp in /sys/class/net/*; do
     [ -e "$devp/operstate" ] || continue
     dn=$(basename "$devp")
     st=$(cat "$devp/operstate" 2>/dev/null)
@@ -329,13 +418,30 @@ if [ "$SNS_OS" = "Darwin" ]; then
   UDP_CNT=$(netstat -an -p udp 2>/dev/null | awk '$1 ~ /^udp/ {c++} END {print c+0}')
   printf "UDP_ALL=%s\n" "${UDP_CNT:-0}"
 else
-  awk 'FNR>1 {st[$4]++} END {for (k in st) printf "TCP_%s=%d\n", k, st[k]}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-  UDP_CNT=$(awk 'FNR>1 {c++} END {print c+0}' /proc/net/udp /proc/net/udp6 2>/dev/null)
-  printf "UDP_ALL=%s\n" "${UDP_CNT:-0}"
+  if command -v ss >/dev/null 2>&1; then
+    sns_to 2 ss -s | awk '
+      /^TCP:/ {
+        if (match($0, /estab [0-9]+/)) { s=substr($0,RSTART+6,RLENGTH-6); printf "TCP_01=%s\n", s }
+        if (match($0, /timewait [0-9]+/)) { s=substr($0,RSTART+9,RLENGTH-9); printf "TCP_06=%s\n", s }
+      }
+      /^UDP[ \t]/ { printf "UDP_ALL=%s\n", $2+0 }
+    '
+    CW=$(sns_to 2 ss -Htan state close-wait | awk 'END{print NR+0}')
+    SR=$(sns_to 2 ss -Htan state syn-recv | awk 'END{print NR+0}')
+    LS=$(sns_to 2 ss -Htan state listening | awk 'END{print NR+0}')
+    printf "TCP_08=%s\nTCP_03=%s\nTCP_0A=%s\n" "${CW:-0}" "${SR:-0}" "${LS:-0}"
+  elif [ -r /proc/net/sockstat ]; then
+    awk '
+      /^TCP:/ { for(i=1;i<=NF;i++) { if($i=="inuse") printf "TCP_01=%s\n", $(i+1); if($i=="tw") printf "TCP_06=%s\n", $(i+1) } }
+      /^UDP:/ { for(i=1;i<=NF;i++) { if($i=="inuse") u+=$(i+1) } }
+      /^UDP6:/ { for(i=1;i<=NF;i++) { if($i=="inuse") u+=$(i+1) } }
+      END { printf "UDP_ALL=%d\n", u+0 }
+    ' /proc/net/sockstat /proc/net/sockstat6 2>/dev/null
+  fi
 fi
 `)
 
-	// Process States & Top CPU / Memory Processes
+	// 6. Process States & Top CPU / Memory Processes
 	if settings.CollectProcesses {
 		b.WriteString(`echo "===SNS_SEC:PROC==="
 if [ "$SNS_OS" = "Darwin" ]; then
@@ -358,7 +464,7 @@ if [ "$SNS_OS" = "Darwin" ]; then
     printf "TOP_MEM=%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7, cmd
   }'
 else
-  ps -eo stat= 2>/dev/null | awk '{
+  sns_to 3 ps -eo stat= | awk '{
     tot++;
     c=substr($1,1,1);
     if (c=="R") run++;
@@ -366,13 +472,13 @@ else
     else if (c=="D") blk++;
     else slp++;
   } END {printf "PSTAT=%d %d %d %d %d\n", tot+0, run+0, slp+0, zom+0, blk+0}'
-  (ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= --sort=-pcpu 2>/dev/null || ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= 2>/dev/null) | head -n 8 | awk '{printf "TOP_CPU=%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7, $8}'
-  (ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= --sort=-rss 2>/dev/null || ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= 2>/dev/null) | head -n 8 | awk '{printf "TOP_MEM=%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7, $8}'
+  (sns_to 3 ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= --sort=-pcpu || sns_to 3 ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm=) | head -n 8 | awk '{printf "TOP_CPU=%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7, $8}'
+  (sns_to 3 ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm= --sort=-rss || sns_to 3 ps -eo pid=,user=,pcpu=,pmem=,rss=,stat=,etime=,comm=) | head -n 8 | awk '{printf "TOP_MEM=%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7, $8}'
 fi
 `)
 	}
 
-	// Listening Ports, Systemd/Launchd Services, and Docker Containers
+	// 7. Listening Ports (up to 500 + truncation sentinel), Merged Systemd/Launchd Services, and Docker (up to 200 + DaemonDown)
 	if settings.CollectPortsAndServices {
 		b.WriteString(`echo "===SNS_SEC:PORTS==="
 if [ "$SNS_OS" = "Darwin" ]; then
@@ -471,12 +577,12 @@ if [ "$SNS_OS" = "Darwin" ]; then
       else printf "%s UNCONN 0 0 %s 0.0.0.0:*\n", proto, ep;
       next;
     }
-  ' | head -n 80
+  ' | awk 'NR<=500 {print} NR==501 {print "PORTS_TRUNC=1"; exit}'
 else
   if command -v ss >/dev/null 2>&1; then
-    ss -tulnpH 2>/dev/null | head -n 80
+    sns_to 3 ss -tulnpH | awk 'NR<=500 {print} NR==501 {print "PORTS_TRUNC=1"; exit}'
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -tulnp 2>/dev/null | awk 'NR>2' | head -n 80
+    sns_to 3 netstat -tulnp | awk 'NR>2 {c++; if(c<=500) print; else if(c==501){print "PORTS_TRUNC=1"; exit}}'
   fi
 fi
 `)
@@ -501,7 +607,7 @@ fi
 		b.WriteString("echo \"===SNS_SEC:SYSTEMD===\"\n")
 		b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
 		b.WriteString("  LC_LIST=$(launchctl list 2>/dev/null || true)\n")
-		b.WriteString("  printf \"%s\\n\" \"$LC_LIST\" | awk '$1 == \"-\" && $2 ~ /^[1-9][0-9]*$/ && $3 ~ /^homebrew\\.mxcl\\./ { n=$3; sub(/^homebrew\\.mxcl\\./, \"\", n); printf \"FAILED_UNIT=%s\\n\", n }' | head -n 15\n")
+		b.WriteString("  printf \"%s\\n\" \"$LC_LIST\" | awk '$1 == \"-\" && $2 ~ /^[1-9][0-9]*$/ && $3 ~ /^homebrew\\.mxcl\\./ { n=$3; sub(/^homebrew\\.mxcl\\./, \"\", n); printf \"FAILED_UNIT=%s\\n\", n }' | head -n 20\n")
 		b.WriteString("  SEEN_SVCS=\" \"\n")
 		if len(watchedClean) > 0 {
 			b.WriteString("  for u in " + strings.Join(watchedClean, " ") + "; do\n")
@@ -536,39 +642,91 @@ fi
   ;; esac
 else
 `)
+		// Single batched systemctl show call instead of 30 sequential D-Bus round-trips!
+		allUnits := make([]string, 0, len(watchedClean)+len(autoClean))
+		allUnits = append(allUnits, watchedClean...)
+		allUnits = append(allUnits, autoClean...)
 		b.WriteString("  if command -v systemctl >/dev/null 2>&1; then\n")
-		b.WriteString("    systemctl --failed --no-legend --no-pager --plain 2>/dev/null | head -n 15 | awk '{printf \"FAILED_UNIT=%s\\n\", $1}'\n")
-		if len(watchedClean) > 0 {
-			b.WriteString("    for u in " + strings.Join(watchedClean, " ") + "; do\n")
-			b.WriteString("      st=$(systemctl is-active \"$u\" 2>/dev/null || true)\n")
-			b.WriteString("      [ -z \"$st\" ] && st=\"not-found\"\n")
-			b.WriteString("      printf \"SVC=%s|%s|watched\\n\" \"$u\" \"$st\"\n")
-			b.WriteString("    done\n")
-		}
-		if len(autoClean) > 0 {
-			b.WriteString("    for u in " + strings.Join(autoClean, " ") + "; do\n")
-			b.WriteString("      ld=$(systemctl show \"$u\" -p LoadState --value 2>/dev/null || true)\n")
-			b.WriteString("      if [ \"$ld\" = \"loaded\" ]; then\n")
-			b.WriteString("        st=$(systemctl is-active \"$u\" 2>/dev/null || echo inactive)\n")
-			b.WriteString("        printf \"SVC=%s|%s|auto\\n\" \"$u\" \"$st\"\n")
-			b.WriteString("      fi\n")
-			b.WriteString("    done\n")
+		b.WriteString("    sns_to 3 systemctl --failed --no-legend --no-pager --plain | head -n 25 | awk '{printf \"FAILED_UNIT=%s\\n\", $1}'\n")
+		if len(allUnits) > 0 {
+			watchedCSV := strings.Join(watchedClean, ",")
+			b.WriteString("    sns_to 3 systemctl show --no-pager --property=Id,LoadState,ActiveState " + strings.Join(allUnits, " ") + " | awk -v wcsv=\"" + watchedCSV + "\" '\n")
+			b.WriteString(`      BEGIN {
+        n=split(wcsv, wa, ",");
+        for(i=1;i<=n;i++) if(wa[i]!="") watched[wa[i]]=1;
+      }
+      function flush_unit(   nm, isw) {
+        if (id == "") return;
+        nm = id; sub(/\.service$/, "", nm);
+        isw = (watched[id] || watched[nm]) ? 1 : 0;
+        if (isw) {
+          st = (load == "loaded" ? (act != "" ? act : "inactive") : "not-found");
+          printf "SVC=%s|%s|watched\n", nm, st;
+        } else if (load == "loaded") {
+          printf "SVC=%s|%s|auto\n", nm, (act != "" ? act : "inactive");
+        }
+        id=""; load=""; act="";
+      }
+      /^Id=/ { id=substr($0, 4); next }
+      /^LoadState=/ { load=substr($0, 11); next }
+      /^ActiveState=/ { act=substr($0, 13); next }
+      /^[ \t]*$/ { flush_unit(); next }
+      END { flush_unit() }
+    '
+`)
 		}
 		b.WriteString("  fi\n")
 		b.WriteString("fi\n")
 
+		// Docker: single timeout-guarded call, up to 200 containers, detects DaemonDown!
 		b.WriteString(`echo "===SNS_SEC:DOCKER==="
 if command -v docker >/dev/null 2>&1; then
-  if docker info >/dev/null 2>&1; then
+  echo "DOCKER_BIN=1"
+  if DK_OUT=$(sns_to 3 docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}'); then
     echo "DOCKER_OK=1"
-    docker ps -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}' 2>/dev/null | head -n 30 | awk '{printf "CTR=%s\n", $0}'
+    if [ -n "$DK_OUT" ]; then
+      printf "%s\n" "$DK_OUT" | awk 'NR<=200 {printf "CTR=%s\n", $0} NR==201 {print "DOCKER_TRUNC=1"; exit}'
+    fi
+  else
+    echo "DOCKER_DOWN=1"
   fi
 fi
 `)
 	}
 
-	// Security Posture: Logged-in Sessions, SSH Brute-Force Audit, Firewall, MAC, Reboot Flag
-	if settings.CollectSecurity {
+	// 8. Slow-Tier Hardware & Kernel Error Health (L2: RAID + dmesg/journalctl -k)
+	if isFull {
+		b.WriteString(`echo "===SNS_SEC:HW==="
+if [ "$SNS_OS" != "Darwin" ]; then
+  if [ -r /proc/mdstat ]; then
+    awk '
+      /^md[0-9]+/ { cur=$1; line=$0; if (line ~ /\(F\)/) printf "RAID_BAD=%s:failed_disk\n", cur; next }
+      cur != "" && /\[[0-9]+\/[0-9]+\] \[[U_]+\]/ {
+        if ($0 ~ /_/) printf "RAID_BAD=%s:%s\n", cur, $0;
+        cur="";
+      }
+    ' /proc/mdstat 2>/dev/null
+  fi
+  KLOG=""
+  if command -v journalctl >/dev/null 2>&1; then
+    KLOG=$(sns_to 2 journalctl -k --since "15 minutes ago" --no-pager -q -p err -n 200 || true)
+  elif command -v dmesg >/dev/null 2>&1; then
+    KLOG=$(sns_to 2 dmesg --level=err,crit,alert,emerg 2>/dev/null | tail -n 100 || true)
+  fi
+  if [ -n "$KLOG" ]; then
+    KERR_MATCH=$(printf "%s\n" "$KLOG" | grep -Ei "I/O error|EXT4-fs error|XFS .*corruption|BTRFS error|Out of memory: Killed process|nfs: server .* not responding|Hardware Error|Machine Check|Call Trace|remounting filesystem read-only" || true)
+    if [ -n "$KERR_MATCH" ]; then
+      KCNT=$(printf "%s\n" "$KERR_MATCH" | grep -c . || echo 0)
+      printf "KERR_CNT=%s\n" "$KCNT"
+      printf "%s\n" "$KERR_MATCH" | tail -n 5 | awk '{s=$0; if(length(s)>180) s=substr(s,1,180); printf "KERR=%s\n", s}'
+    fi
+  fi
+fi
+`)
+	}
+
+	// 9. Slow-Tier Security Posture, 15m-Window SSH Audit, FIM, Persistence, Suspicious Procs & High-Risk Outbound (L1 + L3)
+	if settings.CollectSecurity && isFull {
 		b.WriteString(`echo "===SNS_SEC:SEC==="
 if [ "$SNS_OS" = "Darwin" ]; then
   who 2>/dev/null | head -n 12 | awk '{
@@ -602,12 +760,53 @@ if [ "$SNS_OS" = "Darwin" ]; then
   fi
   SSH_LOG=""
   if command -v log >/dev/null 2>&1; then
-    SSH_LOG=$(log show --style syslog --last 1h --predicate '(processImagePath ENDSWITH "/sshd" OR processImagePath ENDSWITH "/sshd-session") AND (eventMessage CONTAINS "Failed password" OR eventMessage CONTAINS "Invalid user")' 2>/dev/null | tail -n 600 || true)
+    SSH_LOG=$(log show --style syslog --last 15m --predicate '(processImagePath ENDSWITH "/sshd" OR processImagePath ENDSWITH "/sshd-session") AND (eventMessage CONTAINS "Failed password" OR eventMessage CONTAINS "Invalid user" OR eventMessage CONTAINS "Failed publickey" OR eventMessage CONTAINS "Accepted ")' 2>/dev/null | tail -n 600 || true)
   fi
   if [ -n "$SSH_LOG" ]; then
-    FAIL_CNT=$(printf "%s\n" "$SSH_LOG" | grep -c . || echo 0)
-    printf "SSH_FAIL_CNT=%s\n" "$FAIL_CNT"
-    printf "%s\n" "$SSH_LOG" | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{c[$2]++} END {for (ip in c) printf "%d %s\n", c[ip], ip}' | sort -rn | head -n 5 | awk '{printf "SSH_FAIL_IP=%s(%s)\n", $2, $1}'
+    printf "%s\n" "$SSH_LOG" | awk '
+      /Failed password|Invalid user|Failed publickey/ {
+        pid = "";
+        if (match($0, /sshd(-session)?\[[0-9]+\]/)) pid = substr($0, RSTART, RLENGTH);
+        ip = "";
+        if (match($0, /from [0-9a-fA-F:.]+/)) ip = substr($0, RSTART+5, RLENGTH-5);
+        key = (pid != "" ? pid "|" ip : NR);
+        if (!seen_fail[key]++) {
+          cnt++;
+          if (ip != "") ipcnt[ip]++;
+        }
+      }
+      /Accepted (publickey|password|keyboard-interactive)/ {
+        if (match($0, /Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+/)) {
+          s = substr($0, RSTART, RLENGTH);
+          split(s, f, " ");
+          k = f[4] "|" f[6] "|" f[2];
+          if (!seen_ok[k]++ && ok_n < 15) {
+            ok_n++;
+            printf "SSH_LOGIN=%s|%s|%s|%s %s\n", f[4], f[6], f[2], $1, $2;
+          }
+        }
+      }
+      END {
+        printf "SSH_FAIL_CNT=%d\n", cnt+0;
+        for (ip in ipcnt) printf "SSH_FAIL_IP_RAW=%d|%s\n", ipcnt[ip], ip;
+      }
+    ' | awk '
+      /^SSH_FAIL_IP_RAW=/ { sub(/^SSH_FAIL_IP_RAW=/, ""); raw[++n]=$0; next }
+      { print }
+      END {
+        for (i=1; i<=n; i++) {
+          for (j=i+1; j<=n; j++) {
+            split(raw[i], a, "|"); split(raw[j], b, "|");
+            if (b[1]+0 > a[1]+0) { t=raw[i]; raw[i]=raw[j]; raw[j]=t }
+          }
+        }
+        lim = (n < 5 ? n : 5);
+        for (i=1; i<=lim; i++) {
+          split(raw[i], a, "|");
+          printf "SSH_FAIL_IP=%s(%s)\n", a[2], a[1];
+        }
+      }
+    '
   else
     echo "SSH_FAIL_CNT=0"
   fi
@@ -615,21 +814,42 @@ else
   who 2>/dev/null | head -n 12 | awk '{printf "WHO=%s|%s|%s %s|%s\n", $1, $2, $3, $4, $5}'
   [ -r /etc/passwd ] && awk -F: '($3 == 0) {printf "UID0=%s\n", $1}' /etc/passwd 2>/dev/null
   if [ -f /var/run/reboot-required ]; then echo "REBOOT_REQ=1"; else echo "REBOOT_REQ=0"; fi
+  # Zero-Python firewall detection: check systemd units and /etc/ufw/ufw.conf first
   FW_ST="unknown"; FW_DET=""
-  if command -v ufw >/dev/null 2>&1; then
-    UFW_OUT=$(ufw status 2>/dev/null || true)
-    if echo "$UFW_OUT" | grep -qi "Status: active"; then FW_ST="active"; FW_DET="ufw";
-    elif echo "$UFW_OUT" | grep -qi "Status: inactive"; then FW_ST="inactive"; FW_DET="ufw"; fi
-  fi
-  if [ "$FW_ST" = "unknown" ] && command -v firewall-cmd >/dev/null 2>&1; then
-    if firewall-cmd --state 2>/dev/null | grep -qi "running"; then FW_ST="active"; FW_DET="firewalld"; fi
-  fi
-  if [ "$FW_ST" = "unknown" ] && command -v systemctl >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1; then
     for fwsvc in ufw firewalld nftables netfilter-persistent iptables; do
-      if [ "$(systemctl is-active "$fwsvc" 2>/dev/null || true)" = "active" ]; then
+      fwa=$(sns_to 2 systemctl is-active "$fwsvc" || true)
+      if [ "$fwa" = "active" ]; then
         FW_ST="active"; FW_DET="$fwsvc"; break
       fi
     done
+    if [ "$FW_ST" = "active" ] && [ "$FW_DET" = "ufw" ] && [ -r /etc/ufw/ufw.conf ]; then
+      if grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*no' /etc/ufw/ufw.conf 2>/dev/null; then
+        FW_ST="inactive"; FW_DET="ufw"
+      fi
+    fi
+    if [ "$FW_ST" = "unknown" ]; then
+      if [ -r /etc/ufw/ufw.conf ]; then
+        if grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' /etc/ufw/ufw.conf 2>/dev/null; then
+          FW_ST="active"; FW_DET="ufw"
+        elif grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*no' /etc/ufw/ufw.conf 2>/dev/null; then
+          FW_ST="inactive"; FW_DET="ufw"
+        fi
+      else
+        for fwsvc in firewalld ufw; do
+          fwl=$(sns_to 2 systemctl show "$fwsvc" -p LoadState --value || true)
+          if [ "$fwl" = "loaded" ]; then
+            FW_ST="inactive"; FW_DET="$fwsvc"; break
+          fi
+        done
+      fi
+    fi
+  elif [ -r /etc/ufw/ufw.conf ]; then
+    if grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' /etc/ufw/ufw.conf 2>/dev/null; then
+      FW_ST="active"; FW_DET="ufw"
+    elif grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*no' /etc/ufw/ufw.conf 2>/dev/null; then
+      FW_ST="inactive"; FW_DET="ufw"
+    fi
   fi
   printf "FW=%s|%s\n" "$FW_ST" "$FW_DET"
   if command -v getenforce >/dev/null 2>&1; then
@@ -637,26 +857,186 @@ else
   elif [ -r /sys/module/apparmor/parameters/enabled ]; then
     printf "MAC=AppArmor:%s\n" "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)"
   fi
+  # Strict 15-minute window SSH failure (deduplicated per sshd PID, IPv4+IPv6) & successful login audit
   SSH_LOG=""
-  if [ -r /var/log/auth.log ]; then
-    SSH_LOG=$(tail -n 600 /var/log/auth.log 2>/dev/null | grep -E "sshd.*(Failed password|Invalid user)" || true)
-  elif [ -r /var/log/secure ]; then
-    SSH_LOG=$(tail -n 600 /var/log/secure 2>/dev/null | grep -E "sshd.*(Failed password|Invalid user)" || true)
-  elif command -v journalctl >/dev/null 2>&1; then
-    SSH_LOG=$(journalctl -u ssh -u sshd --since "2 hours ago" --no-pager 2>/dev/null | grep -E "Failed password|Invalid user" || true)
+  if command -v journalctl >/dev/null 2>&1; then
+    SSH_LOG=$(sns_to 3 journalctl -u ssh -u sshd --since "15 minutes ago" --no-pager -q -n 2000 || true)
+  fi
+  if [ -z "$SSH_LOG" ]; then
+    AUTH_F=""
+    [ -r /var/log/auth.log ] && AUTH_F="/var/log/auth.log"
+    [ -z "$AUTH_F" ] && [ -r /var/log/secure ] && AUTH_F="/var/log/secure"
+    if [ -n "$AUTH_F" ]; then
+      CUTOFF_ISO=$(date -u -d "15 minutes ago" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null || true)
+      CUTOFF_EP=$(( $(date +%s 2>/dev/null || echo 0) - 900 ))
+      CUR_YR=$(date +%Y 2>/dev/null || echo 2026)
+      SSH_LOG=$(tail -n 2000 "$AUTH_F" 2>/dev/null | grep -E "sshd" | awk -v cut_iso="$CUTOFF_ISO" -v cut_ep="$CUTOFF_EP" -v yr="$CUR_YR" '
+        BEGIN {
+          m["Jan"]=1; m["Feb"]=2; m["Mar"]=3; m["Apr"]=4; m["May"]=5; m["Jun"]=6;
+          m["Jul"]=7; m["Aug"]=8; m["Sep"]=9; m["Oct"]=10; m["Nov"]=11; m["Dec"]=12;
+        }
+        # ISO-8601 prefix e.g. 2026-11-27T00:15:01+00:00
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}/ {
+          if (cut_iso == "" || substr($1, 1, 19) >= cut_iso) print;
+          next;
+        }
+        # Traditional syslog prefix e.g. Nov 27 00:15:01
+        /^[A-Z][a-z][a-z] +[0-9]+ [0-9]{2}:[0-9]{2}:[0-9]{2}/ {
+          mon = m[$1]; day = $2+0; split($3, t, ":");
+          if (mon > 0 && cut_ep > 0) {
+            # Approximate comparison using mktime when available (gawk), else print last 200 matching lines
+            if (PROCINFO["version"] != "") {
+              ep = mktime(sprintf("%04d %02d %02d %02d %02d %02d", yr, mon, day, t[1]+0, t[2]+0, t[3]+0));
+              if (ep >= cut_ep) print;
+              next;
+            }
+          }
+          print;
+        }
+      ' || true)
+    fi
   fi
   if [ -n "$SSH_LOG" ]; then
-    FAIL_CNT=$(printf "%s\n" "$SSH_LOG" | grep -c . || echo 0)
-    printf "SSH_FAIL_CNT=%s\n" "$FAIL_CNT"
-    printf "%s\n" "$SSH_LOG" | grep -oE 'from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{c[$2]++} END {for (ip in c) printf "%d %s\n", c[ip], ip}' | sort -rn | head -n 5 | awk '{printf "SSH_FAIL_IP=%s(%s)\n", $2, $1}'
+    printf "%s\n" "$SSH_LOG" | awk '
+      /Failed password|Failed publickey|Failed keyboard-interactive|Invalid user|maximum authentication attempts exceeded|Too many authentication failures/ {
+        pid = "";
+        if (match($0, /sshd(-session)?\[[0-9]+\]/)) pid = substr($0, RSTART, RLENGTH);
+        ip = "";
+        if (match($0, /from [0-9a-fA-F:.]+/)) ip = substr($0, RSTART+5, RLENGTH-5);
+        key = (pid != "" ? pid "|" ip : NR);
+        if (!seen_fail[key]++) {
+          cnt++;
+          if (ip != "") ipcnt[ip]++;
+        }
+      }
+      /Accepted (publickey|password|keyboard-interactive)/ {
+        if (match($0, /Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+/)) {
+          s = substr($0, RSTART, RLENGTH);
+          split(s, f, " ");
+          k = f[4] "|" f[6] "|" f[2];
+          if (!seen_ok[k]++ && ok_n < 15) {
+            ok_n++;
+            printf "SSH_LOGIN=%s|%s|%s|%s %s\n", f[4], f[6], f[2], $1, $2;
+          }
+        }
+      }
+      END {
+        printf "SSH_FAIL_CNT=%d\n", cnt+0;
+        for (ip in ipcnt) printf "SSH_FAIL_IP_RAW=%d|%s\n", ipcnt[ip], ip;
+      }
+    ' | awk '
+      /^SSH_FAIL_IP_RAW=/ { sub(/^SSH_FAIL_IP_RAW=/, ""); raw[++n]=$0; next }
+      { print }
+      END {
+        for (i=1; i<=n; i++) {
+          for (j=i+1; j<=n; j++) {
+            split(raw[i], a, "|"); split(raw[j], b, "|");
+            if (b[1]+0 > a[1]+0) { t=raw[i]; raw[i]=raw[j]; raw[j]=t }
+          }
+        }
+        lim = (n < 5 ? n : 5);
+        for (i=1; i<=lim; i++) {
+          split(raw[i], a, "|");
+          printf "SSH_FAIL_IP=%s(%s)\n", a[2], a[1];
+        }
+      }
+    '
   else
     echo "SSH_FAIL_CNT=0"
+  fi
+fi
+echo "===SNS_SEC:SEC_DEEP==="
+if [ "$SNS_OS" != "Darwin" ]; then
+  # L3.1 Critical security file hashes (FIM) — single lightweight sha256sum pass
+  if command -v sha256sum >/dev/null 2>&1; then
+    FIM_FILES=""
+    for f in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/ssh/sshd_config /etc/ld.so.preload /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys"; do
+      [ -r "$f" ] && [ -f "$f" ] && FIM_FILES="$FIM_FILES $f"
+    done
+    if [ -n "$FIM_FILES" ]; then
+      sns_to 2 sha256sum $FIM_FILES | awk '{printf "FIM=%s|%s\n", $2, substr($1, 1, 16)}'
+    fi
+    # L3.2 Persistence fingerprint (crontab + cron.d + spool + /etc/systemd/system units)
+    PH=$( (
+      [ -r /etc/crontab ] && cat /etc/crontab 2>/dev/null
+      ls -la /etc/cron.d /var/spool/cron /var/spool/cron/crontabs /etc/systemd/system 2>/dev/null
+      cat /etc/cron.d/* /var/spool/cron/* /var/spool/cron/crontabs/* 2>/dev/null
+    ) | sha256sum 2>/dev/null | awk '{print substr($1, 1, 24)}' )
+    [ -n "$PH" ] && printf "PERSIST_HASH=%s\n" "$PH"
+  fi
+  # L3.3 Deterministic suspicious process cues (miner / reverse shell / /tmp or /dev/shm exec)
+  sns_to 3 ps -eo pid=,user=,args= | awk '
+    $1 ~ /^[0-9]+$/ {
+      pid=$1; user=$2;
+      cmd=$3; for(i=4;i<=NF;i++) cmd=cmd " " $i;
+      low=tolower(cmd);
+      if (low ~ /(^|[\/ ])(xmrig|kdevtmpfsi|kinsing|cpuminer|minerd|nbminer|t-rex|lolminer)([ \/]|$)/ || low ~ /stratum\+(tcp|ssl):\/\//) {
+        if (length(cmd)>120) cmd=substr(cmd,1,120);
+        printf "SUSP_PROC=%s|%s|miner_signature|critical|%s|\n", pid, user, cmd;
+      } else if (low ~ /bash -i >& \/dev\/tcp\/|\/dev\/tcp\/[0-9]+\.[0-9]+|nc .* -e \/bin\/(ba)?sh|python[0-9.]* .*pty\.spawn.*socket/) {
+        if (length(cmd)>120) cmd=substr(cmd,1,120);
+        printf "SUSP_PROC=%s|%s|reverse_shell|critical|%s|\n", pid, user, cmd;
+      }
+    }
+  ' | head -n 10
+  for exep in /proc/[0-9]*/exe; do
+    [ -L "$exep" ] || continue
+    tgt=$(readlink "$exep" 2>/dev/null || true)
+    case "$tgt" in
+      /tmp/*|/dev/shm/*|/var/tmp/*)
+        case "$tgt" in *go-build*|*pytest*|*pip-*|*cc1*|*npm-*) continue ;; esac
+        p=${exep#/proc/}; p=${p%/exe}
+        u=$(stat -c '%U' "/proc/$p" 2>/dev/null || echo "?")
+        c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-100)
+        printf "SUSP_PROC=%s|%s|tmp_exec|warning|%s|%s\n" "$p" "$u" "${c:-$tgt}" "$tgt"
+        ;;
+    esac
+  done 2>/dev/null | head -n 10
+  # L3.4 High-risk outbound port scan (mining pools & reverse-shell common ports; kernel-filtered established TCP)
+  if command -v ss >/dev/null 2>&1; then
+    sns_to 2 ss -Htnp state established | awk '
+      {
+        peer = $4;
+        if (peer == "") next;
+        n = match(peer, /:[0-9]+$/);
+        if (n <= 1) next;
+        port = substr(peer, n+1)+0;
+        ip = substr(peer, 1, n-1);
+        gsub(/^\[|\]$/, "", ip);
+        if (ip ~ /^(127\.|::1$)/) next;
+        reason = "";
+        if (port == 3333 || port == 14444 || port == 14433 || port == 45700 || port == 5555) reason = "miner_pool_port";
+        else if (port == 4444 || port == 6666 || port == 7777 || port == 31337) reason = "reverse_shell_port";
+        if (reason != "") {
+          proc = ""; pid = 0;
+          if (match($0, /\(\("([^"]+)",pid=([0-9]+)/)) {
+            s = substr($0, RSTART, RLENGTH);
+            gsub(/^\(\("/, "", s);
+            split(s, pp, "\",pid=");
+            proc = pp[1]; pid = pp[2]+0;
+          }
+          printf "OUTB=%s|%d|%d|%s|%s\n", ip, port, pid, proc, reason;
+        }
+      }
+    ' | head -n 10
+  fi
+  # L3.5 SSH weak configuration posture (pure read-only)
+  if [ -r /etc/ssh/sshd_config ]; then
+    awk '
+      /^[ \t]*#/ || /^[ \t]*$/ { next }
+      tolower($1)=="permitemptypasswords" && tolower($2)=="yes" { print "SSH_WEAK=PermitEmptyPasswords yes" }
+      tolower($1)=="permitrootlogin" && tolower($2)=="yes" { root_yes=1 }
+      tolower($1)=="passwordauthentication" && tolower($2)=="yes" { pass_yes=1 }
+      END {
+        if (root_yes && pass_yes) print "SSH_WEAK=PermitRootLogin yes + PasswordAuthentication yes";
+      }
+    ' /etc/ssh/sshd_config 2>/dev/null
   fi
 fi
 `)
 	}
 
-	// Ensure >= 250ms delta (Linux) or 1s top sample window (Darwin) before T1 sample
+	// 10. macOS T1 + CPU sample (kept at end for Darwin parity; Linux already ran isolated T0/T1 at start!)
 	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
 	b.WriteString(`  CPU_PCT_VAL=$(top -F -R -l 2 -n 0 -s 1 2>/dev/null | awk '/^CPU usage:/ {
     u=0; s=0; id=0;
@@ -678,14 +1058,8 @@ fi
 `)
 	b.WriteString(darwinCounterSampleBlock)
 	b.WriteString(`  [ -n "$CPU_PCT_VAL" ] && printf "CPU_PCT=%s\n" "$CPU_PCT_VAL"
-else
-  sleep 0.25 2>/dev/null || sleep 1
-  echo "===SNS_SEC:SAMPLE_T1==="
-  [ -r /proc/uptime ] && awk '{printf "UP=%s\n", $1}' /proc/uptime
-  [ -r /proc/stat ] && awk '/^cpu / {print "CPU=" $0} /^ctxt / {print "CTXT=" $2}' /proc/stat
-  [ -r /proc/net/dev ] && awk 'NR>2 {gsub(/:/, " "); printf "NET=%s %s %s %s %s %s %s %s %s\n", $1, $2, $3, $4, $5, $10, $11, $12, $13}' /proc/net/dev
-  [ -r /proc/diskstats ] && awk '$3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+|dm-[0-9]+)$/ {printf "BIO=%s %s %s %s %s\n", $3, $4, $6, $8, $10}' /proc/diskstats
 fi
+echo "===SNS_END==="
 true
 `)
 	return b.String()

@@ -1088,6 +1088,13 @@ func ensureSecretsDefaults(sec *SecretsState) {
 	if sec.MonitorSettings.IntervalSec == 0 && sec.MonitorSettings.RetentionPoints == 0 {
 		sec.MonitorSettings = DefaultMonitorSettings()
 	} else {
+		if sec.MonitorSettings.PolicyVersion < CurrentMonitorPolicyVersion {
+			if sec.MonitorSettings.SlowIntervalSec <= 0 {
+				sec.MonitorSettings.SlowIntervalSec = 300
+			}
+			sec.MonitorSettings.UseSSHConnectionPool = true
+			sec.MonitorSettings.PolicyVersion = CurrentMonitorPolicyVersion
+		}
 		sec.MonitorSettings = sanitizeMonitorSettings(sec.MonitorSettings)
 	}
 	sec.MonitorRules = mergeMonitorAlertRules(sec.MonitorRules)
@@ -1155,6 +1162,9 @@ func ensureMonitorRuntimeDefaults(m *MonitorRuntimeState) {
 	}
 	if m.PortBaselines == nil {
 		m.PortBaselines = make(map[string][]string)
+	}
+	if m.SecurityBaselines == nil {
+		m.SecurityBaselines = make(map[string]ServerSecurityBaseline)
 	}
 	if m.ServerRuntime == nil {
 		m.ServerRuntime = make(map[string]ServerRuntimeMeta)
@@ -1807,6 +1817,10 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 	}
 	s.rtMu.RUnlock()
 
+	if !view.MonitorEnabled {
+		s.SilenceServerMonitorAlerts(id)
+	}
+
 	s.RecordAudit("server.update", fmt.Sprintf("%s (%s:%d)", view.Name, view.Host, view.Port), "更新服务器连接配置", clientIP, true)
 	return &view, nil
 }
@@ -1842,6 +1856,7 @@ func (s *Store) DeleteServer(id, clientIP string) error {
 		delete(s.monitorRT.LatestSnapshots, id)
 		delete(s.monitorRT.HistoryByServer, id)
 		delete(s.monitorRT.PortBaselines, id)
+		delete(s.monitorRT.SecurityBaselines, id)
 		delete(s.monitorRT.ServerRuntime, id)
 		prefix := id + "|"
 		for k := range s.monitorRT.BreachStreaks {

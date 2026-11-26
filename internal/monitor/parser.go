@@ -3,7 +3,9 @@ package monitor
 import (
 	"fmt"
 	"math"
+	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -165,7 +167,6 @@ func isCountedNIC(name string) bool {
 	if strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "virbr") {
 		return false
 	}
-	// Exclude macOS/BSD internal virtual/tunnel/bridge interfaces from aggregate uplink totals
 	if strings.HasPrefix(name, "gif") || strings.HasPrefix(name, "stf") || strings.HasPrefix(name, "awdl") ||
 		strings.HasPrefix(name, "llw") || strings.HasPrefix(name, "anpi") || strings.HasPrefix(name, "XHC") ||
 		strings.HasPrefix(name, "pktap") || strings.HasPrefix(name, "iptap") || strings.HasPrefix(name, "bridge") {
@@ -174,22 +175,51 @@ func isCountedNIC(name string) bool {
 	return true
 }
 
-func parseHostPortEndpoint(ep string) (bindAddr string, port int, publicExposed bool, ok bool) {
+func classifyBindExposure(cleanAddr string) (exposed bool, scope string) {
+	if cleanAddr == "" || cleanAddr == "0.0.0.0" || cleanAddr == "*" || cleanAddr == "::" {
+		return true, "wildcard"
+	}
+	ip, err := netip.ParseAddr(cleanAddr)
+	if err != nil {
+		// Fallback for unusual interface/hostname tokens
+		if strings.HasPrefix(cleanAddr, "127.") || cleanAddr == "::1" || strings.EqualFold(cleanAddr, "localhost") {
+			return false, "loopback"
+		}
+		return true, "public_ip"
+	}
+	ip = ip.Unmap()
+	if ip.IsLoopback() {
+		return false, "loopback"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+		return false, "link_local"
+	}
+	if ip.IsUnspecified() {
+		return true, "wildcard"
+	}
+	if ip.IsPrivate() {
+		// In VPC/cloud servers, NIC-bound private IPv4 (10.x/172.16.x/192.168.x) is network-reachable (and often EIP-mapped)
+		return true, "private_ip"
+	}
+	return true, "public_ip"
+}
+
+func parseHostPortEndpoint(ep string) (bindAddr string, port int, publicExposed bool, exposureScope string, ok bool) {
 	ep = strings.TrimSpace(ep)
 	if ep == "" {
-		return "", 0, false, false
+		return "", 0, false, "", false
 	}
 	lastColon := strings.LastIndexByte(ep, ':')
 	if lastColon <= 0 || lastColon == len(ep)-1 {
-		return "", 0, false, false
+		return "", 0, false, "", false
 	}
 	portStr := ep[lastColon+1:]
 	if portStr == "*" {
-		return "", 0, false, false
+		return "", 0, false, "", false
 	}
 	p, err := strconv.Atoi(portStr)
 	if err != nil || p <= 0 || p > 65535 {
-		return "", 0, false, false
+		return "", 0, false, "", false
 	}
 	addr := ep[:lastColon]
 	// Strip interface scope suffix like 127.0.0.53%lo, [::]%eth0, or [fe80::1%lo0]
@@ -201,11 +231,11 @@ func parseHostPortEndpoint(ep string) (bindAddr string, port int, publicExposed 
 		}
 	}
 	cleanAddr := strings.Trim(addr, "[]")
-	isPublic := cleanAddr == "0.0.0.0" || cleanAddr == "*" || cleanAddr == "::" || cleanAddr == ""
+	isExposed, scope := classifyBindExposure(cleanAddr)
 	if addr == "" {
 		addr = "*"
 	}
-	return addr, p, isPublic, true
+	return addr, p, isExposed, scope, true
 }
 
 func parseListeningPortLine(line string) (vault.ListeningPortStat, bool) {
@@ -218,9 +248,6 @@ func parseListeningPortLine(line string) (vault.ListeningPortStat, bool) {
 		return vault.ListeningPortStat{}, false
 	}
 
-	// Detect ss format vs netstat format:
-	// ss -tulnpH: <Netid> <State> <Recv-Q> <Send-Q> <LocalAddr:Port> <PeerAddr:Port> [Process]
-	// netstat -tulnp: <Proto> <Recv-Q> <Send-Q> <LocalAddr:Port> <ForeignAddr:Port> [State] [PID/Program]
 	localField := ""
 	if len(fields) >= 5 && (fields[1] == "LISTEN" || fields[1] == "UNCONN" || fields[1] == "ESTAB") {
 		if strings.HasPrefix(proto, "tcp") && fields[1] != "LISTEN" {
@@ -228,14 +255,13 @@ func parseListeningPortLine(line string) (vault.ListeningPortStat, bool) {
 		}
 		localField = fields[4]
 	} else {
-		// netstat style
 		if strings.HasPrefix(proto, "tcp") && !strings.Contains(line, "LISTEN") {
 			return vault.ListeningPortStat{}, false
 		}
 		localField = fields[3]
 	}
 
-	bindAddr, port, isPublic, ok := parseHostPortEndpoint(localField)
+	bindAddr, port, isExposed, scope, ok := parseHostPortEndpoint(localField)
 	if !ok {
 		return vault.ListeningPortStat{}, false
 	}
@@ -244,14 +270,14 @@ func parseListeningPortLine(line string) (vault.ListeningPortStat, bool) {
 		Proto:         proto,
 		BindAddr:      bindAddr,
 		Port:          port,
-		PublicExposed: isPublic,
+		PublicExposed: isExposed,
+		ExposureScope: scope,
 	}
 
 	if m := ssUsersRegex.FindStringSubmatch(line); len(m) == 3 {
 		stat.Process = m[1]
 		stat.PID, _ = strconv.Atoi(m[2])
 	} else {
-		// Check netstat trailing PID/Program token (e.g. "812/sshd" or "1024/nginx:")
 		last := fields[len(fields)-1]
 		if slash := strings.IndexByte(last, '/'); slash > 0 {
 			if pid, err := strconv.Atoi(last[:slash]); err == nil {
@@ -263,6 +289,39 @@ func parseListeningPortLine(line string) (vault.ListeningPortStat, bool) {
 	return stat, true
 }
 
+func applyCPUDelta(snap *vault.ServerMonitorSnapshot, fromTicks, toTicks []uint64) bool {
+	if len(fromTicks) < 4 || len(toTicks) < len(fromTicks) {
+		return false
+	}
+	var sum0, sum1 uint64
+	for i := range fromTicks {
+		sum0 += fromTicks[i]
+		sum1 += toTicks[i]
+	}
+	if sum1 <= sum0 {
+		return false
+	}
+	totD := float64(sum1 - sum0)
+	getD := func(idx int) float64 {
+		if idx < len(fromTicks) && toTicks[idx] >= fromTicks[idx] {
+			return float64(toTicks[idx] - fromTicks[idx])
+		}
+		return 0
+	}
+	userD := getD(0) + getD(1)          // user + nice
+	sysD := getD(2) + getD(5) + getD(6) // system + irq + softirq
+	idleD := getD(3)                    // idle
+	iowaitD := getD(4)                  // iowait
+	stealD := getD(7)                   // steal
+
+	snap.CPUPercent = roundOne(math.Max(0, math.Min(100, (totD-idleD)*100.0/totD)))
+	snap.CPUUserPct = roundOne(userD * 100.0 / totD)
+	snap.CPUSystemPct = roundOne(sysD * 100.0 / totD)
+	snap.CPUIowaitPct = roundOne(iowaitD * 100.0 / totD)
+	snap.CPUStealPct = roundOne(stealD * 100.0 / totD)
+	return true
+}
+
 // ParseDeepTelemetry parses multi-section agentless SSH output into a structured ServerMonitorSnapshot.
 func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vault.ServerMonitorSnapshot) {
 	if snap == nil {
@@ -272,7 +331,7 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 	curSec := ""
 	for _, rawLine := range strings.Split(raw, "\n") {
 		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
-		if line == "" {
+		if line == "" || line == "===SNS_END===" {
 			continue
 		}
 		if strings.HasPrefix(line, "===SNS_SEC:") && strings.HasSuffix(line, "===") {
@@ -289,11 +348,16 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		parseSampleLine(l, t0)
 	}
 	t1 := newRawCounterSample()
+	hasT1 := len(sections["SAMPLE_T1"]) > 0
 	for _, l := range sections["SAMPLE_T1"] {
 		parseSampleLine(l, t1)
 	}
+	latest := t0
+	if hasT1 {
+		latest = t1
+	}
 
-	// 1. System Identity & Load
+	// 1. System Identity, Load & Clock Offset
 	for _, l := range sections["SYS"] {
 		idx := strings.IndexByte(l, '=')
 		if idx <= 0 {
@@ -336,6 +400,13 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 			}
 		case "SERVER_TIME":
 			snap.ServerTime = v
+		case "SERVER_EPOCH":
+			if ep, err := strconv.ParseInt(v, 10, 64); err == nil && ep > 1577836800 {
+				snap.RawServerEpoch = ep
+				if !snap.CollectedAt.IsZero() {
+					snap.ClockOffsetSec = ep - snap.CollectedAt.Unix()
+				}
+			}
 		case "TIMEZONE":
 			snap.Timezone = v
 		case "NTP":
@@ -347,42 +418,57 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		}
 	}
 	if snap.CPUCores <= 0 {
-		snap.CPUCores = 1
+		if prev != nil && prev.CPUCores > 0 {
+			snap.CPUCores = prev.CPUCores
+		} else {
+			snap.CPUCores = 1
+		}
 	}
 	snap.LoadPerCore = roundOne(snap.Load1 / float64(snap.CPUCores))
 
-	// 2. Real-time CPU Breakdown & Context Switch Rate from [T0, T1]
-	dt := t1.uptimeSec - t0.uptimeSec
-	if dt <= 0.02 {
-		dt = 0.25
+	// 2. CPU Breakdown & Context Switch Rate
+	// Prefer sustained cross-interval delta (prev.RawCPUTicks -> latest.cpuFields) to avoid 250ms spike noise & self-observation bias;
+	// fallback cleanly to same-script T0 -> T1 delta or macOS CPU_PCT.
+	if len(latest.cpuFields) >= 4 {
+		snap.RawCPUTicks = slices.Clone(latest.cpuFields)
 	}
-	if len(t0.cpuFields) >= 4 && len(t1.cpuFields) >= len(t0.cpuFields) {
-		var sum0, sum1 uint64
-		for i := range t0.cpuFields {
-			sum0 += t0.cpuFields[i]
-			sum1 += t1.cpuFields[i]
-		}
-		if sum1 > sum0 {
-			totD := float64(sum1 - sum0)
-			getD := func(idx int) float64 {
-				if idx < len(t0.cpuFields) && t1.cpuFields[idx] >= t0.cpuFields[idx] {
-					return float64(t1.cpuFields[idx] - t0.cpuFields[idx])
-				}
-				return 0
-			}
-			userD := getD(0) + getD(1)            // user + nice
-			sysD := getD(2) + getD(5) + getD(6)   // system + irq + softirq
-			idleD := getD(3)                      // idle
-			iowaitD := getD(4)                    // iowait
-			stealD := getD(7)                     // steal
+	snap.RawContextSwitches = latest.ctxt
+	snap.RawSampleUptime = latest.uptimeSec
 
-			snap.CPUPercent = roundOne(math.Max(0, math.Min(100, (totD-idleD)*100.0/totD)))
-			snap.CPUUserPct = roundOne(userD * 100.0 / totD)
-			snap.CPUSystemPct = roundOne(sysD * 100.0 / totD)
-			snap.CPUIowaitPct = roundOne(iowaitD * 100.0 / totD)
-			snap.CPUStealPct = roundOne(stealD * 100.0 / totD)
+	prevElapsed := 0.0
+	if prev != nil && prev.Reachable && !prev.CollectedAt.IsZero() && !snap.CollectedAt.IsZero() {
+		el := snap.CollectedAt.Sub(prev.CollectedAt).Seconds()
+		if el >= 3.0 && el <= 3600.0 {
+			prevElapsed = el
 		}
-	} else {
+	}
+
+	dt := 0.0
+	if hasT1 {
+		dt = t1.uptimeSec - t0.uptimeSec
+		if dt <= 0.02 {
+			dt = 0.25
+		}
+	}
+
+	cpuComputed := false
+	if prevElapsed > 0 && prev != nil && len(prev.RawCPUTicks) >= 4 && len(latest.cpuFields) >= len(prev.RawCPUTicks) {
+		if applyCPUDelta(snap, prev.RawCPUTicks, latest.cpuFields) {
+			cpuComputed = true
+			if latest.ctxt > prev.RawContextSwitches {
+				snap.ContextSwSec = int64(float64(latest.ctxt-prev.RawContextSwitches) / prevElapsed)
+			}
+		}
+	}
+	if !cpuComputed && hasT1 && len(t0.cpuFields) >= 4 && len(t1.cpuFields) >= len(t0.cpuFields) {
+		if applyCPUDelta(snap, t0.cpuFields, t1.cpuFields) {
+			cpuComputed = true
+		}
+		if t1.ctxt > t0.ctxt && dt > 0 {
+			snap.ContextSwSec = int64(float64(t1.ctxt-t0.ctxt) / dt)
+		}
+	}
+	if !cpuComputed {
 		pctSrc := t1.cpuPct
 		if len(pctSrc) < 3 {
 			pctSrc = t0.cpuPct
@@ -401,9 +487,6 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 				snap.CPUStealPct = clampPct(pctSrc[4])
 			}
 		}
-	}
-	if t1.ctxt > t0.ctxt && dt > 0 {
-		snap.ContextSwSec = int64(float64(t1.ctxt-t0.ctxt) / dt)
 	}
 
 	// 3. Memory, Swap, File Descriptors, OOM
@@ -454,7 +537,7 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		snap.SwapPercent = roundOne(float64(swapUsedKB) * 100.0 / float64(swapTotalKB))
 	}
 
-	// 4. Multi-Partition Disk Capacity & Inodes
+	// 4. Multi-Partition Disk Capacity, Inodes & Mount Health (RO / Remote)
 	inodeByMount := make(map[string]float64)
 	for _, l := range sections["INODE"] {
 		if !strings.HasPrefix(l, "INODE=") {
@@ -482,18 +565,28 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		totalKB, e1 := strconv.ParseFloat(parts[2], 64)
 		usedKB, e2 := strconv.ParseFloat(parts[3], 64)
 		availKB, _ := strconv.ParseFloat(parts[4], 64)
+		capStr := strings.TrimSpace(parts[5])
 		mount := parts[6]
-		if e1 != nil || e2 != nil || totalKB <= 0 || !strings.HasSuffix(strings.TrimSpace(parts[5]), "%") || seenMounts[mount] {
+		if e1 != nil || e2 != nil || totalKB <= 0 || !strings.HasSuffix(capStr, "%") || seenMounts[mount] {
 			continue
 		}
-		// Skip container bind-mount system files (/etc/hosts, /etc/resolv.conf, /etc/hostname)
 		if strings.HasPrefix(mount, "/etc/") || strings.HasPrefix(mount, "/proc") || strings.HasPrefix(mount, "/sys") {
 			continue
 		}
 		seenMounts[mount] = true
 
-		usedPct := math.Min(100, math.Max(0, roundOne(usedKB*100.0/totalKB)))
+		// Use real non-root effective capacity ratio used/(used+avail) matching df Capacity%
+		// so ext4 5% root-reserved blocks never mask a 100%-full partition!
+		effectiveCapKB := usedKB + availKB
+		var usedPct float64
+		if effectiveCapKB > 0 && availKB >= 0 {
+			usedPct = roundOne(usedKB * 100.0 / effectiveCapKB)
+		} else {
+			usedPct = roundOne(usedKB * 100.0 / totalKB)
+		}
+		usedPct = math.Min(100, math.Max(0, usedPct))
 		inodePct := math.Min(100, math.Max(0, inodeByMount[mount]))
+
 		part := vault.DiskPartitionStat{
 			MountPoint:   mount,
 			Device:       dev,
@@ -521,27 +614,46 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		}
 	}
 
-	// Disk Block I/O Rates (use sustained interval delta if prev exists, else T0->T1 live sample)
+	for _, l := range sections["MOUNTS"] {
+		if strings.HasPrefix(l, "RO_MNT=") {
+			p := strings.SplitN(strings.TrimPrefix(l, "RO_MNT="), "|", 2)
+			if len(p) >= 1 && p[0] != "" {
+				desc := p[0]
+				if len(p) == 2 && p[1] != "" {
+					desc = fmt.Sprintf("%s (%s)", p[0], p[1])
+				}
+				if !slices.Contains(snap.ReadOnlyMounts, desc) {
+					snap.ReadOnlyMounts = append(snap.ReadOnlyMounts, desc)
+				}
+			}
+		} else if strings.HasPrefix(l, "REMOTE_MNT=") {
+			p := strings.SplitN(strings.TrimPrefix(l, "REMOTE_MNT="), "|", 2)
+			if len(p) >= 1 && p[0] != "" {
+				desc := p[0]
+				if len(p) == 2 && p[1] != "" {
+					desc = fmt.Sprintf("%s (%s)", p[0], p[1])
+				}
+				if !slices.Contains(snap.RemoteMounts, desc) {
+					snap.RemoteMounts = append(snap.RemoteMounts, desc)
+				}
+			}
+		}
+	}
+
+	// Disk Block I/O Rates (prefer sustained cross-interval delta, else T0->T1)
 	rd0, wr0, io0 := sumBlockDevices(t0.bioByDev)
-	rd1, wr1, io1 := sumBlockDevices(t1.bioByDev)
+	rd1, wr1, io1 := sumBlockDevices(latest.bioByDev)
 	snap.DiskTotalReadB = rd1
 	snap.DiskTotalWriteB = wr1
 	snap.DiskTotalIOOps = io1
 
-	prevElapsed := 0.0
-	if prev != nil && prev.Reachable && !prev.CollectedAt.IsZero() && !snap.CollectedAt.IsZero() {
-		el := snap.CollectedAt.Sub(prev.CollectedAt).Seconds()
-		if el >= 3.0 && el <= 3600.0 {
-			prevElapsed = el
-		}
-	}
-	if prevElapsed > 0 && rd1 >= prev.DiskTotalReadB && wr1 >= prev.DiskTotalWriteB && prev.DiskTotalReadB+prev.DiskTotalWriteB > 0 {
+	if prevElapsed > 0 && prev != nil && rd1 >= prev.DiskTotalReadB && wr1 >= prev.DiskTotalWriteB && prev.DiskTotalReadB+prev.DiskTotalWriteB > 0 {
 		snap.DiskReadBps = int64(float64(rd1-prev.DiskTotalReadB) / prevElapsed)
 		snap.DiskWriteBps = int64(float64(wr1-prev.DiskTotalWriteB) / prevElapsed)
 		if io1 >= prev.DiskTotalIOOps {
 			snap.DiskIOPS = int64(float64(io1-prev.DiskTotalIOOps) / prevElapsed)
 		}
-	} else if dt > 0 {
+	} else if hasT1 && dt > 0 {
 		if rd1 >= rd0 {
 			snap.DiskReadBps = int64(float64(rd1-rd0) / dt)
 		}
@@ -577,8 +689,8 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		}
 	}
 
-	devNames := make([]string, 0, len(t1.netByDev))
-	for name := range t1.netByDev {
+	devNames := make([]string, 0, len(latest.netByDev))
+	for name := range latest.netByDev {
 		if name == "lo" || name == "lo0" || strings.HasPrefix(name, "veth") {
 			continue
 		}
@@ -587,15 +699,17 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 	sort.Strings(devNames)
 
 	for _, name := range devNames {
-		cur := t1.netByDev[name]
+		cur := latest.netByDev[name]
 		var rxBps, txBps int64
+		computedFromPrev := false
 		if prevElapsed > 0 {
 			if pNic, ok := prevNICMap[name]; ok && cur.rxBytes >= pNic.RxBytes && cur.txBytes >= pNic.TxBytes {
 				rxBps = int64(float64(cur.rxBytes-pNic.RxBytes) / prevElapsed)
 				txBps = int64(float64(cur.txBytes-pNic.TxBytes) / prevElapsed)
+				computedFromPrev = true
 			}
 		}
-		if rxBps == 0 && txBps == 0 && dt > 0 {
+		if !computedFromPrev && hasT1 && dt > 0 {
 			if n0, ok := t0.netByDev[name]; ok {
 				if cur.rxBytes >= n0.rxBytes {
 					rxBps = int64(float64(cur.rxBytes-n0.rxBytes) / dt)
@@ -704,9 +818,13 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		}
 	}
 
-	// 7. Listening Ports
+	// 7. Listening Ports (with truncation flag)
 	seenPorts := make(map[string]bool)
 	for _, l := range sections["PORTS"] {
+		if l == "PORTS_TRUNC=1" {
+			snap.PortsTruncated = true
+			continue
+		}
 		if ps, ok := parseListeningPortLine(l); ok {
 			dedup := fmt.Sprintf("%s|%s|%d", ps.Proto, ps.BindAddr, ps.Port)
 			if !seenPorts[dedup] {
@@ -744,11 +862,20 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 	}
 	snap.SystemdFailedCount = len(snap.SystemdFailedUnits)
 
-	// 9. Docker Containers
+	// 9. Docker Containers (including DaemonDown & Exited non-zero)
 	for _, l := range sections["DOCKER"] {
-		if l == "DOCKER_OK=1" {
+		switch {
+		case l == "DOCKER_BIN=1":
 			snap.Docker.Installed = true
-		} else if strings.HasPrefix(l, "CTR=") {
+		case l == "DOCKER_OK=1":
+			snap.Docker.Installed = true
+			snap.Docker.DaemonDown = false
+		case l == "DOCKER_DOWN=1":
+			snap.Docker.Installed = true
+			snap.Docker.DaemonDown = true
+		case l == "DOCKER_TRUNC=1":
+			snap.Docker.Truncated = true
+		case strings.HasPrefix(l, "CTR="):
 			snap.Docker.Installed = true
 			p := strings.SplitN(strings.TrimPrefix(l, "CTR="), "|", 5)
 			if len(p) >= 5 {
@@ -773,6 +900,8 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 				}
 				if health == "unhealthy" || state == "restarting" || state == "dead" {
 					snap.Docker.Unhealthy++
+				} else if state == "exited" && strings.Contains(lowStatus, "exited (") && !strings.Contains(lowStatus, "exited (0)") {
+					snap.Docker.ExitedAbnormal++
 				}
 				snap.Docker.Containers = append(snap.Docker.Containers, vault.ContainerStat{
 					ID:     idShort,
@@ -786,7 +915,28 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 		}
 	}
 
-	// 10. Security Posture & SSH Login Telemetry
+	// 10. L2 Hardware & Kernel Errors (RAID + dmesg/journalctl -k)
+	for _, l := range sections["HW"] {
+		switch {
+		case strings.HasPrefix(l, "RAID_BAD="):
+			v := strings.TrimSpace(strings.TrimPrefix(l, "RAID_BAD="))
+			if v != "" && !slices.Contains(snap.RAIDDegraded, v) {
+				snap.RAIDDegraded = append(snap.RAIDDegraded, v)
+			}
+		case strings.HasPrefix(l, "KERR_CNT="):
+			snap.KernelErrorCount, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(l, "KERR_CNT=")))
+		case strings.HasPrefix(l, "KERR="):
+			v := strings.TrimSpace(strings.TrimPrefix(l, "KERR="))
+			if v != "" {
+				snap.KernelErrors = append(snap.KernelErrors, v)
+			}
+		}
+	}
+	if snap.KernelErrorCount == 0 && len(snap.KernelErrors) > 0 {
+		snap.KernelErrorCount = len(snap.KernelErrors)
+	}
+
+	// 11. Security Posture & SSH Login Telemetry
 	snap.Security.FirewallStatus = "unknown"
 	for _, l := range sections["SEC"] {
 		switch {
@@ -806,7 +956,7 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 			}
 		case strings.HasPrefix(l, "UID0="):
 			u := strings.TrimSpace(strings.TrimPrefix(l, "UID0="))
-			if u != "" {
+			if u != "" && !slices.Contains(snap.Security.UIDZeroUsers, u) {
 				snap.Security.UIDZeroUsers = append(snap.Security.UIDZeroUsers, u)
 			}
 		case strings.HasPrefix(l, "REBOOT_REQ="):
@@ -827,6 +977,74 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 			ip := strings.TrimSpace(strings.TrimPrefix(l, "SSH_FAIL_IP="))
 			if ip != "" {
 				snap.Security.TopFailedIPs = append(snap.Security.TopFailedIPs, ip)
+			}
+		case strings.HasPrefix(l, "SSH_LOGIN="):
+			p := strings.SplitN(strings.TrimPrefix(l, "SSH_LOGIN="), "|", 4)
+			if len(p) >= 2 && strings.TrimSpace(p[1]) != "" {
+				ev := vault.SSHLoginEvent{
+					User:   strings.TrimSpace(p[0]),
+					FromIP: strings.TrimSpace(p[1]),
+				}
+				if len(p) >= 3 {
+					ev.Method = strings.TrimSpace(p[2])
+				}
+				if len(p) >= 4 {
+					ev.Timestamp = strings.TrimSpace(p[3])
+				}
+				snap.Security.RecentSSHLogins = append(snap.Security.RecentSSHLogins, ev)
+			}
+		}
+	}
+
+	// 12. L3 Zero-AI Deep Security (FIM, Persistence, Suspicious Procs, High-Risk Outbound, Weak SSH Config)
+	for _, l := range sections["SEC_DEEP"] {
+		switch {
+		case strings.HasPrefix(l, "FIM="):
+			p := strings.SplitN(strings.TrimPrefix(l, "FIM="), "|", 2)
+			if len(p) == 2 && p[0] != "" && p[1] != "" {
+				if snap.Security.FileHashes == nil {
+					snap.Security.FileHashes = make(map[string]string)
+				}
+				snap.Security.FileHashes[strings.TrimSpace(p[0])] = strings.TrimSpace(p[1])
+			}
+		case strings.HasPrefix(l, "PERSIST_HASH="):
+			snap.Security.PersistenceHash = strings.TrimSpace(strings.TrimPrefix(l, "PERSIST_HASH="))
+		case strings.HasPrefix(l, "SUSP_PROC="):
+			p := strings.SplitN(strings.TrimPrefix(l, "SUSP_PROC="), "|", 6)
+			if len(p) >= 5 {
+				pid, _ := strconv.Atoi(strings.TrimSpace(p[0]))
+				sp := vault.SuspiciousProcStat{
+					PID:      pid,
+					User:     strings.TrimSpace(p[1]),
+					Reason:   strings.TrimSpace(p[2]),
+					Severity: strings.TrimSpace(p[3]),
+					Command:  strings.TrimSpace(p[4]),
+				}
+				if len(p) == 6 {
+					sp.ExePath = strings.TrimSpace(p[5])
+				}
+				snap.Security.SuspiciousProcs = append(snap.Security.SuspiciousProcs, sp)
+			}
+		case strings.HasPrefix(l, "OUTB="):
+			p := strings.SplitN(strings.TrimPrefix(l, "OUTB="), "|", 5)
+			if len(p) >= 4 {
+				port, _ := strconv.Atoi(strings.TrimSpace(p[1]))
+				pid, _ := strconv.Atoi(strings.TrimSpace(p[2]))
+				oc := vault.OutboundConnStat{
+					RemoteIP:   strings.TrimSpace(p[0]),
+					RemotePort: port,
+					PID:        pid,
+					Process:    strings.TrimSpace(p[3]),
+				}
+				if len(p) == 5 {
+					oc.Reason = strings.TrimSpace(p[4])
+				}
+				snap.Security.SuspiciousOutbound = append(snap.Security.SuspiciousOutbound, oc)
+			}
+		case strings.HasPrefix(l, "SSH_WEAK="):
+			v := strings.TrimSpace(strings.TrimPrefix(l, "SSH_WEAK="))
+			if v != "" && !slices.Contains(snap.Security.SSHWeakConfigs, v) {
+				snap.Security.SSHWeakConfigs = append(snap.Security.SSHWeakConfigs, v)
 			}
 		}
 	}

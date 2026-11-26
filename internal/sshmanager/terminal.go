@@ -175,6 +175,7 @@ func (m *Manager) CloseAllSessions() {
 		s.emitExit("加密保险库已锁定，所有活跃 SSH 会话已安全断开")
 		s.Close()
 	}
+	m.ClosePooledJumps()
 }
 
 func (m *Manager) handleAbnormalSessionDrop(client *ManagedSSHClient) bool {

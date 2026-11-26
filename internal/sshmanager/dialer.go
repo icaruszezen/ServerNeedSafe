@@ -2,7 +2,9 @@ package sshmanager
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -132,6 +134,14 @@ func (m *ManagedSSHClient) Close() error {
 	return firstErr
 }
 
+type pooledJumpEntry struct {
+	client     *ManagedSSHClient
+	configHash string
+	refCount   int
+	lastUsed   time.Time
+	evicted    bool
+}
+
 // Manager coordinates end-to-end client-side SSH dialing, interactive PTY sessions, SFTP operations, and probes.
 type Manager struct {
 	store              *vault.Store
@@ -142,6 +152,8 @@ type Manager struct {
 	jumpCooldowns      map[string]time.Time
 	jumpCooldownTTL    time.Duration
 	fallbackHopTimeout time.Duration
+	jumpPoolMu         sync.Mutex
+	jumpPool           map[string]*pooledJumpEntry
 }
 
 func NewManager(store *vault.Store) *Manager {
@@ -151,6 +163,7 @@ func NewManager(store *vault.Store) *Manager {
 		jumpCooldowns:      make(map[string]time.Time),
 		jumpCooldownTTL:    defaultJumpCooldownTTL,
 		fallbackHopTimeout: defaultFallbackHopTimeout,
+		jumpPool:           make(map[string]*pooledJumpEntry),
 	}
 }
 
@@ -277,7 +290,198 @@ type DialOptions struct {
 	TrustFingerprint string // If non-empty and matches presented fingerprint, pins it in KnownHosts
 	ClientIP         string
 	Timeout          time.Duration
+	ReuseJumpPool    bool // Share underlying jump-host SSH connections across concurrent targets
 	OnProgress       func(DialProgressEvent)
+}
+
+func jumpConfigFingerprint(srv *vault.ServerConfig) string {
+	if srv == nil {
+		return ""
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%s|%d|%s|%s|%s|%s|%s|%s|%s|%v",
+		srv.Host, srv.Port, srv.Username, srv.AuthType,
+		srv.Password, srv.PrivateKey, srv.Passphrase, srv.CredentialID,
+		strings.Join(srv.EffectiveJumpServerIDs(), ","), srv.JumpFallbackDirect,
+	)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func isSSHClientAlive(c *ManagedSSHClient, timeout time.Duration) bool {
+	if c == nil || c.Client == nil {
+		return false
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	resCh := make(chan bool, 1)
+	go func() {
+		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+		resCh <- err == nil
+	}()
+	select {
+	case ok := <-resCh:
+		return ok
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// EvictPooledJump closes (or marks for close once released) any cached shared jump connection for serverID.
+func (m *Manager) EvictPooledJump(serverID string) {
+	if serverID == "" {
+		return
+	}
+	var toClose *ManagedSSHClient
+	m.jumpPoolMu.Lock()
+	if ent, ok := m.jumpPool[serverID]; ok {
+		delete(m.jumpPool, serverID)
+		ent.evicted = true
+		if ent.refCount <= 0 {
+			toClose = ent.client
+		}
+	}
+	m.jumpPoolMu.Unlock()
+	if toClose != nil {
+		_ = toClose.Close()
+	}
+}
+
+// ClosePooledJumps terminates all idle/cached shared jump-host connections.
+func (m *Manager) ClosePooledJumps() {
+	var toClose []*ManagedSSHClient
+	m.jumpPoolMu.Lock()
+	for id, ent := range m.jumpPool {
+		delete(m.jumpPool, id)
+		ent.evicted = true
+		if ent.refCount <= 0 {
+			toClose = append(toClose, ent.client)
+		}
+	}
+	m.jumpPoolMu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+}
+
+// CleanupIdleJumps evicts shared jump connections unused for longer than maxIdle.
+func (m *Manager) CleanupIdleJumps(maxIdle time.Duration) {
+	if maxIdle <= 0 {
+		maxIdle = 5 * time.Minute
+	}
+	cutoff := time.Now().Add(-maxIdle)
+	var toClose []*ManagedSSHClient
+	m.jumpPoolMu.Lock()
+	for id, ent := range m.jumpPool {
+		if ent.refCount <= 0 && ent.lastUsed.Before(cutoff) {
+			delete(m.jumpPool, id)
+			ent.evicted = true
+			toClose = append(toClose, ent.client)
+		}
+	}
+	m.jumpPoolMu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+}
+
+func (m *Manager) acquireSharedJump(jumpID string, jumpOpts DialOptions, branchVisited map[string]bool, depth int) (*ManagedSSHClient, func() error, bool, error) {
+	jSrv, err := m.store.GetServerSecret(jumpID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	cfgHash := jumpConfigFingerprint(jSrv)
+
+	var candidate *pooledJumpEntry
+	var staleToClose *ManagedSSHClient
+	m.jumpPoolMu.Lock()
+	if ent, ok := m.jumpPool[jumpID]; ok {
+		if ent.configHash == cfgHash {
+			ent.refCount++
+			ent.lastUsed = time.Now()
+			candidate = ent
+		} else {
+			delete(m.jumpPool, jumpID)
+			ent.evicted = true
+			if ent.refCount <= 0 {
+				staleToClose = ent.client
+			}
+		}
+	}
+	m.jumpPoolMu.Unlock()
+	if staleToClose != nil {
+		_ = staleToClose.Close()
+	}
+
+	makeRelease := func(ent *pooledJumpEntry) func() error {
+		var once sync.Once
+		return func() error {
+			var closeClient *ManagedSSHClient
+			once.Do(func() {
+				m.jumpPoolMu.Lock()
+				ent.refCount--
+				ent.lastUsed = time.Now()
+				if ent.evicted && ent.refCount <= 0 {
+					closeClient = ent.client
+				}
+				m.jumpPoolMu.Unlock()
+			})
+			if closeClient != nil {
+				return closeClient.Close()
+			}
+			return nil
+		}
+	}
+
+	if candidate != nil {
+		kaTimeout := min(2*time.Second, max(500*time.Millisecond, jumpOpts.Timeout/2))
+		if isSSHClientAlive(candidate.client, kaTimeout) {
+			return candidate.client, makeRelease(candidate), true, nil
+		}
+		// Stale pooled jump: drop it and dial fresh
+		var deadClient *ManagedSSHClient
+		m.jumpPoolMu.Lock()
+		if cur, ok := m.jumpPool[jumpID]; ok && cur == candidate {
+			delete(m.jumpPool, jumpID)
+		}
+		candidate.evicted = true
+		candidate.refCount--
+		if candidate.refCount <= 0 {
+			deadClient = candidate.client
+		}
+		m.jumpPoolMu.Unlock()
+		if deadClient != nil {
+			_ = deadClient.Close()
+		}
+	}
+
+	// Dial fresh jump connection
+	fresh, err := m.dialChain(jumpID, jumpOpts, branchVisited, depth+1)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	newEnt := &pooledJumpEntry{
+		client:     fresh,
+		configHash: cfgHash,
+		refCount:   1,
+		lastUsed:   time.Now(),
+	}
+	var replaced *ManagedSSHClient
+	m.jumpPoolMu.Lock()
+	if old, ok := m.jumpPool[jumpID]; ok {
+		old.evicted = true
+		if old.refCount <= 0 {
+			replaced = old.client
+		}
+	}
+	m.jumpPool[jumpID] = newEnt
+	m.jumpPoolMu.Unlock()
+	if replaced != nil {
+		_ = replaced.Close()
+	}
+
+	return fresh, makeRelease(newEnt), false, nil
 }
 
 func emitDialProgress(fn func(DialProgressEvent), stage, msg string) {
@@ -683,32 +887,65 @@ func (m *Manager) dialViaSingleJump(
 	attemptDeadline := time.Now().Add(hopTimeout)
 
 	jumpOpts := DialOptions{
-		ClientIP: opts.ClientIP,
-		Timeout:  hopTimeout,
+		ClientIP:      opts.ClientIP,
+		Timeout:       hopTimeout,
+		ReuseJumpPool: opts.ReuseJumpPool,
 	}
-	jumpClient, err := m.dialChain(jumpID, jumpOpts, branchVisited, depth+1)
+	var (
+		jumpClient  *ManagedSSHClient
+		releaseJump func() error
+		reusedJump  bool
+		err         error
+	)
+	if opts.ReuseJumpPool {
+		jumpClient, releaseJump, reusedJump, err = m.acquireSharedJump(jumpID, jumpOpts, branchVisited, depth)
+	} else {
+		jumpClient, err = m.dialChain(jumpID, jumpOpts, branchVisited, depth+1)
+		if err == nil {
+			releaseJump = jumpClient.Close
+		}
+	}
 	if err != nil {
 		return nil, jumpErrJumpDial, fmt.Errorf("连接跳板机失败: %w", err)
 	}
 
 	rem := time.Until(attemptDeadline)
 	if rem <= 0 {
-		_ = jumpClient.Close()
+		_ = releaseJump()
 		return nil, jumpErrForward, fmt.Errorf("通过跳板机转发至 %s 超时: %w", targetAddr, context.DeadlineExceeded)
 	}
 
 	fwdCtx, fwdCancel := context.WithTimeout(context.Background(), rem)
 	tunneledConn, err := jumpClient.DialContext(fwdCtx, "tcp", targetAddr)
 	fwdCancel()
+	if err != nil && reusedJump {
+		// Pooled jump connection may have gone stale between keepalive and channel open: evict and redial once.
+		m.EvictPooledJump(jumpID)
+		_ = releaseJump()
+		rem = time.Until(attemptDeadline)
+		if rem > 500*time.Millisecond {
+			jumpOpts.Timeout = rem
+			if j2, rel2, _, err2 := m.acquireSharedJump(jumpID, jumpOpts, branchVisited, depth); err2 == nil {
+				jumpClient = j2
+				releaseJump = rel2
+				rem = time.Until(attemptDeadline)
+				if rem > 0 {
+					fwdCtx2, fwdCancel2 := context.WithTimeout(context.Background(), rem)
+					tunneledConn, err = jumpClient.DialContext(fwdCtx2, "tcp", targetAddr)
+					fwdCancel2()
+				}
+			}
+		}
+	}
 	if err != nil {
-		_ = jumpClient.Close()
+		_ = releaseJump()
 		return nil, jumpErrForward, fmt.Errorf("通过跳板机转发至 %s 失败: %w", targetAddr, err)
 	}
 
 	rem = time.Until(attemptDeadline)
 	if rem <= 0 {
 		_ = tunneledConn.Close()
-		_ = jumpClient.Close()
+		_ = releaseJump()
 		return nil, jumpErrTargetNetwork, fmt.Errorf("通过跳板机进行 SSH 握手超时 (%s): %w", targetAddr, context.DeadlineExceeded)
 	}
 
@@ -738,7 +975,7 @@ func (m *Manager) dialViaSingleJump(
 	}
 	if err != nil {
 		_ = tunneledConn.Close()
-		_ = jumpClient.Close()
+		_ = releaseJump()
 		if *hostKeyErr != nil {
 			return nil, jumpErrTargetHostKey, *hostKeyErr
 		}
@@ -779,7 +1016,7 @@ func (m *Manager) dialViaSingleJump(
 		ImmediateJumpID:    jumpID,
 		HasAlternateRoutes: hasAltRoutes,
 		jumpClient:         jumpClient,
-		closers:            []func() error{jumpClient.Close},
+		closers:            []func() error{releaseJump},
 	}, jumpErrNone, nil
 }
 

@@ -3,9 +3,9 @@ package monitor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"slices"
 	"strings"
 	"sync"
@@ -15,51 +15,69 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
-// RuntimeStatus reports the live scheduler state of the background monitoring engine.
+// RuntimeStatus reports the live scheduler, SSH pool, and webhook health state of the monitoring engine.
 type RuntimeStatus struct {
-	Running       bool       `json:"running"`
-	Collecting    bool       `json:"collecting"`
-	VaultUnlocked bool       `json:"vault_unlocked"`
-	Enabled       bool       `json:"enabled"`
-	IntervalSec   int        `json:"interval_sec"`
-	InFlightCount int        `json:"in_flight_count"`
-	LastSweepAt   *time.Time `json:"last_sweep_at,omitempty"`
-	NextSweepAt   *time.Time `json:"next_sweep_at,omitempty"`
+	Running           bool       `json:"running"`
+	Collecting        bool       `json:"collecting"`
+	VaultUnlocked     bool       `json:"vault_unlocked"`
+	Enabled           bool       `json:"enabled"`
+	IntervalSec       int        `json:"interval_sec"`
+	SlowIntervalSec   int        `json:"slow_interval_sec"`
+	InFlightCount     int        `json:"in_flight_count"`
+	PooledConnections int        `json:"pooled_connections"`
+	LastSweepAt       *time.Time `json:"last_sweep_at,omitempty"`
+	NextSweepAt       *time.Time `json:"next_sweep_at,omitempty"`
+	LastWebhookAt     *time.Time `json:"last_webhook_at,omitempty"`
+	LastWebhookError  string     `json:"last_webhook_error,omitempty"`
 }
 
-// Engine schedules periodic agentless SSH telemetry sweeps, persists encrypted snapshots &
-// time-series samples inside vault.Store, evaluates multi-dimensional alerts, and dispatches webhooks.
+// Engine schedules periodic agentless SSH telemetry sweeps, persists snapshots &
+// time-series samples inside monitor_runtime.json, evaluates multi-dimensional alerts,
+// reuses SSH/jump connections safely, and dispatches multi-platform webhooks.
 type Engine struct {
 	store  *vault.Store
 	sshMgr *sshmanager.Manager
+	pool   *sshConnPool
 
-	mu           sync.Mutex
-	started      bool
-	closed       bool
-	stopCh       chan struct{}
-	wakeCh       chan struct{}
-	unlockCancel context.CancelFunc
-	lastPolled   map[string]time.Time
-	inFlight     map[string]int
-	lastSweepAt  *time.Time
-	nextSweepAt  *time.Time
-	tickInterval time.Duration
+	mu               sync.Mutex
+	started          bool
+	closed           bool
+	stopCh           chan struct{}
+	wakeCh           chan struct{}
+	epochCtx         context.Context
+	epochCancel      context.CancelFunc
+	lastPolled       map[string]time.Time
+	lastSlowAt       map[string]time.Time
+	inFlight         map[string]chan struct{}
+	lastSweepAt      *time.Time
+	nextSweepAt      *time.Time
+	lastPoolCleanup  time.Time
+	lastWebhookAt    *time.Time
+	lastWebhookError string
+	tickInterval     time.Duration
+	webhookRetryWait time.Duration
 
 	webhookPost func(urlClean string, body []byte) error
 	onPersist   func()
 }
 
-// NewEngine creates a new monitoring engine wired to store ready hooks.
+// NewEngine creates a new monitoring engine wired to store ready hooks and SSH connection pooling.
 func NewEngine(store *vault.Store, sshMgr *sshmanager.Manager) *Engine {
+	epochCtx, epochCancel := context.WithCancel(context.Background())
 	e := &Engine{
-		store:        store,
-		sshMgr:       sshMgr,
-		stopCh:       make(chan struct{}),
-		wakeCh:       make(chan struct{}, 1),
-		lastPolled:   make(map[string]time.Time),
-		inFlight:     make(map[string]int),
-		tickInterval: 1 * time.Second,
-		webhookPost:  defaultWebhookPost,
+		store:            store,
+		sshMgr:           sshMgr,
+		pool:             newSSHConnPool(sshMgr),
+		stopCh:           make(chan struct{}),
+		wakeCh:           make(chan struct{}, 1),
+		epochCtx:         epochCtx,
+		epochCancel:      epochCancel,
+		lastPolled:       make(map[string]time.Time),
+		lastSlowAt:       make(map[string]time.Time),
+		inFlight:         make(map[string]chan struct{}),
+		tickInterval:     1 * time.Second,
+		webhookRetryWait: 500 * time.Millisecond,
+		webhookPost:      defaultWebhookPost,
 	}
 
 	if store != nil {
@@ -83,9 +101,8 @@ func (e *Engine) Start() {
 		return
 	}
 	e.started = true
-	if e.store != nil && e.store.IsReady() && e.unlockCancel == nil {
-		_, cancel := context.WithCancel(context.Background())
-		e.unlockCancel = cancel
+	if e.epochCtx == nil {
+		e.epochCtx, e.epochCancel = context.WithCancel(context.Background())
 	}
 	e.mu.Unlock()
 
@@ -93,7 +110,7 @@ func (e *Engine) Start() {
 	e.Wake()
 }
 
-// Close stops the background scheduler and cancels any in-flight probes.
+// Close stops the background scheduler, cancels all in-flight probes, and closes all pooled SSH connections.
 func (e *Engine) Close() {
 	e.mu.Lock()
 	if e.closed {
@@ -101,13 +118,16 @@ func (e *Engine) Close() {
 		return
 	}
 	e.closed = true
-	cancel := e.unlockCancel
-	e.unlockCancel = nil
+	cancel := e.epochCancel
+	e.epochCancel = nil
 	close(e.stopCh)
 	e.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if e.pool != nil {
+		e.pool.EvictAll()
 	}
 }
 
@@ -119,13 +139,35 @@ func (e *Engine) Wake() {
 	}
 }
 
+// EvictServerConnection drops any pooled SSH / jump connection associated with serverID (call after server edit/delete).
+func (e *Engine) EvictServerConnection(serverID string) {
+	if e.pool != nil {
+		e.pool.Evict(serverID)
+	}
+}
+
+// OnPolicyUpdated reconciles engine resources (e.g. closing pooled connections if pooling was turned off) and wakes scheduler.
+func (e *Engine) OnPolicyUpdated(settings vault.MonitorSettings) {
+	if !settings.UseSSHConnectionPool && e.pool != nil {
+		e.pool.EvictAll()
+	}
+	e.Wake()
+}
+
 func (e *Engine) onStoreReady() {
 	e.mu.Lock()
-	if e.unlockCancel != nil {
-		e.unlockCancel()
-	}
+	oldCancel := e.epochCancel
+	e.epochCtx, e.epochCancel = context.WithCancel(context.Background())
 	clear(e.lastPolled)
+	clear(e.lastSlowAt)
 	e.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if e.pool != nil {
+		e.pool.EvictAll()
+	}
 	e.Wake()
 }
 
@@ -139,17 +181,25 @@ func (e *Engine) Status() RuntimeStatus {
 		}
 	}
 
+	pooled := 0
+	if e.pool != nil {
+		pooled = e.pool.Count()
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	inFlightCnt := len(e.inFlight)
 	st := RuntimeStatus{
-		Running:       e.started && !e.closed,
-		Collecting:    inFlightCnt > 0,
-		VaultUnlocked: vaultReady,
-		Enabled:       settings.Enabled,
-		IntervalSec:   settings.IntervalSec,
-		InFlightCount: inFlightCnt,
+		Running:           e.started && !e.closed,
+		Collecting:        inFlightCnt > 0,
+		VaultUnlocked:     vaultReady,
+		Enabled:           settings.Enabled,
+		IntervalSec:       settings.IntervalSec,
+		SlowIntervalSec:   settings.SlowIntervalSec,
+		InFlightCount:     inFlightCnt,
+		PooledConnections: pooled,
+		LastWebhookError:  e.lastWebhookError,
 	}
 	if e.lastSweepAt != nil {
 		t := *e.lastSweepAt
@@ -158,6 +208,10 @@ func (e *Engine) Status() RuntimeStatus {
 	if vaultReady && settings.Enabled && e.nextSweepAt != nil {
 		t := *e.nextSweepAt
 		st.NextSweepAt = &t
+	}
+	if e.lastWebhookAt != nil {
+		t := *e.lastWebhookAt
+		st.LastWebhookAt = &t
 	}
 	return st
 }
@@ -171,6 +225,33 @@ func effectiveServerInterval(srv vault.ServerConfig, globalSec int) time.Duratio
 		sec = 10
 	}
 	return time.Duration(sec) * time.Second
+}
+
+func effectiveSlowInterval(settings vault.MonitorSettings, fastInterval time.Duration) time.Duration {
+	sec := settings.SlowIntervalSec
+	if sec < 60 {
+		sec = 300
+	}
+	d := time.Duration(sec) * time.Second
+	if d < fastInterval {
+		return fastInterval
+	}
+	return d
+}
+
+// serverInitialJitter spreads initial due times across larger fleets (>3 nodes) to avoid thundering-herd spikes.
+func serverInitialJitter(serverID string, totalServers int, interval time.Duration) time.Duration {
+	if totalServers <= 3 {
+		return 0
+	}
+	maxJitter := min(4*time.Second, interval/4)
+	if maxJitter <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(serverID))
+	ms := int64(h.Sum32()) % maxJitter.Milliseconds()
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (e *Engine) schedulerLoop() {
@@ -213,14 +294,36 @@ func (e *Engine) evaluateDueSweep() {
 	}
 
 	now := time.Now().UTC()
+
+	// Periodically evict idle pooled SSH connections
+	e.mu.Lock()
+	shouldCleanupPool := now.Sub(e.lastPoolCleanup) >= 60*time.Second
+	if shouldCleanupPool {
+		e.lastPoolCleanup = now
+	}
+	e.mu.Unlock()
+	if shouldCleanupPool && e.pool != nil {
+		maxIdle := max(5*time.Minute, time.Duration(settings.IntervalSec)*3*time.Second)
+		e.pool.CleanupIdle(maxIdle)
+	}
+
 	var dueServers []vault.ServerConfig
 	var earliestNext time.Time
+
+	// Count active monitored servers for jitter decision
+	monitoredCount := 0
+	for _, srv := range servers {
+		if !srv.MonitorDisabled {
+			monitoredCount++
+		}
+	}
 
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
 		return
 	}
+	parentCtx := e.epochCtx
 	for _, srv := range servers {
 		if srv.MonitorDisabled {
 			continue
@@ -230,6 +333,14 @@ func (e *Engine) evaluateDueSweep() {
 		if !seen {
 			if prev, pErr := e.store.GetPreviousMonitorSnapshot(srv.ID); pErr == nil && prev != nil && !prev.CollectedAt.IsZero() {
 				lastAt = prev.CollectedAt
+				e.lastPolled[srv.ID] = lastAt
+				if prev.LastSlowCollectedAt != nil && !prev.LastSlowCollectedAt.IsZero() {
+					e.lastSlowAt[srv.ID] = *prev.LastSlowCollectedAt
+				}
+			} else if jitter := serverInitialJitter(srv.ID, monitoredCount, interval); jitter > 0 {
+				// Schedule first poll staggered by jitter without permanently delaying subsequent cycles
+				staggeredLast := now.Add(-interval + jitter)
+				lastAt = staggeredLast
 				e.lastPolled[srv.ID] = lastAt
 			}
 		}
@@ -241,7 +352,7 @@ func (e *Engine) evaluateDueSweep() {
 			nextDue = lastAt.Add(interval)
 		}
 
-		if e.inFlight[srv.ID] > 0 {
+		if _, busy := e.inFlight[srv.ID]; busy {
 			later := now.Add(interval)
 			if earliestNext.IsZero() || later.Before(earliestNext) {
 				earliestNext = later
@@ -274,33 +385,26 @@ func (e *Engine) evaluateDueSweep() {
 		return
 	}
 
-	// Acquire in-flight markers & create/reuse unlock cancellation context
 	acquired := make([]vault.ServerConfig, 0, len(dueServers))
 	for _, srv := range dueServers {
-		if e.inFlight[srv.ID] == 0 {
-			e.inFlight[srv.ID]++
+		if _, busy := e.inFlight[srv.ID]; !busy {
+			e.inFlight[srv.ID] = make(chan struct{})
 			e.lastPolled[srv.ID] = now
 			acquired = append(acquired, srv)
-		}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	prevCancel := e.unlockCancel
-	e.unlockCancel = func() {
-		cancel()
-		if prevCancel != nil {
-			prevCancel()
 		}
 	}
 	e.mu.Unlock()
 
 	if len(acquired) == 0 {
-		cancel()
 		return
 	}
 
+	// Derive a per-sweep child context from epochCtx (NO nested closure chain -> zero memory leak!)
+	sweepCtx, sweepCancel := context.WithCancel(parentCtx)
+
 	go func(targets []vault.ServerConfig, sweepSettings vault.MonitorSettings) {
 		defer func() {
-			cancel()
+			sweepCancel()
 			fin := time.Now().UTC()
 			e.mu.Lock()
 			for _, srv := range targets {
@@ -310,8 +414,8 @@ func (e *Engine) evaluateDueSweep() {
 			e.mu.Unlock()
 		}()
 
-		snaps := e.collectBatch(ctx, targets, sweepSettings, false, "scheduler")
-		if ctx.Err() != nil || len(snaps) == 0 {
+		snaps := e.collectBatch(sweepCtx, targets, sweepSettings, false, false, "scheduler")
+		if sweepCtx.Err() != nil || len(snaps) == 0 {
 			return
 		}
 		triggered, resolved, webhookURL, recErr := e.store.RecordMonitorSnapshots(snaps)
@@ -322,18 +426,33 @@ func (e *Engine) evaluateDueSweep() {
 			if persistHook != nil {
 				persistHook()
 			}
-			if webhookURL != "" && (len(triggered) > 0 || len(resolved) > 0) {
-				go e.dispatchWebhook(webhookURL, triggered, resolved)
-			}
+			e.maybeDispatchNotifications(sweepSettings, webhookURL, triggered, resolved)
 		}
 	}(acquired, settings)
 }
 
-func (e *Engine) acquireInFlight(serverID string) {
-	e.mu.Lock()
-	e.inFlight[serverID]++
-	e.lastPolled[serverID] = time.Now().UTC()
-	e.mu.Unlock()
+// acquireServerSlot enforces strict per-server serialization so manual and scheduled probes never overlap.
+func (e *Engine) acquireServerSlot(ctx context.Context, serverID string) error {
+	for {
+		e.mu.Lock()
+		ch, busy := e.inFlight[serverID]
+		if !busy {
+			e.inFlight[serverID] = make(chan struct{})
+			e.lastPolled[serverID] = time.Now().UTC()
+			e.mu.Unlock()
+			return nil
+		}
+		e.mu.Unlock()
+
+		select {
+		case <-ch:
+			// Previous sweep finished; retry acquiring slot
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-e.stopCh:
+			return errors.New("监控引擎已停止")
+		}
+	}
 }
 
 func (e *Engine) releaseInFlight(serverID string) {
@@ -343,15 +462,33 @@ func (e *Engine) releaseInFlight(serverID string) {
 }
 
 func (e *Engine) releaseInFlightLocked(serverID string) {
-	if e.inFlight[serverID] <= 1 {
+	if ch, ok := e.inFlight[serverID]; ok {
 		delete(e.inFlight, serverID)
-	} else {
-		e.inFlight[serverID]--
+		close(ch)
 	}
 }
 
-// CollectServerNow immediately probes a single server (even if its background schedule is paused),
-// records the resulting snapshot & sample point in the encrypted vault, and returns the updated snapshot.
+func (e *Engine) shouldRunFullTier(srv vault.ServerConfig, settings vault.MonitorSettings, prevSnap *vault.ServerMonitorSnapshot, forceFull bool) bool {
+	if forceFull || prevSnap == nil || !prevSnap.Reachable {
+		return true
+	}
+	fastInt := effectiveServerInterval(srv, settings.IntervalSec)
+	slowInt := effectiveSlowInterval(settings, fastInt)
+
+	e.mu.Lock()
+	lastSlow := e.lastSlowAt[srv.ID]
+	e.mu.Unlock()
+	if lastSlow.IsZero() && prevSnap.LastSlowCollectedAt != nil {
+		lastSlow = *prevSnap.LastSlowCollectedAt
+	}
+	if lastSlow.IsZero() {
+		return true
+	}
+	return time.Since(lastSlow) >= slowInt
+}
+
+// CollectServerNow immediately probes a single server (full tier, even if its background schedule is paused),
+// serialized cleanly against any in-flight scheduled sweep, records the snapshot, and returns it.
 func (e *Engine) CollectServerNow(ctx context.Context, serverID, trustFingerprint, clientIP string) (*vault.ServerMonitorSnapshot, error) {
 	if e.store == nil || e.sshMgr == nil {
 		return nil, errors.New("监控引擎未初始化")
@@ -372,10 +509,12 @@ func (e *Engine) CollectServerNow(ctx context.Context, serverID, trustFingerprin
 		return nil, vault.ErrNotFound
 	}
 
-	e.acquireInFlight(serverID)
+	if err := e.acquireServerSlot(ctx, serverID); err != nil {
+		return nil, err
+	}
 	defer e.releaseInFlight(serverID)
 
-	snap, err := e.probeSingleServer(ctx, *target, settings, trustFingerprint, clientIP, true)
+	snap, err := e.probeSingleServer(ctx, *target, settings, trustFingerprint, clientIP, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -392,19 +531,16 @@ func (e *Engine) CollectServerNow(ctx context.Context, serverID, trustFingerprin
 	e.mu.Unlock()
 	e.Wake()
 
-	if webhookURL != "" && (len(triggered) > 0 || len(resolved) > 0) {
-		go e.dispatchWebhook(webhookURL, triggered, resolved)
-	}
+	e.maybeDispatchNotifications(settings, webhookURL, triggered, resolved)
 
-	// Return freshly stored snapshot with computed health score & port baseline flags
 	if detail, dErr := e.store.GetServerMonitorDetail(serverID, 5*time.Minute); dErr == nil && detail.Snapshot != nil {
 		return detail.Snapshot, nil
 	}
 	return snap, nil
 }
 
-// CollectAllNow immediately collects telemetry across the specified server IDs (or all monitor-enabled
-// servers if serverIDs is empty) using the configured bounded worker pool.
+// CollectAllNow immediately collects full-tier telemetry across the specified server IDs (or all monitor-enabled
+// servers if serverIDs is empty) using the configured bounded worker pool, serialized per server.
 func (e *Engine) CollectAllNow(ctx context.Context, serverIDs []string, clientIP string) ([]*vault.ServerMonitorSnapshot, error) {
 	if e.store == nil || e.sshMgr == nil {
 		return nil, errors.New("监控引擎未初始化")
@@ -427,7 +563,6 @@ func (e *Engine) CollectAllNow(ctx context.Context, serverIDs []string, clientIP
 				targets = append(targets, srv)
 			}
 		}
-		// Fallback: if all servers were disabled, manual "collect all" still probes all servers
 		if len(targets) == 0 {
 			targets = servers
 		}
@@ -437,18 +572,22 @@ func (e *Engine) CollectAllNow(ctx context.Context, serverIDs []string, clientIP
 		return []*vault.ServerMonitorSnapshot{}, nil
 	}
 
-	now := time.Now().UTC()
-	e.mu.Lock()
+	// Acquire per-server slots cleanly so manual CollectAll never overlaps an active scheduled sweep on the same server.
+	acquired := make([]vault.ServerConfig, 0, len(targets))
 	for _, srv := range targets {
-		e.inFlight[srv.ID]++
-		e.lastPolled[srv.ID] = now
+		if err := e.acquireServerSlot(ctx, srv.ID); err != nil {
+			for _, acq := range acquired {
+				e.releaseInFlight(acq.ID)
+			}
+			return nil, err
+		}
+		acquired = append(acquired, srv)
 	}
-	e.mu.Unlock()
 
 	defer func() {
 		fin := time.Now().UTC()
 		e.mu.Lock()
-		for _, srv := range targets {
+		for _, srv := range acquired {
 			e.releaseInFlightLocked(srv.ID)
 			e.lastPolled[srv.ID] = fin
 		}
@@ -457,7 +596,7 @@ func (e *Engine) CollectAllNow(ctx context.Context, serverIDs []string, clientIP
 		e.Wake()
 	}()
 
-	snaps := e.collectBatch(ctx, targets, settings, false, clientIP)
+	snaps := e.collectBatch(ctx, acquired, settings, false, true, clientIP)
 	if len(snaps) == 0 {
 		return []*vault.ServerMonitorSnapshot{}, nil
 	}
@@ -466,9 +605,7 @@ func (e *Engine) CollectAllNow(ctx context.Context, serverIDs []string, clientIP
 	if recErr != nil {
 		return nil, recErr
 	}
-	if webhookURL != "" && (len(triggered) > 0 || len(resolved) > 0) {
-		go e.dispatchWebhook(webhookURL, triggered, resolved)
-	}
+	e.maybeDispatchNotifications(settings, webhookURL, triggered, resolved)
 	return snaps, nil
 }
 
@@ -477,6 +614,7 @@ func (e *Engine) collectBatch(
 	targets []vault.ServerConfig,
 	settings vault.MonitorSettings,
 	interactive bool,
+	forceFull bool,
 	clientIP string,
 ) []*vault.ServerMonitorSnapshot {
 	workers := settings.Concurrency
@@ -504,7 +642,7 @@ func (e *Engine) collectBatch(
 			if ctx.Err() != nil {
 				return
 			}
-			snap, err := e.probeSingleServer(ctx, target, settings, "", clientIP, interactive)
+			snap, err := e.probeSingleServer(ctx, target, settings, "", clientIP, interactive, forceFull)
 			if err == nil && snap != nil {
 				results[i] = snap
 			}
@@ -528,6 +666,7 @@ func (e *Engine) probeSingleServer(
 	trustFingerprint string,
 	clientIP string,
 	interactive bool,
+	forceFull bool,
 ) (*vault.ServerMonitorSnapshot, error) {
 	timeoutSec := settings.TimeoutSec
 	if timeoutSec < 5 {
@@ -539,6 +678,13 @@ func (e *Engine) probeSingleServer(
 	nowUTC := startTotal.UTC()
 
 	prevSnap, _ := e.store.GetPreviousMonitorSnapshot(srv.ID)
+	runFull := e.shouldRunFullTier(srv, settings, prevSnap, forceFull)
+	tier := TierFast
+	if runFull {
+		tier = TierFull
+	}
+	hasPrevCPU := prevSnap != nil && prevSnap.Reachable && len(prevSnap.RawCPUTicks) >= 4 &&
+		!prevSnap.CollectedAt.IsZero() && nowUTC.Sub(prevSnap.CollectedAt) >= 3*time.Second && nowUTC.Sub(prevSnap.CollectedAt) <= time.Hour
 
 	dialTimeout := probeTimeout
 	if dl, ok := ctx.Deadline(); ok {
@@ -547,12 +693,7 @@ func (e *Engine) probeSingleServer(
 		}
 	}
 
-	dialStart := time.Now()
-	client, err := e.sshMgr.Dial(srv.ID, sshmanager.DialOptions{
-		TrustFingerprint: trustFingerprint,
-		ClientIP:         clientIP,
-		Timeout:          dialTimeout,
-	})
+	client, latencyMs, reused, release, err := e.pool.Acquire(srv, dialTimeout, trustFingerprint, clientIP, settings.UseSSHConnectionPool)
 	if err != nil {
 		if errors.Is(err, vault.ErrVaultLocked) || errors.Is(err, vault.ErrNotFound) {
 			return nil, err
@@ -561,49 +702,103 @@ func (e *Engine) probeSingleServer(
 			return nil, ctx.Err()
 		}
 		var hkErr *sshmanager.HostKeyUntrustedError
-		if interactive && errors.As(err, &hkErr) {
-			return nil, err
+		if errors.As(err, &hkErr) {
+			if interactive {
+				return nil, err
+			}
+			if hkErr.Reason == "mismatch" {
+				return &vault.ServerMonitorSnapshot{
+					ServerID:              srv.ID,
+					ServerName:            srv.Name,
+					Group:                 srv.Group,
+					Host:                  srv.Host,
+					Port:                  srv.Port,
+					CollectedAt:           nowUTC,
+					CollectionTier:        string(tier),
+					DurationMs:            max(1, time.Since(startTotal).Milliseconds()),
+					Reachable:             false,
+					HealthLevel:           vault.HealthOffline,
+					HealthScore:           0,
+					HostKeyChanged:        true,
+					HostKeyMismatchDetail: hkErr.Error(),
+					Error:                 hkErr.Error(),
+				}, nil
+			}
 		}
 		return &vault.ServerMonitorSnapshot{
-			ServerID:    srv.ID,
-			ServerName:  srv.Name,
-			Group:       srv.Group,
-			Host:        srv.Host,
-			Port:        srv.Port,
-			CollectedAt: nowUTC,
-			DurationMs:  max(1, time.Since(startTotal).Milliseconds()),
-			Reachable:   false,
-			HealthLevel: vault.HealthOffline,
-			HealthScore: 0,
-			Error:       err.Error(),
+			ServerID:       srv.ID,
+			ServerName:     srv.Name,
+			Group:          srv.Group,
+			Host:           srv.Host,
+			Port:           srv.Port,
+			CollectedAt:    nowUTC,
+			CollectionTier: string(tier),
+			DurationMs:     max(1, time.Since(startTotal).Milliseconds()),
+			Reachable:      false,
+			HealthLevel:    vault.HealthOffline,
+			HealthScore:    0,
+			Error:          err.Error(),
 		}, nil
 	}
-	defer client.Close()
 
-	handshakeLatencyMs := max(1, time.Since(dialStart).Milliseconds())
+	connBroken := false
+	defer func() {
+		release(connBroken)
+	}()
 
 	sess, err := client.NewSession()
+	if err != nil && reused {
+		// Reused pooled SSH transport dropped between keepalive and session open: redial once transparently!
+		connBroken = true
+		release(true)
+		connBroken = false
+
+		client, latencyMs, reused, release, err = e.pool.Acquire(srv, dialTimeout, trustFingerprint, clientIP, false)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return &vault.ServerMonitorSnapshot{
+				ServerID:       srv.ID,
+				ServerName:     srv.Name,
+				Group:          srv.Group,
+				Host:           srv.Host,
+				Port:           srv.Port,
+				CollectedAt:    nowUTC,
+				CollectionTier: string(tier),
+				DurationMs:     max(1, time.Since(startTotal).Milliseconds()),
+				Reachable:      false,
+				HealthLevel:    vault.HealthOffline,
+				HealthScore:    0,
+				Error:          err.Error(),
+			}, nil
+		}
+		sess, err = client.NewSession()
+	}
+
 	if err != nil {
+		connBroken = true
 		return &vault.ServerMonitorSnapshot{
-			ServerID:    srv.ID,
-			ServerName:  srv.Name,
-			Group:       srv.Group,
-			Host:        srv.Host,
-			Port:        srv.Port,
-			CollectedAt: nowUTC,
-			DurationMs:  max(1, time.Since(startTotal).Milliseconds()),
-			Reachable:   false,
-			HealthLevel:   vault.HealthOffline,
-			HealthScore:   0,
-			Fingerprint:   client.Fingerprint,
-			RouteLabel:    client.Route.Label,
-			RouteFallback: client.Route.FallbackUsed,
-			Error:         fmt.Sprintf("创建远程监控会话失败: %v", err),
+			ServerID:       srv.ID,
+			ServerName:     srv.Name,
+			Group:          srv.Group,
+			Host:           srv.Host,
+			Port:           srv.Port,
+			CollectedAt:    nowUTC,
+			CollectionTier: string(tier),
+			DurationMs:     max(1, time.Since(startTotal).Milliseconds()),
+			Reachable:      false,
+			HealthLevel:    vault.HealthOffline,
+			HealthScore:    0,
+			Fingerprint:    client.Fingerprint,
+			RouteLabel:     client.Route.Label,
+			RouteFallback:  client.Route.FallbackUsed,
+			Error:          fmt.Sprintf("创建远程监控会话失败: %v", err),
 		}, nil
 	}
 	defer sess.Close()
 
-	script := buildDeepTelemetryScript(settings, srv.WatchedServices)
+	script := buildTelemetryScript(settings, srv.WatchedServices, tier, hasPrevCPU)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	sess.Stdout = &stdoutBuf
 	sess.Stderr = &stderrBuf
@@ -617,11 +812,13 @@ func (e *Engine) probeSingleServer(
 	}()
 
 	var runErr error
+	timedOut := false
 	select {
 	case runErr = <-doneCh:
 	case <-cmdCtx.Done():
+		timedOut = true
+		connBroken = true
 		_ = sess.Close()
-		_ = client.Close()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -629,44 +826,67 @@ func (e *Engine) probeSingleServer(
 	}
 
 	rawOut := stdoutBuf.String()
-	if !strings.Contains(rawOut, "===SNS_SEC:") && runErr != nil {
+	// Integrity check: real scripts emit ===SNS_END===; synthetic test fixtures without ===SNS_END===
+	// still exit cleanly (runErr == nil) and emit ===SNS_SEC:SAMPLE_T1===.
+	// Any mid-script timeout or truncation MUST NOT be treated as a healthy zeroed snapshot (prevents false alert resolution!).
+	hasCompleteSentinel := strings.Contains(rawOut, "===SNS_END===") ||
+		(!timedOut && runErr == nil && strings.Contains(rawOut, "===SNS_SEC:SAMPLE_T1==="))
+
+	if timedOut || !hasCompleteSentinel {
+		connBroken = true
 		errDetail := strings.TrimSpace(stderrBuf.String())
-		if errDetail != "" {
+		switch {
+		case runErr != nil && errDetail != "":
 			errDetail = fmt.Sprintf("%v: %s", runErr, errDetail)
-		} else {
+		case runErr != nil:
 			errDetail = runErr.Error()
+		case errDetail != "":
+			errDetail = fmt.Sprintf("采集输出不完整（缺少结束哨兵）: %s", errDetail)
+		default:
+			errDetail = "采集脚本输出被截断或不完整（已拒绝写入零值以防误销警）"
 		}
 		return &vault.ServerMonitorSnapshot{
-			ServerID:    srv.ID,
-			ServerName:  srv.Name,
-			Group:       srv.Group,
-			Host:        srv.Host,
-			Port:        srv.Port,
-			CollectedAt: nowUTC,
-			DurationMs:  max(1, time.Since(startTotal).Milliseconds()),
-			LatencyMs:   handshakeLatencyMs,
-			Reachable:   false,
-			HealthLevel:   vault.HealthOffline,
-			HealthScore:   0,
-			Fingerprint:   client.Fingerprint,
-			RouteLabel:    client.Route.Label,
-			RouteFallback: client.Route.FallbackUsed,
-			Error:         errDetail,
+			ServerID:       srv.ID,
+			ServerName:     srv.Name,
+			Group:          srv.Group,
+			Host:           srv.Host,
+			Port:           srv.Port,
+			CollectedAt:    nowUTC,
+			CollectionTier: string(tier),
+			DurationMs:     max(1, time.Since(startTotal).Milliseconds()),
+			LatencyMs:      latencyMs,
+			Reachable:      false,
+			HealthLevel:    vault.HealthOffline,
+			HealthScore:    0,
+			Fingerprint:    client.Fingerprint,
+			RouteLabel:     client.Route.Label,
+			RouteFallback:  client.Route.FallbackUsed,
+			PartialError:   errDetail,
+			Error:          errDetail,
 		}, nil
 	}
 
 	snap := &vault.ServerMonitorSnapshot{
-		ServerID:      srv.ID,
-		ServerName:    srv.Name,
-		Group:         srv.Group,
-		Host:          srv.Host,
-		Port:          srv.Port,
-		CollectedAt:   nowUTC,
-		LatencyMs:     handshakeLatencyMs,
-		Reachable:     true,
-		Fingerprint:   client.Fingerprint,
-		RouteLabel:    client.Route.Label,
-		RouteFallback: client.Route.FallbackUsed,
+		ServerID:         srv.ID,
+		ServerName:       srv.Name,
+		Group:            srv.Group,
+		Host:             srv.Host,
+		Port:             srv.Port,
+		CollectedAt:      nowUTC,
+		CollectionTier:   string(tier),
+		LatencyMs:        latencyMs,
+		Reachable:        true,
+		Fingerprint:      client.Fingerprint,
+		RouteLabel:       client.Route.Label,
+		RouteFallback:    client.Route.FallbackUsed,
+		ConnectionReused: reused,
+	}
+	if runFull {
+		ts := nowUTC
+		snap.LastSlowCollectedAt = &ts
+		e.mu.Lock()
+		e.lastSlowAt[srv.ID] = ts
+		e.mu.Unlock()
 	}
 
 	ParseDeepTelemetry(rawOut, snap, prevSnap)
@@ -674,47 +894,160 @@ func (e *Engine) probeSingleServer(
 	return snap, nil
 }
 
-func (e *Engine) dispatchWebhook(webhookURL string, triggered, resolved []vault.MonitorAlert) {
-	urlClean := strings.TrimSpace(webhookURL)
-	if !strings.HasPrefix(urlClean, "http://") && !strings.HasPrefix(urlClean, "https://") {
+func (e *Engine) maybeDispatchNotifications(settings vault.MonitorSettings, webhookURL string, triggered, resolved []vault.MonitorAlert) {
+	if len(triggered) == 0 && len(resolved) == 0 {
 		return
 	}
+	urlClean := strings.TrimSpace(webhookURL)
+	var extraChannels []vault.WebhookChannel
+	if settings.ReuseAIPatrolWebhooks && e.store != nil {
+		extraChannels = e.store.GetEnabledAIPatrolWebhooks()
+	}
+	if urlClean == "" && len(extraChannels) == 0 {
+		return
+	}
+	go e.dispatchWebhook(urlClean, extraChannels, triggered, resolved)
+}
 
-	var lines []string
-	if len(triggered) > 0 {
-		lines = append(lines, fmt.Sprintf("【触发告警 %d 条】", len(triggered)))
-		for _, a := range triggered {
-			lines = append(lines, fmt.Sprintf("- [%s] %s (%s)", strings.ToUpper(string(a.Severity)), a.Title, a.Detail))
+func (e *Engine) dispatchWebhook(webhookURL string, extraChannels []vault.WebhookChannel, triggered, resolved []vault.MonitorAlert) {
+	title, summaryText, markdownText, feishuColor := formatAlertNotificationBodies(triggered, resolved)
+	var lastErr error
+	deliveredAny := false
+
+	// 1. Primary MonitorSettings.WebhookURL (auto-detect Feishu/DingTalk/WeCom/Generic + retries)
+	urlClean := strings.TrimSpace(webhookURL)
+	if strings.HasPrefix(urlClean, "http://") || strings.HasPrefix(urlClean, "https://") {
+		platform := detectWebhookPlatform(urlClean)
+		body, err := buildMonitorWebhookPayload(platform, title, summaryText, markdownText, feishuColor, triggered, resolved)
+		if err == nil && e.webhookPost != nil {
+			err = e.postWithRetry(urlClean, body)
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			deliveredAny = true
 		}
 	}
-	if len(resolved) > 0 {
-		lines = append(lines, fmt.Sprintf("【恢复通知 %d 条】", len(resolved)))
-		for _, a := range resolved {
-			lines = append(lines, fmt.Sprintf("- [RESOLVED] %s", a.Title))
+
+	// 2. Optional reuse of enabled AI Patrol multi-channel webhooks
+	for _, ch := range extraChannels {
+		var chErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				e.sleepRetry(attempt)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			chErr = sendSignedWebhookChannel(ctx, ch, title, summaryText, markdownText, feishuColor, triggered, resolved)
+			cancel()
+			if chErr == nil {
+				break
+			}
+		}
+		if chErr != nil {
+			lastErr = fmt.Errorf("通道 [%s]: %w", ch.Name, chErr)
+		} else {
+			deliveredAny = true
 		}
 	}
-	summaryText := "ServerNeedSafe 服务器监控通知\n" + strings.Join(lines, "\n")
 
-	payload := map[string]any{
-		"source":          "ServerNeedSafe",
-		"timestamp":       time.Now().UTC().Format(time.RFC3339),
-		"triggered_count": len(triggered),
-		"resolved_count":  len(resolved),
-		"triggered":       triggered,
-		"resolved":        resolved,
-		"text":            summaryText,
-		"msg_type":        "text",
-		"content": map[string]string{
-			"text": summaryText,
+	now := time.Now().UTC()
+	e.mu.Lock()
+	if deliveredAny {
+		e.lastWebhookAt = &now
+	}
+	if lastErr != nil {
+		e.lastWebhookError = lastErr.Error()
+	} else if deliveredAny {
+		e.lastWebhookError = ""
+	}
+	e.mu.Unlock()
+
+	if lastErr != nil && e.store != nil {
+		e.store.RecordAudit("monitor.webhook_failed", "webhook", fmt.Sprintf("监控告警推送失败: %v", lastErr), "monitor-engine", false)
+	}
+}
+
+func (e *Engine) postWithRetry(urlClean string, body []byte) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			e.sleepRetry(attempt)
+		}
+		if err := e.webhookPost(urlClean, body); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func (e *Engine) sleepRetry(attempt int) {
+	base := e.webhookRetryWait
+	if base <= 0 {
+		base = 500 * time.Millisecond
+	}
+	d := base * time.Duration(1<<(attempt-1))
+	select {
+	case <-time.After(d):
+	case <-e.stopCh:
+	}
+}
+
+// TestWebhook sends a synthetic test notification to the specified Webhook URL (and optional AI patrol channels).
+func (e *Engine) TestWebhook(ctx context.Context, webhookURL string, reuseAIPatrol bool, clientIP string) error {
+	urlClean := strings.TrimSpace(webhookURL)
+	var extraChannels []vault.WebhookChannel
+	if reuseAIPatrol && e.store != nil {
+		extraChannels = e.store.GetEnabledAIPatrolWebhooks()
+	}
+	if urlClean == "" && len(extraChannels) == 0 {
+		return fmt.Errorf("%w: 请先填写监控 Webhook 地址或勾选复用 AI 巡检通道", vault.ErrInvalidInput)
+	}
+
+	sampleAlert := []vault.MonitorAlert{
+		{
+			RuleKind:   "test",
+			RuleName:   "连通性测试",
+			Severity:   vault.SeverityInfo,
+			Status:     vault.AlertStatusFiring,
+			Title:      "ServerNeedSafe 状态监控 Webhook 连通性测试",
+			Detail:     "如果您收到本条消息，说明当前监控告警 Webhook 协议适配与推送链路工作正常",
+			MetricText: "OK",
 		},
 	}
+	title, summaryText, markdownText, _ := formatAlertNotificationBodies(sampleAlert, nil)
+	title = "ServerNeedSafe · 监控 Webhook 连通性测试"
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
+	var errs []string
+	if urlClean != "" {
+		if !strings.HasPrefix(urlClean, "http://") && !strings.HasPrefix(urlClean, "https://") {
+			return fmt.Errorf("%w: Webhook 地址必须以 http:// 或 https:// 开头", vault.ErrInvalidInput)
+		}
+		platform := detectWebhookPlatform(urlClean)
+		body, err := buildMonitorWebhookPayload(platform, title, summaryText, markdownText, "blue", sampleAlert, nil)
+		if err != nil {
+			return err
+		}
+		if err := postWebhookWithHeaders(ctx, urlClean, body, nil); err != nil {
+			errs = append(errs, fmt.Sprintf("主 Webhook (%s): %v", platform, err))
+		}
+	}
+	for _, ch := range extraChannels {
+		if err := sendSignedWebhookChannel(ctx, ch, title, summaryText, markdownText, "blue", sampleAlert, nil); err != nil {
+			errs = append(errs, fmt.Sprintf("复用通道 [%s]: %v", ch.Name, err))
+		}
 	}
 
-	if e.webhookPost != nil {
-		_ = e.webhookPost(urlClean, body)
+	if len(errs) > 0 {
+		errMsg := strings.Join(errs, "；")
+		if e.store != nil {
+			e.store.RecordAudit("monitor.webhook_test", "webhook", "测试推送失败: "+errMsg, clientIP, false)
+		}
+		return errors.New(errMsg)
 	}
+	if e.store != nil {
+		e.store.RecordAudit("monitor.webhook_test", "webhook", "监控 Webhook 连通性测试发送成功", clientIP, true)
+	}
+	return nil
 }

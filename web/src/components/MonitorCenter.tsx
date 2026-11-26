@@ -96,6 +96,40 @@ function barToneClass(pct: number, warn = 75, crit = 90): string {
   return 'ok';
 }
 
+const RULE_CATEGORIES: { key: string; label: string }[] = [
+  { key: 'all', label: '全部规则' },
+  { key: 'availability', label: '可用性与连接' },
+  { key: 'compute', label: '计算与内存' },
+  { key: 'storage', label: '存储与硬件' },
+  { key: 'services', label: '服务与容器' },
+  { key: 'network', label: '网络与端口' },
+  { key: 'security', label: '安全与入侵 (无AI)' },
+];
+
+function ruleCategoryLabel(cat?: string): string {
+  const found = RULE_CATEGORIES.find((c) => c.key === cat);
+  return found ? found.label : '其他';
+}
+
+function exposureScopeLabel(scope?: string, publicExposed?: boolean): { text: string; tone: string } {
+  switch (scope) {
+    case 'wildcard':
+      return { text: '全网卡暴露 (0.0.0.0/::)', tone: 'amber' };
+    case 'public_ip':
+      return { text: '绑定公网 IP 暴露', tone: 'danger' };
+    case 'private_ip':
+      return { text: '绑定网卡内网 IP', tone: 'amber' };
+    case 'link_local':
+      return { text: '链路本地 (Link-Local)', tone: '' };
+    case 'loopback':
+      return { text: '仅本地回环 (Loopback)', tone: '' };
+    default:
+      return publicExposed
+        ? { text: '对外网卡暴露', tone: 'amber' }
+        : { text: '本地回环/内网', tone: '' };
+  }
+}
+
 export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   servers,
   initialServerId,
@@ -135,6 +169,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   const [policySettings, setPolicySettings] = useState<MonitorSettings | null>(null);
   const [policyRules, setPolicyRules] = useState<MonitorAlertRule[]>([]);
   const [savingPolicy, setSavingPolicy] = useState(false);
+  const [testingWebhook, setTestingWebhook] = useState(false);
+  const [ruleCategoryFilter, setRuleCategoryFilter] = useState<string>('all');
   const [confirmClearAll, setConfirmClearAll] = useState(false);
 
   // HostKey verification modal on manual single-node collect
@@ -331,13 +367,45 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   const handleAcceptPortBaseline = async (serverId: string) => {
     try {
       const res = await api.acceptPortBaseline(serverId);
-      onNotify(`已更新公网监听端口安全基线 (${res.port_baseline.length} 个端口)`);
+      onNotify(`已更新对外监听端口安全基线 (${res.port_baseline.length} 个端口)`);
       await Promise.all([
         loadServerDetail(serverId, historyRange, true),
         loadOverview(),
       ]);
     } catch (err: any) {
       onNotify(err?.message || '更新端口基线失败');
+    }
+  };
+
+  const handleAcceptSecurityBaseline = async (serverId: string) => {
+    try {
+      const res = await api.acceptSecurityBaseline(serverId);
+      const fileCnt = Object.keys(res.security_baseline?.file_hashes || {}).length;
+      const ipCnt = (res.security_baseline?.known_ssh_login_ips || []).length;
+      onNotify(`已采纳并更新主机安全基线 (${fileCnt} 个关键文件 · ${ipCnt} 个已知登录 IP)`);
+      await Promise.all([
+        loadServerDetail(serverId, historyRange, true),
+        loadOverview(),
+      ]);
+    } catch (err: any) {
+      onNotify(err?.message || '更新安全基线失败');
+    }
+  };
+
+  const handleTestMonitorWebhook = async () => {
+    if (!policySettings) return;
+    setTestingWebhook(true);
+    try {
+      const res = await api.testMonitorWebhook(
+        policySettings.webhook_url || '',
+        Boolean(policySettings.reuse_ai_patrol_webhooks)
+      );
+      if (res.runtime) setRuntime(res.runtime);
+      onNotify('测试告警已成功推送至目标 Webhook 通道');
+    } catch (err: any) {
+      onNotify(`Webhook 测试失败：${err?.message || '请检查地址与网络连通性'}`);
+    } finally {
+      setTestingWebhook(false);
     }
   };
 
@@ -445,29 +513,49 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       return [];
     }
     const baseSet = new Set(nodeDetail.port_baseline);
+    const seen = new Set<string>();
     return snap.listening_ports.filter((lp) => {
       if (!lp.public_exposed) return false;
       const proto = lp.proto.toLowerCase().startsWith('udp') ? 'udp' : 'tcp';
-      return !baseSet.has(`${proto}/${lp.port}`);
+      const key = `${proto}/${lp.port}`;
+      if (baseSet.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
   }, [snap?.listening_ports, nodeDetail?.port_baseline]);
+
+  const securityDriftCount = useMemo(() => {
+    if (!snap?.security) return 0;
+    return (
+      (snap.security.file_drifts?.length || 0) +
+      (snap.security.persistence_drifts?.length || 0) +
+      (snap.security.new_ssh_login_ips?.length || 0)
+    );
+  }, [snap?.security]);
 
   return (
     <div className="workspace-surface" id="monitor-center-view">
       {/* Page Header */}
       <div className="page-header">
         <div className="page-header-title">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <h2>服务器全维状态监控中心</h2>
             {activeRuntime?.enabled ? (
               <span className="tag-chip teal">
                 <span className="status-dot" style={{ width: 6, height: 6 }} />
                 {activeRuntime.collecting
                   ? `采集中 (${activeRuntime.in_flight_count})`
-                  : `定时巡检每 ${activeRuntime.interval_sec || 60}s`}
+                  : `快层 ${activeRuntime.interval_sec || 60}s / 慢层 ${
+                      activeRuntime.slow_interval_sec || 300
+                    }s`}
               </span>
             ) : (
               <span className="tag-chip amber">后台定时已暂停</span>
+            )}
+            {(activeRuntime?.pooled_connections || 0) > 0 && (
+              <span className="tag-chip" title="当前复用的 SSH 长连接数量（减少目标机登录日志刷屏）">
+                SSH 连接池复用 {activeRuntime?.pooled_connections} 条
+              </span>
             )}
           </div>
           <p>
@@ -1258,6 +1346,37 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               <span className="tag-chip">{snap.virtualization.toUpperCase()}</span>
                             )}
                             {snap?.ntp_synced && <span className="tag-chip teal">NTP 时钟已同步</span>}
+                            {snap?.connection_reused && (
+                              <span className="tag-chip" title="本次采集复用已建立的 SSH 长连接">
+                                连接池复用
+                              </span>
+                            )}
+                            {snap?.unexpected_reboot && (
+                              <span className="tag-chip amber">检测到非预期重启</span>
+                            )}
+                            {(snap?.read_only_mounts?.length || 0) > 0 && (
+                              <span className="tag-chip danger">
+                                只读挂载 RO ({snap?.read_only_mounts?.length})
+                              </span>
+                            )}
+                            {(snap?.raid_degraded?.length || 0) > 0 && (
+                              <span className="tag-chip danger">RAID 降级故障</span>
+                            )}
+                            {(snap?.disk_full_forecast_hours || 0) > 0 && (
+                              <span
+                                className={`tag-chip ${
+                                  (snap?.disk_full_forecast_hours || 999) <= 6 ? 'danger' : 'amber'
+                                }`}
+                              >
+                                预计 {snap?.disk_full_forecast_hours}h 满盘
+                              </span>
+                            )}
+                            {Math.abs(snap?.clock_offset_sec || 0) >= 5 && (
+                              <span className="tag-chip amber">
+                                时钟偏差 {(snap?.clock_offset_sec || 0) > 0 ? '+' : ''}
+                                {snap?.clock_offset_sec}s
+                              </span>
+                            )}
                             {snap?.security?.reboot_required && (
                               <span className="tag-chip amber">需要重启内核</span>
                             )}
@@ -1320,7 +1439,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                       <div className="alert alert-error" style={{ marginBottom: 16 }}>
                         <AlertTriangle size={15} />
                         <span>
-                          最近一次采集 ({formatDateTime(snap.collected_at)}) 失败：{snap.error}
+                          {snap.host_key_changed
+                            ? `【高危安全拦截】SSH 主机密钥指纹突变 (${formatDateTime(snap.collected_at)})：${
+                                snap.host_key_mismatch_detail || snap.error
+                              }`
+                            : snap.partial_error
+                            ? `最近一次采集 (${formatDateTime(snap.collected_at)}) 超时/输出截断（已保护现有告警不误销警）：${snap.partial_error}`
+                            : `最近一次采集 (${formatDateTime(snap.collected_at)}) 失败：${snap.error}`}
                         </span>
                       </div>
                     )}
@@ -1540,12 +1665,56 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <div className="mon-panel-card">
                               <div className="mon-panel-head">
                                 <h4>
-                                  <HardDrive size={15} /> 文件系统挂载分区与 Inode 容量明细
+                                  <HardDrive size={15} /> 本地文件系统、存储健康与内核稳定性
                                 </h4>
                                 <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
                                   FD {snap.fd_used}/{snap.fd_max} · OOM Kills: {snap.oom_kills}
+                                  {(snap.oom_kills_delta || 0) > 0 && (
+                                    <strong style={{ color: 'var(--danger-text)' }}>
+                                      {' '}(+{snap.oom_kills_delta} 本周期)
+                                    </strong>
+                                  )}
                                 </span>
                               </div>
+                              {(snap.read_only_mounts?.length || 0) > 0 && (
+                                <div className="alert alert-error" style={{ marginBottom: 10 }}>
+                                  <AlertTriangle size={14} />
+                                  <span>
+                                    只读挂载异常 (RO)：{snap.read_only_mounts?.join(', ')}
+                                  </span>
+                                </div>
+                              )}
+                              {(snap.raid_degraded?.length || 0) > 0 && (
+                                <div className="alert alert-error" style={{ marginBottom: 10 }}>
+                                  <AlertTriangle size={14} />
+                                  <span>软 RAID 降级：{snap.raid_degraded?.join('；')}</span>
+                                </div>
+                              )}
+                              {(snap.disk_full_forecast_hours || 0) > 0 && (
+                                <div className="alert" style={{ marginBottom: 10, borderColor: 'var(--amber-border)', background: 'var(--amber-soft)' }}>
+                                  <Clock size={14} />
+                                  <span>
+                                    磁盘耗尽趋势预测：分区 <strong className="mono">{snap.disk_full_forecast_mount || '/'}</strong> 按当前增速预计约{' '}
+                                    <strong>{snap.disk_full_forecast_hours} 小时</strong> 后写满
+                                  </span>
+                                </div>
+                              )}
+                              {(snap.kernel_error_count || 0) > 0 && (
+                                <div className="alert alert-error" style={{ marginBottom: 10, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                                  <strong>内核日志捕获 {snap.kernel_error_count} 条硬件/存储/NFS 错误：</strong>
+                                  {(snap.kernel_errors || []).slice(0, 3).map((ke, ki) => (
+                                    <div key={ki} className="mono" style={{ fontSize: 11.5, wordBreak: 'break-all' }}>
+                                      {ke}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              {(snap.remote_mounts?.length || 0) > 0 && (
+                                <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                                  远程挂载点（默认经 <span className="mono">df -l</span> 安全隔离防 D 态卡死）：{' '}
+                                  <span className="mono">{snap.remote_mounts?.join(', ')}</span>
+                                </div>
+                              )}
                               {snap.disks && snap.disks.length > 0 ? (
                                 <div style={{ overflowX: 'auto' }}>
                                   <table className="data-table">
@@ -1859,13 +2028,14 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 </tr>
                               </thead>
                               <tbody>
-                                {(snap.listening_ports || []).map((lp, idx) => {
+                                  {(snap.listening_ports || []).map((lp, idx) => {
                                   const protoKey = lp.proto.toLowerCase().startsWith('udp')
                                     ? 'udp'
                                     : 'tcp';
                                   const inBaseline = nodeDetail.port_baseline.includes(
                                     `${protoKey}/${lp.port}`
                                   );
+                                  const scopeInfo = exposureScopeLabel(lp.exposure_scope, lp.public_exposed);
                                   return (
                                     <tr key={`${lp.proto}-${lp.bind_addr}-${lp.port}-${idx}`}>
                                       <td className="mono">{lp.proto.toUpperCase()}</td>
@@ -1882,16 +2052,14 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                         )}
                                       </td>
                                       <td>
-                                        {lp.public_exposed ? (
-                                          <span className="tag-chip amber">公网全网卡暴露</span>
-                                        ) : (
-                                          <span className="tag-chip">本地回环/内网</span>
-                                        )}
+                                        <span className={`tag-chip ${scopeInfo.tone}`}>
+                                          {scopeInfo.text}
+                                        </span>
                                       </td>
                                       <td>
                                         {!lp.public_exposed ? (
                                           <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-                                            仅内网安全
+                                            仅本地安全
                                           </span>
                                         ) : inBaseline ? (
                                           <span className="tag-chip teal">已纳入基线</span>
@@ -1910,6 +2078,11 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               </tbody>
                             </table>
                           </div>
+                          {snap.ports_truncated && (
+                            <div style={{ fontSize: 12, color: 'var(--amber-text)', marginTop: 8 }}>
+                              提示：监听端口数超过 500 条已截断展示（已自动启用截断保护，避免误报必监端口离线）。
+                            </div>
+                          )}
                         </div>
                       </div>
                     )}
@@ -1980,14 +2153,26 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <div className="mon-panel-head">
                               <h4>Docker 容器运行健康</h4>
                               {snap.docker.installed ? (
-                                <span className="mono" style={{ fontSize: 12 }}>
-                                  运行中 {snap.docker.running} · 已停止 {snap.docker.stopped} · 异常{' '}
-                                  {snap.docker.unhealthy}
-                                </span>
+                                snap.docker.daemon_down ? (
+                                  <span className="tag-chip danger">Daemon 无响应</span>
+                                ) : (
+                                  <span className="mono" style={{ fontSize: 12 }}>
+                                    运行中 {snap.docker.running} · 已停止 {snap.docker.stopped} · 异常{' '}
+                                    {snap.docker.unhealthy + (snap.docker.exited_abnormal || 0)}
+                                    {snap.docker.truncated ? ' (已截断至 200)' : ''}
+                                  </span>
+                                )
                               ) : (
-                                <span className="tag-chip">未安装或无权限</span>
+                                <span className="tag-chip">未安装</span>
                               )}
                             </div>
+
+                            {snap.docker.daemon_down && (
+                              <div className="alert alert-error" style={{ marginBottom: 12 }}>
+                                <AlertTriangle size={14} />
+                                <span>已检测到 Docker，但 dockerd 守护进程当前无响应或无权限访问。</span>
+                              </div>
+                            )}
 
                             {snap.docker.installed &&
                             snap.docker.containers &&
@@ -2002,49 +2187,128 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {snap.docker.containers.map((c) => (
-                                      <tr key={c.id || c.name}>
-                                        <td className="mono" style={{ fontWeight: 600 }}>
-                                          {c.name}
-                                        </td>
-                                        <td className="mono" style={{ fontSize: 12 }}>
-                                          {c.image}
-                                        </td>
-                                        <td>
-                                          <span
-                                            className={`tag-chip ${
-                                              c.health === 'unhealthy' || c.state === 'restarting'
-                                                ? 'danger'
-                                                : c.state === 'running'
-                                                ? 'teal'
-                                                : ''
-                                            }`}
-                                          >
-                                            {c.status}
-                                          </span>
-                                        </td>
-                                      </tr>
-                                    ))}
+                                    {snap.docker.containers.map((c) => {
+                                      const exitedBad =
+                                        c.state === 'exited' &&
+                                        /exited \([1-9]/i.test(c.status || '');
+                                      const isBad =
+                                        c.health === 'unhealthy' ||
+                                        c.state === 'restarting' ||
+                                        c.state === 'dead' ||
+                                        exitedBad;
+                                      return (
+                                        <tr key={c.id || c.name}>
+                                          <td className="mono" style={{ fontWeight: 600 }}>
+                                            {c.name}
+                                          </td>
+                                          <td className="mono" style={{ fontSize: 12 }}>
+                                            {c.image}
+                                          </td>
+                                          <td>
+                                            <span
+                                              className={`tag-chip ${
+                                                isBad
+                                                  ? 'danger'
+                                                  : c.state === 'running'
+                                                  ? 'teal'
+                                                  : ''
+                                              }`}
+                                            >
+                                              {c.status}
+                                            </span>
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
                                   </tbody>
                                 </table>
                               </div>
                             ) : (
                               <div className="mon-empty-inline">
                                 {snap.docker.installed
-                                  ? '主机上当前没有容器实例'
+                                  ? snap.docker.daemon_down
+                                    ? 'Docker 守护进程不可用'
+                                    : '主机上当前没有容器实例'
                                   : '主机未运行 Docker 守护进程'}
                               </div>
                             )}
                           </div>
                         </div>
 
-                        {/* Host Security Posture & SSH Brute-Force Audit */}
+                        {/* Host Security Posture, FIM Baseline & Zero-AI Intrusion Detection */}
                         <div className="mon-panel-card">
-                          <div className="mon-panel-head">
+                          <div className="mon-panel-head" style={{ flexWrap: 'wrap', gap: 8 }}>
                             <h4>
-                              <ShieldAlert size={15} /> 主机安全基线与 SSH 登录爆破审计
+                              <ShieldAlert size={15} /> 主机安全基线、FIM 与无 AI 入侵审计
                             </h4>
+                            <button
+                              type="button"
+                              className={`btn btn-sm ${securityDriftCount > 0 ? 'btn-primary' : ''}`}
+                              onClick={() => void handleAcceptSecurityBaseline(nodeDetail.server.id)}
+                            >
+                              <ShieldCheck size={13.5} />
+                              {securityDriftCount > 0
+                                ? `采纳安全基线 (${securityDriftCount} 项漂移)`
+                                : '更新安全基线'}
+                            </button>
                           </div>
+
+                          {((snap.security.file_drifts?.length || 0) > 0 ||
+                            (snap.security.persistence_drifts?.length || 0) > 0) && (
+                            <div
+                              className="alert alert-error"
+                              style={{ marginBottom: 12, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
+                            >
+                              <strong>检测到关键安全文件或持久化配置基线漂移 (FIM)：</strong>
+                              {(snap.security.file_drifts || []).map((fd, i) => (
+                                <div key={`fd-${i}`} className="mono" style={{ fontSize: 12 }}>
+                                  • {fd}
+                                </div>
+                              ))}
+                              {(snap.security.persistence_drifts || []).map((pd, i) => (
+                                <div key={`pd-${i}`} className="mono" style={{ fontSize: 12 }}>
+                                  • {pd}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {(snap.security.suspicious_procs?.length || 0) > 0 && (
+                            <div
+                              className="alert alert-error"
+                              style={{ marginBottom: 12, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
+                            >
+                              <strong>检测到 {snap.security.suspicious_procs?.length} 个可疑进程特征：</strong>
+                              {(snap.security.suspicious_procs || []).map((sp, i) => (
+                                <div key={`sp-${i}`} className="mono" style={{ fontSize: 11.5, wordBreak: 'break-all' }}>
+                                  • PID {sp.pid} ({sp.user}) [{sp.reason}/{sp.severity}]: {sp.command}
+                                  {sp.exe_path ? ` → ${sp.exe_path}` : ''}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {(snap.security.suspicious_outbound?.length || 0) > 0 && (
+                            <div
+                              className="alert"
+                              style={{
+                                marginBottom: 12,
+                                borderColor: 'var(--amber-border)',
+                                background: 'var(--amber-soft)',
+                                flexDirection: 'column',
+                                alignItems: 'flex-start',
+                                gap: 4,
+                              }}
+                            >
+                              <strong>检测到 {snap.security.suspicious_outbound?.length} 条高危端口外联：</strong>
+                              {(snap.security.suspicious_outbound || []).map((oc, i) => (
+                                <div key={`oc-${i}`} className="mono" style={{ fontSize: 11.5 }}>
+                                  • {oc.remote_ip}:{oc.remote_port} ({oc.process || 'unknown'}
+                                  {oc.pid ? ` pid=${oc.pid}` : ''}) [{oc.reason || 'high_risk_port'}]
+                                </div>
+                              ))}
+                            </div>
+                          )}
 
                           <div className="kv-list" style={{ marginBottom: 14 }}>
                             <div className="kv-row">
@@ -2055,7 +2319,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                     snap.security.firewall_status === 'active'
                                       ? 'teal'
                                       : snap.security.firewall_status === 'inactive'
-                                      ? 'amber'
+                                      ? 'danger'
                                       : ''
                                   }`}
                                 >
@@ -2073,9 +2337,47 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <div className="kv-row">
                               <span className="kv-key">UID=0 特权账号列表</span>
                               <span className="kv-val">
-                                {(snap.security.uid_zero_users || ['root']).join(', ')}
+                                {(snap.security.uid_zero_users || ['root']).some((u) => u !== 'root') ? (
+                                  <span className="tag-chip danger">
+                                    {(snap.security.uid_zero_users || []).join(', ')} (含非 root!)
+                                  </span>
+                                ) : (
+                                  (snap.security.uid_zero_users || ['root']).join(', ')
+                                )}
                               </span>
                             </div>
+                            <div className="kv-row">
+                              <span className="kv-key">FIM 关键文件与持久化基线</span>
+                              <span className="kv-val">
+                                {Object.keys(snap.security.file_hashes || {}).length > 0 ? (
+                                  <span
+                                    className={`tag-chip ${
+                                      (snap.security.file_drifts?.length || 0) > 0 ||
+                                      (snap.security.persistence_drifts?.length || 0) > 0
+                                        ? 'danger'
+                                        : 'teal'
+                                    }`}
+                                  >
+                                    已监控 {Object.keys(snap.security.file_hashes || {}).length} 个文件
+                                    {snap.security.persistence_hash ? ' + 持久化指纹' : ''}
+                                  </span>
+                                ) : (
+                                  <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+                                    将在慢层采集后自动锁定基线
+                                  </span>
+                                )}
+                              </span>
+                            </div>
+                            {snap.security.ssh_weak_configs && snap.security.ssh_weak_configs.length > 0 && (
+                              <div className="kv-row">
+                                <span className="kv-key">SSH 配置风险提示</span>
+                                <span className="kv-val">
+                                  <span className="tag-chip amber">
+                                    {snap.security.ssh_weak_configs.join('；')}
+                                  </span>
+                                </span>
+                              </div>
+                            )}
                             <div className="kv-row">
                               <span className="kv-key">内核安全更新重启需求</span>
                               <span className="kv-val">
@@ -2087,7 +2389,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               </span>
                             </div>
                             <div className="kv-row">
-                              <span className="kv-key">近期 SSH 登录失败爆破计数</span>
+                              <span className="kv-key">近 15 分钟 SSH 失败爆破计数</span>
                               <span className="kv-val">
                                 <span
                                   className={`tag-chip ${
@@ -2098,7 +2400,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                       : 'teal'
                                   }`}
                                 >
-                                  {snap.security.ssh_failed_recent} 次失败尝试
+                                  {snap.security.ssh_failed_recent} 次失败尝试 (去重)
                                 </span>
                               </span>
                             </div>
@@ -2129,6 +2431,52 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                               </div>
                             )}
                           </div>
+
+                          {snap.security.recent_ssh_logins && snap.security.recent_ssh_logins.length > 0 && (
+                            <div style={{ marginBottom: 14 }}>
+                              <h4 style={{ fontSize: 13, fontWeight: 630, marginBottom: 8 }}>
+                                近期成功 SSH 登录记录
+                                {(snap.security.new_ssh_login_ips?.length || 0) > 0 && (
+                                  <span className="tag-chip amber" style={{ marginLeft: 8 }}>
+                                    +{snap.security.new_ssh_login_ips?.length} 新来源 IP
+                                  </span>
+                                )}
+                              </h4>
+                              <div style={{ overflowX: 'auto' }}>
+                                <table className="data-table">
+                                  <thead>
+                                    <tr>
+                                      <th>用户</th>
+                                      <th>来源 IP</th>
+                                      <th>认证方式</th>
+                                      <th>基线状态</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {snap.security.recent_ssh_logins.slice(0, 8).map((ev, idx) => {
+                                      const isNew = (snap.security.new_ssh_login_ips || []).includes(
+                                        ev.from_ip
+                                      );
+                                      return (
+                                        <tr key={`login-${idx}`}>
+                                          <td className="mono">{ev.user}</td>
+                                          <td className="mono">{ev.from_ip}</td>
+                                          <td className="mono">{ev.method || '—'}</td>
+                                          <td>
+                                            {isNew ? (
+                                              <span className="tag-chip amber">新来源 IP</span>
+                                            ) : (
+                                              <span className="tag-chip teal">已知基线</span>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
 
                           <h4 style={{ fontSize: 13, fontWeight: 630, marginBottom: 8 }}>
                             当前在线交互式终端会话 (who)
@@ -2395,7 +2743,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                     <div className="field-row">
                       <div className="field">
                         <label className="field-label">
-                          <span>默认采集间隔 (秒)</span>
+                          <span>快层实时采集间隔 (秒)</span>
                           <span className="field-hint">支持 10 ~ 86400 秒</span>
                         </label>
                         <input
@@ -2432,6 +2780,45 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
 
                       <div className="field">
                         <label className="field-label">
+                          <span>慢层安全 / 静态审计周期 (秒)</span>
+                          <span className="field-hint">支持 60 ~ 3600 秒（降载防扰）</span>
+                        </label>
+                        <input
+                          type="number"
+                          className="input mono"
+                          min={60}
+                          max={3600}
+                          value={policySettings.slow_interval_sec || 300}
+                          onChange={(e) =>
+                            setPolicySettings({
+                              ...policySettings,
+                              slow_interval_sec: Number(e.target.value) || 300,
+                            })
+                          }
+                        />
+                        <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                          {[180, 300, 600, 900].map((sec) => (
+                            <button
+                              key={sec}
+                              type="button"
+                              className={`group-pill ${
+                                (policySettings.slow_interval_sec || 300) === sec ? 'active' : ''
+                              }`}
+                              style={{ padding: '2px 8px', fontSize: 11.5 }}
+                              onClick={() =>
+                                setPolicySettings({ ...policySettings, slow_interval_sec: sec })
+                              }
+                            >
+                              {sec}s
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="field-row">
+                      <div className="field">
+                        <label className="field-label">
                           <span>单机保存样本点数 (环形缓冲)</span>
                           <span className="field-hint">
                             约{' '}
@@ -2456,57 +2843,77 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           }
                         />
                       </div>
-                    </div>
-
-                    <div className="field-row">
-                      <div className="field">
-                        <label className="field-label">单机 SSH 采集超时 (秒)</label>
-                        <input
-                          type="number"
-                          className="input mono"
-                          min={5}
-                          max={120}
-                          value={policySettings.timeout_sec}
-                          onChange={(e) =>
-                            setPolicySettings({
-                              ...policySettings,
-                              timeout_sec: Number(e.target.value) || 15,
-                            })
-                          }
-                        />
-                      </div>
 
                       <div className="field">
-                        <label className="field-label">最大并发采集工作协程</label>
-                        <input
-                          type="number"
-                          className="input mono"
-                          min={1}
-                          max={20}
-                          value={policySettings.concurrency}
-                          onChange={(e) =>
-                            setPolicySettings({
-                              ...policySettings,
-                              concurrency: Number(e.target.value) || 6,
-                            })
-                          }
-                        />
+                        <label className="field-label">单机超时 (秒) / 最大并发协程</label>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <input
+                            type="number"
+                            className="input mono"
+                            min={5}
+                            max={120}
+                            title="单机 SSH 采集超时 (秒)"
+                            value={policySettings.timeout_sec}
+                            onChange={(e) =>
+                              setPolicySettings({
+                                ...policySettings,
+                                timeout_sec: Number(e.target.value) || 15,
+                              })
+                            }
+                          />
+                          <input
+                            type="number"
+                            className="input mono"
+                            min={1}
+                            max={20}
+                            title="最大并发采集工作协程"
+                            value={policySettings.concurrency}
+                            onChange={(e) =>
+                              setPolicySettings({
+                                ...policySettings,
+                                concurrency: Number(e.target.value) || 6,
+                              })
+                            }
+                          />
+                        </div>
                       </div>
                     </div>
 
                     <div className="field" style={{ marginBottom: 0 }}>
                       <label className="field-label">
                         <span>告警推送 Webhook 地址 (选填，加密存储)</span>
-                        <span className="field-hint">支持飞书/钉钉/企微或通用 JSON Webhook</span>
+                        <span className="field-hint">自动识别飞书 / 钉钉 / 企业微信与通用 JSON，支持重试审计</span>
                       </label>
-                      <input
-                        className="input mono"
-                        placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-                        value={policySettings.webhook_url || ''}
-                        onChange={(e) =>
-                          setPolicySettings({ ...policySettings, webhook_url: e.target.value })
-                        }
-                      />
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <input
+                          className="input mono"
+                          style={{ flex: 1 }}
+                          placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/... 或钉钉/企微 Webhook"
+                          value={policySettings.webhook_url || ''}
+                          onChange={(e) =>
+                            setPolicySettings({ ...policySettings, webhook_url: e.target.value })
+                          }
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={testingWebhook}
+                          onClick={() => void handleTestMonitorWebhook()}
+                        >
+                          <Bell size={13} />
+                          {testingWebhook ? '推送中...' : '测试推送'}
+                        </button>
+                      </div>
+                      {activeRuntime?.last_webhook_error && (
+                        <div style={{ fontSize: 11.5, color: 'var(--danger-text)', marginTop: 6 }}>
+                          最近推送失败：{activeRuntime.last_webhook_error}
+                        </div>
+                      )}
+                      {!activeRuntime?.last_webhook_error && activeRuntime?.last_webhook_at && (
+                        <div style={{ fontSize: 11.5, color: 'var(--status-online)', marginTop: 6 }}>
+                          最近推送成功：{formatDateTime(activeRuntime.last_webhook_at)}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -2514,11 +2921,49 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                   <div className="mon-panel-card">
                     <div className="mon-panel-head">
                       <h4>
-                        <ShieldCheck size={15} /> 全方位采集维度与无人值守开关
+                        <ShieldCheck size={15} /> 全方位采集维度、生产防干扰与推送开关
                       </h4>
                     </div>
 
                     <div className="mon-toggle-list">
+                      <label className="mon-check-row">
+                        <input
+                          type="checkbox"
+                          checked={policySettings.use_ssh_connection_pool}
+                          onChange={(e) =>
+                            setPolicySettings({
+                              ...policySettings,
+                              use_ssh_connection_pool: e.target.checked,
+                            })
+                          }
+                        />
+                        <div>
+                          <strong>启用 SSH 与跳板机长连接池复用（生产推荐）</strong>
+                          <p>
+                            复用持久 SSH 连接与共享跳板隧道，大幅减少目标机 auth.log 刷屏及跳板机 MaxStartups 压力
+                          </p>
+                        </div>
+                      </label>
+
+                      <label className="mon-check-row">
+                        <input
+                          type="checkbox"
+                          checked={policySettings.reuse_ai_patrol_webhooks}
+                          onChange={(e) =>
+                            setPolicySettings({
+                              ...policySettings,
+                              reuse_ai_patrol_webhooks: e.target.checked,
+                            })
+                          }
+                        />
+                        <div>
+                          <strong>同步复用 AI 巡检已配置的多通道 Webhook</strong>
+                          <p>
+                            开启后监控告警与升级通知也将推送至 AI 巡检中已启用的加签飞书/钉钉/企微通道
+                          </p>
+                        </div>
+                      </label>
+
                       <label className="mon-check-row">
                         <input
                           type="checkbox"
@@ -2549,7 +2994,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                         />
                         <div>
                           <strong>采集监听端口、Systemd 服务与 Docker 容器健康</strong>
-                          <p>自动审计 ss/netstat 监听套接字、故障服务单元与容器异常重启</p>
+                          <p>单次批量查询 systemd 与最多 500 端口/200 容器，覆盖非 0 退出容器与 daemon 失联</p>
                         </div>
                       </label>
 
@@ -2565,8 +3010,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           }
                         />
                         <div>
-                          <strong>开启公网暴露监听端口安全基线漂移检测</strong>
-                          <p>当发现安全基线以外新开放的 0.0.0.0 / [::] 端口时立即触发告警</p>
+                          <strong>开启对外监听端口安全基线漂移检测</strong>
+                          <p>覆盖 0.0.0.0/:: 及直接绑定网卡具体 IP 的新开放端口</p>
                         </div>
                       </label>
 
@@ -2582,8 +3027,29 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                           }
                         />
                         <div>
-                          <strong>采集主机安全态势与 SSH 登录爆破日志</strong>
-                          <p>包含防火墙状态、UID=0 特权账户、在线终端会话与近期失败登录源 IP</p>
+                          <strong>采集慢层主机安全态势、FIM 基线与无 AI 入侵特征</strong>
+                          <p>
+                            包含 15 分钟精准窗口 SSH 爆破与成功登录、UID=0、关键文件/Crontab 哈希基线、可疑进程与高危外联
+                          </p>
+                        </div>
+                      </label>
+
+                      <label className="mon-check-row">
+                        <input
+                          type="checkbox"
+                          checked={policySettings.include_remote_mounts}
+                          onChange={(e) =>
+                            setPolicySettings({
+                              ...policySettings,
+                              include_remote_mounts: e.target.checked,
+                            })
+                          }
+                        />
+                        <div>
+                          <strong>高级：包含 NFS / CIFS 远程挂载点容量统计（默认关闭防卡死）</strong>
+                          <p>
+                            默认使用 <span className="mono">df -l</span> 严格隔离远程挂载以防 hard NFS 失联导致 D 态进程堆积；仅建议在 soft 挂载环境按需启用
+                          </p>
                         </div>
                       </label>
 
@@ -2651,13 +3117,16 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                   </div>
                 </div>
 
-                {/* 18-Rule Alert Matrix Editor */}
+                {/* Categorized Multi-Dimensional Zero-AI Alert Rule Matrix Editor */}
                 <div className="mon-panel-card">
-                  <div className="mon-panel-head">
+                  <div className="mon-panel-head" style={{ flexWrap: 'wrap', gap: 10 }}>
                     <div>
-                      <h4>18 项多维告警阈值与连续防抖规则矩阵</h4>
+                      <h4>
+                        {policyRules.length} 项多维告警阈值与连续防抖规则矩阵（已启用{' '}
+                        {policyRules.filter((r) => r.enabled).length} 项）
+                      </h4>
                       <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
-                        支持配置警告阈值 (Warning)、严重阈值 (Critical) 及连续超限次数防抖，恢复正常后自动销警
+                        严格防抖与升级重激活状态机；环境敏感规则默认关闭防噪音，可按分类按需启停
                       </p>
                     </div>
                     <button
@@ -2671,113 +3140,158 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                     </button>
                   </div>
 
+                  <div className="group-pills" style={{ marginBottom: 12 }}>
+                    {RULE_CATEGORIES.map((cat) => {
+                      const cnt =
+                        cat.key === 'all'
+                          ? policyRules.length
+                          : policyRules.filter((r) => (r.category || 'other') === cat.key).length;
+                      return (
+                        <button
+                          key={cat.key}
+                          type="button"
+                          className={`group-pill ${ruleCategoryFilter === cat.key ? 'active' : ''}`}
+                          onClick={() => setRuleCategoryFilter(cat.key)}
+                        >
+                          {cat.label} ({cnt})
+                        </button>
+                      );
+                    })}
+                  </div>
+
                   <div style={{ overflowX: 'auto' }}>
                     <table className="data-table mon-policy-table">
                       <thead>
                         <tr>
                           <th style={{ width: 64 }}>启用</th>
                           <th>规则名称与监控说明</th>
-                          <th style={{ width: 140 }}>警告阈值 (Warning)</th>
-                          <th style={{ width: 140 }}>严重阈值 (Critical)</th>
+                          <th style={{ width: 150 }}>警告阈值 (Warning)</th>
+                          <th style={{ width: 150 }}>严重阈值 (Critical)</th>
                           <th style={{ width: 140 }}>连续超限防抖</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {policyRules.map((rule, idx) => (
-                          <tr key={rule.kind}>
-                            <td data-label="启用状态">
-                              <input
-                                type="checkbox"
-                                checked={rule.enabled}
-                                onChange={(e) => {
-                                  const next = [...policyRules];
-                                  next[idx] = { ...rule, enabled: e.target.checked };
-                                  setPolicyRules(next);
-                                }}
-                              />
-                            </td>
-                            <td data-label="告警规则" className="mon-policy-rule-cell">
-                              <div style={{ fontWeight: 600 }}>{rule.name}</div>
-                              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                {rule.description}
-                              </div>
-                            </td>
-                            <td data-label="警告阈值 (Warning)">
-                              {rule.state_based ? (
-                                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                  状态触发型
-                                </span>
-                              ) : (
-                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                                  <input
-                                    type="number"
-                                    step="any"
-                                    className="input mono mon-rule-input"
-                                    value={rule.warning_threshold}
-                                    onChange={(e) => {
-                                      const next = [...policyRules];
-                                      next[idx] = {
-                                        ...rule,
-                                        warning_threshold: Number(e.target.value),
-                                      };
-                                      setPolicyRules(next);
-                                    }}
-                                  />
-                                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                    {rule.unit}
-                                  </span>
-                                </div>
-                              )}
-                            </td>
-                            <td data-label="严重阈值 (Critical)">
-                              {rule.state_based ? (
-                                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                  异常即告警
-                                </span>
-                              ) : (
-                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                                  <input
-                                    type="number"
-                                    step="any"
-                                    className="input mono mon-rule-input"
-                                    value={rule.critical_threshold}
-                                    onChange={(e) => {
-                                      const next = [...policyRules];
-                                      next[idx] = {
-                                        ...rule,
-                                        critical_threshold: Number(e.target.value),
-                                      };
-                                      setPolicyRules(next);
-                                    }}
-                                  />
-                                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                    {rule.unit}
-                                  </span>
-                                </div>
-                              )}
-                            </td>
-                            <td data-label="连续超限防抖">
-                              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                        {policyRules.map((rule, idx) => {
+                          if (
+                            ruleCategoryFilter !== 'all' &&
+                            (rule.category || 'other') !== ruleCategoryFilter
+                          ) {
+                            return null;
+                          }
+                          return (
+                            <tr key={rule.kind}>
+                              <td data-label="启用状态">
                                 <input
-                                  type="number"
-                                  min={1}
-                                  max={20}
-                                  className="input mono mon-rule-input debounce"
-                                  value={rule.consecutive_count}
+                                  type="checkbox"
+                                  checked={rule.enabled}
                                   onChange={(e) => {
                                     const next = [...policyRules];
-                                    next[idx] = {
-                                      ...rule,
-                                      consecutive_count: Math.max(1, Number(e.target.value) || 1),
-                                    };
+                                    next[idx] = { ...rule, enabled: e.target.checked };
                                     setPolicyRules(next);
                                   }}
                                 />
-                                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>次</span>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td data-label="告警规则" className="mon-policy-rule-cell">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                  <span style={{ fontWeight: 600 }}>{rule.name}</span>
+                                  <span className="tag-chip" style={{ fontSize: 10.5, padding: '1px 6px' }}>
+                                    {ruleCategoryLabel(rule.category)}
+                                  </span>
+                                  {rule.lower_is_worse && (
+                                    <span className="tag-chip amber" style={{ fontSize: 10.5, padding: '1px 6px' }}>
+                                      低于阈值触发 (≤)
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                                  {rule.description}
+                                </div>
+                              </td>
+                              <td data-label="警告阈值 (Warning)">
+                                {rule.state_based ? (
+                                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                    状态触发型
+                                  </span>
+                                ) : (
+                                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                                      {rule.lower_is_worse ? '≤' : '≥'}
+                                    </span>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      min={0}
+                                      className="input mono mon-rule-input"
+                                      value={rule.warning_threshold}
+                                      onChange={(e) => {
+                                        const next = [...policyRules];
+                                        next[idx] = {
+                                          ...rule,
+                                          warning_threshold: Number(e.target.value),
+                                        };
+                                        setPolicyRules(next);
+                                      }}
+                                    />
+                                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                      {rule.unit}
+                                    </span>
+                                  </div>
+                                )}
+                              </td>
+                              <td data-label="严重阈值 (Critical)">
+                                {rule.state_based ? (
+                                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                    异常即告警
+                                  </span>
+                                ) : (
+                                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                                      {rule.lower_is_worse ? '≤' : '≥'}
+                                    </span>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      min={0}
+                                      className="input mono mon-rule-input"
+                                      value={rule.critical_threshold}
+                                      onChange={(e) => {
+                                        const next = [...policyRules];
+                                        next[idx] = {
+                                          ...rule,
+                                          critical_threshold: Number(e.target.value),
+                                        };
+                                        setPolicyRules(next);
+                                      }}
+                                    />
+                                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                      {rule.unit}
+                                    </span>
+                                  </div>
+                                )}
+                              </td>
+                              <td data-label="连续超限防抖">
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    max={20}
+                                    className="input mono mon-rule-input debounce"
+                                    value={rule.consecutive_count}
+                                    onChange={(e) => {
+                                      const next = [...policyRules];
+                                      next[idx] = {
+                                        ...rule,
+                                        consecutive_count: Math.max(1, Number(e.target.value) || 1),
+                                      };
+                                      setPolicyRules(next);
+                                    }}
+                                  />
+                                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>次</span>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
