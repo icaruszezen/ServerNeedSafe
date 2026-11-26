@@ -14,10 +14,12 @@ import (
 type ServerProbeResult struct {
 	ServerID    string  `json:"server_id"`
 	ServerName  string  `json:"server_name"`
-	Reachable   bool    `json:"reachable"`
-	LatencyMs   int64   `json:"latency_ms"`
-	Fingerprint string  `json:"fingerprint,omitempty"`
-	Hostname    string  `json:"hostname,omitempty"`
+	Reachable     bool    `json:"reachable"`
+	LatencyMs     int64   `json:"latency_ms"`
+	Fingerprint   string  `json:"fingerprint,omitempty"`
+	RouteLabel    string  `json:"route_label,omitempty"`
+	RouteFallback bool    `json:"route_fallback,omitempty"`
+	Hostname      string  `json:"hostname,omitempty"`
 	OS          string  `json:"os,omitempty"`
 	Kernel      string  `json:"kernel,omitempty"`
 	Arch        string  `json:"arch,omitempty"`
@@ -121,11 +123,13 @@ func (m *Manager) ProbeServer(serverID, trustFingerprint, clientIP string) (*Ser
 	}
 
 	res := &ServerProbeResult{
-		ServerID:    serverID,
-		ServerName:  client.Server.Name,
-		Reachable:   true,
-		LatencyMs:   latencyMs,
-		Fingerprint: client.Fingerprint,
+		ServerID:      serverID,
+		ServerName:    client.Server.Name,
+		Reachable:     true,
+		LatencyMs:     latencyMs,
+		Fingerprint:   client.Fingerprint,
+		RouteLabel:    client.Route.Label,
+		RouteFallback: client.Route.FallbackUsed,
 	}
 
 	sess, err := client.NewSession()
@@ -235,6 +239,7 @@ type BatchExecResult struct {
 	Stdout     string `json:"stdout"`
 	Stderr     string `json:"stderr"`
 	DurationMs int64  `json:"duration_ms"`
+	RouteLabel string `json:"route_label,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
 
@@ -272,6 +277,7 @@ func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.
 				return
 			}
 			defer client.Close()
+			res.RouteLabel = client.Route.Label
 
 			sess, err := client.NewSession()
 			if err != nil {

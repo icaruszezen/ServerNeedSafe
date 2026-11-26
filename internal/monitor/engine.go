@@ -593,10 +593,12 @@ func (e *Engine) probeSingleServer(
 			CollectedAt: nowUTC,
 			DurationMs:  max(1, time.Since(startTotal).Milliseconds()),
 			Reachable:   false,
-			HealthLevel: vault.HealthOffline,
-			HealthScore: 0,
-			Fingerprint: client.Fingerprint,
-			Error:       fmt.Sprintf("创建远程监控会话失败: %v", err),
+			HealthLevel:   vault.HealthOffline,
+			HealthScore:   0,
+			Fingerprint:   client.Fingerprint,
+			RouteLabel:    client.Route.Label,
+			RouteFallback: client.Route.FallbackUsed,
+			Error:         fmt.Sprintf("创建远程监控会话失败: %v", err),
 		}, nil
 	}
 	defer sess.Close()
@@ -644,23 +646,27 @@ func (e *Engine) probeSingleServer(
 			DurationMs:  max(1, time.Since(startTotal).Milliseconds()),
 			LatencyMs:   handshakeLatencyMs,
 			Reachable:   false,
-			HealthLevel: vault.HealthOffline,
-			HealthScore: 0,
-			Fingerprint: client.Fingerprint,
-			Error:       errDetail,
+			HealthLevel:   vault.HealthOffline,
+			HealthScore:   0,
+			Fingerprint:   client.Fingerprint,
+			RouteLabel:    client.Route.Label,
+			RouteFallback: client.Route.FallbackUsed,
+			Error:         errDetail,
 		}, nil
 	}
 
 	snap := &vault.ServerMonitorSnapshot{
-		ServerID:    srv.ID,
-		ServerName:  srv.Name,
-		Group:       srv.Group,
-		Host:        srv.Host,
-		Port:        srv.Port,
-		CollectedAt: nowUTC,
-		LatencyMs:   handshakeLatencyMs,
-		Reachable:   true,
-		Fingerprint: client.Fingerprint,
+		ServerID:      srv.ID,
+		ServerName:    srv.Name,
+		Group:         srv.Group,
+		Host:          srv.Host,
+		Port:          srv.Port,
+		CollectedAt:   nowUTC,
+		LatencyMs:     handshakeLatencyMs,
+		Reachable:     true,
+		Fingerprint:   client.Fingerprint,
+		RouteLabel:    client.Route.Label,
+		RouteFallback: client.Route.FallbackUsed,
 	}
 
 	ParseDeepTelemetry(rawOut, snap, prevSnap)

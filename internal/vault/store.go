@@ -1062,6 +1062,10 @@ func ensureSecretsDefaults(sec *SecretsState) {
 	}
 	if sec.Servers == nil {
 		sec.Servers = []ServerConfig{}
+	} else {
+		for i := range sec.Servers {
+			normalizeServerJumpConfig(&sec.Servers[i])
+		}
 	}
 	if sec.Credentials == nil {
 		sec.Credentials = []Credential{}
@@ -1195,6 +1199,7 @@ func cloneServersWithoutRuntime(servers []ServerConfig) []ServerConfig {
 	for i, srv := range servers {
 		cp := srv
 		cp.Tags = slices.Clone(srv.Tags)
+		cp.JumpServerIDs = slices.Clone(srv.JumpServerIDs)
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 		cp.LastConnectedAt = nil
@@ -1451,6 +1456,13 @@ func (s *Store) GetServerSecret(id string) (*ServerConfig, error) {
 		if srv.ID == id {
 			cp := srv
 			cp.Tags = slices.Clone(srv.Tags)
+			cp.JumpServerIDs = slices.Clone(srv.EffectiveJumpServerIDs())
+			if len(cp.JumpServerIDs) > 0 {
+				cp.JumpServerID = cp.JumpServerIDs[0]
+			} else {
+				cp.JumpServerID = ""
+				cp.JumpFallbackDirect = false
+			}
 			cp.WatchedServices = slices.Clone(srv.WatchedServices)
 			cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 			return &cp, nil
@@ -1471,9 +1483,11 @@ type ServerMutationInput struct {
 	Password          *string  `json:"password,omitempty"`
 	PrivateKey        *string  `json:"private_key,omitempty"`
 	Passphrase        *string  `json:"passphrase,omitempty"`
-	CredentialID      string   `json:"credential_id"`
-	JumpServerID      string   `json:"jump_server_id"`
-	DefaultPath       string   `json:"default_path"`
+	CredentialID       string   `json:"credential_id"`
+	JumpServerID       string   `json:"jump_server_id"`
+	JumpServerIDs      []string `json:"jump_server_ids,omitempty"`
+	JumpFallbackDirect *bool    `json:"jump_fallback_direct,omitempty"`
+	DefaultPath        string   `json:"default_path"`
 	Notes             string   `json:"notes"`
 	Pinned            bool     `json:"pinned"`
 	KeepAliveSec      int      `json:"keep_alive_sec"`
@@ -1564,35 +1578,120 @@ func sanitizeServerInput(in *ServerMutationInput) error {
 	return nil
 }
 
+func normalizeServerJumpConfig(srv *ServerConfig) {
+	if srv == nil {
+		return
+	}
+	jumpIDs := srv.EffectiveJumpServerIDs()
+	if len(jumpIDs) == 0 {
+		srv.JumpServerID = ""
+		srv.JumpServerIDs = nil
+		srv.JumpFallbackDirect = false
+		return
+	}
+	srv.JumpServerID = jumpIDs[0]
+	srv.JumpServerIDs = jumpIDs
+}
+
+func resolveInputJumpServerIDs(in ServerMutationInput) []string {
+	var raw []string
+	if in.JumpServerIDs != nil {
+		raw = in.JumpServerIDs
+	} else if trimmed := strings.TrimSpace(in.JumpServerID); trimmed != "" {
+		raw = []string{trimmed}
+	}
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" && !slices.Contains(out, trimmed) {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func validateServerJumpChain(servers []ServerConfig, selfID string, jumpIDs []string) error {
+	if len(jumpIDs) == 0 {
+		return nil
+	}
+	byID := make(map[string]ServerConfig, len(servers))
+	for _, srv := range servers {
+		byID[srv.ID] = srv
+	}
+	for _, jid := range jumpIDs {
+		if jid == selfID {
+			return fmt.Errorf("%w: 跳板机不能指向服务器自身", ErrInvalidInput)
+		}
+		if _, ok := byID[jid]; !ok {
+			return fmt.Errorf("%w: 指定的跳板机节点不存在 (%s)", ErrInvalidInput, jid)
+		}
+	}
+	// Verify adding selfID -> jumpIDs edges introduces no cycle reaching selfID.
+	visited := make(map[string]bool, len(servers))
+	queue := slices.Clone(jumpIDs)
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur == selfID {
+			return fmt.Errorf("%w: 检测到循环的 SSH 跳板机配置链路", ErrInvalidInput)
+		}
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+		if node, ok := byID[cur]; ok {
+			for _, next := range node.EffectiveJumpServerIDs() {
+				if next == selfID {
+					return fmt.Errorf("%w: 检测到循环的 SSH 跳板机配置链路", ErrInvalidInput)
+				}
+				if !visited[next] {
+					queue = append(queue, next)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Store) CreateServer(in ServerMutationInput, clientIP string) (*ServerView, error) {
 	if err := sanitizeServerInput(&in); err != nil {
 		return nil, err
+	}
+	jumpIDs := resolveInputJumpServerIDs(in)
+	fallbackDirect := false
+	if in.JumpFallbackDirect != nil && len(jumpIDs) > 0 {
+		fallbackDirect = *in.JumpFallbackDirect
 	}
 
 	newID := uuid.NewString()
 	var view ServerView
 	err := s.mutateSecrets(func(sec *SecretsState) error {
+		if err := validateServerJumpChain(sec.Servers, newID, jumpIDs); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		srv := ServerConfig{
-			ID:              newID,
-			Name:            in.Name,
-			Group:           in.Group,
-			Tags:            slices.Clone(in.Tags),
-			Host:            in.Host,
-			Port:            in.Port,
-			Username:        in.Username,
-			AuthType:        in.AuthType,
-			CredentialID:    in.CredentialID,
-			JumpServerID:    in.JumpServerID,
-			DefaultPath:     strings.TrimSpace(in.DefaultPath),
-			Notes:           strings.TrimSpace(in.Notes),
-			Pinned:          in.Pinned,
-			KeepAliveSec:    in.KeepAliveSec,
-			WatchedServices: slices.Clone(in.WatchedServices),
-			WatchedPorts:    slices.Clone(in.WatchedPorts),
-			CreatedAt:       now,
-			UpdatedAt:       now,
+			ID:                 newID,
+			Name:               in.Name,
+			Group:              in.Group,
+			Tags:               slices.Clone(in.Tags),
+			Host:               in.Host,
+			Port:               in.Port,
+			Username:           in.Username,
+			AuthType:           in.AuthType,
+			CredentialID:       in.CredentialID,
+			JumpServerIDs:      slices.Clone(jumpIDs),
+			JumpFallbackDirect: fallbackDirect,
+			DefaultPath:        strings.TrimSpace(in.DefaultPath),
+			Notes:              strings.TrimSpace(in.Notes),
+			Pinned:             in.Pinned,
+			KeepAliveSec:       in.KeepAliveSec,
+			WatchedServices:    slices.Clone(in.WatchedServices),
+			WatchedPorts:       slices.Clone(in.WatchedPorts),
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		}
+		normalizeServerJumpConfig(&srv)
 		if in.MonitorEnabled != nil {
 			srv.MonitorDisabled = !(*in.MonitorEnabled)
 		}
@@ -1626,7 +1725,8 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 	if err := sanitizeServerInput(&in); err != nil {
 		return nil, err
 	}
-	if in.JumpServerID == id {
+	jumpIDs := resolveInputJumpServerIDs(in)
+	if slices.Contains(jumpIDs, id) {
 		return nil, fmt.Errorf("%w: 跳板机不能指向服务器自身", ErrInvalidInput)
 	}
 
@@ -1642,6 +1742,9 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 		if idx < 0 {
 			return ErrNotFound
 		}
+		if err := validateServerJumpChain(sec.Servers, id, jumpIDs); err != nil {
+			return err
+		}
 
 		srv := sec.Servers[idx]
 		srv.Name = in.Name
@@ -1652,7 +1755,12 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 		srv.Username = in.Username
 		srv.AuthType = in.AuthType
 		srv.CredentialID = in.CredentialID
-		srv.JumpServerID = in.JumpServerID
+		srv.JumpServerID = ""
+		srv.JumpServerIDs = slices.Clone(jumpIDs)
+		if in.JumpFallbackDirect != nil {
+			srv.JumpFallbackDirect = *in.JumpFallbackDirect
+		}
+		normalizeServerJumpConfig(&srv)
 		srv.DefaultPath = strings.TrimSpace(in.DefaultPath)
 		srv.Notes = strings.TrimSpace(in.Notes)
 		srv.Pinned = in.Pinned
@@ -1711,8 +1819,12 @@ func (s *Store) DeleteServer(id, clientIP string) error {
 				deletedTarget = fmt.Sprintf("%s (%s:%d)", srv.Name, srv.Host, srv.Port)
 				sec.Servers = slices.Delete(sec.Servers, i, i+1)
 				for j := range sec.Servers {
-					if sec.Servers[j].JumpServerID == id {
+					curJumps := sec.Servers[j].EffectiveJumpServerIDs()
+					if slices.Contains(curJumps, id) {
+						filtered := slices.DeleteFunc(curJumps, func(jid string) bool { return jid == id })
 						sec.Servers[j].JumpServerID = ""
+						sec.Servers[j].JumpServerIDs = filtered
+						normalizeServerJumpConfig(&sec.Servers[j])
 					}
 				}
 				return nil

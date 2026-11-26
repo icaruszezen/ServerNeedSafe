@@ -96,6 +96,8 @@ export interface ServerView {
   has_passphrase: boolean;
   credential_id?: string;
   jump_server_id?: string;
+  jump_server_ids?: string[];
+  jump_fallback_direct?: boolean;
   default_path?: string;
   notes?: string;
   pinned: boolean;
@@ -124,6 +126,8 @@ export interface ServerMutationPayload {
   passphrase?: string;
   credential_id: string;
   jump_server_id: string;
+  jump_server_ids: string[];
+  jump_fallback_direct: boolean;
   default_path: string;
   notes: string;
   pinned: boolean;
@@ -144,12 +148,23 @@ export interface HostKeyUntrustedInfo {
   expected_fingerprint?: string;
 }
 
+export interface DialRouteInfo {
+  direct: boolean;
+  jump_server_ids?: string[];
+  jump_server_names?: string[];
+  fallback_used: boolean;
+  skipped_jumps?: string[];
+  label: string;
+}
+
 export interface ServerProbeResult {
   server_id: string;
   server_name: string;
   reachable: boolean;
   latency_ms: number;
   fingerprint?: string;
+  route_label?: string;
+  route_fallback?: boolean;
   hostname?: string;
   os?: string;
   kernel?: string;
@@ -200,6 +215,7 @@ export interface BatchExecResult {
   stdout: string;
   stderr: string;
   duration_ms: number;
+  route_label?: string;
   error?: string;
 }
 
@@ -271,6 +287,7 @@ export interface TerminalReadyInfo {
   server_name: string;
   fingerprint: string;
   latency_ms: number;
+  route?: DialRouteInfo;
 }
 
 export interface OpenTerminalTab {
@@ -465,6 +482,8 @@ export interface ServerMonitorSnapshot {
   health_score: number;
   error?: string;
   fingerprint?: string;
+  route_label?: string;
+  route_fallback?: boolean;
 
   hostname?: string;
   os?: string;

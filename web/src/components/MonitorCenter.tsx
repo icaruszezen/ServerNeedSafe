@@ -828,6 +828,14 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                   <span className={`tag-chip ${healthBadgeClass(lvl)}`}>
                                     {healthLabel(lvl)}
                                   </span>
+                                  {s?.reachable && s.route_fallback && (
+                                    <span
+                                      className="tag-chip amber"
+                                      title={`最近采集实际命中线路：${s.route_label || '已退避'}`}
+                                    >
+                                      链路退避
+                                    </span>
+                                  )}
                                   {item.active_alerts > 0 && (
                                     <span className="tag-chip danger tabular">
                                       {item.active_alerts} 告警
@@ -941,7 +949,12 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 <span>
                                   网速 ↓{formatBytesRate(s.net_rx_bps)} ↑{formatBytesRate(s.net_tx_bps)}
                                 </span>
-                                <span>SSH {s.latency_ms}ms</span>
+                                <span title={s.route_label ? `实际连接线路：${s.route_label}` : undefined}>
+                                  SSH {s.latency_ms}ms
+                                  {s.route_label && s.route_label !== '直连'
+                                    ? ` · ${s.route_label}`
+                                    : ''}
+                                </span>
                                 <span>TCP {s.tcp_established}</span>
                                 <span>
                                   端口 {s.listening_ports?.length || 0}
@@ -1232,6 +1245,15 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <span className={`tag-chip ${healthBadgeClass(snap?.health_level)}`}>
                               {healthLabel(snap?.health_level)}
                             </span>
+                            {snap?.route_label &&
+                              (snap.route_fallback || snap.route_label !== '直连') && (
+                                <span
+                                  className={`tag-chip ${snap.route_fallback ? 'amber' : ''}`}
+                                  title={`最近一次采集实际使用的 SSH 线路：${snap.route_label}`}
+                                >
+                                  {snap.route_label}
+                                </span>
+                              )}
                             {snap?.virtualization && (
                               <span className="tag-chip">{snap.virtualization.toUpperCase()}</span>
                             )}
@@ -2085,6 +2107,16 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                 <span className="kv-key">高频攻击来源 IP</span>
                                 <span className="kv-val">
                                   {snap.security.top_failed_ips.join(', ')}
+                                </span>
+                              </div>
+                            )}
+                            {snap.route_label && (
+                              <div className="kv-row">
+                                <span className="kv-key">实际采集线路</span>
+                                <span className="kv-val">
+                                  <span className={`tag-chip ${snap.route_fallback ? 'amber' : 'teal'}`}>
+                                    {snap.route_label}
+                                  </span>
                                 </span>
                               </div>
                             )}

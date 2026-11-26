@@ -1,6 +1,10 @@
 package vault
 
-import "time"
+import (
+	"slices"
+	"strings"
+	"time"
+)
 
 // AuthType defines how an SSH server authenticates.
 type AuthType string
@@ -42,9 +46,11 @@ type ServerConfig struct {
 	Password           string    `json:"password,omitempty"`
 	PrivateKey         string    `json:"private_key,omitempty"`
 	Passphrase         string    `json:"passphrase,omitempty"`
-	CredentialID       string    `json:"credential_id,omitempty"`
-	JumpServerID       string    `json:"jump_server_id,omitempty"` // Optional SSH Bastion / ProxyJump server ID
-	DefaultPath        string    `json:"default_path,omitempty"`   // Default initial SFTP / shell directory
+	CredentialID       string     `json:"credential_id,omitempty"`
+	JumpServerID       string     `json:"jump_server_id,omitempty"`       // Legacy/primary SSH Bastion / ProxyJump server ID (synced with JumpServerIDs[0])
+	JumpServerIDs      []string   `json:"jump_server_ids,omitempty"`      // Ordered candidate SSH jump host IDs for automatic failover
+	JumpFallbackDirect bool       `json:"jump_fallback_direct,omitempty"` // Allow fallback to direct connection when all jump hosts fail
+	DefaultPath        string     `json:"default_path,omitempty"`         // Default initial SFTP / shell directory
 	Notes              string    `json:"notes,omitempty"`
 	Pinned             bool       `json:"pinned"`
 	KeepAliveSec       int        `json:"keep_alive_sec"`
@@ -73,9 +79,11 @@ type ServerView struct {
 	HasPassword       bool       `json:"has_password"`
 	HasPrivateKey     bool       `json:"has_private_key"`
 	HasPassphrase     bool       `json:"has_passphrase"`
-	CredentialID      string     `json:"credential_id,omitempty"`
-	JumpServerID      string     `json:"jump_server_id,omitempty"`
-	DefaultPath       string     `json:"default_path,omitempty"`
+	CredentialID       string     `json:"credential_id,omitempty"`
+	JumpServerID       string     `json:"jump_server_id,omitempty"`
+	JumpServerIDs      []string   `json:"jump_server_ids"`
+	JumpFallbackDirect bool       `json:"jump_fallback_direct"`
+	DefaultPath        string     `json:"default_path,omitempty"`
 	Notes             string     `json:"notes,omitempty"`
 	Pinned            bool       `json:"pinned"`
 	KeepAliveSec      int        `json:"keep_alive_sec"`
@@ -88,6 +96,23 @@ type ServerView struct {
 	LastOSInfo        string     `json:"last_os_info,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+// EffectiveJumpServerIDs returns the deduplicated, ordered list of jump server IDs,
+// automatically falling back to the legacy JumpServerID field if JumpServerIDs is empty.
+func (s ServerConfig) EffectiveJumpServerIDs() []string {
+	raw := s.JumpServerIDs
+	if len(raw) == 0 && strings.TrimSpace(s.JumpServerID) != "" {
+		raw = []string{s.JumpServerID}
+	}
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" && trimmed != s.ID && !slices.Contains(out, trimmed) {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func (s ServerConfig) ToView() ServerView {
@@ -103,33 +128,40 @@ func (s ServerConfig) ToView() ServerView {
 	if watchedPorts == nil {
 		watchedPorts = []int{}
 	}
+	jumpIDs := s.EffectiveJumpServerIDs()
+	primaryJump := ""
+	if len(jumpIDs) > 0 {
+		primaryJump = jumpIDs[0]
+	}
 	return ServerView{
-		ID:                s.ID,
-		Name:              s.Name,
-		Group:             s.Group,
-		Tags:              tags,
-		Host:              s.Host,
-		Port:              s.Port,
-		Username:          s.Username,
-		AuthType:          s.AuthType,
-		HasPassword:       s.Password != "",
-		HasPrivateKey:     s.PrivateKey != "",
-		HasPassphrase:     s.Passphrase != "",
-		CredentialID:      s.CredentialID,
-		JumpServerID:      s.JumpServerID,
-		DefaultPath:       s.DefaultPath,
-		Notes:             s.Notes,
-		Pinned:            s.Pinned,
-		KeepAliveSec:      s.KeepAliveSec,
-		MonitorEnabled:    !s.MonitorDisabled,
-		CustomIntervalSec: s.CustomIntervalSec,
-		WatchedServices:   watchedSvcs,
-		WatchedPorts:      watchedPorts,
-		LastConnectedAt:   s.LastConnectedAt,
-		LastLatencyMs:     s.LastLatencyMs,
-		LastOSInfo:        s.LastOSInfo,
-		CreatedAt:         s.CreatedAt,
-		UpdatedAt:         s.UpdatedAt,
+		ID:                 s.ID,
+		Name:               s.Name,
+		Group:              s.Group,
+		Tags:               tags,
+		Host:               s.Host,
+		Port:               s.Port,
+		Username:           s.Username,
+		AuthType:           s.AuthType,
+		HasPassword:        s.Password != "",
+		HasPrivateKey:      s.PrivateKey != "",
+		HasPassphrase:      s.Passphrase != "",
+		CredentialID:       s.CredentialID,
+		JumpServerID:       primaryJump,
+		JumpServerIDs:      jumpIDs,
+		JumpFallbackDirect: s.JumpFallbackDirect && len(jumpIDs) > 0,
+		DefaultPath:        s.DefaultPath,
+		Notes:              s.Notes,
+		Pinned:             s.Pinned,
+		KeepAliveSec:       s.KeepAliveSec,
+		MonitorEnabled:     !s.MonitorDisabled,
+		CustomIntervalSec:  s.CustomIntervalSec,
+		WatchedServices:    watchedSvcs,
+		WatchedPorts:       watchedPorts,
+		LastConnectedAt:    s.LastConnectedAt,
+		LastLatencyMs:      s.LastLatencyMs,
+		LastOSInfo:         s.LastOSInfo,
+		CreatedAt:          s.CreatedAt,
+		UpdatedAt:          s.UpdatedAt,
 	}
 }
 
