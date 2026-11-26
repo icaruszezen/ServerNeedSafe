@@ -452,20 +452,23 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 	}
 
 	cpuComputed := false
-	if prevElapsed > 0 && prev != nil && len(prev.RawCPUTicks) >= 4 && len(latest.cpuFields) >= len(prev.RawCPUTicks) {
-		if applyCPUDelta(snap, prev.RawCPUTicks, latest.cpuFields) {
-			cpuComputed = true
-			if latest.ctxt > prev.RawContextSwitches {
-				snap.ContextSwSec = int64(float64(latest.ctxt-prev.RawContextSwitches) / prevElapsed)
-			}
-		}
-	}
-	if !cpuComputed && hasT1 && len(t0.cpuFields) >= 4 && len(t1.cpuFields) >= len(t0.cpuFields) {
+	// When the script explicitly captured an isolated T0->T1 pair (initial sweep / synthetic fixture),
+	// honor T0->T1 deterministically; when T1 is omitted (steady-state zero-sleep sweeps with hasPrevCPU=true),
+	// compute the sustained cross-interval delta from prev.RawCPUTicks -> T0.
+	if hasT1 && len(t0.cpuFields) >= 4 && len(t1.cpuFields) >= len(t0.cpuFields) {
 		if applyCPUDelta(snap, t0.cpuFields, t1.cpuFields) {
 			cpuComputed = true
 		}
 		if t1.ctxt > t0.ctxt && dt > 0 {
 			snap.ContextSwSec = int64(float64(t1.ctxt-t0.ctxt) / dt)
+		}
+	}
+	if !cpuComputed && prevElapsed > 0 && prev != nil && len(prev.RawCPUTicks) >= 4 && len(latest.cpuFields) >= len(prev.RawCPUTicks) {
+		if applyCPUDelta(snap, prev.RawCPUTicks, latest.cpuFields) {
+			cpuComputed = true
+			if latest.ctxt > prev.RawContextSwitches {
+				snap.ContextSwSec = int64(float64(latest.ctxt-prev.RawContextSwitches) / prevElapsed)
+			}
 		}
 	}
 	if !cpuComputed {
