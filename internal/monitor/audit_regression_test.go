@@ -9,11 +9,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -915,4 +918,132 @@ func TestMultiPlatformWebhookFormatsRetryAndAIPatrolReuse(t *testing.T) {
 	if st.LastWebhookError != "" || st.LastWebhookAt == nil {
 		t.Fatalf("expected clean webhook runtime status after retry success, got %+v", st)
 	}
+}
+
+func TestBuildTelemetryScriptShellSyntaxMatrixAndFastTierExecution(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell syntax checks require Unix sh/bash")
+	}
+
+	var shells []string
+	for _, candidate := range []string{"/bin/sh", "bash"} {
+		if path, err := exec.LookPath(candidate); err == nil {
+			shells = append(shells, path)
+		}
+	}
+	if len(shells) == 0 {
+		t.Fatal("expected at least one POSIX shell (/bin/sh or bash) to validate telemetry script syntax")
+	}
+
+	bools := []bool{false, true}
+	tiers := []CollectionTier{TierFast, TierFull}
+	watchedCases := [][]string{nil, {"sshd", "postgresql@16"}}
+
+	for _, tier := range tiers {
+		for _, hasPrevCPU := range bools {
+			for _, collectProcs := range bools {
+				for _, collectPorts := range bools {
+					for _, collectSec := range bools {
+						for _, includeRemote := range bools {
+							for _, watched := range watchedCases {
+								settings := vault.DefaultMonitorSettings()
+								settings.CollectProcesses = collectProcs
+								settings.CollectPortsAndServices = collectPorts
+								settings.CollectSecurity = collectSec
+								settings.IncludeRemoteMounts = includeRemote
+
+								script := buildTelemetryScript(settings, watched, tier, hasPrevCPU)
+								for _, sh := range shells {
+									cmd := exec.Command(sh, "-n")
+									cmd.Stdin = strings.NewReader(script)
+									if out, err := cmd.CombinedOutput(); err != nil {
+										t.Fatalf("shell syntax error (%s -n) for tier=%s hasPrevCPU=%v procs=%v ports=%v sec=%v remote=%v watched=%v: %v\n%s",
+											sh, tier, hasPrevCPU, collectProcs, collectPorts, collectSec, includeRemote, watched, err, string(out))
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Execute real TierFull -> TierFast sweeps over bash -c (matching default Ubuntu/Linux SSH login shell)
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		bashPath = "/bin/sh"
+	}
+
+	host, port, stop := startCustomSSHServer(t, "ops", "FastTier!1", func(cmd string) (string, uint32) {
+		fastCmd := strings.ReplaceAll(cmd, "sleep 0.25 2>/dev/null || sleep 1", "sleep 0.05 2>/dev/null || true")
+		c := exec.Command(bashPath, "-c", fastCmd)
+		out, runErr := c.CombinedOutput()
+		if runErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				return string(out), uint32(exitErr.ExitCode())
+			}
+			return fmt.Sprintf("%s\n%v", string(out), runErr), 1
+		}
+		return string(out), 0
+	})
+	defer stop()
+
+	store, err := vault.NewStore(filepath.Join(t.TempDir(), "vault.sns"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Setup("StrongFastTierPass#2026", "127.0.0.1"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	pass := "FastTier!1"
+	srvView, err := store.CreateServer(vault.ServerMutationInput{
+		Name:     "Bash-FastTier-Node",
+		Group:    "生产环境",
+		Host:     host,
+		Port:     port,
+		Username: "ops",
+		AuthType: vault.AuthPassword,
+		Password: &pass,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	servers, settings, err := store.ListAllServerConfigs()
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("ListAllServerConfigs: len=%d err=%v", len(servers), err)
+	}
+	srvCfg := servers[0]
+
+	sshMgr := sshmanager.NewManager(store)
+	eng := NewEngine(store, sshMgr)
+	defer eng.Close()
+
+	// 1. Initial sweep runs TierFull and establishes RawCPUTicks & slow-tier fields
+	fullSnap, err := eng.probeSingleServer(context.Background(), srvCfg, settings, "", "127.0.0.1", false, false)
+	if err != nil || !fullSnap.Reachable || fullSnap.CollectionTier != string(TierFull) {
+		t.Fatalf("initial full sweep failed: snap=%+v err=%v", fullSnap, err)
+	}
+	// Backdate CollectedAt by 10s so the next sweep meets hasPrevCPU (>= 3s elapsed) while staying inside SlowIntervalSec
+	fullSnap.CollectedAt = time.Now().UTC().Add(-10 * time.Second)
+	if _, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{fullSnap}); err != nil {
+		t.Fatalf("RecordMonitorSnapshots full: %v", err)
+	}
+
+	// 2. Follow-up sweep MUST select TierFast (with hasPrevCPU=true) and execute cleanly in bash -c
+	fastSnap, err := eng.probeSingleServer(context.Background(), srvCfg, settings, "", "127.0.0.1", false, false)
+	if err != nil || !fastSnap.Reachable || fastSnap.CollectionTier != string(TierFast) || fastSnap.Error != "" || fastSnap.PartialError != "" {
+		t.Fatalf("fast-tier bash sweep failed (regression of syntax error near unexpected token `else`): snap=%+v err=%v", fastSnap, err)
+	}
+	if _, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{fastSnap}); err != nil {
+		t.Fatalf("RecordMonitorSnapshots fast: %v", err)
+	}
+	if fastSnap.OS == "" || fastSnap.Hostname == "" {
+		t.Fatalf("expected fast-tier snapshot to preserve cached OS/Hostname after merge, got os=%q host=%q", fastSnap.OS, fastSnap.Hostname)
+	}
+	_ = srvView
 }

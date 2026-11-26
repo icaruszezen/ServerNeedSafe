@@ -1227,17 +1227,24 @@ func mergeSlowTierFromPrev(incoming, prev *ServerMonitorSnapshot) {
 		incoming.KernelErrorCount = prev.KernelErrorCount
 		incoming.KernelErrors = slices.Clone(prev.KernelErrors)
 	}
-	// Preserve cached IPv4 per interface when fast-tier omits `ip -4 addr`
+	// Preserve cached IPv4 & State per interface when fast-tier omits `ip -4 addr` / Darwin `ifconfig`
 	if len(prev.Interfaces) > 0 && len(incoming.Interfaces) > 0 {
 		prevIP := make(map[string]string, len(prev.Interfaces))
+		prevState := make(map[string]string, len(prev.Interfaces))
 		for _, nic := range prev.Interfaces {
 			if nic.IPv4 != "" {
 				prevIP[nic.Name] = nic.IPv4
+			}
+			if nic.State != "" {
+				prevState[nic.Name] = nic.State
 			}
 		}
 		for i := range incoming.Interfaces {
 			if incoming.Interfaces[i].IPv4 == "" {
 				incoming.Interfaces[i].IPv4 = prevIP[incoming.Interfaces[i].Name]
+			}
+			if incoming.Interfaces[i].State == "" {
+				incoming.Interfaces[i].State = prevState[incoming.Interfaces[i].Name]
 			}
 		}
 	}

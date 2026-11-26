@@ -367,8 +367,8 @@ fi
 
 	// 5. Interface States & Zero-Lock Socket Matrix
 	b.WriteString("echo \"===SNS_SEC:IFACE===\"\n")
-	b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
 	if isFull {
+		b.WriteString("if [ \"$SNS_OS\" = \"Darwin\" ]; then\n")
 		b.WriteString(`  ifconfig 2>/dev/null | awk '
     /^[a-zA-Z0-9._-]+:/ {
       if (dev != "") {
@@ -392,11 +392,11 @@ fi
       }
     }'
 `)
-	}
-	b.WriteString("else\n")
-	if isFull {
+		b.WriteString("else\n")
 		b.WriteString(`  sns_to 2 ip -4 -o addr show | awk '{split($4,a,"/"); printf "IP4=%s|%s\n", $2, a[1]}'
 `)
+	} else {
+		b.WriteString("if [ \"$SNS_OS\" != \"Darwin\" ]; then\n")
 	}
 	b.WriteString(`  for devp in /sys/class/net/*; do
     [ -e "$devp/operstate" ] || continue
