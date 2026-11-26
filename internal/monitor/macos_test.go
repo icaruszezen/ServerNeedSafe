@@ -463,3 +463,102 @@ func TestMonitorEngineWithFakeMacOSSSHServer(t *testing.T) {
 		t.Fatalf("expected Darwin kernel in HostMemory OSArch, got %q", mems[0].OSArch)
 	}
 }
+
+func TestMacOSFastTierTelemetryExecutionAndInterfaceStatePreservation(t *testing.T) {
+	fakeBin := buildFakeDarwinBinDir(t)
+	settings := vault.DefaultMonitorSettings()
+
+	runScript := func(script string) string {
+		t.Helper()
+		testScript := strings.Replace(
+			script,
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"PATH="+fakeBin+":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			1,
+		)
+		shells := []string{"/bin/sh"}
+		if bashPath, err := exec.LookPath("bash"); err == nil {
+			shells = append(shells, bashPath)
+		}
+		var lastOut string
+		for _, sh := range shells {
+			outBytes, err := exec.Command(sh, "-c", testScript).CombinedOutput()
+			if err != nil {
+				t.Fatalf("Darwin script failed under %s: %v\noutput:\n%s", sh, err, string(outBytes))
+			}
+			lastOut = string(outBytes)
+			if !strings.Contains(lastOut, "===SNS_END===") {
+				t.Fatalf("Darwin script missing ===SNS_END=== under %s:\n%s", sh, lastOut)
+			}
+		}
+		return lastOut
+	}
+
+	store, err := vault.NewStore(filepath.Join(t.TempDir(), "vault.sns"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Setup("StrongMacFastPass#2026", "127.0.0.1"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	pass := "MacPass!1"
+	srv, err := store.CreateServer(vault.ServerMutationInput{
+		Name:     "macmini-fast",
+		Group:    "本地服务器",
+		Host:     "127.0.0.1",
+		Port:     22,
+		Username: "zezen",
+		AuthType: vault.AuthPassword,
+		Password: &pass,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+
+	// 1. Full tier establishes OS, IPv4, interface operational State, and security posture
+	t0 := time.Date(2026, 11, 26, 14, 40, 0, 0, time.UTC)
+	fullOut := runScript(buildTelemetryScript(settings, []string{"redis"}, TierFull, false))
+	fullSnap := &vault.ServerMonitorSnapshot{
+		ServerID:            srv.ID,
+		ServerName:          srv.Name,
+		CollectedAt:         t0,
+		LastSlowCollectedAt: &t0,
+		CollectionTier:      string(TierFull),
+		Reachable:           true,
+	}
+	ParseDeepTelemetry(fullOut, fullSnap, nil)
+	if _, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{fullSnap}); err != nil {
+		t.Fatalf("RecordMonitorSnapshots full: %v", err)
+	}
+
+	// 2. Fast tier omits Darwin ifconfig; must execute cleanly in /bin/sh & bash AND preserve en0 IPv4 + State="up"
+	fastOut := runScript(buildTelemetryScript(settings, []string{"redis"}, TierFast, true))
+	fastSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       srv.ID,
+		ServerName:     srv.Name,
+		CollectedAt:    t0.Add(60 * time.Second),
+		CollectionTier: string(TierFast),
+		Reachable:      true,
+	}
+	ParseDeepTelemetry(fastOut, fastSnap, fullSnap)
+	if _, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{fastSnap}); err != nil {
+		t.Fatalf("RecordMonitorSnapshots fast: %v", err)
+	}
+
+	if fastSnap.OS != "macOS 15.3.1 (24D70)" || fastSnap.Security.FirewallStatus != "active" {
+		t.Fatalf("expected fast tier to preserve macOS static/security fields, got os=%q fw=%q", fastSnap.OS, fastSnap.Security.FirewallStatus)
+	}
+	var foundEn0 bool
+	for _, nic := range fastSnap.Interfaces {
+		if nic.Name == "en0" {
+			foundEn0 = true
+			if nic.IPv4 != "192.168.50.111" || nic.State != "up" {
+				t.Fatalf("expected fast-tier macOS en0 to preserve IPv4 and State='up', got %+v", nic)
+			}
+		}
+	}
+	if !foundEn0 {
+		t.Fatalf("expected en0 interface in fast-tier macOS snapshot, got %+v", fastSnap.Interfaces)
+	}
+}
