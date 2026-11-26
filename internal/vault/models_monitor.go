@@ -210,8 +210,10 @@ type ServerMonitorSnapshot struct {
 	Reachable   bool               `json:"reachable"`
 	HealthLevel MonitorHealthLevel `json:"health_level"`
 	HealthScore int                `json:"health_score"`
-	Error       string             `json:"error,omitempty"`
-	Fingerprint string             `json:"fingerprint,omitempty"`
+	Error         string             `json:"error,omitempty"`
+	Fingerprint   string             `json:"fingerprint,omitempty"`
+	RouteLabel    string             `json:"route_label,omitempty"`
+	RouteFallback bool               `json:"route_fallback,omitempty"`
 
 	// System Identity & Clock
 	Hostname       string `json:"hostname,omitempty"`

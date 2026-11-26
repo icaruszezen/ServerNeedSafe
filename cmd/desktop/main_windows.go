@@ -10,13 +10,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
+	"github.com/icaruszezen/ServerNeedSafe/internal/updater"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
@@ -103,6 +106,14 @@ func resolveLocalDataDir() (dataDir string, webviewDir string, err error) {
 }
 
 func main() {
+	// Support `--version` before acquiring singleton mutex or initializing WebView2 (used by pre-swap self-check).
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-version" || arg == "-v" {
+			fmt.Println(version.String())
+			return
+		}
+	}
+
 	enableHighDPI()
 
 	// Ensure single running local desktop instance
@@ -113,8 +124,15 @@ func main() {
 		return
 	}
 	if mutexHandle != 0 {
-		defer windows.CloseHandle(mutexHandle)
+		defer func() {
+			if mutexHandle != 0 {
+				_ = windows.CloseHandle(mutexHandle)
+				mutexHandle = 0
+			}
+		}()
 	}
+
+	updater.CleanupPreviousBackup()
 
 	dataDir, webviewDir, err := resolveLocalDataDir()
 	if err != nil {
@@ -149,20 +167,64 @@ func main() {
 		return
 	}
 
-	apiServer := api.NewServer(api.Config{
+	var (
+		wvMu      sync.Mutex
+		wvInst    webview2.WebView
+		httpSrv   *http.Server
+		apiSrv    *api.Server
+		closeOnce sync.Once
+	)
+	shutdownAll := func() {
+		closeOnce.Do(func() {
+			authMgr.RevokeAll()
+			if apiSrv != nil {
+				apiSrv.Close()
+			}
+			if httpSrv != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				_ = httpSrv.Shutdown(ctx)
+			}
+			if mutexHandle != 0 {
+				_ = windows.CloseHandle(mutexHandle)
+				mutexHandle = 0
+			}
+		})
+	}
+
+	apiSrv = api.NewServer(api.Config{
 		DeployMode: "desktop",
 		Store:      store,
 		Auth:       authMgr,
 		StaticFS:   staticFS,
+		OnRestart: func(exePath, backupPath string) error {
+			// On Windows, StageAndReplaceBinary has already launched the detached swap helper
+			// waiting on our PID. Terminate the WebView2 loop (or exit directly in fallback mode)
+			// so stores flush and the singleton mutex releases cleanly.
+			wvMu.Lock()
+			w := wvInst
+			wvMu.Unlock()
+			if w != nil {
+				w.Dispatch(func() {
+					w.Terminate()
+				})
+				return nil
+			}
+			go func() {
+				shutdownAll()
+				os.Exit(0)
+			}()
+			return nil
+		},
 	})
 
-	httpServer := &http.Server{
-		Handler:           apiServer.Handler(),
+	httpSrv = &http.Server{
+		Handler:           apiSrv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		_ = httpServer.Serve(ln)
+		_ = httpSrv.Serve(ln)
 	}()
 
 	port := ln.Addr().(*net.TCPAddr).Port
@@ -183,8 +245,16 @@ func main() {
 	})
 
 	if w != nil {
+		wvMu.Lock()
+		wvInst = w
+		wvMu.Unlock()
+
 		w.Navigate(bootURL)
 		w.Run()
+
+		wvMu.Lock()
+		wvInst = nil
+		wvMu.Unlock()
 		w.Destroy()
 	} else {
 		// Fallback for older Windows Server environments lacking Edge WebView2 runtime
@@ -199,10 +269,6 @@ func main() {
 		)
 	}
 
-	// Revoke sessions & shut down loopback engine immediately on window close
-	authMgr.RevokeAll()
-	apiServer.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(ctx)
+	// Revoke sessions, flush runtime stores, close loopback engine, and release singleton mutex
+	shutdownAll()
 }

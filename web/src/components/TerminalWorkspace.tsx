@@ -15,10 +15,12 @@ import {
   Search,
   Server,
   Bot,
+  GitBranch,
 } from 'lucide-react';
 import { api, ApiError, terminalClient } from '../api';
 import type {
   AppSettings,
+  DialRouteInfo,
   HostKeyUntrustedInfo,
   OpenTerminalTab,
   ServerProbeResult,
@@ -73,7 +75,8 @@ interface SinglePaneProps {
     tabId: string,
     state: 'connecting' | 'connected' | 'closed' | 'error',
     fingerprint?: string,
-    latencyMs?: number
+    latencyMs?: number,
+    route?: DialRouteInfo
   ) => void;
   onHostKeyChallenge: (tabId: string, info: HostKeyUntrustedInfo) => void;
   registerHandle: (tabId: string, handle: SinglePaneHandle | null) => void;
@@ -103,6 +106,8 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
   const searchRef = useRef<SearchAddon | null>(null);
   const connectedRef = useRef(false);
   const connectSeqRef = useRef(0);
+  const autoReconnectAttemptsRef = useRef(0);
+  const autoReconnectTimerRef = useRef<number | null>(null);
   const recentOutputRef = useRef<string>('');
   const fontSizeRef = useRef(fontSize);
   const consumeModifiersRef = useRef(consumeModifiers);
@@ -112,6 +117,10 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
 
   const connectSession = useCallback(
     async (trustFp = '') => {
+      if (autoReconnectTimerRef.current !== null) {
+        window.clearTimeout(autoReconnectTimerRef.current);
+        autoReconnectTimerRef.current = null;
+      }
       const seq = ++connectSeqRef.current;
       connectedRef.current = false;
 
@@ -143,7 +152,8 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
         if (seq !== connectSeqRef.current) return;
 
         connectedRef.current = true;
-        onStatusChange(tab.tabId, 'connected', ready.fingerprint, ready.latency_ms);
+        autoReconnectAttemptsRef.current = 0;
+        onStatusChange(tab.tabId, 'connected', ready.fingerprint, ready.latency_ms, ready.route);
         try {
           fit.fit();
           terminalClient.resizeTerminal(tab.tabId, term.cols, term.rows);
@@ -165,6 +175,9 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     },
     [tab, onStatusChange, onHostKeyChallenge]
   );
+
+  const connectSessionRef = useRef(connectSession);
+  connectSessionRef.current = connectSession;
 
   useEffect(() => {
     const container = mountRef.current;
@@ -220,6 +233,18 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     const decoder = new TextDecoder('utf-8', { fatal: false });
 
     const unsubSocket = terminalClient.subscribeTerminal(tab.tabId, {
+      onProgress: (ev) => {
+        if (!ev.message) return;
+        if (ev.stage === 'failed') {
+          term.writeln(`\x1b[33m[跳板退避] ${ev.message}\x1b[0m`);
+        } else if (ev.stage === 'skipped') {
+          term.writeln(`\x1b[38;5;214m[跳板冷却] ${ev.message}\x1b[0m`);
+        } else if (ev.stage === 'connected') {
+          term.writeln(`\x1b[32m[链路就绪] ${ev.message}\x1b[0m`);
+        } else {
+          term.writeln(`\x1b[38;5;245m[链路尝试] ${ev.message}\x1b[0m`);
+        }
+      },
       onOutput: (chunk) => {
         term.write(chunk);
         try {
@@ -233,10 +258,22 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
           // ignore decode edge cases
         }
       },
-      onExit: (message) => {
+      onExit: (message, info) => {
         connectedRef.current = false;
-        onStatusChange(tab.tabId, 'closed');
         term.writeln(`\r\n\x1b[33m[${message || '会话已结束'}]\x1b[0m`);
+        if (info?.auto_reconnect && autoReconnectAttemptsRef.current < 1) {
+          autoReconnectAttemptsRef.current += 1;
+          onStatusChange(tab.tabId, 'connecting');
+          term.writeln(
+            `\x1b[36m[自动退避重连] 已保留原有输出历史，正在尝试切换至下一跳板或直连重新建立会话...\x1b[0m`
+          );
+          autoReconnectTimerRef.current = window.setTimeout(() => {
+            autoReconnectTimerRef.current = null;
+            void connectSessionRef.current();
+          }, 400);
+          return;
+        }
+        onStatusChange(tab.tabId, 'closed');
       },
     });
 
@@ -314,9 +351,10 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
         term.focus();
       },
       reconnect: (trustFp?: string) => {
+        autoReconnectAttemptsRef.current = 0;
         term.clear();
         recentOutputRef.current = '';
-        void connectSession(trustFp);
+        void connectSessionRef.current(trustFp);
       },
       searchNext: (query: string) => {
         if (query) searchAddon.findNext(query);
@@ -330,6 +368,10 @@ const SingleTerminalPane: React.FC<SinglePaneProps> = ({
     void connectSession();
 
     return () => {
+      if (autoReconnectTimerRef.current !== null) {
+        window.clearTimeout(autoReconnectTimerRef.current);
+        autoReconnectTimerRef.current = null;
+      }
       connectSeqRef.current++;
       connectedRef.current = false;
       recentOutputRef.current = '';
@@ -406,6 +448,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
         status: 'connecting' | 'connected' | 'closed' | 'error';
         fingerprint?: string;
         latencyMs?: number;
+        route?: DialRouteInfo;
       }
     >
   >({});
@@ -611,7 +654,8 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
       tabId: string,
       status: 'connecting' | 'connected' | 'closed' | 'error',
       fingerprint?: string,
-      latencyMs?: number
+      latencyMs?: number,
+      route?: DialRouteInfo
     ) => {
       setTabMeta((prev) => ({
         ...prev,
@@ -619,6 +663,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
           status,
           fingerprint: fingerprint || prev[tabId]?.fingerprint,
           latencyMs: latencyMs || prev[tabId]?.latencyMs,
+          route: route || prev[tabId]?.route,
         },
       }));
       if (status === 'connected') {
@@ -940,6 +985,28 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
               <span style={{ color: '#e2e8f0' }}>
                 {activeTab.server.username}@{activeTab.server.host}:{activeTab.server.port}
               </span>
+              {currentMeta?.route?.label && (
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    color: currentMeta.route.fallback_used
+                      ? '#fbbf24'
+                      : !currentMeta.route.direct
+                      ? '#93c5fd'
+                      : '#94a3b8',
+                  }}
+                  title={
+                    currentMeta.route.skipped_jumps && currentMeta.route.skipped_jumps.length > 0
+                      ? `已跳过异常/冷却跳板: ${currentMeta.route.skipped_jumps.join('、')}`
+                      : `当前 SSH 连接线路：${currentMeta.route.label}`
+                  }
+                >
+                  <GitBranch size={11} />
+                  {currentMeta.route.label}
+                </span>
+              )}
               {currentMeta?.latencyMs ? <span>延迟 {currentMeta.latencyMs}ms</span> : null}
               {currentTelemetry?.os ? <span>{currentTelemetry.os}</span> : null}
               {currentTelemetry?.load_avg ? <span>负载 {currentTelemetry.load_avg}</span> : null}

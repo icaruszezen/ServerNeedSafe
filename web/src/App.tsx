@@ -13,6 +13,7 @@ import {
   Moon,
   Menu,
   X,
+  ArrowUpCircle,
 } from 'lucide-react';
 import { api, registerOnUnauthorized, terminalClient } from './api';
 import type {
@@ -22,6 +23,7 @@ import type {
   OpenTerminalTab,
   ServerView,
   Snippet,
+  UpdateOverviewResponse,
 } from './types';
 import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
@@ -31,6 +33,7 @@ import { AIOpsCenter } from './components/AIOpsCenter';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
 import { VaultSecurity } from './components/VaultSecurity';
+import { UpdateModal } from './components/UpdateModal';
 
 type NavKey = 'servers' | 'monitor' | 'terminals' | 'ai' | 'keychain' | 'snippets' | 'vault';
 
@@ -74,6 +77,11 @@ export const App: React.FC = () => {
   // Toast notifications
   const [toasts, setToasts] = useState<{ id: number; msg: string }[]>([]);
 
+  // Release auto-detection & update modal state
+  const [updateOverview, setUpdateOverview] = useState<UpdateOverviewResponse | null>(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [updateBannerDismissedTag, setUpdateBannerDismissedTag] = useState<string>('');
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('sns_ui_theme', theme);
@@ -115,6 +123,8 @@ export const App: React.FC = () => {
     setMonitorTargetId('');
     setFiringAlertsCount(0);
     setPatrolUnreadCount(0);
+    setUpdateOverview(null);
+    setUpdateModalOpen(false);
     setActiveNav('servers');
   }, []);
 
@@ -156,11 +166,26 @@ export const App: React.FC = () => {
     void checkStatus();
   }, [checkStatus, clearUnlockedMemory]);
 
+  const loadUpdateOverview = useCallback(async () => {
+    try {
+      const ov = await api.getUpdateStatus();
+      setUpdateOverview(ov);
+    } catch {
+      // Ignore transient network errors
+    }
+  }, []);
+
   useEffect(() => {
     if (authStatus?.authenticated) {
       void loadWorkspaceData();
+      void loadUpdateOverview();
+      // Sync background release check results periodically while console stays open
+      const timer = window.setInterval(() => {
+        void loadUpdateOverview();
+      }, 5 * 60 * 1000);
+      return () => window.clearInterval(timer);
     }
-  }, [authStatus?.authenticated, loadWorkspaceData]);
+  }, [authStatus?.authenticated, loadWorkspaceData, loadUpdateOverview]);
 
   useEffect(() => {
     if (!mobileNavOpen) return;
@@ -240,6 +265,34 @@ export const App: React.FC = () => {
     return ids;
   }, [backendActiveServerIds, terminalTabs]);
 
+  const currentVersionLabel =
+    updateOverview?.current?.version || authStatus?.version?.version || 'dev';
+  const latestTag = updateOverview?.latest_release?.tag_name || '';
+  const hasVisibleUpdate = Boolean(
+    updateOverview?.update_available && !updateOverview?.skipped && latestTag
+  );
+  const showUpdateBanner =
+    hasVisibleUpdate && updateBannerDismissedTag !== latestTag;
+
+  const handleOpenUpdateModal = useCallback(() => {
+    setMobileNavOpen(false);
+    setUpdateModalOpen(true);
+    void loadUpdateOverview();
+  }, [loadUpdateOverview]);
+
+  const handleSkipBannerVersion = useCallback(
+    async (tag: string) => {
+      try {
+        const res = await api.skipUpdateVersion(tag);
+        setUpdateOverview(res.status);
+        notify(`已忽略版本 ${tag} 的更新提示`);
+      } catch (err: any) {
+        notify(err?.message || '忽略版本失败');
+      }
+    },
+    [notify]
+  );
+
   if (bootLoading || !authStatus) {
     return (
       <div className="auth-viewport">
@@ -298,6 +351,18 @@ export const App: React.FC = () => {
         </div>
 
         <div className="mobile-topbar-actions">
+          {hasVisibleUpdate && (
+            <button
+              type="button"
+              id="mobile-update-btn"
+              className="nav-badge live"
+              style={{ border: 'none', cursor: 'pointer', padding: '2px 8px' }}
+              onClick={handleOpenUpdateModal}
+              title={`发现新版本 ${latestTag}`}
+            >
+              ↑ {latestTag}
+            </button>
+          )}
           {firingAlertsCount > 0 && (
             <button
               type="button"
@@ -489,15 +554,29 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="sidebar-footer">
-          <div
-            className="sidebar-vault-pill"
-            title="XChaCha20-Poly1305 落盘加密 · 7×24 后台无人值守监控与 AI 巡检"
+          <button
+            type="button"
+            id="sidebar-version-btn"
+            className={`sidebar-version-btn ${hasVisibleUpdate ? 'has-update' : ''}`}
+            onClick={handleOpenUpdateModal}
+            title={
+              hasVisibleUpdate
+                ? `发现新版本 ${latestTag}，点击查看更新日志并一键更新`
+                : `当前版本 ${currentVersionLabel}，点击检查 GitHub 新版本`
+            }
           >
-            <span>加密守护运行</span>
-            <span className="mono" style={{ fontSize: 10.5 }}>
-              7×24 · XChaCha20
+            <span className="sidebar-version-left">
+              <ArrowUpCircle size={13.5} />
+              <span className="mono">{currentVersionLabel}</span>
             </span>
-          </div>
+            {hasVisibleUpdate ? (
+              <span className="sidebar-update-pill">新版本 {latestTag}</span>
+            ) : (
+              <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>
+                7×24 · 检查更新
+              </span>
+            )}
+          </button>
           <div className="sidebar-actions">
             <button
               type="button"
@@ -526,6 +605,46 @@ export const App: React.FC = () => {
 
       {/* Main Content Stage */}
       <main className="main-stage">
+        {showUpdateBanner && (
+          <div className="update-banner" id="global-update-banner" role="status">
+            <div className="update-banner-left">
+              <ArrowUpCircle size={15} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+              <span>
+                发现 ServerNeedSafe 新版本 <strong className="mono">{latestTag}</strong>
+                {updateOverview?.active_mirror?.name && (
+                  <span className="update-banner-mirror">
+                    （已选线路：{updateOverview.active_mirror.name}）
+                  </span>
+                )}
+              </span>
+            </div>
+            <div className="update-banner-actions">
+              <button
+                type="button"
+                className="btn btn-sm btn-teal"
+                onClick={handleOpenUpdateModal}
+              >
+                查看并更新
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                onClick={() => void handleSkipBannerVersion(latestTag)}
+              >
+                忽略此版本
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost btn-icon"
+                aria-label="暂时收起更新提醒"
+                onClick={() => setUpdateBannerDismissedTag(latestTag)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeNav === 'servers' && (
           <ServerManager
             servers={servers}
@@ -609,6 +728,9 @@ export const App: React.FC = () => {
 
         {activeNav === 'vault' && (
           <VaultSecurity
+            updateOverview={updateOverview}
+            onUpdateOverviewChange={setUpdateOverview}
+            onOpenUpdateModal={handleOpenUpdateModal}
             onSettingsChanged={(s) => setSettings(s)}
             onLogoutSession={handleLogoutSession}
             onRevokeAllSessions={handleRevokeAllSessions}
@@ -616,6 +738,20 @@ export const App: React.FC = () => {
           />
         )}
       </main>
+
+      <UpdateModal
+        open={updateModalOpen}
+        overview={updateOverview}
+        onClose={() => setUpdateModalOpen(false)}
+        onOverviewChange={setUpdateOverview}
+        onOpenSettings={() => {
+          setActiveNav('vault');
+          window.setTimeout(() => {
+            document.getElementById('system-update-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 80);
+        }}
+        onNotify={notify}
+      />
 
       {toasts.length > 0 && (
         <div className="toast-stack" aria-live="polite">

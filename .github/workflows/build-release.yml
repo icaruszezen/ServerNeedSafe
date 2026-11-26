@@ -80,6 +80,9 @@ jobs:
           cache: true
 
       - name: Build Windows GUI EXEs & Linux Server Binaries
+        env:
+          SNS_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+          SNS_COMMIT: ${{ github.sha }}
         run: bash ./scripts/build-all.sh
 
       - name: Verify Windows Native GUI Subsystem Header
@@ -177,6 +180,9 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: serverneedsafe:ci-smoke
+          build-args: |
+            SNS_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+            SNS_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -229,6 +235,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SNS_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+            SNS_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

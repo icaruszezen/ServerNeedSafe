@@ -15,6 +15,9 @@ import {
   GitBranch,
   X,
   FolderPlus,
+  ArrowUp,
+  ArrowDown,
+  AlertTriangle,
 } from 'lucide-react';
 import { api, ApiError } from '../api';
 import type {
@@ -55,6 +58,8 @@ const emptyForm: ServerMutationPayload = {
   passphrase: '',
   credential_id: '',
   jump_server_id: '',
+  jump_server_ids: [],
+  jump_fallback_direct: false,
   default_path: '',
   notes: '',
   pinned: false,
@@ -64,6 +69,13 @@ const emptyForm: ServerMutationPayload = {
   watched_services: [],
   watched_ports: [],
 };
+
+function getEffectiveJumpIds(srv: ServerView): string[] {
+  if (srv.jump_server_ids && srv.jump_server_ids.length > 0) {
+    return srv.jump_server_ids;
+  }
+  return srv.jump_server_id ? [srv.jump_server_id] : [];
+}
 
 export const ServerManager: React.FC<ServerManagerProps> = ({
   servers,
@@ -102,11 +114,24 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   const [deletingServer, setDeletingServer] = useState<ServerView | null>(null);
   const [standaloneSftpServer, setStandaloneSftpServer] = useState<ServerView | null>(null);
 
+  const serverById = useMemo(() => {
+    const map: Record<string, ServerView> = {};
+    for (const s of servers) map[s.id] = s;
+    return map;
+  }, [servers]);
+
   const serverNameById = useMemo(() => {
     const map: Record<string, string> = {};
     for (const s of servers) map[s.id] = s.name;
     return map;
   }, [servers]);
+
+  const deleteAffectedServers = useMemo(() => {
+    if (!deletingServer) return [];
+    return servers.filter(
+      (s) => s.id !== deletingServer.id && getEffectiveJumpIds(s).includes(deletingServer.id)
+    );
+  }, [servers, deletingServer]);
 
   const credentialNameById = useMemo(() => {
     const map: Record<string, string> = {};
@@ -150,6 +175,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   };
 
   const openEditModal = (srv: ServerView) => {
+    const jumpIds = getEffectiveJumpIds(srv);
     setEditingServer(srv);
     setForm({
       name: srv.name,
@@ -163,7 +189,9 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       private_key: '',
       passphrase: '',
       credential_id: srv.credential_id || '',
-      jump_server_id: srv.jump_server_id || '',
+      jump_server_id: jumpIds[0] || '',
+      jump_server_ids: jumpIds,
+      jump_fallback_direct: Boolean(srv.jump_fallback_direct && jumpIds.length > 0),
       default_path: srv.default_path || '',
       notes: srv.notes || '',
       pinned: srv.pinned,
@@ -195,8 +223,12 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
         .map((s) => s.trim())
         .filter(Boolean);
 
+      const cleanJumpIds = form.jump_server_ids.filter(Boolean);
       const payload: ServerMutationPayload = {
         ...form,
+        jump_server_id: cleanJumpIds[0] || '',
+        jump_server_ids: cleanJumpIds,
+        jump_fallback_direct: cleanJumpIds.length > 0 ? Boolean(form.jump_fallback_direct) : false,
         tags: tagsText
           .split(/[,，]/)
           .map((t) => t.trim())
@@ -453,15 +485,25 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                         </>
                       )}
                     </span>
-                    {srv.jump_server_id && (
-                      <span
-                        className="tag-chip amber"
-                        title={`跳板机: ${serverNameById[srv.jump_server_id] || '已关联'}`}
-                      >
-                        <GitBranch size={11} /> 跳板:{' '}
-                        {serverNameById[srv.jump_server_id] || '已关联'}
-                      </span>
-                    )}
+                    {(() => {
+                      const jumpIds = getEffectiveJumpIds(srv);
+                      if (jumpIds.length === 0) return null;
+                      const jumpNames = jumpIds.map((id) => serverNameById[id] || '已关联');
+                      const fullRoute = `${jumpNames.join(' → ')}${
+                        srv.jump_fallback_direct ? ' → 直连' : '（不退避直连）'
+                      }`;
+                      const shortLabel =
+                        jumpIds.length === 1
+                          ? `跳板: ${jumpNames[0]}${srv.jump_fallback_direct ? ' → 直连' : ''}`
+                          : `跳板×${jumpIds.length}: ${jumpNames[0]}${
+                              srv.jump_fallback_direct ? '…→直连' : ' 等'
+                            }`;
+                      return (
+                        <span className="tag-chip amber" title={`跳板退避链路: ${fullRoute}`}>
+                          <GitBranch size={11} /> {shortLabel}
+                        </span>
+                      );
+                    })()}
                     {srv.last_latency_ms ? (
                       <span className="tag-chip teal tabular">{srv.last_latency_ms} ms</span>
                     ) : null}
@@ -495,6 +537,21 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
 
                   {liveProbe && (
                     <div className="server-telemetry-mini">
+                      {liveProbe.route_label &&
+                        (getEffectiveJumpIds(srv).length > 0 || liveProbe.route_fallback) && (
+                          <div
+                            className="telemetry-route-row"
+                            style={{
+                              color: liveProbe.route_fallback
+                                ? 'var(--amber-text)'
+                                : 'var(--text-secondary)',
+                            }}
+                            title={`本次连通探测实际命中线路：${liveProbe.route_label}`}
+                          >
+                            <GitBranch size={11} />
+                            <span>探测线路：{liveProbe.route_label}</span>
+                          </div>
+                        )}
                       <div className="telemetry-cell">
                         <span>系统负载</span>
                         <strong title={liveProbe.load_avg || liveProbe.os || '正常'}>
@@ -772,17 +829,41 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                 </div>
               )}
 
-              <div className="field-row">
-                <div className="field">
-                  <label className="field-label">SSH 跳板机 / 堡垒机 (ProxyJump，选填)</label>
+              {/* Ordered Multi-Jump Failover Chain Configuration */}
+              <div className="jump-chain-box">
+                <div className="jump-chain-header">
+                  <span style={{ fontSize: 12.5, fontWeight: 620, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <GitBranch size={13.5} /> SSH 跳板机链路与自动退避 (ProxyJump，选填)
+                  </span>
+                  <span className="field-hint">前序跳板失败时自动顺延尝试下一节点</span>
+                </div>
+
+                <div className="field" style={{ marginBottom: 10 }}>
                   <select
+                    id="srv-jump-add-select"
                     className="select"
-                    value={form.jump_server_id}
-                    onChange={(e) => setForm({ ...form, jump_server_id: e.target.value })}
+                    value=""
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      if (!nextId || form.jump_server_ids.includes(nextId)) return;
+                      const nextList = [...form.jump_server_ids, nextId];
+                      setForm({
+                        ...form,
+                        jump_server_ids: nextList,
+                        jump_server_id: nextList[0] || '',
+                      });
+                    }}
                   >
-                    <option value="">直连（不使用跳板机）</option>
+                    <option value="">
+                      {form.jump_server_ids.length === 0
+                        ? '+ 添加优先跳板机（留空则直连）'
+                        : '+ 添加下一个备用跳板机节点...'}
+                    </option>
                     {servers
-                      .filter((s) => s.id !== editingServer?.id)
+                      .filter(
+                        (s) =>
+                          s.id !== editingServer?.id && !form.jump_server_ids.includes(s.id)
+                      )
                       .map((s) => (
                         <option key={s.id} value={s.id}>
                           {s.name} ({s.host}:{s.port})
@@ -790,6 +871,125 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                       ))}
                   </select>
                 </div>
+
+                {form.jump_server_ids.length > 0 ? (
+                  <>
+                    <div className="jump-chain-list" id="srv-jump-chain-list">
+                      {form.jump_server_ids.map((jid, idx) => {
+                        const jSrv = serverById[jid];
+                        return (
+                          <div className="jump-chain-item" key={jid}>
+                            <span className={`jump-chain-rank ${idx === 0 ? 'primary' : ''}`}>
+                              {idx === 0 ? '#1 主跳板' : `#${idx + 1} 备选`}
+                            </span>
+                            <div className="jump-chain-node-info">
+                              <span className="jump-chain-node-name">
+                                {jSrv?.name || jid}
+                              </span>
+                              {jSrv && (
+                                <span className="jump-chain-node-host mono">
+                                  {jSrv.host}:{jSrv.port}
+                                </span>
+                              )}
+                            </div>
+                            <div className="jump-chain-item-actions">
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm btn-icon"
+                                disabled={idx === 0}
+                                title="上移优先级"
+                                onClick={() => {
+                                  if (idx === 0) return;
+                                  const next = [...form.jump_server_ids];
+                                  [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                                  setForm({
+                                    ...form,
+                                    jump_server_ids: next,
+                                    jump_server_id: next[0] || '',
+                                  });
+                                }}
+                              >
+                                <ArrowUp size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm btn-icon"
+                                disabled={idx === form.jump_server_ids.length - 1}
+                                title="下移优先级"
+                                onClick={() => {
+                                  if (idx === form.jump_server_ids.length - 1) return;
+                                  const next = [...form.jump_server_ids];
+                                  [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+                                  setForm({
+                                    ...form,
+                                    jump_server_ids: next,
+                                    jump_server_id: next[0] || '',
+                                  });
+                                }}
+                              >
+                                <ArrowDown size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-ghost btn-sm btn-icon"
+                                style={{ color: 'var(--danger-text)' }}
+                                title="移除此跳板机"
+                                onClick={() => {
+                                  const next = form.jump_server_ids.filter((id) => id !== jid);
+                                  setForm({
+                                    ...form,
+                                    jump_server_ids: next,
+                                    jump_server_id: next[0] || '',
+                                    jump_fallback_direct:
+                                      next.length > 0 ? form.jump_fallback_direct : false,
+                                  });
+                                }}
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="jump-chain-footer">
+                      <label
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 12.5,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <input
+                          id="srv-jump-fallback-direct-checkbox"
+                          type="checkbox"
+                          checked={Boolean(form.jump_fallback_direct)}
+                          onChange={(e) =>
+                            setForm({ ...form, jump_fallback_direct: e.target.checked })
+                          }
+                        />
+                        全部跳板机不可用时，允许自动退避至直连目标服务器
+                      </label>
+                      <div className="jump-chain-preview">
+                        退避顺序：
+                        {form.jump_server_ids
+                          .map((id) => serverNameById[id] || id)
+                          .join(' → ')}
+                        {form.jump_fallback_direct ? ' → 直连' : '（不退避直连）'}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="jump-chain-empty">
+                    当前为直连模式。对于海外节点，可依次添加多个跳板机实现掉线自动退避。
+                  </div>
+                )}
+              </div>
+
+              <div className="field-row">
                 <div className="field">
                   <label className="field-label">默认远程目录 (选填)</label>
                   <input
@@ -799,9 +999,6 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     onChange={(e) => setForm({ ...form, default_path: e.target.value })}
                   />
                 </div>
-              </div>
-
-              <div className="field-row">
                 <div className="field">
                   <label className="field-label">标签 (多个以逗号分隔)</label>
                   <input
@@ -811,15 +1008,16 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     onChange={(e) => setTagsText(e.target.value)}
                   />
                 </div>
-                <div className="field">
-                  <label className="field-label">备注说明</label>
-                  <input
-                    className="input"
-                    placeholder="用途、内网段或负责人备注"
-                    value={form.notes}
-                    onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                  />
-                </div>
+              </div>
+
+              <div className="field">
+                <label className="field-label">备注说明</label>
+                <input
+                  className="input"
+                  placeholder="用途、内网段或负责人备注"
+                  value={form.notes}
+                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                />
               </div>
 
               {/* Per-Server Monitoring Configuration */}
@@ -997,6 +1195,20 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                 </code>
                 ) 吗？
               </p>
+              {deleteAffectedServers.length > 0 && (
+                <div className="alert alert-warn" style={{ marginTop: 12, marginBottom: 0 }}>
+                  <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <div style={{ fontSize: 12.5, lineHeight: 1.55 }}>
+                    <div>
+                      以下 <strong>{deleteAffectedServers.length}</strong> 台服务器的跳板链路引用了此节点：
+                      <strong>{deleteAffectedServers.map((s) => s.name).join('、')}</strong>
+                    </div>
+                    <div style={{ marginTop: 2, opacity: 0.9 }}>
+                      确认删除后将自动从它们的跳板列表中剔除该节点（剩余跳板顺位前移；若无剩余跳板则转为直连）。
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="modal-footer">
               <button type="button" className="btn" onClick={() => setDeletingServer(null)}>

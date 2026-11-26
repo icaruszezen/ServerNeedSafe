@@ -25,6 +25,7 @@ import type {
   MCPRuntimeStatus,
   MCPTokenScope,
   MCPTokenView,
+  MirrorProbeResult,
   MonitorAlert,
   MonitorAlertRule,
   MonitorOverviewResponse,
@@ -44,6 +45,8 @@ import type {
   Snippet,
   SyncSummary,
   TerminalReadyInfo,
+  UpdateOverviewResponse,
+  UpdateSettings,
   VaultSecurityOverview,
   WorkspaceBootstrapResponse,
 } from './types';
@@ -53,19 +56,22 @@ export class ApiError extends Error {
   code: string;
   hostKeyInfo?: HostKeyUntrustedInfo;
   retryAfterSec?: number;
+  activeSSHTabs?: number;
 
   constructor(
     message: string,
     status: number,
     code = 'ERROR',
     hostKeyInfo?: HostKeyUntrustedInfo,
-    retryAfterSec?: number
+    retryAfterSec?: number,
+    activeSSHTabs?: number
   ) {
     super(message);
     this.status = status;
     this.code = code;
     this.hostKeyInfo = hostKeyInfo;
     this.retryAfterSec = retryAfterSec;
+    this.activeSSHTabs = activeSSHTabs;
   }
 }
 
@@ -80,6 +86,7 @@ interface ErrorResponsePayload {
   code?: string;
   host_key?: HostKeyUntrustedInfo;
   retry_after_sec?: number;
+  active_ssh_tabs?: number;
 }
 
 async function parseErrorResponse(res: Response): Promise<never> {
@@ -94,7 +101,14 @@ async function parseErrorResponse(res: Response): Promise<never> {
   if (res.status === 401 && (code === 'UNAUTHORIZED' || code === 'VAULT_NOT_INIT')) {
     onUnauthorizedCallback?.();
   }
-  throw new ApiError(msg, res.status, code, payload.host_key, payload.retry_after_sec);
+  throw new ApiError(
+    msg,
+    res.status,
+    code,
+    payload.host_key,
+    payload.retry_after_sec,
+    payload.active_ssh_tabs
+  );
 }
 
 async function requestJSON<T>(
@@ -188,9 +202,21 @@ async function postSSEStream(
 // Native WebSocket Interactive SSH PTY Terminal Client (/api/ws/terminal)
 // ============================================================================
 
+export interface TerminalProgressInfo {
+  stage: 'trying' | 'failed' | 'skipped' | 'connected' | string;
+  message: string;
+}
+
+export interface TerminalExitInfo {
+  message: string;
+  abnormal?: boolean;
+  auto_reconnect?: boolean;
+}
+
 interface TerminalCallbacks {
+  onProgress?: (ev: TerminalProgressInfo) => void;
   onOutput: (chunk: Uint8Array) => void;
-  onExit: (message: string) => void;
+  onExit: (message: string, info?: TerminalExitInfo) => void;
 }
 
 class TerminalWebSocketClient {
@@ -233,6 +259,13 @@ class TerminalWebSocketClient {
 
     return new Promise<{ ready: TerminalReadyInfo }>((resolve, reject) => {
       let settled = false;
+      let exitNotified = false;
+
+      const notifyExitOnce = (message: string, info?: TerminalExitInfo) => {
+        if (exitNotified) return;
+        exitNotified = true;
+        this.subscribers.get(params.tab_id)?.onExit(message, info);
+      };
 
       ws.onmessage = (ev: MessageEvent) => {
         if (ev.data instanceof ArrayBuffer) {
@@ -249,8 +282,18 @@ class TerminalWebSocketClient {
               ready?: TerminalReadyInfo;
               error?: string;
               message?: string;
+              stage?: string;
+              abnormal?: boolean;
+              auto_reconnect?: boolean;
               host_key?: HostKeyUntrustedInfo;
             };
+            if (msg.type === 'progress' && msg.message) {
+              this.subscribers.get(params.tab_id)?.onProgress?.({
+                stage: msg.stage || 'trying',
+                message: msg.message,
+              });
+              return;
+            }
             if (msg.type === 'ready' && msg.ready) {
               settled = true;
               resolve({ ready: msg.ready });
@@ -275,12 +318,17 @@ class TerminalWebSocketClient {
                 this.closeTerminal(params.tab_id);
                 reject(new ApiError(msg.error || '终端连接失败', 400, 'SSH_CONNECT_FAILED'));
               } else {
-                this.subscribers.get(params.tab_id)?.onExit(msg.error || '连接异常中断');
+                notifyExitOnce(msg.error || '连接异常中断');
               }
               return;
             }
             if (msg.type === 'exit') {
-              this.subscribers.get(params.tab_id)?.onExit(msg.message || '远程终端会话已退出');
+              const exitMsg = msg.message || '远程终端会话已退出';
+              notifyExitOnce(exitMsg, {
+                message: exitMsg,
+                abnormal: Boolean(msg.abnormal),
+                auto_reconnect: Boolean(msg.auto_reconnect),
+              });
             }
           } catch {
             // ignore non-JSON frame
@@ -304,7 +352,7 @@ class TerminalWebSocketClient {
           settled = true;
           reject(new ApiError('终端连接已关闭', 400, 'WS_CLOSED'));
         } else {
-          this.subscribers.get(params.tab_id)?.onExit('终端连接已关闭');
+          notifyExitOnce('终端连接已关闭');
         }
       };
     });
@@ -1054,4 +1102,44 @@ export const api = {
       approvals: ExternalApproval[];
       pending_count: number;
     }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/resolve`, { approve }),
+
+  // GitHub Release Auto-Detection, China Mirror Probing & Self-Update
+  getHealth: () =>
+    requestJSON<{ ok: boolean; version?: string; mode?: string; daemon_running?: boolean }>(
+      'GET',
+      '/api/health'
+    ),
+
+  getUpdateStatus: () => requestJSON<UpdateOverviewResponse>('GET', '/api/system/update/status'),
+
+  checkUpdateNow: (force_probe = false) =>
+    requestJSON<UpdateOverviewResponse>('POST', '/api/system/update/check', { force_probe }),
+
+  probeUpdateMirrors: () =>
+    requestJSON<{ ok: boolean; mirrors: MirrorProbeResult[]; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/mirrors/probe',
+      {}
+    ),
+
+  updateUpdateConfig: (payload: UpdateSettings) =>
+    requestJSON<{ ok: boolean; settings: UpdateSettings; status: UpdateOverviewResponse }>(
+      'PUT',
+      '/api/system/update/config',
+      payload
+    ),
+
+  skipUpdateVersion: (version: string) =>
+    requestJSON<{ ok: boolean; settings: UpdateSettings; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/skip',
+      { version }
+    ),
+
+  applyUpdate: (confirm_disconnect_ssh = false) =>
+    requestJSON<{ ok: boolean; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/apply',
+      { confirm_disconnect_ssh }
+    ),
 };

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 )
 
 func (s *Server) handleDesktopBoot(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +50,7 @@ func (s *Server) buildStatusPayload(authenticated bool) map[string]any {
 		"vault_status":             vStatus,
 		"authenticated":            authenticated,
 		"deploy_mode":              s.cfg.DeployMode,
+		"version":                  version.Current(),
 		"daemon_running":           daemonRunning,
 		"legacy_migration_pending": legacyPending,
 		"session_ttl_hours":        int(s.cfg.Auth.SessionTTL().Hours()),

@@ -14,7 +14,9 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/mcp"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
+	"github.com/icaruszezen/ServerNeedSafe/internal/updater"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 )
 
 const (
@@ -26,13 +28,16 @@ const (
 // Store, SSH, Monitor, and AI run natively in-process 7x24 with split encrypted secrets +
 // non-encrypted runtime storage so background monitoring & patrol never lock or stall.
 type Config struct {
-	DeployMode string // "server" or "desktop"
-	Store      *vault.Store
-	SSH        *sshmanager.Manager
-	Monitor    *monitor.Engine
-	AI         *aiops.Service
-	Auth       *auth.Manager
-	StaticFS   fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
+	DeployMode             string // "server" or "desktop"
+	Store                  *vault.Store
+	SSH                    *sshmanager.Manager
+	Monitor                *monitor.Engine
+	AI                     *aiops.Service
+	Updater                *updater.Service
+	Auth                   *auth.Manager
+	StaticFS               fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
+	OnRestart              func(exePath, backupPath string) error
+	DisableAutoUpdateCheck bool
 }
 
 type Server struct {
@@ -60,6 +65,20 @@ func NewServer(cfg Config) *Server {
 			cfg.AI = aiops.NewService(cfg.Store, cfg.SSH)
 		}
 	}
+	if cfg.Updater == nil {
+		cfg.Updater = updater.NewService(updater.Config{
+			DeployMode: cfg.DeployMode,
+			Store:      cfg.Store,
+			ActiveSSHCount: func() int {
+				if cfg.SSH == nil {
+					return 0
+				}
+				return len(cfg.SSH.ListActiveSessions())
+			},
+			OnRestart:       cfg.OnRestart,
+			DisableAutoLoop: cfg.DisableAutoUpdateCheck || cfg.Store == nil,
+		})
+	}
 
 	s := &Server{
 		cfg:         cfg,
@@ -69,6 +88,9 @@ func NewServer(cfg Config) *Server {
 	}
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Start()
+	}
+	if s.cfg.Updater != nil {
+		s.cfg.Updater.Start()
 	}
 	if s.cfg.Store != nil && s.cfg.DeployMode == "desktop" {
 		s.cfg.Store.RegisterOnReady(func() {
@@ -83,6 +105,9 @@ func NewServer(cfg Config) *Server {
 }
 
 func (s *Server) Close() {
+	if s.cfg.Updater != nil {
+		s.cfg.Updater.Close()
+	}
 	if s.mcpLoopback != nil {
 		s.mcpLoopback.Close()
 	}
@@ -163,9 +188,12 @@ func (s *Server) registerRoutes() {
 
 	// Public healthcheck
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		curVer := version.Current()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":             true,
 			"mode":           s.cfg.DeployMode,
+			"version":        curVer.Version,
+			"build":          curVer,
 			"initialized":    s.cfg.Store != nil && s.cfg.Store.IsInitialized(),
 			"daemon_mode":    true,
 			"daemon_running": s.isDaemonReady() || (s.cfg.Store != nil && !s.cfg.Store.IsInitialized()),
@@ -284,6 +312,14 @@ func (s *Server) registerRoutes() {
 	if s.mcpServer != nil {
 		s.mux.Handle("/api/mcp", s.mcpServer.HTTPHandler(false))
 	}
+
+	// GitHub Release Auto-Detection, China Mirror Probing & Self-Update
+	s.mux.HandleFunc("GET /api/system/update/status", s.requireAuth(s.handleGetUpdateStatus))
+	s.mux.HandleFunc("POST /api/system/update/check", s.requireAuth(s.handleCheckUpdateNow))
+	s.mux.HandleFunc("POST /api/system/update/mirrors/probe", s.requireAuth(s.handleProbeUpdateMirrors))
+	s.mux.HandleFunc("PUT /api/system/update/config", s.requireAuth(s.handleUpdateUpdateConfig))
+	s.mux.HandleFunc("POST /api/system/update/skip", s.requireAuth(s.handleSkipUpdateVersion))
+	s.mux.HandleFunc("POST /api/system/update/apply", s.requireAuth(s.handleApplyUpdate))
 
 	// Native WebSocket Interactive SSH PTY Terminal
 	s.mux.HandleFunc("GET /api/ws/terminal", s.requireAuth(s.handleWebSocketTerminal))

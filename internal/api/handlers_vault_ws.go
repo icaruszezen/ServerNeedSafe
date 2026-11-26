@@ -177,6 +177,9 @@ func (s *Server) handleImportVaultFile(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
 	}
+	if s.cfg.Updater != nil {
+		s.cfg.Updater.NotifySettingsUpdated()
+	}
 
 	s.cfg.Auth.ResetAuthFailures()
 	sess, err := s.cfg.Auth.CreateSession(s.cfg.Store.AuthVersion(), clientIP, r.UserAgent())
@@ -229,6 +232,9 @@ func (s *Server) handleVaultSyncApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
+	}
+	if s.cfg.Updater != nil {
+		s.cfg.Updater.NotifySettingsUpdated()
 	}
 
 	encInfo, _ := s.cfg.Store.EncryptionInfo()
@@ -423,6 +429,9 @@ func (s *Server) handleVaultSyncPull(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
 	}
+	if s.cfg.Updater != nil {
+		s.cfg.Updater.NotifySettingsUpdated()
+	}
 
 	encInfo, _ := s.cfg.Store.EncryptionInfo()
 	rev := snapResp.Snapshot.Config.Revision
@@ -509,15 +518,24 @@ func (s *Server) handleWebSocketTerminal(w http.ResponseWriter, r *http.Request)
 		trustFP,
 		extractClientIP(r),
 		sshmanager.TerminalCallbacks{
+			OnProgress: func(ev sshmanager.DialProgressEvent) {
+				_ = writeJSONFrame(map[string]any{
+					"type":    "progress",
+					"stage":   ev.Stage,
+					"message": ev.Message,
+				})
+			},
 			OnOutput: func(chunk []byte) {
 				if err := writeBinaryFrame(chunk); err != nil {
 					signalDone()
 				}
 			},
-			OnExit: func(msg string) {
+			OnExitDetail: func(ev sshmanager.TerminalExitEvent) {
 				_ = writeJSONFrame(map[string]any{
-					"type":    "exit",
-					"message": msg,
+					"type":           "exit",
+					"message":        ev.Message,
+					"abnormal":       ev.Abnormal,
+					"auto_reconnect": ev.AutoReconnect,
 				})
 				signalDone()
 			},
