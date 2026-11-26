@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
@@ -278,6 +279,7 @@ func (c *LLMClient) streamOpenAI(
 	var contentBuf strings.Builder
 	callByIdx := make(map[int]*partialCall)
 	maxIdx := -1
+	var streamErrMsg string
 
 	endpoint := resolveOpenAIEndpoint(prov.BaseURL)
 	meta, err := c.Transport().PostStream(ctx, endpoint, headers, bodyBytes, func(rawLine string) bool {
@@ -294,6 +296,7 @@ func (c *LLMClient) streamOpenAI(
 		}
 
 		var chunk struct {
+			Error   any `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
@@ -310,6 +313,10 @@ func (c *LLMClient) streamOpenAI(
 		}
 		if json.Unmarshal([]byte(dataStr), &chunk) != nil {
 			return true
+		}
+		if chunk.Error != nil {
+			streamErrMsg = extractProviderErrMsg([]byte(dataStr))
+			return false
 		}
 		for _, ch := range chunk.Choices {
 			if ch.Delta.Content != "" {
@@ -346,6 +353,9 @@ func (c *LLMClient) streamOpenAI(
 	if meta.StatusCode >= 400 {
 		return nil, fmt.Errorf("模型接口返回 HTTP %d: %s", meta.StatusCode, extractProviderErrMsg(meta.RawBody))
 	}
+	if streamErrMsg != "" {
+		return nil, fmt.Errorf("模型流式接口返回错误: %s", streamErrMsg)
+	}
 	if !strings.Contains(strings.ToLower(meta.ContentType), "text/event-stream") {
 		return parseOpenAINonStream(bytes.NewReader(meta.RawBody), onDelta)
 	}
@@ -353,11 +363,12 @@ func (c *LLMClient) streamOpenAI(
 	turn := &AssistantTurn{
 		Content: contentBuf.String(),
 	}
+	fallbackPrefix := uuid.NewString()[:8]
 	for i := 0; i <= maxIdx; i++ {
 		if pc, ok := callByIdx[i]; ok && pc.name != "" {
 			id := pc.id
 			if id == "" {
-				id = fmt.Sprintf("call_%d", i+1)
+				id = fmt.Sprintf("call_%s_%d", fallbackPrefix, i+1)
 			}
 			args := strings.TrimSpace(pc.args.String())
 			if args == "" {
@@ -374,7 +385,12 @@ func (c *LLMClient) streamOpenAI(
 }
 
 func parseOpenAINonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, 4*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("读取大模型响应失败: %w", err)
+	}
 	var resp struct {
+		Error   any `json:"error"`
 		Choices []struct {
 			Message struct {
 				Content   string `json:"content"`
@@ -388,8 +404,11 @@ func parseOpenAINonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, er
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r, 4*1024*1024)).Decode(&resp); err != nil {
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, fmt.Errorf("解析大模型响应失败: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("模型接口返回错误: %s", extractProviderErrMsg(raw))
 	}
 	if len(resp.Choices) == 0 {
 		return &AssistantTurn{}, nil
@@ -399,10 +418,11 @@ func parseOpenAINonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, er
 		onDelta(msg.Content)
 	}
 	turn := &AssistantTurn{Content: msg.Content}
+	fallbackPrefix := uuid.NewString()[:8]
 	for i, tc := range msg.ToolCalls {
 		id := tc.ID
 		if id == "" {
-			id = fmt.Sprintf("call_%d", i+1)
+			id = fmt.Sprintf("call_%s_%d", fallbackPrefix, i+1)
 		}
 		args := strings.TrimSpace(tc.Function.Arguments)
 		if args == "" {
@@ -430,24 +450,47 @@ func resolveAnthropicEndpoint(baseURL string) string {
 	return u + "/v1/messages"
 }
 
-func (c *LLMClient) streamAnthropic(
-	ctx context.Context,
-	prov vault.AIProviderConfig,
-	systemPrompt string,
-	history []vault.AIChatMessage,
-	tools []ToolDefinition,
-	onDelta func(string),
-) (*AssistantTurn, error) {
+func buildAnthropicMessages(history []vault.AIChatMessage) []map[string]any {
 	var anthMessages []map[string]any
+
+	toBlocks := func(content any) []map[string]any {
+		switch v := content.(type) {
+		case []map[string]any:
+			return v
+		case string:
+			if strings.TrimSpace(v) == "" {
+				return nil
+			}
+			return []map[string]any{{"type": "text", "text": v}}
+		default:
+			return nil
+		}
+	}
+
+	appendMsg := func(role string, content any) {
+		if len(anthMessages) > 0 && anthMessages[len(anthMessages)-1]["role"] == role {
+			prevBlocks := toBlocks(anthMessages[len(anthMessages)-1]["content"])
+			nextBlocks := toBlocks(content)
+			merged := append(prevBlocks, nextBlocks...)
+			if len(merged) > 0 {
+				anthMessages[len(anthMessages)-1]["content"] = merged
+			}
+			return
+		}
+		anthMessages = append(anthMessages, map[string]any{
+			"role":    role,
+			"content": content,
+		})
+	}
 
 	for i := 0; i < len(history); i++ {
 		m := history[i]
 		switch m.Role {
 		case "user":
-			anthMessages = append(anthMessages, map[string]any{
-				"role":    "user",
-				"content": m.Content,
-			})
+			if strings.TrimSpace(m.Content) == "" {
+				continue
+			}
+			appendMsg("user", m.Content)
 		case "assistant":
 			var blocks []map[string]any
 			if strings.TrimSpace(m.Content) != "" {
@@ -469,10 +512,7 @@ func (c *LLMClient) streamAnthropic(
 				})
 			}
 			if len(blocks) > 0 {
-				anthMessages = append(anthMessages, map[string]any{
-					"role":    "assistant",
-					"content": blocks,
-				})
+				appendMsg("assistant", blocks)
 			}
 		case "tool":
 			var resultBlocks []map[string]any
@@ -486,12 +526,28 @@ func (c *LLMClient) streamAnthropic(
 				})
 			}
 			i--
-			anthMessages = append(anthMessages, map[string]any{
-				"role":    "user",
-				"content": resultBlocks,
-			})
+			if len(resultBlocks) > 0 {
+				appendMsg("user", resultBlocks)
+			}
 		}
 	}
+
+	// Anthropic Messages API requires the first message to have role "user".
+	for len(anthMessages) > 0 && anthMessages[0]["role"] != "user" {
+		anthMessages = anthMessages[1:]
+	}
+	return anthMessages
+}
+
+func (c *LLMClient) streamAnthropic(
+	ctx context.Context,
+	prov vault.AIProviderConfig,
+	systemPrompt string,
+	history []vault.AIChatMessage,
+	tools []ToolDefinition,
+	onDelta func(string),
+) (*AssistantTurn, error) {
+	anthMessages := buildAnthropicMessages(history)
 
 	maxTok := prov.MaxTokens
 	if maxTok <= 0 {
@@ -542,6 +598,7 @@ func (c *LLMClient) streamAnthropic(
 	var contentBuf strings.Builder
 	blocks := make(map[int]*anthBlock)
 	maxIdx := -1
+	var streamErrMsg string
 
 	endpoint := resolveAnthropicEndpoint(prov.BaseURL)
 	meta, err := c.Transport().PostStream(ctx, endpoint, headers, bodyBytes, func(rawLine string) bool {
@@ -556,6 +613,7 @@ func (c *LLMClient) streamAnthropic(
 		var ev struct {
 			Type         string `json:"type"`
 			Index        int    `json:"index"`
+			Error        any    `json:"error"`
 			ContentBlock struct {
 				Type  string          `json:"type"`
 				ID    string          `json:"id"`
@@ -573,6 +631,9 @@ func (c *LLMClient) streamAnthropic(
 			return true
 		}
 		switch ev.Type {
+		case "error":
+			streamErrMsg = extractProviderErrMsg([]byte(dataStr))
+			return false
 		case "content_block_start":
 			b := &anthBlock{
 				kind: ev.ContentBlock.Type,
@@ -614,19 +675,27 @@ func (c *LLMClient) streamAnthropic(
 	if meta.StatusCode >= 400 {
 		return nil, fmt.Errorf("Anthropic 接口返回 HTTP %d: %s", meta.StatusCode, extractProviderErrMsg(meta.RawBody))
 	}
+	if streamErrMsg != "" {
+		return nil, fmt.Errorf("Anthropic 流式接口返回错误: %s", streamErrMsg)
+	}
 	if !strings.Contains(strings.ToLower(meta.ContentType), "text/event-stream") {
 		return parseAnthropicNonStream(bytes.NewReader(meta.RawBody), onDelta)
 	}
 
 	turn := &AssistantTurn{Content: contentBuf.String()}
+	fallbackPrefix := uuid.NewString()[:8]
 	for i := 0; i <= maxIdx; i++ {
 		if b, ok := blocks[i]; ok && b.kind == "tool_use" && b.name != "" {
+			id := b.id
+			if id == "" {
+				id = fmt.Sprintf("toolu_%s_%d", fallbackPrefix, i+1)
+			}
 			args := strings.TrimSpace(b.json.String())
 			if args == "" {
 				args = "{}"
 			}
 			turn.ToolCalls = append(turn.ToolCalls, LLMToolCall{
-				ID:        b.id,
+				ID:        id,
 				Name:      b.name,
 				Arguments: args,
 			})
@@ -636,7 +705,13 @@ func (c *LLMClient) streamAnthropic(
 }
 
 func parseAnthropicNonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, 4*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("读取 Anthropic 响应失败: %w", err)
+	}
 	var resp struct {
+		Type    string `json:"type"`
+		Error   any    `json:"error"`
 		Content []struct {
 			Type  string          `json:"type"`
 			Text  string          `json:"text"`
@@ -645,11 +720,15 @@ func parseAnthropicNonStream(r io.Reader, onDelta func(string)) (*AssistantTurn,
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r, 4*1024*1024)).Decode(&resp); err != nil {
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, fmt.Errorf("解析 Anthropic 响应失败: %w", err)
+	}
+	if resp.Type == "error" || resp.Error != nil {
+		return nil, fmt.Errorf("Anthropic 接口返回错误: %s", extractProviderErrMsg(raw))
 	}
 	turn := &AssistantTurn{}
 	var sb strings.Builder
+	fallbackPrefix := uuid.NewString()[:8]
 	for i, blk := range resp.Content {
 		switch blk.Type {
 		case "text":
@@ -657,7 +736,7 @@ func parseAnthropicNonStream(r io.Reader, onDelta func(string)) (*AssistantTurn,
 		case "tool_use":
 			id := blk.ID
 			if id == "" {
-				id = fmt.Sprintf("toolu_%d", i+1)
+				id = fmt.Sprintf("toolu_%s_%d", fallbackPrefix, i+1)
 			}
 			args := strings.TrimSpace(string(blk.Input))
 			if args == "" {
@@ -693,7 +772,7 @@ func extractProviderErrMsg(raw []byte) string {
 	}
 	s := strings.TrimSpace(string(raw))
 	if len(s) > 360 {
-		s = s[:360] + "..."
+		s = TruncateUTF8Bytes(s, 360) + "..."
 	}
 	if s == "" {
 		return "未知错误"

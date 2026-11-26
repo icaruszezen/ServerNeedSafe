@@ -55,6 +55,7 @@ type PatrolAnalysisUpdate struct {
 	DeepEvidence      []string
 	AIWebhookNotified *bool
 	MarkUnread        *bool
+	OnlyIfNotAnalyzed bool
 }
 
 func hashMCPToken(raw string) string {
@@ -532,6 +533,10 @@ func (s *Store) UpdatePatrolRecordAnalysis(id string, upd PatrolAnalysisUpdate, 
 	for i := range s.aiopsRT.PatrolRecords {
 		if s.aiopsRT.PatrolRecords[i].ID == id {
 			rec := &s.aiopsRT.PatrolRecords[i]
+			if upd.OnlyIfNotAnalyzed && rec.AIAnalyzed {
+				s.rtMu.Unlock()
+				return nil, fmt.Errorf("%w: 该巡检记录已完成 AI 研判", ErrInvalidInput)
+			}
 			rec.AIAnalyzed = true
 			rec.AIAnalyzedAt = &now
 			if upd.AnalysisState != "" {
@@ -591,6 +596,31 @@ func (s *Store) UpdatePatrolRecordAnalysis(id string, upd PatrolAnalysisUpdate, 
 	return nil, ErrNotFound
 }
 
+// MarkPatrolWebhookNotified marks an existing patrol record as webhook-notified without
+// mutating AIAnalyzedAt or emitting a duplicate analysis audit entry.
+func (s *Store) MarkPatrolWebhookNotified(id string) {
+	if !s.IsReady() || strings.TrimSpace(id) == "" {
+		return
+	}
+	s.rtMu.Lock()
+	changed := false
+	if s.aiopsRT != nil {
+		for i := range s.aiopsRT.PatrolRecords {
+			if s.aiopsRT.PatrolRecords[i].ID == id {
+				s.aiopsRT.PatrolRecords[i].AIWebhookNotified = true
+				s.aiopsRT.PatrolRecords[i].WebhookNotified = true
+				s.dirtyAIOps = true
+				changed = true
+				break
+			}
+		}
+	}
+	s.rtMu.Unlock()
+	if changed {
+		s.triggerFlush()
+	}
+}
+
 // --- External AI HITL Approval Queue (aiops_runtime.json) ---
 
 // ListExternalApprovals returns external AI mutation proposals filtered by optional status ("pending"/"approved"/"rejected").
@@ -613,14 +643,9 @@ func (s *Store) ListExternalApprovals(status string, limit int) ([]ExternalAppro
 		if filter != "" && filter != "all" && ap.Status != filter {
 			continue
 		}
-		out = append(out, cloneExternalApproval(ap))
-		if limit > 0 && len(out) >= limit {
-			// continue counting total pending without appending more items
-			continue
+		if limit <= 0 || len(out) < limit {
+			out = append(out, cloneExternalApproval(ap))
 		}
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
 	}
 	return out, pending, nil
 }

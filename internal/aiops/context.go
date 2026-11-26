@@ -848,6 +848,9 @@ func (s *Service) runCompactionOnSession(
 
 // CompactSessionNow allows the user to trigger manual rolling compaction or reset the existing summary.
 func (s *Service) CompactSessionNow(ctx context.Context, sessionID string, reset bool) (*vault.AIChatSession, *CompactionInfo, *SessionContextInspection, error) {
+	unlock := s.lockSession(sessionID)
+	defer unlock()
+
 	sess, err := s.store.GetAISession(sessionID)
 	if err != nil {
 		return nil, nil, nil, err

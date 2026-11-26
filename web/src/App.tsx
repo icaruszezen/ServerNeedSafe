@@ -29,7 +29,8 @@ import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
 import { MonitorCenter } from './components/MonitorCenter';
 import { TerminalWorkspace } from './components/TerminalWorkspace';
-import { AIOpsCenter } from './components/AIOpsCenter';
+import { AIOpsCenter, type CenterTab } from './components/AIOpsCenter';
+import type { MemorySubSection } from './components/AIMemoryAgentsTab';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
 import { VaultSecurity } from './components/VaultSecurity';
@@ -59,6 +60,8 @@ export const App: React.FC = () => {
   const [activeNav, setActiveNav] = useState<NavKey>('servers');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [monitorTargetId, setMonitorTargetId] = useState<string>('');
+  const [aiInitialTab, setAiInitialTab] = useState<CenterTab | undefined>(undefined);
+  const [aiInitialMemorySection, setAiInitialMemorySection] = useState<MemorySubSection | undefined>(undefined);
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
   const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
 
@@ -693,7 +696,12 @@ export const App: React.FC = () => {
               onCloseTab={handleCloseTab}
               onOpenServerTab={(srv) => handleConnectTerminal(srv, false)}
               onNavigateServers={() => setActiveNav('servers')}
-              onNavigateAICenter={() => setActiveNav('ai')}
+              onNavigateAICenter={(tab, memSec) => {
+                setAiInitialTab(tab);
+                setAiInitialMemorySection(memSec);
+                setActiveNav('ai');
+              }}
+              onRefreshWorkspace={loadWorkspaceData}
               onNotify={notify}
             />
           </div>
@@ -702,6 +710,12 @@ export const App: React.FC = () => {
         {activeNav === 'ai' && (
           <AIOpsCenter
             servers={servers}
+            initialTab={aiInitialTab}
+            initialMemorySection={aiInitialMemorySection}
+            onConsumeInitialTab={() => {
+              setAiInitialTab(undefined);
+              setAiInitialMemorySection(undefined);
+            }}
             onBadgeChange={setPatrolUnreadCount}
             onRefreshWorkspace={loadWorkspaceData}
             onNotify={notify}

@@ -22,6 +22,7 @@ import {
   ChevronDown,
   ChevronRight,
   ExternalLink,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -106,8 +107,8 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
   const [publicEndpointHint, setPublicEndpointHint] = useState(
     overview?.mcp_config?.public_endpoint_hint || ''
   );
-  const [desktopPort, setDesktopPort] = useState(
-    overview?.mcp_config?.desktop_loopback_port || 18900
+  const [desktopPortStr, setDesktopPortStr] = useState(
+    String(overview?.mcp_config?.desktop_loopback_port || 18900)
   );
   const [savingConfig, setSavingConfig] = useState(false);
 
@@ -118,6 +119,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
   const [tokenAllowedServers, setTokenAllowedServers] = useState<string[]>([]);
   const [creatingToken, setCreatingToken] = useState(false);
   const [justCreatedToken, setJustCreatedToken] = useState<{
+    id: string;
     name: string;
     rawToken: string;
     clientHint: string;
@@ -146,7 +148,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
       setApprovals(res.external_approvals || []);
       setSkillMarkdown(res.skill_markdown || '');
       setPublicEndpointHint(res.mcp_config.public_endpoint_hint || '');
-      setDesktopPort(res.mcp_config.desktop_loopback_port || 18900);
+      setDesktopPortStr(String(res.mcp_config.desktop_loopback_port || 18900));
     } catch (err: any) {
       onNotify(err?.message || '加载外部 AI MCP 配置失败');
     } finally {
@@ -161,7 +163,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
       setApprovals(overview.external_approvals || []);
       setSkillMarkdown(overview.skill_markdown || '');
       setPublicEndpointHint(overview.mcp_config.public_endpoint_hint || '');
-      setDesktopPort(overview.mcp_config.desktop_loopback_port || 18900);
+      setDesktopPortStr(String(overview.mcp_config.desktop_loopback_port || 18900));
       setLoading(false);
     } else {
       void refreshMCPOverview();
@@ -265,11 +267,26 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
     onNotify('已下载标准巡检 SKILL.md 技能文件');
   };
 
+  const parseDesktopPort = (): number | null => {
+    const n = Number(desktopPortStr.trim());
+    if (!Number.isInteger(n) || n < 1024 || n > 65535) {
+      onNotify('本地 MCP 回环端口必须在 1024 - 65535 之间');
+      return null;
+    }
+    return n;
+  };
+
   const handleToggleGateway = async (nextEnabled: boolean) => {
+    let portVal = 18900;
+    if (isDesktopMode && nextEnabled) {
+      const parsed = parseDesktopPort();
+      if (parsed === null) return;
+      portVal = parsed;
+    }
     setSavingConfig(true);
     try {
       const payload = isDesktopMode
-        ? { desktop_loopback_enabled: nextEnabled, desktop_loopback_port: desktopPort }
+        ? { desktop_loopback_enabled: nextEnabled, ...(nextEnabled ? { desktop_loopback_port: portVal } : {}) }
         : { enabled: nextEnabled };
       const res = await api.updateMCPConfig(payload);
       setMcpConfig(res.mcp_config);
@@ -294,17 +311,24 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
 
   const handleSaveEndpointSettings = async (e: React.FormEvent) => {
     e.preventDefault();
+    let portVal = 18900;
+    if (isDesktopMode) {
+      const parsed = parseDesktopPort();
+      if (parsed === null) return;
+      portVal = parsed;
+    }
     setSavingConfig(true);
     try {
       const res = await api.updateMCPConfig(
         isDesktopMode
-          ? { desktop_loopback_port: desktopPort }
+          ? { desktop_loopback_port: portVal }
           : { public_endpoint_hint: publicEndpointHint.trim() }
       );
       setMcpConfig(res.mcp_config);
       setMcpRuntime(res.mcp_runtime);
       setSkillMarkdown(res.skill_markdown);
       onNotify('MCP 接入地址设置已加密保存');
+      await onReloadOverview();
     } catch (err: any) {
       onNotify(err?.message || '保存接入设置失败');
     } finally {
@@ -330,6 +354,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
       setMcpConfig(res.mcp_config);
       setMcpRuntime(res.mcp_runtime);
       setJustCreatedToken({
+        id: res.token.id,
         name: res.token.name,
         rawToken: res.raw_token,
         clientHint: tokenClientHint,
@@ -358,6 +383,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
       const res = await api.updateMCPToken(tok.id, { enabled: !tok.enabled });
       setMcpConfig(res.mcp_config);
       onNotify(tok.enabled ? `已暂停令牌「${tok.name}」` : `已恢复启用令牌「${tok.name}」`);
+      await onReloadOverview();
     } catch (err: any) {
       onNotify(err?.message || '更新令牌状态失败');
     }
@@ -367,7 +393,9 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
     try {
       const res = await api.deleteMCPToken(tok.id);
       setMcpConfig(res.mcp_config);
+      setJustCreatedToken((cur) => (cur?.id === tok.id ? null : cur));
       onNotify(`已永久吊销令牌「${tok.name}」`);
+      await onReloadOverview();
     } catch (err: any) {
       onNotify(err?.message || '吊销令牌失败');
     }
@@ -466,8 +494,18 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
                 桌面回环端口启动异常：{mcpRuntime.desktop_loopback_error}
               </div>
             )}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-              <span className="tag-chip mono" style={{ fontSize: 11.5 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8, maxWidth: '100%' }}>
+              <span
+                className="tag-chip mono"
+                style={{
+                  fontSize: 11.5,
+                  maxWidth: '100%',
+                  height: 'auto',
+                  whiteSpace: 'normal',
+                  wordBreak: 'break-all',
+                  padding: '3px 8px',
+                }}
+              >
                 端点: {effectiveURL}
               </span>
               <button
@@ -807,15 +845,26 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
                 <strong style={{ fontSize: 13, color: 'var(--accent-teal)' }}>
                   新令牌「{justCreatedToken.name}」已签发（明文仅展示一次，已自动填入下方四端配置！）
                 </strong>
-                <button
-                  type="button"
-                  className="btn btn-teal btn-sm"
-                  onClick={() =>
-                    void copyText('raw-token', justCreatedToken.rawToken, ' MCP 令牌明文')
-                  }
-                >
-                  {copiedKey === 'raw-token' ? <Check size={12} /> : <Copy size={12} />} 复制令牌
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn btn-teal btn-sm"
+                    onClick={() =>
+                      void copyText('raw-token', justCreatedToken.rawToken, ' MCP 令牌明文')
+                    }
+                  >
+                    {copiedKey === 'raw-token' ? <Check size={12} /> : <Copy size={12} />} 复制令牌
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm btn-icon"
+                    title="收起明文令牌提示"
+                    aria-label="收起明文令牌提示"
+                    onClick={() => setJustCreatedToken(null)}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
               </div>
               <code className="mcp-raw-token-code">{justCreatedToken.rawToken}</code>
             </div>
@@ -835,19 +884,19 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
             }}
           >
             {isDesktopMode ? (
-              <div className="field" style={{ flex: 1, minWidth: 180 }}>
+              <div className="field" style={{ flex: '1 1 180px', minWidth: 0 }}>
                 <label className="field-label">桌面版独立回环 MCP 端口（仅绑定 127.0.0.1）</label>
                 <input
                   type="number"
                   min={1024}
                   max={65535}
                   className="input mono"
-                  value={desktopPort}
-                  onChange={(e) => setDesktopPort(Number(e.target.value) || 18900)}
+                  value={desktopPortStr}
+                  onChange={(e) => setDesktopPortStr(e.target.value)}
                 />
               </div>
             ) : (
-              <div className="field" style={{ flex: 1, minWidth: 220 }}>
+              <div className="field" style={{ flex: '1 1 220px', minWidth: 0 }}>
                 <label className="field-label">
                   外部访问地址提示（可选，反代/域名部署时填写，如 https://ops.example.com）
                 </label>
@@ -1069,7 +1118,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
         <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
           <ExternalLink size={12} />
           <span>
-            定时无人值守提示：在「定时安全巡检」设置中将研判引擎切换为<strong>外部 AI 接管</strong>或<strong>外部优先+超时回退</strong>，配合本地系统 cron / Claude Code{' '}
+            定时无人值守提示：在「后台巡检与告警」设置中将研判引擎切换为<strong>外部 AI 接管</strong>或<strong>外部优先+超时回退</strong>，配合本地系统 cron / Claude Code{' '}
             <code className="mono">/loop</code> 定期调用 <code className="mono">patrol_triage</code> 即可用本地订阅实现 7×24 全自动深度巡检。
           </span>
         </div>

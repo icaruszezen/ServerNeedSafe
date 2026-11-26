@@ -96,7 +96,7 @@ else
   UID0=$(awk -F: '($3 == 0) {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
   printf "METRIC_UID0=%s\n" "$UID0"
 
-  PORTS=$( (ss -tulnH 2>/dev/null || netstat -tuln 2>/dev/null | awk 'NR>2') | awk '{print $1 ":" $5}' | sed 's/.*:\([0-9][0-9]*\)$/\1/' | sort -u | tr '\n' ',' | sed 's/,$//' )
+  PORTS=$( (if command -v ss >/dev/null 2>&1; then ss -tulnH 2>/dev/null | awk '{print $5}'; else netstat -tuln 2>/dev/null | awk 'NR>2 {print $4}'; fi) | awk '{n=split($0, a, ":"); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) print p}' | sort -u | tr '\n' ',' | sed 's/,$//' )
   printf "METRIC_PORTS=%s\n" "$PORTS"
 
   FAILED_UNITS=""
@@ -108,6 +108,13 @@ fi
 `
 
 func (s *Service) patrolSchedulerLoop() {
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	defer loopCancel()
+	go func() {
+		<-s.stopCh
+		loopCancel()
+	}()
+
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
@@ -124,7 +131,7 @@ func (s *Service) patrolSchedulerLoop() {
 		}
 
 		// Always check expired external-AI patrol fallback deadlines regardless of periodic schedule toggle
-		s.ProcessExpiredExternalPatrolFallbacks(context.Background())
+		s.ProcessExpiredExternalPatrolFallbacks(loopCtx)
 
 		cfg, err := s.store.GetPatrolConfigSecret()
 		if err != nil || !cfg.Enabled {
@@ -161,7 +168,7 @@ func (s *Service) patrolSchedulerLoop() {
 		s.mu.Unlock()
 
 		if due {
-			_, _ = s.RunPatrolNow(context.Background(), "scheduled", false)
+			_, _ = s.RunPatrolNow(loopCtx, "scheduled", false)
 		}
 	}
 }
@@ -245,11 +252,15 @@ func (s *Service) RunPatrolForServers(ctx context.Context, trigger string, force
 
 	defer func() {
 		now := time.Now().UTC()
+		latestCfg := cfg
+		if fresh, cErr := s.store.GetPatrolConfigSecret(); cErr == nil && fresh != nil {
+			latestCfg = fresh
+		}
 		s.mu.Lock()
 		s.patrolRunning = false
 		s.lastPatrolAt = &now
-		if cfg.Enabled {
-			next := now.Add(time.Duration(max(5, cfg.IntervalMinutes)) * time.Minute)
+		if latestCfg != nil && latestCfg.Enabled {
+			next := now.Add(time.Duration(max(5, latestCfg.IntervalMinutes)) * time.Minute)
 			s.nextPatrolAt = &next
 		} else {
 			s.nextPatrolAt = nil
@@ -421,22 +432,28 @@ func (s *Service) ProcessExpiredExternalPatrolFallbacks(ctx context.Context) int
 		analyzedAt := time.Now().UTC()
 		working.AIAnalyzedAt = &analyzedAt
 
-		aiNotified := false
-		if cfg != nil && len(cfg.Webhooks) > 0 && working.Status != "healthy" {
-			aiNotified = s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, working)
-		}
+		// Atomically commit fallback analysis ONLY if an external MCP client did not submit a report
+		// while the built-in fallback LLM request was in flight.
 		markUnread := working.Status != "healthy"
-		if _, uErr := s.store.UpdatePatrolRecordAnalysis(working.ID, vault.PatrolAnalysisUpdate{
+		updated, uErr := s.store.UpdatePatrolRecordAnalysis(working.ID, vault.PatrolAnalysisUpdate{
 			AnalysisState:     "fallback_completed",
 			AISource:          "builtin",
 			AIModel:           working.AIModel,
 			AISummary:         working.AISummary,
 			AIRootCause:       working.AIRootCause,
 			AIRecommendations: working.AIRecommendations,
-			AIWebhookNotified: &aiNotified,
 			MarkUnread:        &markUnread,
-		}, "patrol-fallback"); uErr == nil {
-			processed++
+			OnlyIfNotAnalyzed: true,
+		}, "patrol-fallback")
+		if uErr != nil {
+			continue
+		}
+		processed++
+
+		if cfg != nil && len(cfg.Webhooks) > 0 && updated.Status != "healthy" {
+			if notified := s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, *updated); notified {
+				s.store.MarkPatrolWebhookNotified(working.ID)
+			}
 		}
 	}
 	if processed > 0 {
@@ -538,6 +555,7 @@ func (s *Service) evaluateServerPatrol(
 		}
 	}
 
+	hasUnexpectedPorts := false
 	if cfg.CheckListeningPorts && baseline != nil && len(baseline.ListeningPorts) > 0 {
 		var newPorts []string
 		for _, p := range ports {
@@ -546,17 +564,22 @@ func (s *Service) evaluateServerPatrol(
 			}
 		}
 		if len(newPorts) > 0 {
+			hasUnexpectedPorts = true
 			bumpSeverity("warning")
 			finding.NewPorts = newPorts
 			finding.Anomalies = append(finding.Anomalies, fmt.Sprintf("相比基线新增监听端口: %s", strings.Join(newPorts, ", ")))
 		}
 	}
 
-	_ = s.store.SavePatrolBaseline(vault.ServerBaselineSnapshot{
-		ServerID:       srv.ID,
-		ListeningPorts: ports,
-		UIDZeroUsers:   uid0,
-	})
+	// Only establish initial baseline or update when no suspicious new ports were detected,
+	// so newly exposed ports are NOT silently absorbed into the trusted baseline on the next cycle.
+	if baseline == nil || len(baseline.ListeningPorts) == 0 || !hasUnexpectedPorts {
+		_ = s.store.SavePatrolBaseline(vault.ServerBaselineSnapshot{
+			ServerID:       srv.ID,
+			ListeningPorts: ports,
+			UIDZeroUsers:   uid0,
+		})
+	}
 	return finding
 }
 
@@ -599,10 +622,13 @@ func (s *Service) enrichPatrolWithLLM(ctx context.Context, prov vault.AIProvider
 		return
 	}
 
+	raw := strings.TrimSpace(turn.Content)
+	if raw == "" {
+		return
+	}
 	rec.AIAnalyzed = true
 	rec.AIModel = prov.Model
 
-	raw := strings.TrimSpace(turn.Content)
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")

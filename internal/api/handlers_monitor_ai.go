@@ -509,21 +509,8 @@ func (s *Server) handleUpdateAISession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "更新会话参数格式错误")
 		return
 	}
-	sess, err := s.cfg.Store.GetAISession(id)
+	sess, err := s.cfg.AI.UpdateSession(id, req.Mode, req.ServerIDs, req.Title)
 	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	if req.Mode == vault.AIModeSuggest || req.Mode == vault.AIModeStandard || req.Mode == vault.AIModeAutonomous {
-		sess.Mode = req.Mode
-	}
-	if req.ServerIDs != nil {
-		sess.ServerIDs = *req.ServerIDs
-	}
-	if req.Title != nil && strings.TrimSpace(*req.Title) != "" {
-		sess.Title = strings.TrimSpace(*req.Title)
-	}
-	if err := s.cfg.Store.SaveAISession(*sess); err != nil {
 		writeDomainError(w, err)
 		return
 	}

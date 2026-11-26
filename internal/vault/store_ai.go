@@ -588,6 +588,15 @@ func (s *Store) ListAISessions(scope string) ([]AIChatSessionSummary, error) {
 		}
 		out = append(out, cs.ToSummary())
 	}
+	slices.SortStableFunc(out, func(a, b AIChatSessionSummary) int {
+		if a.UpdatedAt.After(b.UpdatedAt) {
+			return -1
+		}
+		if b.UpdatedAt.After(a.UpdatedAt) {
+			return 1
+		}
+		return 0
+	})
 	return out, nil
 }
 
@@ -682,7 +691,13 @@ func (s *Store) SaveAISession(sess AIChatSession) error {
 	updated := false
 	for i := range s.aiopsRT.AISessions {
 		if s.aiopsRT.AISessions[i].ID == sess.ID {
-			s.aiopsRT.AISessions[i] = cloneSession(sess)
+			cp := cloneSession(sess)
+			if i > 0 {
+				s.aiopsRT.AISessions = slices.Delete(s.aiopsRT.AISessions, i, i+1)
+				s.aiopsRT.AISessions = append([]AIChatSession{cp}, s.aiopsRT.AISessions...)
+			} else {
+				s.aiopsRT.AISessions[0] = cp
+			}
 			updated = true
 			break
 		}
@@ -727,18 +742,26 @@ func (s *Store) ResolveRunbookProposal(proposalID string, accept bool, syncSnipp
 		return nil, ErrVaultLocked
 	}
 
-	// Step 1: Locate proposal under rtMu.RLock
-	s.rtMu.RLock()
+	// Step 1: Atomically verify pending status and claim "resolving" under rtMu.Lock
+	// so concurrent requests cannot create duplicate Runbooks or Snippets.
+	s.rtMu.Lock()
 	var prop AIRunbookProposal
 	found := false
+	alreadyResolved := ""
 	if s.aiopsRT != nil {
-		for _, cs := range s.aiopsRT.AISessions {
-			for _, rp := range cs.RunbookProposals {
+		for si := range s.aiopsRT.AISessions {
+			for pi := range s.aiopsRT.AISessions[si].RunbookProposals {
+				rp := &s.aiopsRT.AISessions[si].RunbookProposals[pi]
 				if rp.ID == proposalID {
-					prop = rp
+					found = true
+					if rp.Status != "pending" {
+						alreadyResolved = rp.Status
+						break
+					}
+					rp.Status = "resolving"
+					prop = *rp
 					prop.DiagnosticSteps = slices.Clone(rp.DiagnosticSteps)
 					prop.FixCommands = slices.Clone(rp.FixCommands)
-					found = true
 					break
 				}
 			}
@@ -747,9 +770,28 @@ func (s *Store) ResolveRunbookProposal(proposalID string, accept bool, syncSnipp
 			}
 		}
 	}
-	s.rtMu.RUnlock()
+	s.rtMu.Unlock()
 	if !found {
 		return nil, ErrNotFound
+	}
+	if alreadyResolved != "" {
+		return nil, fmt.Errorf("%w: 该 Runbook 技能提案已处理 (%s)", ErrInvalidInput, alreadyResolved)
+	}
+
+	rollbackPending := func() {
+		s.rtMu.Lock()
+		if s.aiopsRT != nil {
+			for si := range s.aiopsRT.AISessions {
+				for pi := range s.aiopsRT.AISessions[si].RunbookProposals {
+					if s.aiopsRT.AISessions[si].RunbookProposals[pi].ID == proposalID &&
+						s.aiopsRT.AISessions[si].RunbookProposals[pi].Status == "resolving" {
+						s.aiopsRT.AISessions[si].RunbookProposals[pi].Status = "pending"
+						break
+					}
+				}
+			}
+		}
+		s.rtMu.Unlock()
 	}
 
 	now := time.Now().UTC()
@@ -776,23 +818,26 @@ func (s *Store) ResolveRunbookProposal(proposalID string, accept bool, syncSnipp
 		}
 		if syncSnippet {
 			if err := s.syncRunbookSnippet(&rbIn, now); err != nil {
+				rollbackPending()
 				return nil, err
 			}
 		}
 	}
 
-	// Step 2: Update runtime state
+	// Step 2: Commit final runtime state
 	s.rtMu.Lock()
 	foundSessIdx, foundPropIdx := -1, -1
-	for si := range s.aiopsRT.AISessions {
-		for pi := range s.aiopsRT.AISessions[si].RunbookProposals {
-			if s.aiopsRT.AISessions[si].RunbookProposals[pi].ID == proposalID {
-				foundSessIdx, foundPropIdx = si, pi
+	if s.aiopsRT != nil {
+		for si := range s.aiopsRT.AISessions {
+			for pi := range s.aiopsRT.AISessions[si].RunbookProposals {
+				if s.aiopsRT.AISessions[si].RunbookProposals[pi].ID == proposalID {
+					foundSessIdx, foundPropIdx = si, pi
+					break
+				}
+			}
+			if foundSessIdx >= 0 {
 				break
 			}
-		}
-		if foundSessIdx >= 0 {
-			break
 		}
 	}
 	if foundSessIdx < 0 {
@@ -920,9 +965,13 @@ func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string
 				kind = "custom"
 			}
 			var ch WebhookChannel
+			var old WebhookChannel
+			hasOld := false
 			if win.ID != "" {
-				if old, ok := existingByID[win.ID]; ok {
-					ch = old
+				if prev, ok := existingByID[win.ID]; ok {
+					ch = prev
+					old = prev
+					hasOld = true
 				}
 			}
 			if ch.ID == "" {
@@ -936,6 +985,11 @@ func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string
 			}
 			if win.Secret != nil {
 				ch.Secret = strings.TrimSpace(*win.Secret)
+			} else if hasOld && old.Secret != "" {
+				sameDest := SameEndpointURL(ch.URL, old.URL) && ch.Kind == old.Kind
+				if !sameDest {
+					return fmt.Errorf("%w: 更换 Webhook 地址或类型时必须重新填写签名密钥", ErrInvalidInput)
+				}
 			}
 			if ch.URL != "" {
 				mergedWebhooks = append(mergedWebhooks, ch)

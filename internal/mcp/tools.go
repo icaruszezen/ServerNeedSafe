@@ -3,7 +3,6 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
-	"path"
 	"slices"
 	"strings"
 	"time"
@@ -381,13 +380,17 @@ func (s *Server) readResource(tok *vault.MCPToken, uri string) (mime string, tex
 		return "application/json", mustMarshalPretty(ov), nil
 
 	case "serverneedsafe://approvals/pending":
-		aps, pending, err := s.store.ListExternalApprovals("pending", 50)
+		aps, _, err := s.store.ListExternalApprovals("pending", 0)
 		if err != nil {
 			return "", "", err
 		}
 		aps = filterApprovalsByToken(tok, aps)
+		pendingCount := len(aps)
+		if len(aps) > 50 {
+			aps = aps[:50]
+		}
 		return "application/json", mustMarshalPretty(map[string]any{
-			"pending_count": pending,
+			"pending_count": pendingCount,
 			"approvals":     aps,
 		}), nil
 
@@ -620,6 +623,13 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if recID == "" {
 			return "缺少必填参数 patrol_record_id", true
 		}
+		existing, err := s.store.GetPatrolRecord(recID)
+		if err != nil {
+			return "认领巡检记录失败: " + err.Error(), true
+		}
+		if !isPatrolRecordAllowedForWrite(c.token, *existing) {
+			return "当前 MCP 令牌无权认领包含未授权服务器的巡检记录", true
+		}
 		rec, err := s.store.ClaimPatrolRecord(recID, clientName, c.clientIP)
 		if err != nil {
 			return "认领巡检记录失败: " + err.Error(), true
@@ -628,6 +638,9 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		srvIDs := make([]string, 0, len(filtered.Findings))
 		for _, f := range filtered.Findings {
 			srvIDs = append(srvIDs, f.ServerID)
+		}
+		if len(srvIDs) == 0 && c.token != nil && len(c.token.AllowedServers) > 0 {
+			srvIDs = slices.Clone(c.token.AllowedServers)
 		}
 		return mustMarshalPretty(map[string]any{
 			"patrol_record": filtered,
@@ -649,6 +662,17 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "参数解析失败: " + err.Error(), true
 		}
+		recID := strings.TrimSpace(args.PatrolRecordID)
+		if recID == "" {
+			return "缺少必填参数 patrol_record_id", true
+		}
+		existing, err := s.store.GetPatrolRecord(recID)
+		if err != nil {
+			return "回写巡检报告失败: " + err.Error(), true
+		}
+		if !isPatrolRecordAllowedForWrite(c.token, *existing) {
+			return "当前 MCP 令牌无权回写包含未授权服务器的巡检报告", true
+		}
 		extClient := strings.TrimSpace(args.ClientName)
 		if extClient == "" {
 			extClient = clientName
@@ -656,7 +680,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 			extClient = friendlyClientName(extClient)
 		}
 		updated, err := s.ai.SubmitExternalPatrolReport(c.reqCtx, aiops.ExternalPatrolReportInput{
-			PatrolRecordID:  args.PatrolRecordID,
+			PatrolRecordID:  recID,
 			Summary:         args.Summary,
 			RootCause:       args.RootCause,
 			Recommendations: args.Recommendations,
@@ -767,7 +791,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if !isServerAllowed(c.token, sid) {
 			return fmt.Sprintf("当前 MCP 令牌无权访问服务器 %s", sid), true
 		}
-		if isBlockedReadPath(filePath) {
+		if aiops.IsBlockedReadPath(filePath) {
 			s.store.RecordAudit("mcp.blocked", sid+":"+filePath, fmt.Sprintf("外部 AI (%s) 尝试读取受保护敏感文件被硬拦截", clientName), c.clientIP, false)
 			return fmt.Sprintf("安全护栏禁止读取敏感凭据/密钥文件 (%s)", filePath), true
 		}
@@ -777,7 +801,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		}
 		s.store.RecordAudit("mcp.sftp_read", sid+":"+filePath, fmt.Sprintf("外部 AI (%s) 只读查看远程文件", clientName), c.clientIP, true)
 		if len(content) > 24000 {
-			content = content[:24000] + "\n... [文件内容过长已截断]"
+			content = aiops.TruncateUTF8Bytes(content, 24000) + "\n... [文件内容过长已截断]"
 		}
 		return content, false
 
@@ -786,6 +810,12 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 			ServerIDs []string `json:"server_ids"`
 		}
 		_ = json.Unmarshal(rawArgs, &args)
+		for _, sid := range args.ServerIDs {
+			trimmed := strings.TrimSpace(sid)
+			if trimmed != "" && !isServerAllowed(c.token, trimmed) {
+				return fmt.Sprintf("当前 MCP 令牌无权获取服务器 %s 的运维上下文", trimmed), true
+			}
+		}
 		sids := filterServerIDsByToken(c.token, args.ServerIDs)
 		agentsMD, _ := s.store.GetAgentsMD()
 		runbooks, _ := s.store.ListRunbooks()
@@ -817,7 +847,11 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if sid := strings.TrimSpace(args.ServerID); sid != "" && !isServerAllowed(c.token, sid) {
 			return fmt.Sprintf("当前 MCP 令牌无权检索服务器 %s 的记忆", sid), true
 		}
-		out, _ := s.ai.SearchMemory(args.Query, args.ServerID, args.Category, args.Limit)
+		var allowed []string
+		if c.token != nil && len(c.token.AllowedServers) > 0 {
+			allowed = c.token.AllowedServers
+		}
+		out, _ := s.ai.SearchMemoryScoped(args.Query, args.ServerID, args.Category, args.Limit, allowed)
 		return out, false
 
 	case "get_runbook":
@@ -1029,13 +1063,27 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if args.Limit <= 0 || args.Limit > 100 {
 			args.Limit = 20
 		}
-		aps, pending, err := s.store.ListExternalApprovals(status, args.Limit)
+		allAps, _, err := s.store.ListExternalApprovals("all", 0)
 		if err != nil {
 			return "获取审批列表失败: " + err.Error(), true
 		}
-		filtered := filterApprovalsByToken(c.token, aps)
+		allowedAll := filterApprovalsByToken(c.token, allAps)
+		pendingTotal := 0
+		filtered := make([]vault.ExternalApproval, 0, min(args.Limit, len(allowedAll)))
+		statusFilter := strings.ToLower(status)
+		for _, ap := range allowedAll {
+			if ap.Status == "pending" {
+				pendingTotal++
+			}
+			if statusFilter != "all" && ap.Status != statusFilter {
+				continue
+			}
+			if len(filtered) < args.Limit {
+				filtered = append(filtered, ap)
+			}
+		}
 		return mustMarshalPretty(map[string]any{
-			"pending_total": pending,
+			"pending_total": pendingTotal,
 			"count":         len(filtered),
 			"approvals":     filtered,
 		}), false
@@ -1154,48 +1202,39 @@ func filterPatrolRecordsByToken(tok *vault.MCPToken, recs []vault.PatrolRecord) 
 	return out
 }
 
-func filterApprovalsByToken(tok *vault.MCPToken, aps []vault.ExternalApproval) []vault.ExternalApproval {
+func isPatrolRecordAllowedForWrite(tok *vault.MCPToken, rec vault.PatrolRecord) bool {
 	if tok == nil || len(tok.AllowedServers) == 0 {
-		return aps
+		return true
 	}
-	out := make([]vault.ExternalApproval, 0, len(aps))
-	for _, ap := range aps {
-		ok := true
-		for _, sid := range ap.ServerIDs {
-			if !slices.Contains(tok.AllowedServers, sid) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			cp := ap
-			cp.NewContent = ""
-			out = append(out, cp)
+	for _, f := range rec.Findings {
+		if f.ServerID != "" && !slices.Contains(tok.AllowedServers, f.ServerID) {
+			return false
 		}
 	}
-	return out
+	return true
 }
 
-func isBlockedReadPath(rawPath string) bool {
-	clean := path.Clean(strings.ReplaceAll(strings.TrimSpace(rawPath), "\\", "/"))
-	low := strings.ToLower(clean)
-	base := strings.ToLower(path.Base(clean))
-	if low == "/etc/shadow" || low == "/etc/gshadow" || low == "/etc/sudoers" {
-		return true
-	}
-	if base == "secrets.enc" || base == "master.key" || base == ".vault.key" || base == "vault.sns" {
-		return true
-	}
-	if strings.Contains(low, "/.ssh/") {
-		switch base {
-		case "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "identity":
-			return true
+func filterApprovalsByToken(tok *vault.MCPToken, aps []vault.ExternalApproval) []vault.ExternalApproval {
+	restricted := tok != nil && len(tok.AllowedServers) > 0
+	out := make([]vault.ExternalApproval, 0, len(aps))
+	for _, ap := range aps {
+		if restricted {
+			ok := true
+			for _, sid := range ap.ServerIDs {
+				if !slices.Contains(tok.AllowedServers, sid) {
+					ok = false
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
 		}
-		if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
-			return true
-		}
+		cp := ap
+		cp.NewContent = ""
+		out = append(out, cp)
 	}
-	return false
+	return out
 }
 
 func mustMarshalPretty(v any) string {

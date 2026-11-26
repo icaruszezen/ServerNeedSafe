@@ -170,9 +170,9 @@ func (s *Service) CreateExternalApprovalProposal(ctx context.Context, in Externa
 		if cleanPath == "" {
 			return nil, fmt.Errorf("%w: 远程文件路径 path 不能为空", vault.ErrInvalidInput)
 		}
-		if cleanPath == "/etc/shadow" || cleanPath == "/etc/gshadow" || cleanPath == "/etc/passwd" || cleanPath == "/etc/sudoers" {
-			s.store.RecordAudit("mcp.blocked", serverNames[0]+":"+cleanPath, fmt.Sprintf("外部 AI (%s) 尝试提议覆写系统核心鉴权文件 %s 被硬拦截", clientName, cleanPath), in.ClientIP, false)
-			return nil, fmt.Errorf("安全熔断器禁止 AI 修改系统核心鉴权文件 (%s)", cleanPath)
+		if IsBlockedWritePath(cleanPath) {
+			s.store.RecordAudit("mcp.blocked", serverNames[0]+":"+cleanPath, fmt.Sprintf("外部 AI (%s) 尝试提议覆写系统核心鉴权或保险库文件 %s 被硬拦截", clientName, cleanPath), in.ClientIP, false)
+			return nil, fmt.Errorf("安全熔断器禁止 AI 修改系统核心鉴权或保险库文件 (%s)", cleanPath)
 		}
 		oldContent, _ := s.ssh.SFTPReadText(in.ServerIDs[0], cleanPath, in.ClientIP)
 		ap.FilePath = cleanPath
@@ -218,7 +218,11 @@ func (s *Service) ResolveExternalApproval(ctx context.Context, approvalID string
 	if !s.store.IsReady() {
 		return nil, vault.ErrVaultLocked
 	}
-	ap, err := s.store.GetExternalApproval(strings.TrimSpace(approvalID))
+	trimmedID := strings.TrimSpace(approvalID)
+	unlock := s.lockExternalApproval(trimmedID)
+	defer unlock()
+
+	ap, err := s.store.GetExternalApproval(trimmedID)
 	if err != nil {
 		return nil, err
 	}
@@ -263,8 +267,8 @@ func (s *Service) ResolveExternalApproval(ctx context.Context, approvalID string
 	case "sftp_write_file":
 		if len(ap.ServerIDs) == 0 {
 			execErr = fmt.Errorf("缺少目标服务器 ID")
-		} else if ap.FilePath == "/etc/shadow" || ap.FilePath == "/etc/gshadow" || ap.FilePath == "/etc/passwd" || ap.FilePath == "/etc/sudoers" {
-			execErr = fmt.Errorf("安全熔断器禁止修改系统核心鉴权文件 (%s)", ap.FilePath)
+		} else if IsBlockedWritePath(ap.FilePath) {
+			execErr = fmt.Errorf("安全熔断器禁止修改系统核心鉴权或保险库文件 (%s)", ap.FilePath)
 		} else if err := s.ssh.SFTPWriteText(ap.ServerIDs[0], ap.FilePath, ap.NewContent, clientIP); err != nil {
 			execErr = err
 		} else {
@@ -332,10 +336,16 @@ func (s *Service) maybeRecordExternalApprovedChangeMemory(ap vault.ExternalAppro
 
 // SearchMemory exposes the unified hybrid memory search to internal callers such as the MCP gateway.
 func (s *Service) SearchMemory(query, serverID, category string, limit int) (string, []string) {
+	return s.SearchMemoryScoped(query, serverID, category, limit, nil)
+}
+
+// SearchMemoryScoped searches long-term memories and host memories while enforcing an optional server allowlist.
+// When allowedServers is non-empty, only global memories and entries/hosts belonging to allowedServers are returned.
+func (s *Service) SearchMemoryScoped(query, serverID, category string, limit int, allowedServers []string) (string, []string) {
 	if limit <= 0 || limit > 20 {
 		limit = 8
 	}
-	out, hitIDs := s.executeSearchMemory(query, serverID, category, limit)
+	out, hitIDs := s.executeSearchMemory(query, serverID, category, limit, allowedServers)
 	if len(hitIDs) > 0 {
 		s.store.TouchAIMemoryUsage(hitIDs)
 	}

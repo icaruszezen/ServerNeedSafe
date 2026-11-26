@@ -3157,6 +3157,14 @@ pre,
   gap: 10px;
 }
 
+.ai-approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
 .diff-viewer {
   background: #0d1117;
   color: #e6edf3;
@@ -3717,9 +3725,7 @@ pre,
 @media (max-width: 960px) {
   .ai-agents-editor-grid.mode-split,
   .ai-mem-card-grid,
-  .ai-ctx-grid,
-  .mcp-two-col-grid,
-  .mcp-prompts-strip {
+  .ai-ctx-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -3935,6 +3941,13 @@ pre,
   color: var(--amber-text);
   font-size: 12.5px;
   line-height: 1.5;
+}
+
+@media (max-width: 960px) {
+  .mcp-two-col-grid,
+  .mcp-prompts-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* ==========================================================================

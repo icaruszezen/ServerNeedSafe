@@ -85,6 +85,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   const [editorMode, setEditorMode] = useState<'split' | 'edit' | 'preview'>('split');
   const [showBudgetConfig, setShowBudgetConfig] = useState(false);
   const [budgetDraft, setBudgetDraft] = useState<AIMemoryConfig>(DEFAULT_MEMORY_CONFIG);
+  const [budgetNumStr, setBudgetNumStr] = useState({
+    agents_md_max_chars: String(DEFAULT_MEMORY_CONFIG.agents_md_max_chars),
+    memory_prompt_budget_chars: String(DEFAULT_MEMORY_CONFIG.memory_prompt_budget_chars),
+    compaction_trigger_pct: String(Math.round(DEFAULT_MEMORY_CONFIG.compaction_trigger_ratio * 100)),
+    compaction_keep_recent: String(DEFAULT_MEMORY_CONFIG.compaction_keep_recent),
+  });
   const [savingBudget, setSavingBudget] = useState(false);
   const mdImportInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -98,6 +104,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   useEffect(() => {
     if (overview?.memory_config) {
       setBudgetDraft(overview.memory_config);
+      setBudgetNumStr({
+        agents_md_max_chars: String(overview.memory_config.agents_md_max_chars),
+        memory_prompt_budget_chars: String(overview.memory_config.memory_prompt_budget_chars),
+        compaction_trigger_pct: String(Math.round(overview.memory_config.compaction_trigger_ratio * 100)),
+        compaction_keep_recent: String(overview.memory_config.compaction_keep_recent),
+      });
     }
   }, [overview?.memory_config]);
 
@@ -121,6 +133,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   // --- Host Memory 2.0 State ---
   const [syncingMonitorId, setSyncingMonitorId] = useState<string | null>(null);
   const [editingHostMemory, setEditingHostMemory] = useState<{
+    is_new?: boolean;
     server_id: string;
     summary: string;
     os_arch: string;
@@ -143,6 +156,55 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
     verification: string;
     sync_snippet: boolean;
   } | null>(null);
+
+  useEffect(() => {
+    if (!editingEntry && !editingHostMemory && !editingRunbook) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setEditingEntry(null);
+        setEditingHostMemory(null);
+        setEditingRunbook(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editingEntry, editingHostMemory, editingRunbook]);
+
+  const hostMemoryByServerId = useMemo(() => {
+    const map = new Map<string, HostMemory>();
+    for (const hm of overview?.host_memories || []) {
+      map.set(hm.server_id, hm);
+    }
+    return map;
+  }, [overview?.host_memories]);
+
+  const buildHostMemoryFormState = (serverId: string, isNew: boolean) => {
+    const existing = hostMemoryByServerId.get(serverId);
+    if (existing) {
+      return {
+        is_new: isNew,
+        server_id: serverId,
+        summary: existing.summary || '',
+        os_arch: existing.os_arch || '',
+        key_services_csv: (existing.key_services || []).join(', '),
+        deploy_paths_csv: (existing.deploy_paths || []).join(', '),
+        ports_note: existing.ports_note || '',
+        constraints: existing.constraints || '',
+        notes: existing.notes || '',
+      };
+    }
+    return {
+      is_new: isNew,
+      server_id: serverId,
+      summary: '',
+      os_arch: '',
+      key_services_csv: '',
+      deploy_paths_csv: '',
+      ports_note: '',
+      constraints: '',
+      notes: '',
+    };
+  };
 
   const serverNameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -213,7 +275,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
     const a = document.createElement('a');
     a.href = url;
     a.download = 'AGENTS.md';
+    document.body.appendChild(a);
     a.click();
+    a.remove();
     URL.revokeObjectURL(url);
     onNotify('已导出 AGENTS.md 文件');
   };
@@ -234,9 +298,30 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
 
   const handleSaveBudgetConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    const agentsMax = Number(budgetNumStr.agents_md_max_chars);
+    const memBudget = Number(budgetNumStr.memory_prompt_budget_chars);
+    const triggerPct = Number(budgetNumStr.compaction_trigger_pct);
+    const keepRecent = Number(budgetNumStr.compaction_keep_recent);
+
+    const payload: AIMemoryConfig = {
+      ...budgetDraft,
+      agents_md_max_chars: Number.isFinite(agentsMax)
+        ? Math.min(30000, Math.max(1000, Math.round(agentsMax)))
+        : DEFAULT_MEMORY_CONFIG.agents_md_max_chars,
+      memory_prompt_budget_chars: Number.isFinite(memBudget)
+        ? Math.min(24000, Math.max(1000, Math.round(memBudget)))
+        : DEFAULT_MEMORY_CONFIG.memory_prompt_budget_chars,
+      compaction_trigger_ratio: Number.isFinite(triggerPct)
+        ? Math.min(0.9, Math.max(0.4, triggerPct / 100))
+        : DEFAULT_MEMORY_CONFIG.compaction_trigger_ratio,
+      compaction_keep_recent: Number.isFinite(keepRecent)
+        ? Math.min(20, Math.max(2, Math.round(keepRecent)))
+        : DEFAULT_MEMORY_CONFIG.compaction_keep_recent,
+    };
+
     setSavingBudget(true);
     try {
-      await api.updateAIMemoryConfig(budgetDraft);
+      await api.updateAIMemoryConfig(payload);
       onNotify('记忆与上下文预算策略已加密保存');
       await onReloadOverview();
     } catch (err: any) {
@@ -250,6 +335,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   const handleSaveMemoryEntry = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingEntry) return;
+    if (editingEntry.scope === 'server' && editingEntry.server_ids.length === 0) {
+      onNotify('主机专属记忆请至少勾选一台关联服务器，或切换为「全局记忆」');
+      return;
+    }
     try {
       await api.upsertAIMemory({
         id: editingEntry.id,
@@ -614,12 +703,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       className="input mono"
                       min={1000}
                       max={30000}
-                      value={budgetDraft.agents_md_max_chars}
+                      value={budgetNumStr.agents_md_max_chars}
                       onChange={(e) =>
-                        setBudgetDraft({
-                          ...budgetDraft,
-                          agents_md_max_chars: Number(e.target.value) || 6000,
-                        })
+                        setBudgetNumStr((prev) => ({ ...prev, agents_md_max_chars: e.target.value }))
                       }
                     />
                   </div>
@@ -630,12 +716,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       className="input mono"
                       min={1000}
                       max={24000}
-                      value={budgetDraft.memory_prompt_budget_chars}
+                      value={budgetNumStr.memory_prompt_budget_chars}
                       onChange={(e) =>
-                        setBudgetDraft({
-                          ...budgetDraft,
-                          memory_prompt_budget_chars: Number(e.target.value) || 4500,
-                        })
+                        setBudgetNumStr((prev) => ({
+                          ...prev,
+                          memory_prompt_budget_chars: e.target.value,
+                        }))
                       }
                     />
                   </div>
@@ -649,15 +735,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       className="input mono"
                       min={40}
                       max={90}
-                      value={Math.round(budgetDraft.compaction_trigger_ratio * 100)}
+                      value={budgetNumStr.compaction_trigger_pct}
                       onChange={(e) =>
-                        setBudgetDraft({
-                          ...budgetDraft,
-                          compaction_trigger_ratio: Math.min(
-                            0.9,
-                            Math.max(0.4, (Number(e.target.value) || 70) / 100)
-                          ),
-                        })
+                        setBudgetNumStr((prev) => ({
+                          ...prev,
+                          compaction_trigger_pct: e.target.value,
+                        }))
                       }
                     />
                   </div>
@@ -668,12 +751,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       className="input mono"
                       min={2}
                       max={20}
-                      value={budgetDraft.compaction_keep_recent}
+                      value={budgetNumStr.compaction_keep_recent}
                       onChange={(e) =>
-                        setBudgetDraft({
-                          ...budgetDraft,
-                          compaction_keep_recent: Number(e.target.value) || 6,
-                        })
+                        setBudgetNumStr((prev) => ({
+                          ...prev,
+                          compaction_keep_recent: e.target.value,
+                        }))
                       }
                     />
                   </div>
@@ -779,7 +862,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
               className="select"
               style={{ width: 'auto', minWidth: 112, height: 33 }}
               value={memScopeFilter}
-              onChange={(e) => setMemScopeFilter(e.target.value as any)}
+              onChange={(e) => {
+                const next = e.target.value as 'all' | 'global' | 'server';
+                setMemScopeFilter(next);
+                if (next === 'global') setMemServerFilter('all');
+              }}
             >
               <option value="all">全部范围</option>
               <option value="global">仅全局</option>
@@ -877,9 +964,13 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                         className="btn btn-ghost btn-sm btn-icon"
                         style={{ color: 'var(--danger-text)' }}
                         onClick={async () => {
-                          await api.deleteAIMemory(m.id);
-                          onNotify(`已删除长期记忆《${m.title}》`);
-                          await onReloadOverview();
+                          try {
+                            await api.deleteAIMemory(m.id);
+                            onNotify(`已删除长期记忆《${m.title}》`);
+                            await onReloadOverview();
+                          } catch (err: any) {
+                            onNotify(err?.message || '删除长期记忆失败');
+                          }
                         }}
                         title="删除记忆"
                       >
@@ -956,18 +1047,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                     type="button"
                     id="ai-add-host-mem-btn"
                     className="btn btn-sm"
-                    onClick={() =>
-                      setEditingHostMemory({
-                        server_id: servers[0].id,
-                        summary: '',
-                        os_arch: '',
-                        key_services_csv: '',
-                        deploy_paths_csv: '',
-                        ports_note: '',
-                        constraints: '',
-                        notes: '',
-                      })
-                    }
+                    onClick={() => {
+                      const unprofiled = servers.find((s) => !hostMemoryByServerId.has(s.id));
+                      const targetId = unprofiled ? unprofiled.id : servers[0].id;
+                      setEditingHostMemory(buildHostMemoryFormState(targetId, true));
+                    }}
                   >
                     <Plus size={13} /> 手工录入画像
                   </button>
@@ -1016,6 +1100,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                         className="btn btn-ghost btn-sm btn-icon"
                         onClick={() =>
                           setEditingHostMemory({
+                            is_new: false,
                             server_id: m.server_id,
                             summary: m.summary,
                             os_arch: m.os_arch || '',
@@ -1035,9 +1120,13 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                         className="btn btn-ghost btn-sm btn-icon"
                         style={{ color: 'var(--danger-text)' }}
                         onClick={async () => {
-                          await api.deleteHostMemory(m.server_id);
-                          onNotify('已清空该主机环境画像');
-                          await onReloadOverview();
+                          try {
+                            await api.deleteHostMemory(m.server_id);
+                            onNotify('已清空该主机环境画像');
+                            await onReloadOverview();
+                          } catch (err: any) {
+                            onNotify(err?.message || '清空主机画像失败');
+                          }
                         }}
                         title="清空画像"
                       >
@@ -1172,9 +1261,13 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       className="btn btn-ghost btn-sm btn-icon"
                       style={{ color: 'var(--danger-text)' }}
                       onClick={async () => {
-                        await api.deleteRunbook(rb.id);
-                        onNotify('已删除该 Runbook');
-                        await onReloadOverview();
+                        try {
+                          await api.deleteRunbook(rb.id);
+                          onNotify('已删除该 Runbook');
+                          await onReloadOverview();
+                        } catch (err: any) {
+                          onNotify(err?.message || '删除 Runbook 失败');
+                        }
                       }}
                     >
                       <Trash2 size={13.5} />
@@ -1373,17 +1466,20 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
               <div className="modal-body">
                 <div className="field-row">
                   <div className="field">
-                    <label className="field-label">目标服务器</label>
+                    <label className="field-label">
+                      目标服务器{editingHostMemory.is_new && hostMemoryByServerId.has(editingHostMemory.server_id) ? '（已载入现有画像）' : ''}
+                    </label>
                     <select
                       className="select"
+                      disabled={!editingHostMemory.is_new}
                       value={editingHostMemory.server_id}
                       onChange={(e) =>
-                        setEditingHostMemory({ ...editingHostMemory, server_id: e.target.value })
+                        setEditingHostMemory(buildHostMemoryFormState(e.target.value, true))
                       }
                     >
                       {servers.map((s) => (
                         <option key={s.id} value={s.id}>
-                          {s.name} ({s.host})
+                          {s.name} ({s.host}){hostMemoryByServerId.has(s.id) ? ' · 已有画像' : ''}
                         </option>
                       ))}
                     </select>

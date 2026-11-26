@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ShieldAlert,
   CheckCircle2,
@@ -133,7 +133,10 @@ export const ToolTraceStep: React.FC<{ tool: AIToolCallRecord }> = ({ tool }) =>
         role="button"
         tabIndex={0}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') setExpanded(!expanded);
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setExpanded(!expanded);
+          }
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0, flex: 1 }}>
@@ -380,7 +383,7 @@ export const RunbookProposalCard: React.FC<RunbookProposalCardProps> = ({
 };
 
 export function extractShellSnippets(content: string): string[] {
-  const regex = /```(?:bash|sh|shell|zsh)?\n([\s\S]*?)```/g;
+  const regex = /```(?:bash|sh|shell|zsh)[ \t]*\r?\n([\s\S]*?)```/gi;
   const out: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = regex.exec(content)) !== null) {
@@ -409,9 +412,14 @@ export const ShellSnippetActionBar: React.FC<{
             <button
               type="button"
               className="btn btn-sm copilot-cmd-btn"
-              onClick={() => {
-                void navigator.clipboard?.writeText(cmd);
-                onNotify?.('命令已复制到剪贴板');
+              onClick={async () => {
+                try {
+                  if (!navigator.clipboard) throw new Error('unavailable');
+                  await navigator.clipboard.writeText(cmd);
+                  onNotify?.('命令已复制到剪贴板');
+                } catch {
+                  onNotify?.('浏览器剪贴板写入失败，请手动选中复制');
+                }
               }}
             >
               <Copy size={11} /> 复制
@@ -460,7 +468,12 @@ function renderInlineFormatting(text: string): React.ReactNode[] {
 }
 
 export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
-  const segments = text.split(/(```[\s\S]*?```)/g);
+  // Support an in-progress (unclosed) fenced code block cleanly during SSE streaming
+  const normalized = text.replace(/\r\n/g, '\n');
+  const fenceMatches = normalized.match(/```/g);
+  const renderText =
+    fenceMatches && fenceMatches.length % 2 === 1 ? `${normalized}\n\`\`\`` : normalized;
+  const segments = renderText.split(/(```[\s\S]*?```)/g);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {segments.map((seg, idx) => {
@@ -540,6 +553,22 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                     }}
                   >
                     {renderInlineFormatting(h3[1])}
+                  </div>
+                );
+              }
+              const quote = line.match(/^>\s?(.*)$/);
+              if (quote) {
+                return (
+                  <div
+                    key={li}
+                    style={{
+                      borderLeft: '3px solid var(--accent-teal-border)',
+                      paddingLeft: 10,
+                      color: 'var(--text-secondary)',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {renderInlineFormatting(quote[1])}
                   </div>
                 );
               }
@@ -670,6 +699,15 @@ export const ContextInspectorModal: React.FC<ContextInspectorModalProps> = ({
   onOpenAgentsMD,
 }) => {
   const [summaryExpanded, setSummaryExpanded] = useState(true);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   const usagePct = Math.min(100, Math.max(0, inspection?.usage_percent ?? 0));
   const barTone =
     usagePct >= 75 ? 'var(--danger-text)' : usagePct >= 55 ? 'var(--amber-text)' : 'var(--accent-teal)';
@@ -763,7 +801,7 @@ export const ContextInspectorModal: React.FC<ContextInspectorModalProps> = ({
                     type="button"
                     id="ai-ctx-compact-now-btn"
                     className="btn btn-teal btn-sm"
-                    disabled={compacting || inspection.total_messages < 4}
+                    disabled={compacting || inspection.uncompacted_messages < 4}
                     onClick={() => onCompact(false)}
                   >
                     <Minimize2 size={13} />

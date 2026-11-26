@@ -2,6 +2,7 @@ package aiops
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -18,16 +19,18 @@ const (
 
 var (
 	blockedPatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(^|[;&|\s])rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive|--no-preserve-root)[a-zA-Z\s-]*\s+(/|/\*)\s*($|[;&|])`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?rm\s+(?:-[a-zA-Z]*[rR][a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*[rR]|-[a-zA-Z]*[rR]\s+-[a-zA-Z]*f|-[a-zA-Z]*f\s+-[a-zA-Z]*[rR]|--recursive|--no-preserve-root)[a-zA-Z0-9\s-]*\s+(/|/\*)\s*($|[;&|])`),
 		regexp.MustCompile(`(?i)--no-preserve-root`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])(mkfs(\.[a-z0-9]+)?|wipefs|fdisk|parted|sfdisk)\b`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])diskutil\s+(eraseDisk|eraseVolume|zeroDisk|randomDisk|partitionDisk|apfs\s+deleteContainer|apfs\s+deleteVolume)\b`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])dd\s+[^;&|]*of=/dev/(sd|vd|nvme|xvd|mmcblk|loop|dm-|disk|rdisk)`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?(mkfs(\.[a-z0-9]+)?|wipefs|fdisk|parted|sfdisk)\b`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?diskutil\s+(eraseDisk|eraseVolume|zeroDisk|randomDisk|partitionDisk|apfs\s+deleteContainer|apfs\s+deleteVolume)\b`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?dd\s+[^;&|]*of=/dev/(sd|vd|nvme|xvd|mmcblk|loop|dm-|disk|rdisk)`),
 		regexp.MustCompile(`:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])(shutdown|poweroff|halt|init\s+0|reboot\s+-f)\b`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?(shutdown|poweroff|halt|init\s+0|reboot\s+-f)\b`),
 		regexp.MustCompile(`(?i)>\s*/dev/(sd|vd|nvme|xvd|disk|rdisk)[a-z0-9]*`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])(chmod|chown)\s+(-[a-zA-Z]*R[a-zA-Z]*\s+)\S+\s+/\s*($|[;&|])`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])(?:/[a-z0-9._-]+)*/?(chmod|chown)\s+(-[a-zA-Z]*R[a-zA-Z]*\s+)\S+\s+/\s*($|[;&|])`),
 	}
+
+	sedWriteOrExecRe = regexp.MustCompile(`(^|[;\s{}])(?:(?:\d+|\$|/[^/]*/)(?:,(?:\d+|\$|/[^/]*/))?)?\s*([wW]\s+\S|e(\s|$|;))`)
 
 	safeSimpleCommands = map[string]bool{
 		"uname":      true,
@@ -108,9 +111,9 @@ func ClassifyCommand(raw string) (RiskClass, string) {
 		}
 	}
 
-	// Subshells or command substitution can hide arbitrary mutations
-	if strings.Contains(cmd, "`") || strings.Contains(cmd, "$(") {
-		return RiskMutating, "包含子 Shell 命令替换 ($(...) / 反引号)，需人工审阅确认"
+	// Subshells, command substitution, or process substitution can hide arbitrary mutations
+	if strings.Contains(cmd, "`") || strings.Contains(cmd, "$(") || strings.Contains(cmd, "<(") {
+		return RiskMutating, "包含子 Shell 命令替换或进程替换 ($(...) / <(...) / 反引号)，需人工审阅确认"
 	}
 
 	// Strip benign stderr redirections before checking file write operators
@@ -142,6 +145,12 @@ func splitShellSegments(s string) []string {
 
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
+		if ch == '\\' && !inSingle && i+1 < len(s) {
+			cur.WriteByte(ch)
+			i++
+			cur.WriteByte(s[i])
+			continue
+		}
 		if ch == '\'' && !inDouble {
 			inSingle = !inSingle
 			cur.WriteByte(ch)
@@ -178,6 +187,10 @@ func splitShellSegments(s string) []string {
 		}
 		cur.WriteByte(ch)
 	}
+	if inSingle || inDouble {
+		// Unclosed quotes may hide arbitrary shell tokens; conservatively treat as mutating
+		return nil
+	}
 	if trimmed := strings.TrimSpace(cur.String()); trimmed != "" {
 		out = append(out, trimmed)
 	}
@@ -207,11 +220,17 @@ func isSegmentReadOnly(seg string) (bool, string) {
 
 	if safe, exists := safeSimpleCommands[bin]; exists && safe {
 		// Guard infinite-blocking flags on tail/top/journalctl
-		if bin == "tail" && slices.ContainsFunc(args, func(a string) bool { return a == "-f" || a == "-F" || a == "--follow" }) {
+		if bin == "tail" && slices.ContainsFunc(args, func(a string) bool {
+			return a == "-f" || a == "-F" || a == "--follow" || strings.HasPrefix(a, "--follow=") || hasShortFlagChar(a, 'f', 'F')
+		}) {
 			return false, "tail -f 持续阻塞流不能作为一次性探针自动执行"
 		}
-		if bin == "journalctl" && slices.ContainsFunc(args, func(a string) bool { return a == "-f" || a == "--follow" || strings.HasPrefix(a, "--vacuum") }) {
-			return false, "journalctl 日志清理或阻塞跟随操作需人工审批"
+		if bin == "journalctl" && slices.ContainsFunc(args, func(a string) bool {
+			return a == "-f" || a == "--follow" || hasShortFlagChar(a, 'f') ||
+				strings.HasPrefix(a, "--vacuum") || a == "--rotate" || a == "--flush" ||
+				a == "--relinquish-var" || a == "--sync"
+		}) {
+			return false, "journalctl 日志清理、轮转或阻塞跟随操作需人工审批"
 		}
 		return true, ""
 	}
@@ -244,14 +263,19 @@ func isSegmentReadOnly(seg string) (bool, string) {
 		return true, ""
 	case "sed":
 		for _, a := range args {
-			if a == "-i" || strings.HasPrefix(a, "-i") || a == "--in-place" {
-				return false, "sed -i 原地修改文件操作需人工审批"
+			if a == "-i" || strings.HasPrefix(a, "-i") || a == "--in-place" || strings.HasPrefix(a, "--in-place=") ||
+				a == "-f" || strings.HasPrefix(a, "--file") {
+				return false, "sed 原地修改或外部脚本文件操作需人工审批"
 			}
+		}
+		if isSedExpressionMutating(strings.Join(args, " ")) {
+			return false, "sed 包含命令执行 (e) 或文件写入 (w) 表达式，需人工审批"
 		}
 		return true, ""
 	case "find":
 		for _, a := range args {
-			if a == "-delete" || a == "-exec" || a == "-execdir" || a == "-ok" || a == "-fprint" {
+			switch a {
+			case "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls":
 				return false, fmt.Sprintf("find 包含变更/执行参数 (%s)，需人工审批", a)
 			}
 		}
@@ -281,7 +305,9 @@ func isSegmentReadOnly(seg string) (bool, string) {
 		if len(args) > 0 {
 			switch args[0] {
 			case "ps", "images", "info", "version", "inspect", "logs", "top", "port", "diff":
-				if args[0] == "logs" && slices.Contains(args, "-f") {
+				if args[0] == "logs" && slices.ContainsFunc(args[1:], func(a string) bool {
+					return a == "-f" || a == "--follow" || a == "--follow=true" || hasShortFlagChar(a, 'f')
+				}) {
 					return false, "docker logs -f 持续跟随不能自动执行"
 				}
 				return true, ""
@@ -493,6 +519,124 @@ func isPositiveIntArg(s string) bool {
 		}
 	}
 	return nonZero
+}
+
+func hasShortFlagChar(arg string, targets ...rune) bool {
+	if len(arg) < 2 || arg[0] != '-' || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	for _, ch := range arg[1:] {
+		for _, t := range targets {
+			if ch == t {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isSedExpressionMutating conservatively detects GNU sed e (exec) and w/W (write file) commands
+// and substitution flags (s/.../.../e or s/.../.../w file) while allowing common read-only s///g/i/p expressions.
+func isSedExpressionMutating(joined string) bool {
+	// Strip outer quotes to inspect embedded sed commands/flags
+	unquoted := strings.ReplaceAll(strings.ReplaceAll(joined, "'", " "), "\"", " ")
+	if sedWriteOrExecRe.MatchString(unquoted) {
+		return true
+	}
+	// Check s<delim>...<delim>...<delim><flags> for e/w flags
+	idx := 0
+	for idx < len(unquoted) {
+		pos := strings.IndexByte(unquoted[idx:], 's')
+		if pos < 0 {
+			break
+		}
+		abs := idx + pos
+		idx = abs + 1
+		if abs > 0 {
+			prev := unquoted[abs-1]
+			if prev != ' ' && prev != '\t' && prev != ';' && prev != '{' {
+				continue
+			}
+		}
+		if abs+1 >= len(unquoted) {
+			break
+		}
+		delim := unquoted[abs+1]
+		if (delim >= 'a' && delim <= 'z') || (delim >= 'A' && delim <= 'Z') || (delim >= '0' && delim <= '9') || delim == ' ' || delim == '\t' || delim == '\\' {
+			continue
+		}
+		// Walk to the 3rd unescaped delimiter
+		count := 0
+		j := abs + 2
+		for j < len(unquoted) {
+			if unquoted[j] == '\\' && j+1 < len(unquoted) {
+				j += 2
+				continue
+			}
+			if unquoted[j] == delim {
+				count++
+				if count == 2 {
+					j++
+					break
+				}
+			}
+			j++
+		}
+		if count == 2 {
+			// Inspect flags after closing delimiter until whitespace or ';'
+			for j < len(unquoted) && unquoted[j] != ' ' && unquoted[j] != '\t' && unquoted[j] != ';' && unquoted[j] != '}' {
+				if unquoted[j] == 'e' || unquoted[j] == 'E' || unquoted[j] == 'w' || unquoted[j] == 'W' {
+					return true
+				}
+				j++
+			}
+		}
+	}
+	return false
+}
+
+// IsBlockedReadPath reports whether a remote file path targets system password hashes, sudoers,
+// SSH private keys, or ServerNeedSafe vault files that AI agents must NEVER read via SFTP.
+// Path traversal sequences (e.g. /etc//shadow, /tmp/../etc/shadow) are normalized with path.Clean first.
+func IsBlockedReadPath(rawPath string) bool {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return false
+	}
+	clean := path.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
+	low := strings.ToLower(clean)
+	base := strings.ToLower(path.Base(clean))
+	if low == "/etc/shadow" || low == "/etc/gshadow" || low == "/etc/master.passwd" || low == "/etc/sudoers" || strings.HasPrefix(low, "/etc/sudoers.d/") {
+		return true
+	}
+	if base == "secrets.enc" || base == "master.key" || base == ".vault.key" || base == "vault.sns" {
+		return true
+	}
+	if strings.Contains("/"+strings.TrimPrefix(low, "/"), "/.ssh/") {
+		switch base {
+		case "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "identity":
+			return true
+		}
+		if strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsBlockedWritePath reports whether a remote file path targets critical OS authentication or vault
+// files that AI agents are hard-blocked from overwriting via SFTP.
+func IsBlockedWritePath(rawPath string) bool {
+	if IsBlockedReadPath(rawPath) {
+		return true
+	}
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return false
+	}
+	clean := path.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
+	low := strings.ToLower(clean)
+	return low == "/etc/passwd"
 }
 
 // BuildUnifiedDiff computes a compact, readable unified diff between oldContent and newContent.

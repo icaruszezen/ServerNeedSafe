@@ -17,11 +17,11 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 )
 
 const (
 	ServerName             = "serverneedsafe"
-	ServerVersion          = "2.5.1"
 	DefaultProtocolVersion = "2025-03-26"
 	maxMCPBodyBytes        = 4 * 1024 * 1024
 	sessionIdleTTL         = 12 * time.Hour
@@ -146,7 +146,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, desktopLoopba
 
 	case http.MethodDelete:
 		if sid := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); sid != "" {
-			s.deleteSession(sid)
+			s.deleteSession(sid, tok.ID)
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -251,8 +251,8 @@ type mcpCallContext struct {
 }
 
 func (s *Server) resolveClientName(c *mcpCallContext) string {
-	if c.sessionID != "" {
-		if sess := s.getSession(c.sessionID); sess != nil && sess.ClientName != "" {
+	if c.sessionID != "" && c.token != nil {
+		if sess := s.getSession(c.sessionID, c.token.ID); sess != nil && sess.ClientName != "" {
 			return friendlyClientName(sess.ClientName)
 		}
 	}
@@ -318,8 +318,8 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 
 	// Handle notifications cleanly with no JSON-RPC response body
 	if isNotification || strings.HasPrefix(req.Method, "notifications/") {
-		if req.Method == "notifications/initialized" && c.sessionID != "" {
-			s.touchSession(c.sessionID)
+		if req.Method == "notifications/initialized" && c.sessionID != "" && c.token != nil {
+			s.touchSession(c.sessionID, c.token.ID)
 		}
 		return nil, ""
 	}
@@ -359,7 +359,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 				},
 				"serverInfo": map[string]any{
 					"name":    ServerName,
-					"version": ServerVersion,
+					"version": version.Current().Version,
 				},
 				"instructions": "ServerNeedSafe 安全运维与 AI 巡检 MCP 网关。受管主机 SSH 密码/私钥已严格物理隔离。巡检时请优先调用 get_ops_context 或读取 serverneedsafe://agents-md 了解运维规范与主机画像；使用 list_patrol_records(pending_only=true) / claim_patrol 或 run_patrol 接管巡检，通过 exec_readonly_ssh / sftp_read_file 深度取证后调用 submit_patrol_report 回写结构化结论；如需线上修复变更，请调用 propose_ssh_command 或 propose_sftp_write 提交至 Web 端 HITL 审批队列。",
 			},
@@ -373,7 +373,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "tools/list":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      parsedID,
@@ -383,7 +383,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "tools/call":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		var params struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
@@ -413,7 +413,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "resources/list":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      parsedID,
@@ -423,7 +423,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "resources/read":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		var params struct {
 			URI string `json:"uri"`
 		}
@@ -458,7 +458,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "prompts/list":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		return &jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      parsedID,
@@ -468,7 +468,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 		}, ""
 
 	case "prompts/get":
-		s.touchSession(c.sessionID)
+		s.touchSession(c.sessionID, c.token.ID)
 		var params struct {
 			Name      string            `json:"name"`
 			Arguments map[string]string `json:"arguments"`
@@ -546,34 +546,39 @@ func (s *Server) createSession(tokenID, clientName, clientVer, proto string) str
 	return sid
 }
 
-func (s *Server) getSession(sid string) *mcpSession {
-	if sid == "" {
+func (s *Server) getSession(sid, tokenID string) *mcpSession {
+	if sid == "" || tokenID == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[sid]
-	if !ok {
+	if !ok || sess.TokenID != tokenID {
 		return nil
 	}
 	cp := *sess
 	return &cp
 }
 
-func (s *Server) touchSession(sid string) {
-	if sid == "" {
+func (s *Server) touchSession(sid, tokenID string) {
+	if sid == "" || tokenID == "" {
 		return
 	}
 	s.mu.Lock()
-	if sess, ok := s.sessions[sid]; ok {
+	if sess, ok := s.sessions[sid]; ok && sess.TokenID == tokenID {
 		sess.LastSeenAt = time.Now().UTC()
 	}
 	s.mu.Unlock()
 }
 
-func (s *Server) deleteSession(sid string) {
+func (s *Server) deleteSession(sid, tokenID string) {
+	if sid == "" || tokenID == "" {
+		return
+	}
 	s.mu.Lock()
-	delete(s.sessions, sid)
+	if sess, ok := s.sessions[sid]; ok && sess.TokenID == tokenID {
+		delete(s.sessions, sid)
+	}
 	s.mu.Unlock()
 }
 
