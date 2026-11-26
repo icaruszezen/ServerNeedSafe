@@ -466,6 +466,44 @@ async function runSuite() {
     );
     await assertNoHorizontalOverflow(page, 'Servers-Desktop-1440');
 
+    // Verify all buttons inside every .server-card stay strictly within card bounds across desktop & mobile widths
+    for (const cardVp of [
+      { name: 'desktop-1440', width: 1440, height: 940 },
+      { name: 'desktop-1280', width: 1280, height: 800 },
+      { name: 'desktop-1024', width: 1024, height: 768 },
+      { name: 'mobile-390', width: 390, height: 844 },
+      { name: 'mobile-320', width: 320, height: 568 },
+    ]) {
+      await page.setViewportSize({ width: cardVp.width, height: cardVp.height });
+      const cardBtnViolations = await page.evaluate(() => {
+        const bad = [];
+        for (const card of document.querySelectorAll('.server-card')) {
+          const cr = card.getBoundingClientRect();
+          if (cr.width <= 0) continue;
+          for (const btn of card.querySelectorAll('button')) {
+            const br = btn.getBoundingClientRect();
+            if (br.width <= 0) continue;
+            if (br.left < cr.left - 0.5 || br.right > cr.right + 0.5) {
+              bad.push({
+                cardId: card.id,
+                cardLeft: Math.round(cr.left * 10) / 10,
+                cardRight: Math.round(cr.right * 10) / 10,
+                btnText: btn.textContent?.trim(),
+                btnLeft: Math.round(br.left * 10) / 10,
+                btnRight: Math.round(br.right * 10) / 10,
+              });
+            }
+          }
+        }
+        return bad;
+      });
+      assert.deepEqual(
+        cardBtnViolations,
+        [],
+        `Expected all .server-card buttons strictly inside card bounds at ${cardVp.name}, got ${JSON.stringify(cardBtnViolations)}`
+      );
+    }
+
     // =========================================================================
     // 4. Keychain Modals, Snippets Modal & SFTP 2-Tier Readability (375px & 320px)
     // =========================================================================

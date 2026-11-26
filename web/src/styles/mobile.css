@@ -624,6 +624,10 @@
     gap: 8px;
   }
 
+  .server-card-actions .server-action-btn {
+    min-height: 34px;
+  }
+
   /* Monitor Center Responsive Adaptations */
   .mon-subnav-bar {
     padding: 0 12px;
