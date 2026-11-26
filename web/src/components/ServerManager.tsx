@@ -6,6 +6,7 @@ import {
   Terminal,
   FolderOpen,
   Activity,
+  BarChart3,
   Edit2,
   Trash2,
   Star,
@@ -377,7 +378,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                       <div className={`server-icon-box ${isConnected ? 'connected' : ''}`}>
                         <Server size={18} />
                       </div>
-                      <div style={{ minWidth: 0 }}>
+                      <div className="server-identity-text">
                         <div className="server-name-row">
                           <span className="server-name" title={srv.name}>
                             {srv.name}
@@ -395,13 +396,16 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                             </span>
                           )}
                         </div>
-                        <div className="server-endpoint">
+                        <div
+                          className="server-endpoint"
+                          title={`${srv.username}@${srv.host}:${srv.port}`}
+                        >
                           {srv.username}@{srv.host}:{srv.port}
                         </div>
                       </div>
                     </div>
 
-                    <div style={{ display: 'flex', gap: 2 }}>
+                    <div className="server-card-head-actions">
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm btn-icon"
@@ -424,7 +428,16 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
 
                   <div className="server-meta-strip">
                     <span className="tag-chip">{srv.group}</span>
-                    <span className="tag-chip">
+                    <span
+                      className="tag-chip"
+                      title={
+                        srv.auth_type === 'password'
+                          ? '密码认证'
+                          : srv.auth_type === 'private_key'
+                            ? 'SSH 私钥'
+                            : credentialNameById[srv.credential_id || ''] || '凭据库密钥'
+                      }
+                    >
                       {srv.auth_type === 'password' ? (
                         <>
                           <Lock size={11} /> 密码认证
@@ -441,13 +454,16 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                       )}
                     </span>
                     {srv.jump_server_id && (
-                      <span className="tag-chip amber">
+                      <span
+                        className="tag-chip amber"
+                        title={`跳板机: ${serverNameById[srv.jump_server_id] || '已关联'}`}
+                      >
                         <GitBranch size={11} /> 跳板:{' '}
                         {serverNameById[srv.jump_server_id] || '已关联'}
                       </span>
                     )}
                     {srv.last_latency_ms ? (
-                      <span className="tag-chip teal">{srv.last_latency_ms} ms</span>
+                      <span className="tag-chip teal tabular">{srv.last_latency_ms} ms</span>
                     ) : null}
                     {srv.tags.map((t) => (
                       <span key={t} className="tag-chip">
@@ -456,23 +472,24 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     ))}
                   </div>
 
-                  {srv.last_os_info && !liveProbe && (
-                    <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                      系统环境：{srv.last_os_info}
-                    </div>
-                  )}
-
-                  {srv.notes && !liveProbe && (
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: 'var(--text-muted)',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                      }}
-                    >
-                      备注：{srv.notes}
+                  {(srv.last_os_info || srv.notes) && !liveProbe && (
+                    <div className="server-info-list">
+                      {srv.last_os_info && (
+                        <div className="server-info-row">
+                          <span className="server-info-label">系统环境</span>
+                          <span className="server-info-value" title={srv.last_os_info}>
+                            {srv.last_os_info}
+                          </span>
+                        </div>
+                      )}
+                      {srv.notes && (
+                        <div className="server-info-row">
+                          <span className="server-info-label">备注</span>
+                          <span className="server-info-value" title={srv.notes}>
+                            {srv.notes}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -480,7 +497,9 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     <div className="server-telemetry-mini">
                       <div className="telemetry-cell">
                         <span>系统负载</span>
-                        <strong>{liveProbe.load_avg || liveProbe.os || '正常'}</strong>
+                        <strong title={liveProbe.load_avg || liveProbe.os || '正常'}>
+                          {liveProbe.load_avg || liveProbe.os || '正常'}
+                        </strong>
                       </div>
                       <div className="telemetry-cell">
                         <span>内存占用</span>
@@ -503,44 +522,51 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     </div>
                   )}
 
-                  <div className="server-card-footer">
-                    <div style={{ display: 'flex', gap: 6 }}>
+                  <div
+                    className={`server-card-footer server-card-actions${
+                      onOpenMonitor ? '' : ' server-card-actions--three'
+                    }`}
+                  >
+                    <div className="server-card-action-group">
                       <button
                         type="button"
-                        className="btn btn-sm"
+                        className="btn btn-sm server-action-btn server-action-secondary"
                         disabled={probingId === srv.id}
                         onClick={() => void handleProbe(srv)}
                       >
                         <Activity size={13} />
-                        {probingId === srv.id ? '探测中...' : '连通探测'}
+                        <span>{probingId === srv.id ? '探测中...' : '连通探测'}</span>
                       </button>
                       {onOpenMonitor && (
                         <button
                           type="button"
-                          className="btn btn-sm"
+                          className="btn btn-sm server-action-btn server-action-secondary"
                           onClick={() => onOpenMonitor(srv.id)}
                           title="查看全维监控指标与历史趋势曲线"
                         >
-                          监控详情
+                          <BarChart3 size={13} />
+                          <span>监控详情</span>
                         </button>
                       )}
                     </div>
 
-                    <div style={{ display: 'flex', gap: 6 }}>
+                    <div className="server-card-action-group">
                       <button
                         type="button"
-                        className="btn btn-sm"
+                        className="btn btn-sm server-action-btn"
                         onClick={() => setStandaloneSftpServer(srv)}
                         title="打开 SFTP 远程文件管理器"
                       >
-                        <FolderOpen size={13} /> SFTP
+                        <FolderOpen size={13} />
+                        <span>SFTP</span>
                       </button>
                       <button
                         type="button"
-                        className="btn btn-sm btn-primary"
+                        className="btn btn-sm btn-primary server-action-btn server-action-primary"
                         onClick={() => onConnectTerminal(srv, false)}
                       >
-                        <Terminal size={13} /> SSH 终端
+                        <Terminal size={13} />
+                        <span>SSH 终端</span>
                       </button>
                     </div>
                   </div>
