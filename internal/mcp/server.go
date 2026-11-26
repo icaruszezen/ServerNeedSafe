@@ -21,7 +21,7 @@ import (
 
 const (
 	ServerName             = "serverneedsafe"
-	ServerVersion          = "2.4.0"
+	ServerVersion          = "2.5.0"
 	DefaultProtocolVersion = "2025-03-26"
 	maxMCPBodyBytes        = 4 * 1024 * 1024
 	sessionIdleTTL         = 12 * time.Hour
