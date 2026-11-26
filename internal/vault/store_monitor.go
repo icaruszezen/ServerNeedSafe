@@ -106,6 +106,35 @@ func sanitizeMonitorSettings(in MonitorSettings) MonitorSettings {
 	return in
 }
 
+func mergeMonitorAlertRules(existing []MonitorAlertRule) []MonitorAlertRule {
+	defaults := DefaultMonitorAlertRules()
+	existingByKind := make(map[string]MonitorAlertRule, len(existing))
+	for _, r := range existing {
+		if r.ConsecutiveCount < 1 {
+			r.ConsecutiveCount = 1
+		}
+		existingByKind[r.Kind] = r
+	}
+	merged := make([]MonitorAlertRule, 0, len(defaults))
+	for _, def := range defaults {
+		if ex, ok := existingByKind[def.Kind]; ok {
+			ex.Name = def.Name
+			ex.Description = def.Description
+			ex.Unit = def.Unit
+			ex.StateBased = def.StateBased
+			if ex.ConsecutiveCount < 1 {
+				ex.ConsecutiveCount = 1
+			} else if ex.ConsecutiveCount > 20 {
+				ex.ConsecutiveCount = 20
+			}
+			merged = append(merged, ex)
+		} else {
+			merged = append(merged, def)
+		}
+	}
+	return merged
+}
+
 func ensureMonitorInitialized(state *VaultState) {
 	if state == nil {
 		return
@@ -135,55 +164,7 @@ func ensureMonitorInitialized(state *VaultState) {
 	if m.PortBaselines == nil {
 		m.PortBaselines = make(map[string][]string)
 	}
-
-	// Merge any newly introduced default alert rules while preserving customized rules
-	defaults := DefaultMonitorAlertRules()
-	existingByKind := make(map[string]MonitorAlertRule, len(m.Rules))
-	for _, r := range m.Rules {
-		if r.ConsecutiveCount < 1 {
-			r.ConsecutiveCount = 1
-		}
-		existingByKind[r.Kind] = r
-	}
-	merged := make([]MonitorAlertRule, 0, len(defaults))
-	for _, def := range defaults {
-		if ex, ok := existingByKind[def.Kind]; ok {
-			ex.Name = def.Name
-			ex.Description = def.Description
-			ex.Unit = def.Unit
-			ex.StateBased = def.StateBased
-			if ex.ConsecutiveCount < 1 {
-				ex.ConsecutiveCount = 1
-			} else if ex.ConsecutiveCount > 20 {
-				ex.ConsecutiveCount = 20
-			}
-			merged = append(merged, ex)
-		} else {
-			merged = append(merged, def)
-		}
-	}
-	m.Rules = merged
-}
-
-// readMonitorData safely returns state.Monitor under RLock without mutating state.
-func readMonitorData(state *VaultState) *MonitorVaultData {
-	if state != nil && state.Monitor != nil {
-		return state.Monitor
-	}
-	return DefaultMonitorVaultData()
-}
-
-func scrubMonitorData(state *VaultState) {
-	if state == nil || state.Monitor == nil {
-		return
-	}
-	state.Monitor.Settings.WebhookURL = ""
-	clear(state.Monitor.LatestSnapshots)
-	clear(state.Monitor.HistoryByServer)
-	clear(state.Monitor.BreachStreaks)
-	clear(state.Monitor.PortBaselines)
-	state.Monitor.Alerts = nil
-	state.Monitor = nil
+	m.Rules = mergeMonitorAlertRules(m.Rules)
 }
 
 func cloneSnapshot(in *ServerMonitorSnapshot) *ServerMonitorSnapshot {
@@ -663,296 +644,312 @@ func evaluateSnapshotRules(
 	return out
 }
 
-// CheckIdleStatus reports whether idle timeout has elapsed and whether unattended background monitoring is active.
-func (s *Store) CheckIdleStatus() (idleExceeded bool, unattendedMonitor bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.dek) == 0 || s.state == nil {
-		return false, false
-	}
-	mins := s.state.Settings.AutoLockMinutes
-	if mins <= 0 {
-		return false, false
-	}
-	exceeded := time.Since(s.lastActivity) >= time.Duration(mins)*time.Minute
-	if !exceeded {
-		return false, false
-	}
-	mon := s.state.Monitor
-	unattended := mon != nil && mon.Settings.Enabled && mon.Settings.UnattendedWhileUnlocked && len(s.state.Servers) > 0
-	return true, unattended
-}
-
-// ListAllServerConfigs returns deep copies of all ServerConfigs for internal scheduled monitoring.
+// ListAllServerConfigs returns deep copies of all ServerConfigs and monitor settings for scheduled monitoring.
 func (s *Store) ListAllServerConfigs() ([]ServerConfig, MonitorSettings, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return nil, MonitorSettings{}, ErrVaultLocked
 	}
-	mon := readMonitorData(s.state)
-	out := make([]ServerConfig, len(s.state.Servers))
-	for i, srv := range s.state.Servers {
+	out := make([]ServerConfig, len(s.secrets.Servers))
+	for i, srv := range s.secrets.Servers {
 		cp := srv
 		cp.Tags = slices.Clone(srv.Tags)
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
 		out[i] = cp
 	}
-	return out, mon.Settings, nil
+	return out, s.secrets.MonitorSettings, nil
 }
 
 // GetPreviousMonitorSnapshot returns a copy of the last recorded snapshot for rate delta calculation.
 func (s *Store) GetPreviousMonitorSnapshot(serverID string) (*ServerMonitorSnapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	if s.state.Monitor == nil {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.monitorRT == nil {
 		return nil, nil
 	}
-	return cloneSnapshot(s.state.Monitor.LatestSnapshots[serverID]), nil
+	return cloneSnapshot(s.monitorRT.LatestSnapshots[serverID]), nil
 }
 
-// RecordMonitorSnapshots atomically persists one or more collected server snapshots, appends encrypted
-// time-series samples, evaluates alert state transitions & port baselines, and seals vault.sns once.
+// RecordMonitorSnapshots persists collected server snapshots, time-series samples, alerts, port baselines,
+// and per-server runtime metadata strictly into non-secret runtime state (monitor_runtime.json) with
+// debounced atomic flushing. It NEVER rewrites secrets.enc or blocks credential operations.
 func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (triggered []MonitorAlert, resolved []MonitorAlert, webhookURL string, err error) {
 	if len(snapshots) == 0 {
 		return nil, nil, "", nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.dek) == 0 || s.state == nil {
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, nil, "", ErrVaultLocked
 	}
+	monSettings := s.secrets.MonitorSettings
+	rules := slices.Clone(s.secrets.MonitorRules)
+	autoSyncMem := s.secrets.AISettings.MemoryConfig.AutoSyncMonitorToMemory
+	srvByID := make(map[string]ServerConfig, len(s.secrets.Servers))
+	for _, srv := range s.secrets.Servers {
+		cp := srv
+		cp.WatchedServices = slices.Clone(srv.WatchedServices)
+		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
+		srvByID[srv.ID] = cp
+	}
+	s.secMu.RUnlock()
 
-	err = s.mutateLocked(func(st *VaultState) error {
-		triggered = nil
-		resolved = nil
-		ensureMonitorInitialized(st)
-		mon := st.Monitor
-		webhookURL = mon.Settings.WebhookURL
+	webhookURL = monSettings.WebhookURL
+	now := time.Now().UTC()
 
-		srvByID := make(map[string]int, len(st.Servers))
-		for i, srv := range st.Servers {
-			srvByID[srv.ID] = i
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.monitorRT = DefaultMonitorRuntimeState()
+	}
+	ensureMonitorRuntimeDefaults(s.monitorRT)
+	mon := s.monitorRT
+
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	ensureAIOpsRuntimeDefaults(s.aiopsRT)
+
+	aiMemChanged := false
+
+	for _, rawIncoming := range snapshots {
+		if rawIncoming == nil {
+			continue
+		}
+		srvCfg, exists := srvByID[rawIncoming.ServerID]
+		if !exists {
+			continue
+		}
+		incoming := cloneSnapshot(rawIncoming)
+		incoming.ServerName = srvCfg.Name
+		incoming.Group = srvCfg.Group
+		incoming.Host = srvCfg.Host
+		incoming.Port = srvCfg.Port
+		if incoming.CollectedAt.IsZero() {
+			incoming.CollectedAt = now
 		}
 
-		now := time.Now().UTC()
+		// Mark watched ports on incoming snapshot
+		if len(srvCfg.WatchedPorts) > 0 {
+			for i := range incoming.ListeningPorts {
+				if slices.Contains(srvCfg.WatchedPorts, incoming.ListeningPorts[i].Port) {
+					incoming.ListeningPorts[i].Watched = true
+				}
+			}
+		}
 
-		for _, rawIncoming := range snapshots {
-			if rawIncoming == nil {
+		// Port baseline comparison
+		var driftedPorts []ListeningPortStat
+		if incoming.Reachable && monSettings.CollectPortsAndServices && len(incoming.ListeningPorts) > 0 {
+			curPublicKeys := extractPublicPortKeys(incoming.ListeningPorts)
+			baseKeys, hasBaseline := mon.PortBaselines[srvCfg.ID]
+			if !hasBaseline {
+				mon.PortBaselines[srvCfg.ID] = curPublicKeys
+			} else if monSettings.DetectPortDrift {
+				baseSet := make(map[string]bool, len(baseKeys))
+				for _, k := range baseKeys {
+					baseSet[k] = true
+				}
+				for _, lp := range incoming.ListeningPorts {
+					if !lp.PublicExposed || lp.Port <= 0 {
+						continue
+					}
+					proto := "tcp"
+					if strings.HasPrefix(strings.ToLower(lp.Proto), "udp") {
+						proto = "udp"
+					}
+					key := fmt.Sprintf("%s/%d", proto, lp.Port)
+					if !baseSet[key] {
+						driftedPorts = append(driftedPorts, lp)
+					}
+				}
+			}
+		}
+
+		// Evaluate breaches & health score
+		breaches := evaluateSnapshotRules(incoming, srvCfg, rules, driftedPorts)
+		ComputeSnapshotHealth(incoming, breaches)
+		*rawIncoming = *cloneSnapshot(incoming)
+
+		// Update lightweight per-server runtime metadata strictly inside monitor_runtime.json
+		if incoming.Reachable {
+			meta := mon.ServerRuntime[srvCfg.ID]
+			if incoming.LatencyMs > 0 {
+				meta.LastLatencyMs = incoming.LatencyMs
+			}
+			osLabel := strings.TrimSpace(incoming.OS)
+			if osLabel == "" && incoming.Kernel != "" {
+				osLabel = "Linux " + incoming.Kernel
+			}
+			if osLabel != "" {
+				meta.LastOSInfo = osLabel
+			}
+			mon.ServerRuntime[srvCfg.ID] = meta
+
+			if autoSyncMem {
+				if mergeMonitorSnapshotIntoHostMemorySlice(&s.aiopsRT.HostMemories, incoming, now) {
+					aiMemChanged = true
+				}
+			}
+		}
+
+		// Persist latest snapshot & compact ring-buffered sample
+		mon.LatestSnapshots[srvCfg.ID] = cloneSnapshot(incoming)
+		series := append(mon.HistoryByServer[srvCfg.ID], incoming.ToSamplePoint())
+		maxPts := monSettings.RetentionPoints
+		if maxPts < 30 {
+			maxPts = 30
+		}
+		if len(series) > maxPts {
+			series = slices.Clone(series[len(series)-maxPts:])
+		}
+		mon.HistoryByServer[srvCfg.ID] = series
+
+		// Update breach streaks & firing/resolved alerts for this server
+		activeBreachMap := make(map[string]CandidateBreach, len(breaches))
+		for _, b := range breaches {
+			activeBreachMap[b.DedupKey] = b
+			mon.BreachStreaks[b.DedupKey]++
+			if mon.BreachStreaks[b.DedupKey] < b.ConsecutiveReq {
 				continue
 			}
-			srvIdx, exists := srvByID[rawIncoming.ServerID]
-			if !exists {
-				continue
-			}
-			incoming := cloneSnapshot(rawIncoming)
-			srvCfg := st.Servers[srvIdx]
-			incoming.ServerName = srvCfg.Name
-			incoming.Group = srvCfg.Group
-			incoming.Host = srvCfg.Host
-			incoming.Port = srvCfg.Port
-			if incoming.CollectedAt.IsZero() {
-				incoming.CollectedAt = now
-			}
 
-			// Mark watched ports & services on incoming snapshot
-			if len(srvCfg.WatchedPorts) > 0 {
-				for i := range incoming.ListeningPorts {
-					if slices.Contains(srvCfg.WatchedPorts, incoming.ListeningPorts[i].Port) {
-						incoming.ListeningPorts[i].Watched = true
-					}
-				}
-			}
-
-			// Port baseline comparison
-			var driftedPorts []ListeningPortStat
-			if incoming.Reachable && mon.Settings.CollectPortsAndServices && len(incoming.ListeningPorts) > 0 {
-				curPublicKeys := extractPublicPortKeys(incoming.ListeningPorts)
-				baseKeys, hasBaseline := mon.PortBaselines[srvCfg.ID]
-				if !hasBaseline {
-					mon.PortBaselines[srvCfg.ID] = curPublicKeys
-				} else if mon.Settings.DetectPortDrift {
-					baseSet := make(map[string]bool, len(baseKeys))
-					for _, k := range baseKeys {
-						baseSet[k] = true
-					}
-					for _, lp := range incoming.ListeningPorts {
-						if !lp.PublicExposed || lp.Port <= 0 {
-							continue
-						}
-						proto := "tcp"
-						if strings.HasPrefix(strings.ToLower(lp.Proto), "udp") {
-							proto = "udp"
-						}
-						key := fmt.Sprintf("%s/%d", proto, lp.Port)
-						if !baseSet[key] {
-							driftedPorts = append(driftedPorts, lp)
-						}
-					}
-				}
-			}
-
-			// Evaluate breaches & health score
-			breaches := evaluateSnapshotRules(incoming, srvCfg, mon.Rules, driftedPorts)
-			ComputeSnapshotHealth(incoming, breaches)
-			*rawIncoming = *cloneSnapshot(incoming)
-
-			// Update ServerConfig lightweight runtime metadata
-			if incoming.Reachable {
-				if incoming.LatencyMs > 0 {
-					st.Servers[srvIdx].LastLatencyMs = incoming.LatencyMs
-				}
-				osLabel := strings.TrimSpace(incoming.OS)
-				if osLabel == "" && incoming.Kernel != "" {
-					osLabel = "Linux " + incoming.Kernel
-				}
-				if osLabel != "" {
-					st.Servers[srvIdx].LastOSInfo = osLabel
-				}
-				EnsureStateDefaults(st)
-				if st.AISettings.MemoryConfig.AutoSyncMonitorToMemory {
-					mergeMonitorSnapshotIntoHostMemoryLocked(st, incoming, now)
-				}
-			}
-
-			// Persist latest snapshot & compact ring-buffered sample
-			mon.LatestSnapshots[srvCfg.ID] = cloneSnapshot(incoming)
-			series := append(mon.HistoryByServer[srvCfg.ID], incoming.ToSamplePoint())
-			maxPts := mon.Settings.RetentionPoints
-			if len(series) > maxPts {
-				series = slices.Clone(series[len(series)-maxPts:])
-			}
-			mon.HistoryByServer[srvCfg.ID] = series
-
-			// Update breach streaks & firing/resolved alerts for this server
-			activeBreachMap := make(map[string]CandidateBreach, len(breaches))
-			for _, b := range breaches {
-				activeBreachMap[b.DedupKey] = b
-				mon.BreachStreaks[b.DedupKey]++
-				if mon.BreachStreaks[b.DedupKey] < b.ConsecutiveReq {
-					continue
-				}
-
-				// Find existing unresolved alert with same DedupKey
-				foundExisting := false
-				for idx := range mon.Alerts {
-					al := &mon.Alerts[idx]
-					if al.DedupKey == b.DedupKey && al.Status != AlertStatusResolved {
-						al.LastSeenAt = incoming.CollectedAt
-						al.Occurrences++
-						al.ServerName = srvCfg.Name
-						al.Host = fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port)
-						al.Title = b.Title
-						al.Detail = b.Detail
-						al.MetricText = b.MetricText
-						al.ThresholdText = b.ThresholdText
-						if b.Severity == SeverityCritical && al.Severity != SeverityCritical {
-							al.Severity = SeverityCritical
-						}
-						foundExisting = true
-						break
-					}
-				}
-				if !foundExisting {
-					newAlert := MonitorAlert{
-						ID:            uuid.NewString(),
-						DedupKey:      b.DedupKey,
-						ServerID:      srvCfg.ID,
-						ServerName:    srvCfg.Name,
-						Host:          fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
-						RuleKind:      b.RuleKind,
-						RuleName:      b.RuleName,
-						Severity:      b.Severity,
-						Status:        AlertStatusFiring,
-						Title:         b.Title,
-						Detail:        b.Detail,
-						MetricText:    b.MetricText,
-						ThresholdText: b.ThresholdText,
-						Occurrences:   mon.BreachStreaks[b.DedupKey],
-						TriggeredAt:   incoming.CollectedAt,
-						LastSeenAt:    incoming.CollectedAt,
-					}
-					mon.Alerts = append([]MonitorAlert{newAlert}, mon.Alerts...)
-					triggered = append(triggered, newAlert)
-				}
-			}
-
-			// Clear non-breached streaks for this server
-			prefix := srvCfg.ID + "|"
-			for k := range mon.BreachStreaks {
-				if strings.HasPrefix(k, prefix) {
-					if _, stillBreached := activeBreachMap[k]; !stillBreached {
-						if incoming.Reachable || strings.HasPrefix(k, srvCfg.ID+"|offline|") {
-							delete(mon.BreachStreaks, k)
-						}
-					}
-				}
-			}
-
-			// Auto-resolve active alerts whose condition has recovered
+			foundExisting := false
 			for idx := range mon.Alerts {
 				al := &mon.Alerts[idx]
-				if al.ServerID != srvCfg.ID || al.Status == AlertStatusResolved {
-					continue
+				if al.DedupKey == b.DedupKey && al.Status != AlertStatusResolved {
+					al.LastSeenAt = incoming.CollectedAt
+					al.Occurrences++
+					al.ServerName = srvCfg.Name
+					al.Host = fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port)
+					al.Title = b.Title
+					al.Detail = b.Detail
+					al.MetricText = b.MetricText
+					al.ThresholdText = b.ThresholdText
+					if b.Severity == SeverityCritical && al.Severity != SeverityCritical {
+						al.Severity = SeverityCritical
+					}
+					foundExisting = true
+					break
 				}
-				if _, stillBreached := activeBreachMap[al.DedupKey]; stillBreached {
-					continue
+			}
+			if !foundExisting {
+				newAlert := MonitorAlert{
+					ID:            uuid.NewString(),
+					DedupKey:      b.DedupKey,
+					ServerID:      srvCfg.ID,
+					ServerName:    srvCfg.Name,
+					Host:          fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
+					RuleKind:      b.RuleKind,
+					RuleName:      b.RuleName,
+					Severity:      b.Severity,
+					Status:        AlertStatusFiring,
+					Title:         b.Title,
+					Detail:        b.Detail,
+					MetricText:    b.MetricText,
+					ThresholdText: b.ThresholdText,
+					Occurrences:   mon.BreachStreaks[b.DedupKey],
+					TriggeredAt:   incoming.CollectedAt,
+					LastSeenAt:    incoming.CollectedAt,
 				}
-				// Only resolve resource alerts when host is reachable; resolve offline when reachable
-				if !incoming.Reachable && al.RuleKind != "offline" {
-					continue
-				}
-				resTime := incoming.CollectedAt
-				al.Status = AlertStatusResolved
-				al.ResolvedAt = &resTime
-				al.LastSeenAt = resTime
-				resolved = append(resolved, *al)
+				mon.Alerts = append([]MonitorAlert{newAlert}, mon.Alerts...)
+				triggered = append(triggered, newAlert)
 			}
 		}
 
-		// Enforce MaxAlertRecords cap while keeping active alerts intact
-		if len(mon.Alerts) > mon.Settings.MaxAlertRecords {
-			trimmed := make([]MonitorAlert, 0, mon.Settings.MaxAlertRecords)
-			for _, a := range mon.Alerts {
-				if a.Status != AlertStatusResolved && len(trimmed) < mon.Settings.MaxAlertRecords {
-					trimmed = append(trimmed, a)
+		// Clear non-breached streaks for this server
+		prefix := srvCfg.ID + "|"
+		for k := range mon.BreachStreaks {
+			if strings.HasPrefix(k, prefix) {
+				if _, stillBreached := activeBreachMap[k]; !stillBreached {
+					if incoming.Reachable || strings.HasPrefix(k, srvCfg.ID+"|offline|") {
+						delete(mon.BreachStreaks, k)
+					}
 				}
 			}
-			for _, a := range mon.Alerts {
-				if a.Status == AlertStatusResolved && len(trimmed) < mon.Settings.MaxAlertRecords {
-					trimmed = append(trimmed, a)
-				}
-			}
-			sort.SliceStable(trimmed, func(i, j int) bool {
-				return trimmed[i].TriggeredAt.After(trimmed[j].TriggeredAt)
-			})
-			mon.Alerts = trimmed
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, nil, "", err
+
+		// Auto-resolve active alerts whose condition has recovered
+		for idx := range mon.Alerts {
+			al := &mon.Alerts[idx]
+			if al.ServerID != srvCfg.ID || al.Status == AlertStatusResolved {
+				continue
+			}
+			if _, stillBreached := activeBreachMap[al.DedupKey]; stillBreached {
+				continue
+			}
+			if !incoming.Reachable && al.RuleKind != "offline" {
+				continue
+			}
+			resTime := incoming.CollectedAt
+			al.Status = AlertStatusResolved
+			al.ResolvedAt = &resTime
+			al.LastSeenAt = resTime
+			resolved = append(resolved, *al)
+		}
 	}
+
+	// Enforce MaxAlertRecords cap while keeping active alerts intact
+	maxAlerts := monSettings.MaxAlertRecords
+	if maxAlerts < 50 {
+		maxAlerts = 50
+	}
+	if len(mon.Alerts) > maxAlerts {
+		trimmed := make([]MonitorAlert, 0, maxAlerts)
+		for _, a := range mon.Alerts {
+			if a.Status != AlertStatusResolved && len(trimmed) < maxAlerts {
+				trimmed = append(trimmed, a)
+			}
+		}
+		for _, a := range mon.Alerts {
+			if a.Status == AlertStatusResolved && len(trimmed) < maxAlerts {
+				trimmed = append(trimmed, a)
+			}
+		}
+		sort.SliceStable(trimmed, func(i, j int) bool {
+			return trimmed[i].TriggeredAt.After(trimmed[j].TriggeredAt)
+		})
+		mon.Alerts = trimmed
+	}
+
+	s.dirtyMonitor = true
+	if aiMemChanged {
+		s.dirtyAIOps = true
+	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return triggered, resolved, webhookURL, nil
 }
 
-// GetMonitorOverview builds the complete fleet monitoring dashboard state from encrypted memory.
+// GetMonitorOverview builds the fleet monitoring dashboard state by joining server configs with runtime telemetry.
 func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
-	mon := readMonitorData(s.state)
+	monSettings := s.secrets.MonitorSettings
+	serverViews := make([]ServerView, len(s.secrets.Servers))
+	for i, srv := range s.secrets.Servers {
+		serverViews[i] = srv.ToView()
+	}
+	s.secMu.RUnlock()
+
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	mon := s.monitorRT
+	if mon == nil {
+		mon = DefaultMonitorRuntimeState()
+	}
 
 	activeAlertsBySrv := make(map[string]int)
 	var kpi FleetMonitorKPI
-	kpi.TotalServers = len(s.state.Servers)
+	kpi.TotalServers = len(serverViews)
 
 	for _, al := range mon.Alerts {
 		if al.Status != AlertStatusResolved {
@@ -966,21 +963,22 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 		}
 	}
 
-	nodes := make([]ServerMonitorCardItem, 0, len(s.state.Servers))
+	nodes := make([]ServerMonitorCardItem, 0, len(serverViews))
 	var sumScore int
 	var sumCPU, sumMem, sumDisk float64
 	var sumLat int64
 
-	for _, srv := range s.state.Servers {
-		view := srv.ToView()
+	for _, view := range serverViews {
+		if meta, ok := mon.ServerRuntime[view.ID]; ok {
+			applyServerRuntimeMeta(&view, meta)
+		}
 		if view.MonitorEnabled {
 			kpi.MonitoredServers++
 		}
-		snap := cloneSnapshot(mon.LatestSnapshots[srv.ID])
-		fullSeries := mon.HistoryByServer[srv.ID]
+		snap := cloneSnapshot(mon.LatestSnapshots[view.ID])
+		fullSeries := mon.HistoryByServer[view.ID]
 		kpi.TotalSamples += len(fullSeries)
 
-		// Last 30 points for lightweight card sparkline
 		sparkStart := 0
 		if len(fullSeries) > 30 {
 			sparkStart = len(fullSeries) - 30
@@ -1026,11 +1024,10 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 			Snapshot:     snap,
 			Sparkline:    spark,
 			SLA:          sla,
-			ActiveAlerts: activeAlertsBySrv[srv.ID],
+			ActiveAlerts: activeAlertsBySrv[view.ID],
 		})
 	}
 
-	// Sort: pinned first, then critical/offline/warning/healthy, then name
 	levelRank := func(item ServerMonitorCardItem) int {
 		if item.Snapshot == nil {
 			return 3
@@ -1072,7 +1069,7 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 	}
 
 	return &MonitorOverviewData{
-		Settings: mon.Settings,
+		Settings: monSettings,
 		KPI:      kpi,
 		Nodes:    nodes,
 		Alerts:   alertsOut,
@@ -1081,24 +1078,35 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 
 // GetServerMonitorDetail returns deep snapshot, time-filtered historical series, SLA, and alerts for one server.
 func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) (*ServerMonitorDetail, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
-
-	var targetSrv *ServerConfig
-	for i := range s.state.Servers {
-		if s.state.Servers[i].ID == serverID {
-			targetSrv = &s.state.Servers[i]
+	var targetView *ServerView
+	for i := range s.secrets.Servers {
+		if s.secrets.Servers[i].ID == serverID {
+			v := s.secrets.Servers[i].ToView()
+			targetView = &v
 			break
 		}
 	}
-	if targetSrv == nil {
+	s.secMu.RUnlock()
+	if targetView == nil {
 		return nil, ErrNotFound
 	}
 
-	mon := readMonitorData(s.state)
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	mon := s.monitorRT
+	if mon == nil {
+		mon = DefaultMonitorRuntimeState()
+	}
+
+	if meta, ok := mon.ServerRuntime[serverID]; ok {
+		applyServerRuntimeMeta(targetView, meta)
+	}
+
 	snap := cloneSnapshot(mon.LatestSnapshots[serverID])
 	allPoints := mon.HistoryByServer[serverID]
 
@@ -1133,7 +1141,7 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 	}
 
 	return &ServerMonitorDetail{
-		Server:       targetSrv.ToView(),
+		Server:       *targetView,
 		Snapshot:     snap,
 		Series:       filtered,
 		SLA:          computeSLA(filtered),
@@ -1142,63 +1150,64 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 	}, nil
 }
 
-// GetMonitorPolicy returns current encrypted monitor settings and alert rules.
+// GetMonitorPolicy returns current monitor settings and alert rules from secrets.enc.
 func (s *Store) GetMonitorPolicy() (MonitorSettings, []MonitorAlertRule, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return MonitorSettings{}, nil, ErrVaultLocked
 	}
-	mon := readMonitorData(s.state)
-	return mon.Settings, slices.Clone(mon.Rules), nil
+	return s.secrets.MonitorSettings, slices.Clone(s.secrets.MonitorRules), nil
 }
 
 // UpdateMonitorPolicy validates and saves updated schedule settings and alert rules.
 func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAlertRule, clientIP string) (MonitorSettings, []MonitorAlertRule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return MonitorSettings{}, nil, ErrVaultLocked
-	}
-
 	var outSettings MonitorSettings
 	var outRules []MonitorAlertRule
-	err := s.mutateLocked(func(st *VaultState) error {
-		ensureMonitorInitialized(st)
-		mon := st.Monitor
-
-		mon.Settings = sanitizeMonitorSettings(settings)
+	err := s.mutateSecrets(func(sec *SecretsState) error {
+		sec.MonitorSettings = sanitizeMonitorSettings(settings)
 		if len(rules) > 0 {
-			mon.Rules = slices.Clone(rules)
-			ensureMonitorInitialized(st)
+			sec.MonitorRules = mergeMonitorAlertRules(rules)
 		}
-
-		// Trim existing series if RetentionPoints was lowered
-		for sid, pts := range mon.HistoryByServer {
-			if len(pts) > mon.Settings.RetentionPoints {
-				mon.HistoryByServer[sid] = slices.Clone(pts[len(pts)-mon.Settings.RetentionPoints:])
-			}
-		}
-
-		appendAuditLocked(st, "monitor.policy_update", "monitor", fmt.Sprintf("更新状态监控策略 (周期 %ds, 保留 %d 点)", mon.Settings.IntervalSec, mon.Settings.RetentionPoints), clientIP, true)
-		outSettings = mon.Settings
-		outRules = slices.Clone(mon.Rules)
+		outSettings = sec.MonitorSettings
+		outRules = slices.Clone(sec.MonitorRules)
 		return nil
 	})
 	if err != nil {
 		return MonitorSettings{}, nil, err
 	}
+
+	// Trim existing runtime series if RetentionPoints was lowered
+	s.rtMu.Lock()
+	if s.monitorRT != nil {
+		trimmed := false
+		for sid, pts := range s.monitorRT.HistoryByServer {
+			if len(pts) > outSettings.RetentionPoints {
+				s.monitorRT.HistoryByServer[sid] = slices.Clone(pts[len(pts)-outSettings.RetentionPoints:])
+				trimmed = true
+			}
+		}
+		if trimmed {
+			s.dirtyMonitor = true
+		}
+	}
+	s.appendAuditRuntimeLocked("monitor.policy_update", "monitor", fmt.Sprintf("更新状态监控策略 (周期 %ds, 保留 %d 点)", outSettings.IntervalSec, outSettings.RetentionPoints), clientIP, true)
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return outSettings, outRules, nil
 }
 
 // ListMonitorAlerts returns filtered alert incidents.
 func (s *Store) ListMonitorAlerts(statusFilter, serverID string, limit int) ([]MonitorAlert, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	mon := readMonitorData(s.state)
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	mon := s.monitorRT
+	if mon == nil {
+		return []MonitorAlert{}, nil
+	}
 
 	var out []MonitorAlert
 	for _, al := range mon.Alerts {
@@ -1226,158 +1235,126 @@ func (s *Store) ListMonitorAlerts(statusFilter, serverID string, limit int) ([]M
 	return out, nil
 }
 
-// AcknowledgeMonitorAlert marks an active firing alert as acknowledged.
+// AcknowledgeMonitorAlert marks an active firing alert as acknowledged (runtime-only, never touches secrets.enc).
 func (s *Store) AcknowledgeMonitorAlert(alertID, clientIP string) (*MonitorAlert, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
 
-	mon := readMonitorData(s.state)
-	targetIdx := -1
-	for i := range mon.Alerts {
-		if mon.Alerts[i].ID == alertID {
-			targetIdx = i
-			break
-		}
-	}
-	if targetIdx < 0 {
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
 		return nil, ErrNotFound
 	}
-	if mon.Alerts[targetIdx].Status != AlertStatusFiring {
-		cp := mon.Alerts[targetIdx]
-		return &cp, nil
-	}
-
-	var updated MonitorAlert
-	err := s.mutateLocked(func(st *VaultState) error {
-		ensureMonitorInitialized(st)
-		for i := range st.Monitor.Alerts {
-			al := &st.Monitor.Alerts[i]
-			if al.ID == alertID {
-				if al.Status == AlertStatusFiring {
-					now := time.Now().UTC()
-					al.Status = AlertStatusAcknowledged
-					al.AcknowledgedAt = &now
-					appendAuditLocked(st, "monitor.alert_ack", al.ServerName, al.Title, clientIP, true)
-				}
-				updated = *al
-				return nil
+	for i := range s.monitorRT.Alerts {
+		al := &s.monitorRT.Alerts[i]
+		if al.ID == alertID {
+			if al.Status == AlertStatusFiring {
+				now := time.Now().UTC()
+				al.Status = AlertStatusAcknowledged
+				al.AcknowledgedAt = &now
+				s.dirtyMonitor = true
+				s.appendAuditRuntimeLocked("monitor.alert_ack", al.ServerName, al.Title, clientIP, true)
 			}
+			cp := *al
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return &cp, nil
 		}
-		return ErrNotFound
-	})
-	if err != nil {
-		return nil, err
 	}
-	return &updated, nil
+	s.rtMu.Unlock()
+	return nil, ErrNotFound
 }
 
-// ClearResolvedMonitorAlerts removes all resolved alert incidents.
+// ClearResolvedMonitorAlerts removes all resolved alert incidents (runtime-only).
 func (s *Store) ClearResolvedMonitorAlerts(clientIP string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return 0, ErrVaultLocked
 	}
 
-	mon := readMonitorData(s.state)
-	hasResolved := false
-	for _, al := range mon.Alerts {
-		if al.Status == AlertStatusResolved {
-			hasResolved = true
-			break
-		}
-	}
-	if !hasResolved {
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
 		return 0, nil
 	}
-
-	removed := 0
-	err := s.mutateLocked(func(st *VaultState) error {
-		ensureMonitorInitialized(st)
-		before := len(st.Monitor.Alerts)
-		kept := make([]MonitorAlert, 0, before)
-		for _, al := range st.Monitor.Alerts {
-			if al.Status != AlertStatusResolved {
-				kept = append(kept, al)
-			}
+	before := len(s.monitorRT.Alerts)
+	kept := make([]MonitorAlert, 0, before)
+	for _, al := range s.monitorRT.Alerts {
+		if al.Status != AlertStatusResolved {
+			kept = append(kept, al)
 		}
-		removed = before - len(kept)
-		st.Monitor.Alerts = kept
-		if removed > 0 {
-			appendAuditLocked(st, "monitor.alerts_clear", "alerts", fmt.Sprintf("清理已恢复历史告警 %d 条", removed), clientIP, true)
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
+	}
+	removed := before - len(kept)
+	if removed > 0 {
+		s.monitorRT.Alerts = kept
+		s.dirtyMonitor = true
+		s.appendAuditRuntimeLocked("monitor.alerts_clear", "alerts", fmt.Sprintf("清理已恢复历史告警 %d 条", removed), clientIP, true)
+	}
+	s.rtMu.Unlock()
+	if removed > 0 {
+		s.triggerFlush()
 	}
 	return removed, nil
 }
 
 // AcceptServerPortBaseline pins the server's current public listening ports as its trusted port baseline.
 func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
 
-	var outBase []string
-	err := s.mutateLocked(func(st *VaultState) error {
-		ensureMonitorInitialized(st)
-		mon := st.Monitor
-
-		snap := mon.LatestSnapshots[serverID]
-		if snap == nil {
-			return ErrNotFound
-		}
-		newBase := extractPublicPortKeys(snap.ListeningPorts)
-		mon.PortBaselines[serverID] = newBase
-		delete(mon.BreachStreaks, fmt.Sprintf("%s|port_drift|", serverID))
-
-		now := time.Now().UTC()
-		for i := range mon.Alerts {
-			al := &mon.Alerts[i]
-			if al.ServerID == serverID && al.RuleKind == "port_drift" && al.Status != AlertStatusResolved {
-				al.Status = AlertStatusResolved
-				al.ResolvedAt = &now
-			}
-		}
-
-		appendAuditLocked(st, "monitor.port_baseline", snap.ServerName, fmt.Sprintf("确认并更新公网监听端口安全基线 (%d 个端口)", len(newBase)), clientIP, true)
-		outBase = slices.Clone(newBase)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
 	}
+	snap := s.monitorRT.LatestSnapshots[serverID]
+	if snap == nil {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
+	}
+	newBase := extractPublicPortKeys(snap.ListeningPorts)
+	s.monitorRT.PortBaselines[serverID] = newBase
+	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|port_drift|", serverID))
+
+	now := time.Now().UTC()
+	for i := range s.monitorRT.Alerts {
+		al := &s.monitorRT.Alerts[i]
+		if al.ServerID == serverID && al.RuleKind == "port_drift" && al.Status != AlertStatusResolved {
+			al.Status = AlertStatusResolved
+			al.ResolvedAt = &now
+		}
+	}
+	s.dirtyMonitor = true
+	s.appendAuditRuntimeLocked("monitor.port_baseline", snap.ServerName, fmt.Sprintf("确认并更新公网监听端口安全基线 (%d 个端口)", len(newBase)), clientIP, true)
+	outBase := slices.Clone(newBase)
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return outBase, nil
 }
 
 // ClearMonitorHistory purges historical monitoring records for one server or all servers.
 func (s *Store) ClearMonitorHistory(serverID, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		ensureMonitorInitialized(st)
-		mon := st.Monitor
 
+	s.rtMu.Lock()
+	if s.monitorRT != nil {
 		if serverID != "" {
-			delete(mon.HistoryByServer, serverID)
-			delete(mon.LatestSnapshots, serverID)
-			appendAuditLocked(st, "monitor.history_clear", serverID, "清空单台主机历史监控时序数据", clientIP, true)
+			delete(s.monitorRT.HistoryByServer, serverID)
+			delete(s.monitorRT.LatestSnapshots, serverID)
+			s.appendAuditRuntimeLocked("monitor.history_clear", serverID, "清空单台主机历史监控时序数据", clientIP, true)
 		} else {
-			clear(mon.HistoryByServer)
-			clear(mon.LatestSnapshots)
-			clear(mon.BreachStreaks)
-			appendAuditLocked(st, "monitor.history_clear", "all", "清空全部服务器历史监控时序数据", clientIP, true)
+			clear(s.monitorRT.HistoryByServer)
+			clear(s.monitorRT.LatestSnapshots)
+			clear(s.monitorRT.BreachStreaks)
+			s.appendAuditRuntimeLocked("monitor.history_clear", "all", "清空全部服务器历史监控时序数据", clientIP, true)
 		}
-		return nil
-	})
+		s.dirtyMonitor = true
+	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return nil
 }
+

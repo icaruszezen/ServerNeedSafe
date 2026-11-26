@@ -12,15 +12,17 @@ services:
       - TZ=Asia/Shanghai
       - SNS_ADDR=0.0.0.0:8080
       - SNS_DATA_DIR=/data
-      - SNS_SESSION_TTL=8h
-      # 强烈建议（生产环境）：注入 ≥32 字节的随机高熵外部主密钥，使 /data/.vault.key 与解封密钥分离存放。
-      # 生成示例：openssl rand -base64 48 ；请通过 .env / Docker secret 注入，切勿与 /data 一同备份。
-      # 未配置时 .vault.key 内含明文封装主密钥（仅依赖 0600 文件权限），/data 整体外泄即等同保险库泄露。
-      # - SNS_MASTER_KEY=${SNS_MASTER_KEY:?请设置至少32字节的随机密钥}
+      - SNS_SESSION_TTL=168h
+      # 可选：通过环境变量注入外部静态加密主密钥（≥32 字节），与 /data 目录分离存储。
+      # 未设置时首次启动会在 /data/master.key (0600) 自动生成随机 256-bit 主密钥。
+      # 建议仅在内网受控主机或启用了 HTTPS/防火墙的安全宿主机上部署。
+      # - SNS_MASTER_KEY=${SNS_MASTER_KEY}
     volumes:
-      # 持久化存储加密数据包 (vault.sns) 与 7×24 自动挂载封装密钥 (.vault.key)
-      # 注意：导出的 .sns 备份仅凭管理员密码加密；但 /data 目录本身含 .vault.key，
-      # 未配置 SNS_MASTER_KEY 时获得整个 /data 目录的攻击者可直接解密全部应用数据，请严格保护该目录。
+      # 持久化分层存储目录：
+      # - secrets.enc / master.key : XChaCha20-Poly1305 加密凭据与配置（仅配置变更时写入）
+      # - monitor_runtime.json     : 7×24 监控快照、时序历史、告警与基线（独立异步防抖落盘）
+      # - aiops_runtime.json       : AI 会话记录、主机记忆、Runbook 与巡检历史
+      # - audit_logs.json          : 操作审计日志
       - ./data:/data
     security_opt:
       - no-new-privileges:true

@@ -12,26 +12,24 @@ import (
 	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
 func newTestServerInstance(t *testing.T, dataDir string, sessionTTL time.Duration) (*Server, *httptest.Server) {
 	t.Helper()
-	blindStore, err := vault.NewBlindStore(filepath.Join(dataDir, "vault.sns"))
+	store, err := vault.NewStore(dataDir)
 	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	authMgr, err := auth.NewManager(sessionTTL, false)
 	if err != nil {
+		store.Close()
 		t.Fatalf("NewManager: %v", err)
 	}
 	srv := NewServer(Config{
 		DeployMode: "server",
-		BlindStore: blindStore,
-		KeyMgr:     vault.NewServerKeyManager(dataDir),
+		Store:      store,
 		Auth:       authMgr,
-		Relay:      relay.NewManager("127.0.0.1:0"),
 	})
 	ts := httptest.NewServer(srv.Handler())
 	return srv, ts
@@ -42,14 +40,14 @@ func newCookieHTTPClient() *http.Client {
 	return &http.Client{Jar: jar}
 }
 
-func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
+func TestDecoupledAuthSessionLockRestartAndPasswordRotation(t *testing.T) {
 	dataDir := t.TempDir()
-	srv, ts := newTestServerInstance(t, dataDir, 8*time.Hour)
+	srv, ts := newTestServerInstance(t, dataDir, auth.DefaultSessionTTL)
 
 	rawHTTP := &http.Client{}
 	adminClient := newCookieHTTPClient()
 
-	// 1. Unauthenticated callers get 401 on all protected routes & zero metadata before setup
+	// 1. Unauthenticated callers get 401 on all protected routes before setup
 	for _, ep := range []string{
 		"/api/workspace/bootstrap",
 		"/api/servers",
@@ -58,8 +56,7 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 		"/api/monitor/overview",
 		"/api/ai/overview",
 		"/api/vault/security",
-		"/api/vault/export",
-		"/api/vault/blob",
+		"/api/vault/sync/snapshot",
 	} {
 		res, err := rawHTTP.Get(ts.URL + ep)
 		if err != nil {
@@ -70,8 +67,16 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 			t.Fatalf("expected 401 on %s before setup, got %d", ep, res.StatusCode)
 		}
 	}
+	expUnauth, err := rawHTTP.Post(ts.URL+"/api/vault/export", "application/json", bytes.NewReader([]byte(`{"backup_password":"BackupPass!2026"}`)))
+	if err != nil {
+		t.Fatalf("unauth POST /api/vault/export: %v", err)
+	}
+	expUnauth.Body.Close()
+	if expUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on POST /api/vault/export before setup, got %d", expUnauth.StatusCode)
+	}
 
-	// 2. Native Admin Setup creates encrypted vault.sns + 0600 .vault.key + HttpOnly session cookie
+	// 2. Setup creates secrets.enc + 0600 master.key + HttpOnly SameSite=Lax cookie + 7-day default session
 	adminPass1 := "AdminSecretPassword!2026"
 	setupBody, _ := json.Marshal(map[string]string{"password": adminPass1})
 	res, err := adminClient.Post(ts.URL+"/api/auth/setup", "application/json", bytes.NewReader(setupBody))
@@ -80,12 +85,13 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 	}
 	var setupResp struct {
 		Encryption vault.EncryptionInfo `json:"encryption"`
+		Settings   vault.AppSettings    `json:"settings"`
 		Status     struct {
-			Authenticated     bool   `json:"authenticated"`
-			DaemonRunning     bool   `json:"daemon_running"`
-			MigrationPending  bool   `json:"migration_pending"`
-			AutoUnlockEnabled bool   `json:"auto_unlock_enabled"`
-			VaultStatus       string `json:"vault_status"`
+			Authenticated          bool   `json:"authenticated"`
+			DaemonRunning          bool   `json:"daemon_running"`
+			LegacyMigrationPending bool   `json:"legacy_migration_pending"`
+			SessionTTLHours        int    `json:"session_ttl_hours"`
+			VaultStatus            string `json:"vault_status"`
 		} `json:"status"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&setupResp); err != nil {
@@ -94,45 +100,54 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 	}
 	cookies := res.Cookies()
 	res.Body.Close()
-	if res.StatusCode != http.StatusOK || !setupResp.Status.Authenticated || !setupResp.Status.DaemonRunning || !setupResp.Status.AutoUnlockEnabled || setupResp.Status.MigrationPending {
+	if res.StatusCode != http.StatusOK || !setupResp.Status.Authenticated || !setupResp.Status.DaemonRunning || setupResp.Status.LegacyMigrationPending {
 		t.Fatalf("unexpected setup response: status=%d body=%+v", res.StatusCode, setupResp)
+	}
+	if setupResp.Status.SessionTTLHours != 168 {
+		t.Fatalf("expected default 168h (7d) session TTL, got %d", setupResp.Status.SessionTTLHours)
+	}
+	if setupResp.Settings.AutoLockMinutes != 0 {
+		t.Fatalf("expected default AutoLockMinutes=0 (idle auto-logout disabled), got %d", setupResp.Settings.AutoLockMinutes)
 	}
 
 	hasSessionCookie := false
 	for _, ck := range cookies {
-		if ck.Name == adminSessionCookieName && ck.HttpOnly && ck.SameSite == http.SameSiteStrictMode {
+		if ck.Name == adminSessionCookieName && ck.HttpOnly && ck.SameSite == http.SameSiteLaxMode {
 			hasSessionCookie = true
 		}
 	}
 	if !hasSessionCookie {
-		t.Fatalf("expected HttpOnly SameSite=Strict %s cookie on setup, got %+v", adminSessionCookieName, cookies)
+		t.Fatalf("expected HttpOnly SameSite=Lax %s cookie on setup, got %+v", adminSessionCookieName, cookies)
 	}
 
-	keyPath := filepath.Join(dataDir, ".vault.key")
+	keyPath := filepath.Join(dataDir, "master.key")
 	stKey, err := os.Stat(keyPath)
 	if err != nil || stKey.Mode().Perm() != 0o600 {
-		t.Fatalf("expected 0600 .vault.key at %s, stat=%v err=%v", keyPath, stKey, err)
+		t.Fatalf("expected 0600 master.key at %s, stat=%v err=%v", keyPath, stKey, err)
+	}
+	masterKeyBefore, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read master.key: %v", err)
 	}
 
-	// 3. Unauthenticated caller STILL sees zero vault metadata while 7x24 daemon runs in background!
+	// 3. Unauthenticated caller sees daemon_running=true while sensitive storage paths/settings remain hidden
 	res, err = rawHTTP.Get(ts.URL + "/api/auth/status")
 	if err != nil {
 		t.Fatalf("unauth GET /api/auth/status: %v", err)
 	}
 	var pubStatus struct {
-		Authenticated bool                 `json:"authenticated"`
-		DaemonRunning bool                 `json:"daemon_running"`
-		VaultPath     string               `json:"vault_path"`
-		KeySealPath   string               `json:"key_seal_path"`
-		Encryption    vault.EncryptionInfo `json:"encryption"`
+		Authenticated bool                    `json:"authenticated"`
+		DaemonRunning bool                    `json:"daemon_running"`
+		Storage       *vault.StorageFilesInfo `json:"storage"`
+		Settings      *vault.AppSettings      `json:"settings"`
 	}
 	_ = json.NewDecoder(res.Body).Decode(&pubStatus)
 	res.Body.Close()
 	if pubStatus.Authenticated || !pubStatus.DaemonRunning {
 		t.Fatalf("unexpected unauth status: %+v", pubStatus)
 	}
-	if pubStatus.VaultPath != "" || pubStatus.KeySealPath != "" || pubStatus.Encryption.VaultID != "" || pubStatus.Encryption.AuthPubKeySHA256 != "" || pubStatus.Encryption.Revision != 0 {
-		t.Fatalf("SECURITY FAILURE: unauthenticated /api/auth/status leaked metadata: %+v", pubStatus)
+	if pubStatus.Storage != nil || pubStatus.Settings != nil {
+		t.Fatalf("unauthenticated /api/auth/status should not expose storage paths or settings: %+v", pubStatus)
 	}
 
 	// 4. Create server + snippet via authenticated cookie session & verify 1-RTT /api/workspace/bootstrap
@@ -195,14 +210,14 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 	}
 	loginRes2.Body.Close()
 
-	// Lock via adminClient -> revokes BOTH adminClient and adminClient2, while 7x24 daemon stays unlocked!
+	// Lock via adminClient -> revokes BOTH adminClient and adminClient2, while 7x24 daemon stays ready!
 	lockRes, err := adminClient.Post(ts.URL+"/api/auth/lock", "application/json", bytes.NewReader([]byte(`{}`)))
 	if err != nil || lockRes.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/auth/lock failed: status=%v err=%v", lockRes.StatusCode, err)
 	}
 	lockRes.Body.Close()
 
-	if !srv.isDaemonUnlocked() {
+	if !srv.isDaemonReady() {
 		t.Fatalf("CRITICAL: locking Web sessions MUST NOT stop 7x24 background daemon!")
 	}
 	for idx, cl := range []*http.Client{adminClient, adminClient2} {
@@ -213,105 +228,73 @@ func TestNativeDaemonAuthSessionIdleMigrationAndKDF(t *testing.T) {
 		}
 	}
 
-	// 6. Restarting server auto-unlocks in <1ms via .vault.key without requiring admin password!
+	// 6. Restarting server auto-loads secrets.enc via master.key without requiring admin password!
 	ts.Close()
 	srv.Close()
 
-	srvRestarted, tsRestarted := newTestServerInstance(t, dataDir, 8*time.Hour)
-	if !srvRestarted.isDaemonUnlocked() {
-		tsRestarted.Close()
-		srvRestarted.Close()
-		t.Fatalf("expected restarted server to auto-unlock immediately via .vault.key")
-	}
-	tsRestarted.Close()
-	srvRestarted.Close()
+	srvRestarted, tsRestarted := newTestServerInstance(t, dataDir, auth.DefaultSessionTTL)
+	defer tsRestarted.Close()
+	defer srvRestarted.Close()
 
-	// 7. Delete .vault.key to simulate legacy vault.sns upgrade -> enters migration_pending, then auto-migrates on first login!
-	if err := os.Remove(keyPath); err != nil {
-		t.Fatalf("os.Remove(.vault.key): %v", err)
-	}
-	srvLegacy, tsLegacy := newTestServerInstance(t, dataDir, 8*time.Hour)
-	defer tsLegacy.Close()
-	defer srvLegacy.Close()
-
-	if srvLegacy.isDaemonUnlocked() {
-		t.Fatalf("expected daemon to remain locked before migration when .vault.key is absent")
-	}
-	migStatusRes, _ := rawHTTP.Get(tsLegacy.URL + "/api/auth/status")
-	var migStatus struct {
-		DaemonRunning    bool `json:"daemon_running"`
-		MigrationPending bool `json:"migration_pending"`
-	}
-	_ = json.NewDecoder(migStatusRes.Body).Decode(&migStatus)
-	migStatusRes.Body.Close()
-	if migStatus.DaemonRunning || !migStatus.MigrationPending {
-		t.Fatalf("expected migration_pending=true before first login, got %+v", migStatus)
+	if !srvRestarted.isDaemonReady() {
+		t.Fatalf("expected restarted server to auto-boot ready via master.key")
 	}
 
-	migratedClient := newCookieHTTPClient()
-	migLoginRes, err := migratedClient.Post(tsLegacy.URL+"/api/auth/login", "application/json", bytes.NewReader(goodLogin))
-	if err != nil || migLoginRes.StatusCode != http.StatusOK {
-		t.Fatalf("migration login failed: status=%v err=%v", migLoginRes.StatusCode, err)
+	// 7. Admin Password Change: never rotates master.key, never stops daemon, invalidates old password & old sessions
+	reloginClient := newCookieHTTPClient()
+	rlRes, err := reloginClient.Post(tsRestarted.URL+"/api/auth/login", "application/json", bytes.NewReader(goodLogin))
+	if err != nil || rlRes.StatusCode != http.StatusOK {
+		t.Fatalf("login after restart failed: status=%v err=%v", rlRes.StatusCode, err)
 	}
-	var migAfter struct {
-		Status struct {
-			Authenticated     bool `json:"authenticated"`
-			DaemonRunning     bool `json:"daemon_running"`
-			MigrationPending  bool `json:"migration_pending"`
-			AutoUnlockEnabled bool `json:"auto_unlock_enabled"`
-		} `json:"status"`
-	}
-	_ = json.NewDecoder(migLoginRes.Body).Decode(&migAfter)
-	migLoginRes.Body.Close()
-	if !migAfter.Status.Authenticated || !migAfter.Status.DaemonRunning || migAfter.Status.MigrationPending || !migAfter.Status.AutoUnlockEnabled {
-		t.Fatalf("expected seamless .vault.key migration on first login, got %+v", migAfter)
-	}
-	if _, err := os.Stat(keyPath); err != nil {
-		t.Fatalf("expected .vault.key regenerated during migration: %v", err)
-	}
-
-	// 8. Argon2id KDF Profile Tuning (POST /api/vault/kdf) + Admin Password Rotation (POST /api/auth/password)
-	kdfReq, _ := json.Marshal(map[string]any{
-		"password":       adminPass1,
-		"kdf_memory_kib": 32 * 1024,
-		"kdf_time":       2,
-		"kdf_threads":    4,
-	})
-	kdfRes, err := migratedClient.Post(tsLegacy.URL+"/api/vault/kdf", "application/json", bytes.NewReader(kdfReq))
-	if err != nil || kdfRes.StatusCode != http.StatusOK {
-		t.Fatalf("POST /api/vault/kdf failed: status=%v err=%v", kdfRes.StatusCode, err)
-	}
-	var kdfOut struct {
-		Encryption vault.EncryptionInfo `json:"encryption"`
-	}
-	_ = json.NewDecoder(kdfRes.Body).Decode(&kdfOut)
-	kdfRes.Body.Close()
-	if kdfOut.Encryption.KDFMemoryKiB != 32*1024 || kdfOut.Encryption.KDFTime != 2 {
-		t.Fatalf("expected KDF updated to 32768 KiB / t=2, got %+v", kdfOut.Encryption)
-	}
+	rlRes.Body.Close()
 
 	adminPass2 := "RotatedAdminMasterPass!2027"
 	rotReq, _ := json.Marshal(map[string]string{
 		"old_password": adminPass1,
 		"new_password": adminPass2,
 	})
-	rotRes, err := migratedClient.Post(tsLegacy.URL+"/api/auth/password", "application/json", bytes.NewReader(rotReq))
+	rotRes, err := reloginClient.Post(tsRestarted.URL+"/api/auth/password", "application/json", bytes.NewReader(rotReq))
 	if err != nil || rotRes.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/auth/password failed: status=%v err=%v", rotRes.StatusCode, err)
 	}
 	rotRes.Body.Close()
 
+	if !srvRestarted.isDaemonReady() {
+		t.Fatalf("changing admin password MUST NOT lock or interrupt daemon")
+	}
+	masterKeyAfter, err := os.ReadFile(keyPath)
+	if err != nil || !bytes.Equal(masterKeyBefore, masterKeyAfter) {
+		t.Fatalf("changing admin password MUST NOT rotate master.key")
+	}
+
 	// Verify old password fails and new password works!
-	oldTry, _ := rawHTTP.Post(tsLegacy.URL+"/api/auth/login", "application/json", bytes.NewReader(goodLogin))
+	oldTry, _ := rawHTTP.Post(tsRestarted.URL+"/api/auth/login", "application/json", bytes.NewReader(goodLogin))
 	oldTry.Body.Close()
 	if oldTry.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected old password rejected after rotation, got %d", oldTry.StatusCode)
 	}
 	newLoginBody, _ := json.Marshal(map[string]string{"password": adminPass2})
 	newClient := newCookieHTTPClient()
-	newTry, err := newClient.Post(tsLegacy.URL+"/api/auth/login", "application/json", bytes.NewReader(newLoginBody))
+	newTry, err := newClient.Post(tsRestarted.URL+"/api/auth/login", "application/json", bytes.NewReader(newLoginBody))
 	if err != nil || newTry.StatusCode != http.StatusOK {
 		t.Fatalf("expected rotated password login to succeed: status=%v err=%v", newTry.StatusCode, err)
 	}
 	newTry.Body.Close()
+
+	// Verify /api/vault/security reports split storage & encryption info
+	secRes, err := newClient.Get(tsRestarted.URL + "/api/vault/security")
+	if err != nil || secRes.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/vault/security failed: status=%v err=%v", secRes.StatusCode, err)
+	}
+	var secPayload struct {
+		DaemonRunning   bool                   `json:"daemon_running"`
+		SessionTTLHours int                    `json:"session_ttl_hours"`
+		Encryption      vault.EncryptionInfo   `json:"encryption"`
+		Storage         vault.StorageFilesInfo `json:"storage"`
+	}
+	_ = json.NewDecoder(secRes.Body).Decode(&secPayload)
+	secRes.Body.Close()
+	if !secPayload.DaemonRunning || secPayload.SessionTTLHours != 168 || secPayload.Storage.MasterKeyMode != "file" || secPayload.Storage.SecretsSizeBytes == 0 {
+		t.Fatalf("unexpected /api/vault/security payload: %+v", secPayload)
+	}
 }

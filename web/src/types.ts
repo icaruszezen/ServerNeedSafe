@@ -2,36 +2,34 @@ export type VaultStatus = 'uninitialized' | 'locked' | 'unlocked';
 export type AuthType = 'password' | 'private_key' | 'credential';
 export type HostKeyPolicy = 'tofu' | 'ask_new';
 
-export interface VaultAnchor {
-  vault_id: string;
-  min_revision: number;
-  auth_pubkey_sha256: string;
-  min_kdf_memory_kib: number;
-  min_kdf_time: number;
-  updated_at: string;
-}
-
 export interface SyncSummary {
   direction: 'push' | 'pull';
   remote_url: string;
   vault_id: string;
   revision: number;
   bytes: number;
+  include_runtime?: boolean;
+}
+
+export interface StorageFilesInfo {
+  data_dir: string;
+  secrets_path: string;
+  secrets_size_bytes: number;
+  master_key_mode: 'file' | 'env' | string;
+  master_key_path?: string;
+  monitor_size_bytes: number;
+  aiops_size_bytes: number;
+  audit_size_bytes: number;
+  runtime_total_bytes: number;
 }
 
 export interface EncryptionInfo {
   format_version: number;
   vault_id?: string;
   revision?: number;
-  kdf_algo: string;
-  kdf_time: number;
-  kdf_memory_kib: number;
-  kdf_threads: number;
-  wrap_algo: string;
   cipher_algo: string;
-  auth_algo?: string;
-  auth_pubkey_sha256?: string;
-  zero_knowledge?: boolean;
+  password_hash_algo?: string;
+  master_key_mode?: string;
   vault_size_bytes: number;
 }
 
@@ -50,15 +48,13 @@ export interface AuthStatusResponse {
   authenticated: boolean;
   deploy_mode: 'server' | 'desktop';
   daemon_running?: boolean;
-  migration_pending?: boolean;
-  auto_unlock_enabled?: boolean;
-  vault_path?: string;
+  legacy_migration_pending?: boolean;
+  session_ttl_hours?: number;
   encryption: EncryptionInfo;
+  storage?: StorageFilesInfo;
   settings?: AppSettings;
-  anchor?: VaultAnchor;
   patrol_enabled?: boolean;
   active_sessions?: number;
-  active_relays?: number;
   active_ssh_tabs?: number;
 }
 
@@ -222,20 +218,17 @@ export interface AuditEntry {
 
 export interface VaultSecurityOverview {
   deploy_mode: string;
-  vault_path: string;
+  data_dir: string;
+  secrets_path: string;
   daemon_running?: boolean;
-  auto_unlock_enabled?: boolean;
-  /** "env" = wrapped by SNS_MASTER_KEY, "file" = wrapping key stored inside .vault.key, "" = no seal */
-  auto_unlock_mode?: 'env' | 'file' | '';
-  key_seal_path?: string;
+  session_ttl_hours?: number;
   encryption: EncryptionInfo;
+  storage: StorageFilesInfo;
   settings: AppSettings;
   known_hosts: KnownHost[];
   audit_logs: AuditEntry[];
   active_sessions: number;
-  active_relays?: number;
   active_ssh_tabs: number;
-  anchor?: VaultAnchor;
 }
 
 export interface WorkspaceBootstrapResponse {

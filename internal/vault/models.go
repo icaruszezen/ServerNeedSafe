@@ -228,8 +228,132 @@ type AppSettings struct {
 	RemoteSyncURL      string        `json:"remote_sync_url,omitempty"`     // Optional remote zero-knowledge server URL
 }
 
-// VaultState is the root plaintext structure serialized, compressed, padded,
-// and encrypted via XChaCha20-Poly1305 into vault.sns exclusively on the client.
+// LegacyPasswordVerifier preserves password verification compatibility when an existing
+// v2.x vault.sns + .vault.key is auto-migrated unattended on boot before the admin logs in.
+// Once the admin logs in once, it is transparently replaced by AdminPasswordHash.
+type LegacyPasswordVerifier struct {
+	KDFTime       uint32 `json:"kdf_time"`
+	KDFMemoryKiB  uint32 `json:"kdf_memory_kib"`
+	KDFThreads    uint8  `json:"kdf_threads"`
+	KDFSalt       []byte `json:"kdf_salt"`
+	AuthPublicKey []byte `json:"auth_public_key"`
+}
+
+// SecretsState holds ONLY sensitive configuration and credentials encrypted at rest in secrets.enc.
+// High-frequency operational data (monitor snapshots/history/alerts, AI sessions/patrol records,
+// audit logs, server latency/online timestamps) lives in separate non-encrypted runtime files so
+// 7x24 background jobs never trigger secrets re-encryption or lock contention.
+type SecretsState struct {
+	SchemaVersion     int                     `json:"schema_version"`
+	VaultID           string                  `json:"vault_id"`
+	Revision          uint64                  `json:"revision"`
+	AuthVersion       uint64                  `json:"auth_version"`
+	AdminPasswordHash string                  `json:"admin_password_hash,omitempty"`
+	LegacyAuth        *LegacyPasswordVerifier `json:"legacy_auth,omitempty"`
+	CreatedAt         time.Time               `json:"created_at"`
+	UpdatedAt         time.Time               `json:"updated_at"`
+	Groups            []string                `json:"groups"`
+	Servers           []ServerConfig          `json:"servers"`
+	Credentials       []Credential            `json:"credentials"`
+	Snippets          []Snippet               `json:"snippets"`
+	KnownHosts        []KnownHost             `json:"known_hosts"`
+	Settings          AppSettings             `json:"settings"`
+	MonitorSettings   MonitorSettings         `json:"monitor_settings"`
+	MonitorRules      []MonitorAlertRule      `json:"monitor_rules"`
+	AISettings        AISettings              `json:"ai_settings"`
+}
+
+// ServerRuntimeMeta tracks volatile per-server telemetry/connection metadata outside secrets.enc.
+type ServerRuntimeMeta struct {
+	LastConnectedAt *time.Time `json:"last_connected_at,omitempty"`
+	LastLatencyMs   int64      `json:"last_latency_ms,omitempty"`
+	LastOSInfo      string     `json:"last_os_info,omitempty"`
+}
+
+// MonitorRuntimeState is persisted asynchronously to monitor_runtime.json without encryption overhead.
+type MonitorRuntimeState struct {
+	LatestSnapshots       map[string]*ServerMonitorSnapshot `json:"latest_snapshots"`
+	HistoryByServer       map[string][]MonitorSamplePoint   `json:"history_by_server"`
+	Alerts                []MonitorAlert                    `json:"alerts"`
+	BreachStreaks         map[string]int                    `json:"breach_streaks"`
+	PortBaselines         map[string][]string               `json:"port_baselines"`
+	ServerRuntime         map[string]ServerRuntimeMeta      `json:"server_runtime,omitempty"`
+	KnownHostLastVerified map[string]time.Time              `json:"known_host_last_verified,omitempty"`
+}
+
+// AIOpsRuntimeState is persisted asynchronously to aiops_runtime.json without encryption overhead.
+type AIOpsRuntimeState struct {
+	HostMemories    []HostMemory             `json:"host_memories"`
+	AIMemories      []AIMemoryEntry          `json:"ai_memories"`
+	Runbooks        []AIRunbook              `json:"runbooks"`
+	AISessions      []AIChatSession          `json:"ai_sessions"`
+	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines"`
+	PatrolRecords   []PatrolRecord           `json:"patrol_records"`
+}
+
+// AuditRuntimeState is persisted asynchronously to audit_logs.json without encryption overhead.
+type AuditRuntimeState struct {
+	AuditLogs []AuditEntry `json:"audit_logs"`
+}
+
+// CoreConfigSnapshot represents portable core configuration & encrypted credentials for backup/sync.
+type CoreConfigSnapshot struct {
+	VaultID         string             `json:"vault_id,omitempty"`
+	Revision        uint64             `json:"revision,omitempty"`
+	Groups          []string           `json:"groups"`
+	Servers         []ServerConfig     `json:"servers"`
+	Credentials     []Credential       `json:"credentials"`
+	Snippets        []Snippet          `json:"snippets"`
+	KnownHosts      []KnownHost        `json:"known_hosts"`
+	Settings        AppSettings        `json:"settings"`
+	MonitorSettings MonitorSettings    `json:"monitor_settings"`
+	MonitorRules    []MonitorAlertRule `json:"monitor_rules"`
+	AISettings      AISettings         `json:"ai_settings"`
+}
+
+// AIKnowledgeSnapshot carries reusable SRE knowledge (host profiles, long-term memories, runbooks).
+type AIKnowledgeSnapshot struct {
+	HostMemories []HostMemory    `json:"host_memories"`
+	AIMemories   []AIMemoryEntry `json:"ai_memories"`
+	Runbooks     []AIRunbook     `json:"runbooks"`
+}
+
+// RuntimeDataSnapshot carries optional operational history (monitoring, AI chats, patrol, audit).
+type RuntimeDataSnapshot struct {
+	Monitor         *MonitorRuntimeState     `json:"monitor,omitempty"`
+	AISessions      []AIChatSession          `json:"ai_sessions,omitempty"`
+	PatrolBaselines []ServerBaselineSnapshot `json:"patrol_baselines,omitempty"`
+	PatrolRecords   []PatrolRecord           `json:"patrol_records,omitempty"`
+	AuditLogs       []AuditEntry             `json:"audit_logs,omitempty"`
+}
+
+// BackupBundle is the structured payload inside v3 password-encrypted .sns backups and cross-instance sync.
+type BackupBundle struct {
+	SchemaVersion  int                  `json:"schema_version"`
+	IncludeRuntime bool                 `json:"include_runtime"`
+	ExportedAt     time.Time            `json:"exported_at"`
+	Config         CoreConfigSnapshot   `json:"config"`
+	AIKnowledge    AIKnowledgeSnapshot  `json:"ai_knowledge"`
+	Runtime        *RuntimeDataSnapshot `json:"runtime,omitempty"`
+}
+
+// SyncSnapshot aliases BackupBundle for simplified authenticated cross-instance push/pull sync.
+type SyncSnapshot = BackupBundle
+
+// StorageFilesInfo summarizes the split on-disk storage footprint for the Security Center UI.
+type StorageFilesInfo struct {
+	DataDir           string `json:"data_dir"`
+	SecretsPath       string `json:"secrets_path"`
+	SecretsSizeBytes  int64  `json:"secrets_size_bytes"`
+	MasterKeyMode     string `json:"master_key_mode"` // "file" or "env"
+	MasterKeyPath     string `json:"master_key_path,omitempty"`
+	MonitorSizeBytes  int64  `json:"monitor_size_bytes"`
+	AIOpsSizeBytes    int64  `json:"aiops_size_bytes"`
+	AuditSizeBytes    int64  `json:"audit_size_bytes"`
+	RuntimeTotalBytes int64  `json:"runtime_total_bytes"`
+}
+
+// VaultState is kept for legacy v1/v2 .sns container deserialization and migration compatibility.
 type VaultState struct {
 	SchemaVersion   int                      `json:"schema_version"`
 	VaultID         string                   `json:"vault_id,omitempty"`
@@ -257,7 +381,7 @@ type VaultState struct {
 func DefaultVaultState() *VaultState {
 	now := time.Now().UTC()
 	return &VaultState{
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 		Revision:      1,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -310,7 +434,7 @@ func DefaultVaultState() *VaultState {
 		KnownHosts: []KnownHost{},
 		AuditLogs:  []AuditEntry{},
 		Settings: AppSettings{
-			AutoLockMinutes:    30,
+			AutoLockMinutes:    0, // Default disabled for intranet/trusted-host deployment (bounded by 7d session TTL)
 			HostKeyPolicy:      HostKeyTOFU,
 			TerminalFontSize:   14,
 			TerminalScrollback: 5000,
@@ -332,3 +456,54 @@ func DefaultVaultState() *VaultState {
 		PatrolRecords:   []PatrolRecord{},
 	}
 }
+
+func DefaultMonitorRuntimeState() *MonitorRuntimeState {
+	return &MonitorRuntimeState{
+		LatestSnapshots:       make(map[string]*ServerMonitorSnapshot),
+		HistoryByServer:       make(map[string][]MonitorSamplePoint),
+		Alerts:                []MonitorAlert{},
+		BreachStreaks:         make(map[string]int),
+		PortBaselines:         make(map[string][]string),
+		ServerRuntime:         make(map[string]ServerRuntimeMeta),
+		KnownHostLastVerified: make(map[string]time.Time),
+	}
+}
+
+func DefaultAIOpsRuntimeState(now time.Time) *AIOpsRuntimeState {
+	return &AIOpsRuntimeState{
+		HostMemories:    []HostMemory{},
+		AIMemories:      []AIMemoryEntry{},
+		Runbooks:        DefaultStarterRunbooks(now),
+		AISessions:      []AIChatSession{},
+		PatrolBaselines: []ServerBaselineSnapshot{},
+		PatrolRecords:   []PatrolRecord{},
+	}
+}
+
+func DefaultAuditRuntimeState() *AuditRuntimeState {
+	return &AuditRuntimeState{
+		AuditLogs: []AuditEntry{},
+	}
+}
+
+func DefaultSecretsState(vaultID string) *SecretsState {
+	def := DefaultVaultState()
+	return &SecretsState{
+		SchemaVersion:   3,
+		VaultID:         vaultID,
+		Revision:        1,
+		AuthVersion:     1,
+		CreatedAt:       def.CreatedAt,
+		UpdatedAt:       def.UpdatedAt,
+		Groups:          def.Groups,
+		Servers:         def.Servers,
+		Credentials:     def.Credentials,
+		Snippets:        def.Snippets,
+		KnownHosts:      def.KnownHosts,
+		Settings:        def.Settings,
+		MonitorSettings: def.Monitor.Settings,
+		MonitorRules:    def.Monitor.Rules,
+		AISettings:      def.AISettings,
+	}
+}
+

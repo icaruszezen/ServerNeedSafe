@@ -471,7 +471,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
             )}
           </div>
           <p>
-            已加密存储 <strong className="tabular">{kpi?.total_samples || 0}</strong> 个全维时序样本点
+            已持久化 <strong className="tabular">{kpi?.total_samples || 0}</strong> 个全维时序样本点
             {activeRuntime?.last_sweep_at
               ? ` · 最近巡检 ${formatTimeShort(activeRuntime.last_sweep_at)}`
               : ''}
@@ -564,7 +564,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
         </div>
 
         <div className="mon-encryption-note">
-          <Lock size={12} /> 监控快照与历史曲线 100% 封装于 vault.sns 零知识加密区
+          <Lock size={12} /> 监控数据独立落盘至 monitor_runtime.json · 与凭据加密解耦
         </div>
       </div>
 
@@ -576,7 +576,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
             </div>
             <h3>尚未添加需要监控的服务器</h3>
             <p>
-              请先在「主机资产」中添加至少一台 SSH 服务器。添加后监控引擎将自动按设定周期巡检并加密记录各项指标与趋势曲线。
+              请先在「主机资产」中添加至少一台 SSH 服务器。添加后后台守护引擎将按设定周期自动 7×24 采集并持久化各项指标与趋势曲线。
             </p>
             <button type="button" className="btn btn-primary" onClick={onNavigateServers}>
               <Server size={14} /> 前往添加服务器
@@ -793,7 +793,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                 </div>
 
                 {loadingOverview && !overview ? (
-                  <div className="empty-state">正在读取零知识加密监控状态...</div>
+                  <div className="empty-state">正在加载监控运行状态...</div>
                 ) : filteredNodes.length === 0 ? (
                   <div className="empty-state" style={{ padding: '40px 20px' }}>
                     <h3>当前筛选条件下没有匹配的节点</h3>
@@ -2547,24 +2547,23 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                         </div>
                       </label>
 
-                      <label className="mon-check-row">
-                        <input
-                          type="checkbox"
-                          checked={policySettings.unattended_while_unlocked}
-                          onChange={(e) =>
-                            setPolicySettings({
-                              ...policySettings,
-                              unattended_while_unlocked: e.target.checked,
-                            })
-                          }
-                        />
+                      <div
+                        className="mon-check-row"
+                        style={{
+                          background: 'var(--accent-teal-soft)',
+                          borderColor: 'var(--accent-teal-border)',
+                          cursor: 'default',
+                        }}
+                      >
                         <div>
-                          <strong>Web 会话空闲超时后保持后台无人值守定时记录</strong>
+                          <strong style={{ color: 'var(--accent-teal)' }}>
+                            7×24 全天候后台独立采集（与 Web 会话及加密解耦）
+                          </strong>
                           <p>
-                            空闲超时将注销浏览器会话（重新访问需验证主密码），但后台守护协程继续定时采集；点击「立即锁定」则彻底擦除密钥停止采集
+                            监控时序、告警与基线已独立持久化至非加密运行态文件，无论浏览器关闭、Web 会话过期或修改管理员密码，后台采集均持续运行且不触发凭据重加密。
                           </p>
                         </div>
-                      </label>
+                      </div>
                     </div>
 
                     <div

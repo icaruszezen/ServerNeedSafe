@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> [1/4] 编译轻量前端静态资源 (Vite + SHA-384 SRI)..."
+echo "==> [1/4] 编译轻量前端静态资源 (Vite)..."
 (cd web && npm run build)
 
 mkdir -p dist

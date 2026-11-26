@@ -9,60 +9,71 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
+	"strings"
+	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	vaultMagic                = "SNSVAULT"
-	vaultFormatVersionV1      = uint16(1)
-	vaultFormatVersion        = uint16(2)
-	DefaultKDFTime            = uint32(3)
-	DefaultKDFMemoryKiB       = uint32(64 * 1024) // 64 MiB Argon2id memory-hard cost
-	DefaultKDFThreads         = uint8(4)
-	MinAllowedKDFMemoryKiB    = uint32(16 * 1024) // 16 MiB strict floor to block server KDF downgrade attacks
-	// Hard ceilings for Argon2id cost parameters. KDF parameters are read from untrusted inputs
-	// (uploaded .sns backups, remote /api/auth/challenge responses, on-disk headers), so without an
-	// upper bound a crafted header such as kdf_memory_kib=4294967295 would make argon2.IDKey try to
-	// allocate terabytes of RAM and crash the 7x24 daemon (unauthenticated OOM DoS on import).
+	secretsMagic = "SNSSEC01"
+
+	vaultMagic            = "SNSVAULT"
+	vaultFormatVersionV1  = uint16(1)
+	vaultFormatVersionV2  = uint16(2)
+	backupFormatVersionV3 = uint16(3)
+
+	// Lightweight fixed Argon2id parameters (~10ms native Go, low memory, zero queueing).
+	PasswordHashTime      = uint32(2)
+	PasswordHashMemoryKiB = uint32(16 * 1024) // 16 MiB
+	PasswordHashThreads   = uint8(2)
+
+	BackupKDFTime      = uint32(2)
+	BackupKDFMemoryKiB = uint32(16 * 1024) // 16 MiB
+	BackupKDFThreads   = uint8(2)
+
+	// Upper bounds when importing external backup headers to prevent accidental OOM from corrupted files.
 	MaxAllowedKDFMemoryKiB = uint32(1024 * 1024) // 1 GiB
 	MaxAllowedKDFTime      = uint32(32)
 	MaxAllowedKDFThreads   = uint8(64)
-	kdfSaltSize               = 32
-	dekSize                   = 32
-	paddingBlockSize          = 4096
-	maxHeaderBytes            = 64 * 1024
-	maxVaultBlobBytes         = 64 * 1024 * 1024
+
+	kdfSaltSize       = 32
+	dekSize           = 32
+	maxHeaderBytes    = 64 * 1024
+	maxVaultBlobBytes = 128 * 1024 * 1024
 )
 
 var (
-	ErrInvalidPassword   = errors.New("管理员密码错误或加密容器认证失败")
-	ErrCorruptedVault    = errors.New("加密数据文件格式损坏或遭到篡改")
-	ErrVaultLocked       = errors.New("应用加密保险库处于锁定状态，请先验证管理员密码")
-	ErrVaultNotInit      = errors.New("尚未初始化管理员密码与加密保险库")
-	ErrVaultAlreadyInit  = errors.New("加密保险库已初始化")
-	ErrWeakPassword      = errors.New("管理员密码长度至少需要 8 位字符")
-	ErrRevisionConflict  = errors.New("加密保险库版本冲突，检测到并发修改")
-	ErrRollbackDetected  = errors.New("安全警报：检测到服务端加密数据包版本回滚或替换篡改")
-	ErrInvalidSignature  = errors.New("零知识密码学签名验证失败")
-	ErrKDFDowngrade      = errors.New("安全警报：服务端返回的密钥派生参数低于安全下限，已阻断降级攻击")
+	ErrInvalidPassword  = errors.New("管理员密码错误或加密文件认证失败")
+	ErrCorruptedVault   = errors.New("加密数据文件格式损坏或遭到篡改")
+	ErrVaultLocked      = errors.New("检测到旧版加密容器待迁移，请先验证一次原管理员密码完成自动升级")
+	ErrVaultNotInit     = errors.New("尚未初始化管理员密码与敏感资产加密库")
+	ErrVaultAlreadyInit = errors.New("系统已初始化管理员密码")
+	ErrWeakPassword     = errors.New("密码长度至少需要 8 位字符")
 )
 
-// EnvelopeHeader contains ONLY public cryptographic key-derivation, zero-knowledge Ed25519
-// verification public key, anti-rollback revision, and AEAD nonce parameters.
-// Zero application metadata, server IPs, usernames, or user secrets exist in this header.
-type EnvelopeHeader struct {
+// EncryptionInfo exposes clean read-only cryptographic metadata for the Security Center UI.
+type EncryptionInfo struct {
+	FormatVersion    int    `json:"format_version"`
+	VaultID          string `json:"vault_id,omitempty"`
+	Revision         uint64 `json:"revision,omitempty"`
+	CipherAlgo       string `json:"cipher_algo"`
+	PasswordHashAlgo string `json:"password_hash_algo"`
+	MasterKeyMode    string `json:"master_key_mode,omitempty"`
+	VaultSizeBytes   int64  `json:"vault_size_bytes"`
+}
+
+// LegacyEnvelopeHeader is retained ONLY for reading legacy v1/v2 .sns backups and auto-migrating v2.x vault.sns.
+type LegacyEnvelopeHeader struct {
 	VaultID         string `json:"vault_id"`
 	Revision        uint64 `json:"revision"`
 	KDFAlgo         string `json:"kdf_algo"`
@@ -79,35 +90,18 @@ type EnvelopeHeader struct {
 	PayloadNonce    []byte `json:"payload_nonce"`
 }
 
-// PublicKDFParams contains ONLY the non-oracle KDF salt and cost parameters needed by a client
-// to derive its zero-knowledge Ed25519 authentication key during login challenge-response.
-// Notice AuthPublicKey and WrappedDEK are intentionally omitted so unauthenticated network callers
-// obtain zero offline password-verification oracle.
-type PublicKDFParams struct {
-	VaultID      string `json:"vault_id"`
-	Revision     uint64 `json:"revision"`
-	KDFAlgo      string `json:"kdf_algo"`
-	KDFTime      uint32 `json:"kdf_time"`
-	KDFMemoryKiB uint32 `json:"kdf_memory_kib"`
-	KDFThreads   uint8  `json:"kdf_threads"`
-	KDFSalt      []byte `json:"kdf_salt"`
-}
-
-// EncryptionInfo exposes safe read-only cryptographic parameters for the Security Center UI.
-type EncryptionInfo struct {
-	FormatVersion     int    `json:"format_version"`
-	VaultID           string `json:"vault_id,omitempty"`
-	Revision          uint64 `json:"revision,omitempty"`
-	KDFAlgo           string `json:"kdf_algo"`
-	KDFTime           uint32 `json:"kdf_time"`
-	KDFMemoryKiB      uint32 `json:"kdf_memory_kib"`
-	KDFThreads        uint8  `json:"kdf_threads"`
-	WrapAlgo          string `json:"wrap_algo"`
-	CipherAlgo        string `json:"cipher_algo"`
-	AuthAlgo          string `json:"auth_algo"`
-	AuthPubKeySHA256  string `json:"auth_pubkey_sha256,omitempty"`
-	VaultSizeBytes    int64  `json:"vault_size_bytes"`
-	ZeroKnowledge     bool   `json:"zero_knowledge"`
+// BackupHeaderV3 is the authenticated JSON header for portable password-encrypted .sns v3 backups.
+type BackupHeaderV3 struct {
+	VaultID        string    `json:"vault_id"`
+	IncludeRuntime bool      `json:"include_runtime"`
+	CreatedAt      time.Time `json:"created_at"`
+	KDFAlgo        string    `json:"kdf_algo"`
+	KDFTime        uint32    `json:"kdf_time"`
+	KDFMemoryKiB   uint32    `json:"kdf_memory_kib"`
+	KDFThreads     uint8     `json:"kdf_threads"`
+	KDFSalt        []byte    `json:"kdf_salt"`
+	CipherAlgo     string    `json:"cipher_algo"`
+	PayloadNonce   []byte    `json:"payload_nonce"`
 }
 
 // ZeroBytes overwrites a byte slice in memory with zeros.
@@ -129,11 +123,6 @@ func randomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
 func hkdfDerive32(secret, salt []byte, info string) ([]byte, error) {
 	r := hkdf.New(sha256.New, secret, salt, []byte(info))
 	out := make([]byte, 32)
@@ -144,77 +133,364 @@ func hkdfDerive32(secret, salt []byte, info string) ([]byte, error) {
 	return out, nil
 }
 
-// DeriveVaultKeys runs memory-hard Argon2id followed by domain-separated HKDF-SHA256
-// to produce two cryptographically independent keys:
-//  1. kek (32B): wraps/unwraps the random 256-bit DEK exclusively on the client.
-//  2. authPriv / authPub (Ed25519): proves admin password knowledge via zero-knowledge signatures
-//     without ever revealing password, master secret, kek, or dek to the server.
-func DeriveVaultKeys(
-	password string,
-	salt []byte,
-	kdfTime uint32,
-	kdfMemoryKiB uint32,
-	kdfThreads uint8,
-	minMemoryKiB uint32,
-) (kek []byte, authPriv ed25519.PrivateKey, authPub ed25519.PublicKey, err error) {
-	if minMemoryKiB == 0 {
-		minMemoryKiB = MinAllowedKDFMemoryKiB
-	}
-	if len(salt) < kdfSaltSize || kdfTime < 1 || kdfThreads < 1 {
-		return nil, nil, nil, ErrCorruptedVault
-	}
-	if kdfMemoryKiB < minMemoryKiB {
-		return nil, nil, nil, ErrKDFDowngrade
-	}
-	if err := checkKDFCeiling(kdfTime, kdfMemoryKiB, kdfThreads); err != nil {
-		return nil, nil, nil, err
-	}
-
-	pwBytes := []byte(password)
-	master := argon2.IDKey(pwBytes, salt, kdfTime, kdfMemoryKiB, kdfThreads, dekSize)
-	zeroBytes(pwBytes)
-	defer zeroBytes(master)
-
-	kek, err = hkdfDerive32(master, salt, "SNSVAULT-v2-KEK")
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	authSeed, err := hkdfDerive32(master, salt, "SNSVAULT-v2-AUTH-ED25519")
-	if err != nil {
-		zeroBytes(kek)
-		return nil, nil, nil, err
-	}
-	defer zeroBytes(authSeed)
-
-	authPriv = ed25519.NewKeyFromSeed(authSeed)
-	authPub = slices.Clone(authPriv.Public().(ed25519.PublicKey))
-	return kek, authPriv, authPub, nil
+func constantTimeEqual(a, b []byte) bool {
+	return len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1
 }
 
-// checkKDFCeiling rejects Argon2id parameters above the hard safety ceilings (anti-OOM DoS).
 func checkKDFCeiling(kdfTime, kdfMemoryKiB uint32, kdfThreads uint8) error {
-	if kdfTime > MaxAllowedKDFTime || kdfMemoryKiB > MaxAllowedKDFMemoryKiB || kdfThreads > MaxAllowedKDFThreads {
-		return fmt.Errorf("%w: Argon2id 参数超出安全上限（内存 ≤ %d MiB / 轮数 ≤ %d / 并行度 ≤ %d）",
-			ErrCorruptedVault, MaxAllowedKDFMemoryKiB/1024, MaxAllowedKDFTime, MaxAllowedKDFThreads)
+	if kdfTime < 1 || kdfMemoryKiB < 1024 || kdfThreads < 1 ||
+		kdfTime > MaxAllowedKDFTime || kdfMemoryKiB > MaxAllowedKDFMemoryKiB || kdfThreads > MaxAllowedKDFThreads {
+		return fmt.Errorf("%w: Argon2id 参数超出合理范围", ErrCorruptedVault)
 	}
 	return nil
 }
 
-// legacy v1 KEK derivation for seamless v1 backup import & upgrade
-func deriveLegacyV1KEK(password string, h *EnvelopeHeader) ([]byte, error) {
-	if h.KDFAlgo != "argon2id" || len(h.KDFSalt) < 16 || h.KDFTime < 1 || h.KDFMemoryKiB < 8192 || h.KDFThreads < 1 {
+// --- Lightweight Admin Login Password Hashing (decoupled from data encryption) ---
+
+// HashAdminPassword creates a PHC-formatted lightweight Argon2id password hash.
+func HashAdminPassword(password string) (string, error) {
+	if len([]rune(password)) < 8 {
+		return "", ErrWeakPassword
+	}
+	salt, err := randomBytes(16)
+	if err != nil {
+		return "", err
+	}
+	pwBytes := []byte(password)
+	hash := argon2.IDKey(pwBytes, salt, PasswordHashTime, PasswordHashMemoryKiB, PasswordHashThreads, 32)
+	zeroBytes(pwBytes)
+	defer zeroBytes(hash)
+
+	return fmt.Sprintf(
+		"$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
+		PasswordHashMemoryKiB,
+		PasswordHashTime,
+		PasswordHashThreads,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(hash),
+	), nil
+}
+
+// VerifyAdminPassword verifies a plaintext password against a PHC Argon2id hash in constant time.
+func VerifyAdminPassword(password, encoded string) bool {
+	if password == "" || encoded == "" {
+		return false
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[1] != "argon2id" {
+		return false
+	}
+	var mem, timeCost uint32
+	var threads uint8
+	for _, kv := range strings.Split(parts[3], ",") {
+		pair := strings.SplitN(kv, "=", 2)
+		if len(pair) != 2 {
+			return false
+		}
+		v, err := strconv.ParseUint(pair[1], 10, 32)
+		if err != nil {
+			return false
+		}
+		switch pair[0] {
+		case "m":
+			mem = uint32(v)
+		case "t":
+			timeCost = uint32(v)
+		case "p":
+			threads = uint8(v)
+		}
+	}
+	if checkKDFCeiling(timeCost, mem, threads) != nil {
+		return false
+	}
+	salt, err1 := base64.RawStdEncoding.DecodeString(parts[4])
+	expectedHash, err2 := base64.RawStdEncoding.DecodeString(parts[5])
+	if err1 != nil || err2 != nil || len(salt) < 8 || len(expectedHash) < 16 {
+		return false
+	}
+
+	pwBytes := []byte(password)
+	derived := argon2.IDKey(pwBytes, salt, timeCost, mem, threads, uint32(len(expectedHash)))
+	zeroBytes(pwBytes)
+	defer zeroBytes(derived)
+	return constantTimeEqual(derived, expectedHash)
+}
+
+// VerifyLegacyAuth verifies a password against a migrated v2.x vault's Ed25519 derived public key.
+func VerifyLegacyAuth(password string, legacy *LegacyPasswordVerifier) bool {
+	if password == "" || legacy == nil || len(legacy.KDFSalt) < 16 || len(legacy.AuthPublicKey) != ed25519.PublicKeySize {
+		return false
+	}
+	if checkKDFCeiling(legacy.KDFTime, legacy.KDFMemoryKiB, legacy.KDFThreads) != nil {
+		return false
+	}
+	pwBytes := []byte(password)
+	master := argon2.IDKey(pwBytes, legacy.KDFSalt, legacy.KDFTime, legacy.KDFMemoryKiB, legacy.KDFThreads, dekSize)
+	zeroBytes(pwBytes)
+	defer zeroBytes(master)
+
+	authSeed, err := hkdfDerive32(master, legacy.KDFSalt, "SNSVAULT-v2-AUTH-ED25519")
+	if err != nil {
+		return false
+	}
+	defer zeroBytes(authSeed)
+
+	authPriv := ed25519.NewKeyFromSeed(authSeed)
+	defer zeroBytes(authPriv)
+	authPub := authPriv.Public().(ed25519.PublicKey)
+	return constantTimeEqual(authPub, legacy.AuthPublicKey)
+}
+
+// --- Secrets File Encryption (secrets.enc: gzip + XChaCha20-Poly1305, zero padding overhead) ---
+
+func gzipJSON(v any) ([]byte, error) {
+	rawJSON, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	defer zeroBytes(rawJSON)
+
+	var gzBuf bytes.Buffer
+	gzW, err := gzip.NewWriterLevel(&gzBuf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := gzW.Write(rawJSON); err != nil {
+		_ = gzW.Close()
+		return nil, err
+	}
+	if err := gzW.Close(); err != nil {
+		return nil, err
+	}
+	return gzBuf.Bytes(), nil
+}
+
+func gunzipJSON(comp []byte, dst any) error {
+	gzR, err := gzip.NewReader(bytes.NewReader(comp))
+	if err != nil {
+		return ErrCorruptedVault
+	}
+	defer gzR.Close()
+
+	rawJSON, err := io.ReadAll(io.LimitReader(gzR, 256*1024*1024))
+	if err != nil {
+		return ErrCorruptedVault
+	}
+	defer zeroBytes(rawJSON)
+
+	if err := json.Unmarshal(rawJSON, dst); err != nil {
+		return ErrCorruptedVault
+	}
+	return nil
+}
+
+// SealSecretsBytes encrypts SecretsState with XChaCha20-Poly1305 under the local master key.
+// Binary layout: magic("SNSSEC01", 8B) + nonce(24B) + ciphertext(AEAD, AAD=magic).
+func SealSecretsBytes(masterKey []byte, secrets *SecretsState) ([]byte, error) {
+	if len(masterKey) != dekSize {
+		return nil, errors.New("invalid master key length")
+	}
+	compressed, err := gzipJSON(secrets)
+	if err != nil {
+		return nil, err
+	}
+	defer zeroBytes(compressed)
+
+	aead, err := chacha20poly1305.NewX(masterKey)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := randomBytes(aead.NonceSize())
+	if err != nil {
+		return nil, err
+	}
+	ct := aead.Seal(nil, nonce, compressed, []byte(secretsMagic))
+
+	out := make([]byte, len(secretsMagic)+len(nonce)+len(ct))
+	copy(out[0:8], secretsMagic)
+	copy(out[8:8+len(nonce)], nonce)
+	copy(out[8+len(nonce):], ct)
+	return out, nil
+}
+
+// OpenSecretsBytes authenticates and decrypts secrets.enc using the local master key.
+func OpenSecretsBytes(masterKey []byte, raw []byte) (*SecretsState, error) {
+	minLen := len(secretsMagic) + chacha20poly1305.NonceSizeX + chacha20poly1305.Overhead
+	if len(masterKey) != dekSize || len(raw) < minLen || len(raw) > maxVaultBlobBytes {
 		return nil, ErrCorruptedVault
 	}
-	if err := checkKDFCeiling(h.KDFTime, h.KDFMemoryKiB, h.KDFThreads); err != nil {
+	if string(raw[0:8]) != secretsMagic {
+		return nil, ErrCorruptedVault
+	}
+	aead, err := chacha20poly1305.NewX(masterKey)
+	if err != nil {
+		return nil, ErrCorruptedVault
+	}
+	nonce := raw[8 : 8+chacha20poly1305.NonceSizeX]
+	ct := raw[8+chacha20poly1305.NonceSizeX:]
+	plain, err := aead.Open(nil, nonce, ct, []byte(secretsMagic))
+	if err != nil {
+		return nil, ErrCorruptedVault
+	}
+	defer zeroBytes(plain)
+
+	var st SecretsState
+	if err := gunzipJSON(plain, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// --- Portable Password-Encrypted Backup Format (SNSVAULT v3) + Legacy v1/v2 Import ---
+
+// SealBackupContainer encrypts a portable BackupBundle with a user-chosen backup passphrase.
+func SealBackupContainer(password string, bundle *BackupBundle) ([]byte, error) {
+	if len([]rune(password)) < 8 {
+		return nil, ErrWeakPassword
+	}
+	salt, err := randomBytes(kdfSaltSize)
+	if err != nil {
 		return nil, err
 	}
 	pwBytes := []byte(password)
-	defer zeroBytes(pwBytes)
-	return argon2.IDKey(pwBytes, h.KDFSalt, h.KDFTime, h.KDFMemoryKiB, h.KDFThreads, dekSize), nil
+	key := argon2.IDKey(pwBytes, salt, BackupKDFTime, BackupKDFMemoryKiB, BackupKDFThreads, dekSize)
+	zeroBytes(pwBytes)
+	defer zeroBytes(key)
+
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := randomBytes(aead.NonceSize())
+	if err != nil {
+		return nil, err
+	}
+
+	hdr := BackupHeaderV3{
+		VaultID:        bundle.Config.VaultID,
+		IncludeRuntime: bundle.IncludeRuntime,
+		CreatedAt:      bundle.ExportedAt,
+		KDFAlgo:        "argon2id",
+		KDFTime:        BackupKDFTime,
+		KDFMemoryKiB:   BackupKDFMemoryKiB,
+		KDFThreads:     BackupKDFThreads,
+		KDFSalt:        salt,
+		CipherAlgo:     "xchacha20-poly1305",
+		PayloadNonce:   nonce,
+	}
+	hdrBytes, err := json.Marshal(&hdr)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := make([]byte, len(vaultMagic)+2+4+len(hdrBytes))
+	copy(prefix[0:8], vaultMagic)
+	binary.BigEndian.PutUint16(prefix[8:10], backupFormatVersionV3)
+	binary.BigEndian.PutUint32(prefix[10:14], uint32(len(hdrBytes)))
+	copy(prefix[14:], hdrBytes)
+
+	compressed, err := gzipJSON(bundle)
+	if err != nil {
+		return nil, err
+	}
+	defer zeroBytes(compressed)
+
+	ct := aead.Seal(nil, nonce, compressed, prefix)
+	out := make([]byte, len(prefix)+len(ct))
+	copy(out, prefix)
+	copy(out[len(prefix):], ct)
+	return out, nil
 }
 
-func dekWrapAADV2(h *EnvelopeHeader) []byte {
+// OpenBackupContainer decrypts a .sns backup file (supports new v3 backups as well as legacy v1/v2 vaults).
+func OpenBackupContainer(raw []byte, password string) (*BackupBundle, int, error) {
+	if password == "" {
+		return nil, 0, ErrInvalidPassword
+	}
+	minLen := len(vaultMagic) + 2 + 4 + 2 + chacha20poly1305.Overhead
+	if len(raw) < minLen || len(raw) > maxVaultBlobBytes || string(raw[0:8]) != vaultMagic {
+		return nil, 0, ErrCorruptedVault
+	}
+	ver := binary.BigEndian.Uint16(raw[8:10])
+	switch ver {
+	case backupFormatVersionV3:
+		hdrLen := int(binary.BigEndian.Uint32(raw[10:14]))
+		if hdrLen <= 0 || hdrLen > maxHeaderBytes || 14+hdrLen >= len(raw) {
+			return nil, 0, ErrCorruptedVault
+		}
+		prefix := raw[:14+hdrLen]
+		ct := raw[14+hdrLen:]
+		var hdr BackupHeaderV3
+		if err := json.Unmarshal(raw[14:14+hdrLen], &hdr); err != nil {
+			return nil, 0, ErrCorruptedVault
+		}
+		if hdr.KDFAlgo != "argon2id" || len(hdr.KDFSalt) < 16 || hdr.CipherAlgo != "xchacha20-poly1305" {
+			return nil, 0, ErrCorruptedVault
+		}
+		if err := checkKDFCeiling(hdr.KDFTime, hdr.KDFMemoryKiB, hdr.KDFThreads); err != nil {
+			return nil, 0, err
+		}
+		pwBytes := []byte(password)
+		key := argon2.IDKey(pwBytes, hdr.KDFSalt, hdr.KDFTime, hdr.KDFMemoryKiB, hdr.KDFThreads, dekSize)
+		zeroBytes(pwBytes)
+		defer zeroBytes(key)
+
+		aead, err := chacha20poly1305.NewX(key)
+		if err != nil || len(hdr.PayloadNonce) != aead.NonceSize() {
+			return nil, 0, ErrCorruptedVault
+		}
+		plain, err := aead.Open(nil, hdr.PayloadNonce, ct, prefix)
+		if err != nil {
+			return nil, 0, ErrInvalidPassword
+		}
+		defer zeroBytes(plain)
+
+		var bundle BackupBundle
+		if err := gunzipJSON(plain, &bundle); err != nil {
+			return nil, 0, err
+		}
+		return &bundle, int(ver), nil
+
+	case vaultFormatVersionV2, vaultFormatVersionV1:
+		_, st, _, err := OpenLegacyVaultContainer(raw, password)
+		if err != nil {
+			return nil, 0, err
+		}
+		return legacyVaultStateToBackupBundle(st), int(ver), nil
+
+	default:
+		return nil, 0, fmt.Errorf("%w: unsupported version %d", ErrCorruptedVault, ver)
+	}
+}
+
+// --- Legacy v1 / v2 SNSVAULT Reader (Migration & Old Backup Import Compatibility) ---
+
+func parseLegacyContainer(raw []byte) (ver uint16, prefix []byte, hdr *LegacyEnvelopeHeader, ciphertext []byte, err error) {
+	minLen := len(vaultMagic) + 2 + 4 + 2 + chacha20poly1305.Overhead
+	if len(raw) < minLen || len(raw) > maxVaultBlobBytes || string(raw[0:8]) != vaultMagic {
+		return 0, nil, nil, nil, ErrCorruptedVault
+	}
+	ver = binary.BigEndian.Uint16(raw[8:10])
+	if ver != vaultFormatVersionV2 && ver != vaultFormatVersionV1 {
+		return 0, nil, nil, nil, fmt.Errorf("%w: unsupported legacy version %d", ErrCorruptedVault, ver)
+	}
+	hdrLen := int(binary.BigEndian.Uint32(raw[10:14]))
+	if hdrLen <= 0 || hdrLen > maxHeaderBytes || 14+hdrLen >= len(raw) {
+		return 0, nil, nil, nil, ErrCorruptedVault
+	}
+	prefix = raw[:14+hdrLen]
+	ciphertext = raw[14+hdrLen:]
+	if len(ciphertext) <= chacha20poly1305.Overhead {
+		return 0, nil, nil, nil, ErrCorruptedVault
+	}
+	var parsed LegacyEnvelopeHeader
+	if err := json.Unmarshal(raw[14:14+hdrLen], &parsed); err != nil {
+		return 0, nil, nil, nil, ErrCorruptedVault
+	}
+	return ver, prefix, &parsed, ciphertext, nil
+}
+
+func legacyDekWrapAADV2(h *LegacyEnvelopeHeader) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("SNSVAULT-v2-DEK-WRAP:")
 	buf.WriteString(h.VaultID)
@@ -229,7 +505,7 @@ func dekWrapAADV2(h *EnvelopeHeader) []byte {
 	return buf.Bytes()
 }
 
-func dekWrapAADV1(h *EnvelopeHeader) []byte {
+func legacyDekWrapAADV1(h *LegacyEnvelopeHeader) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("SNSVAULT-v1-DEK-WRAP:")
 	buf.WriteString(h.KDFAlgo)
@@ -240,142 +516,7 @@ func dekWrapAADV1(h *EnvelopeHeader) []byte {
 	return buf.Bytes()
 }
 
-func wrapDEKV2(kek, dek []byte, h *EnvelopeHeader) error {
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-	nonce, err := randomBytes(gcm.NonceSize())
-	if err != nil {
-		return err
-	}
-	h.WrapAlgo = "aes-256-gcm"
-	h.WrappedDEKNonce = nonce
-	h.WrappedDEK = gcm.Seal(nil, nonce, dek, dekWrapAADV2(h))
-	return nil
-}
-
-func unwrapDEKV2(password string, h *EnvelopeHeader, minMemoryKiB uint32) ([]byte, ed25519.PrivateKey, error) {
-	if h.WrapAlgo != "aes-256-gcm" || h.KDFAlgo != "argon2id" || h.AuthAlgo != "ed25519" || len(h.AuthPublicKey) != ed25519.PublicKeySize {
-		return nil, nil, ErrCorruptedVault
-	}
-	kek, authPriv, authPub, err := DeriveVaultKeys(password, h.KDFSalt, h.KDFTime, h.KDFMemoryKiB, h.KDFThreads, minMemoryKiB)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer zeroBytes(kek)
-
-	if !constantTimeEqual(authPub, h.AuthPublicKey) {
-		zeroBytes(authPriv)
-		return nil, nil, ErrInvalidPassword
-	}
-
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		zeroBytes(authPriv)
-		return nil, nil, ErrCorruptedVault
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		zeroBytes(authPriv)
-		return nil, nil, ErrCorruptedVault
-	}
-	if len(h.WrappedDEKNonce) != gcm.NonceSize() {
-		zeroBytes(authPriv)
-		return nil, nil, ErrCorruptedVault
-	}
-	dek, err := gcm.Open(nil, h.WrappedDEKNonce, h.WrappedDEK, dekWrapAADV2(h))
-	if err != nil {
-		zeroBytes(authPriv)
-		return nil, nil, ErrInvalidPassword
-	}
-	if len(dek) != dekSize {
-		zeroBytes(dek)
-		zeroBytes(authPriv)
-		return nil, nil, ErrCorruptedVault
-	}
-	return dek, authPriv, nil
-}
-
-func unwrapDEKV1(password string, h *EnvelopeHeader) ([]byte, error) {
-	if h.WrapAlgo != "aes-256-gcm" {
-		return nil, ErrCorruptedVault
-	}
-	kek, err := deriveLegacyV1KEK(password, h)
-	if err != nil {
-		return nil, err
-	}
-	defer zeroBytes(kek)
-
-	block, err := aes.NewCipher(kek)
-	if err != nil {
-		return nil, ErrCorruptedVault
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, ErrCorruptedVault
-	}
-	if len(h.WrappedDEKNonce) != gcm.NonceSize() {
-		return nil, ErrCorruptedVault
-	}
-	dek, err := gcm.Open(nil, h.WrappedDEKNonce, h.WrappedDEK, dekWrapAADV1(h))
-	if err != nil {
-		return nil, ErrInvalidPassword
-	}
-	if len(dek) != dekSize {
-		zeroBytes(dek)
-		return nil, ErrCorruptedVault
-	}
-	return dek, nil
-}
-
-// packPlaintext compresses JSON state and pads it to 4 KiB blocks with CSPRNG bytes
-// to eliminate exact-size side-channel leakage on disk and over HTTP transfers.
-func packPlaintext(state *VaultState) ([]byte, error) {
-	rawJSON, err := json.Marshal(state)
-	if err != nil {
-		return nil, err
-	}
-	defer zeroBytes(rawJSON)
-
-	var gzBuf bytes.Buffer
-	gzWriter, err := gzip.NewWriterLevel(&gzBuf, gzip.BestSpeed)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := gzWriter.Write(rawJSON); err != nil {
-		_ = gzWriter.Close()
-		return nil, err
-	}
-	if err := gzWriter.Close(); err != nil {
-		return nil, err
-	}
-	compressed := gzBuf.Bytes()
-	compLen := len(compressed)
-
-	totalUnaligned := 4 + compLen
-	rem := totalUnaligned % paddingBlockSize
-	padLen := 0
-	if rem != 0 {
-		padLen = paddingBlockSize - rem
-	}
-	frame := make([]byte, totalUnaligned+padLen)
-	binary.BigEndian.PutUint32(frame[0:4], uint32(compLen))
-	copy(frame[4:4+compLen], compressed)
-	if padLen > 0 {
-		if _, err := io.ReadFull(rand.Reader, frame[4+compLen:]); err != nil {
-			zeroBytes(frame)
-			return nil, err
-		}
-	}
-	return frame, nil
-}
-
-func unpackPlaintext(frame []byte) (*VaultState, error) {
+func unpackLegacyPlaintext(frame []byte) (*VaultState, error) {
 	if len(frame) < 4 {
 		return nil, ErrCorruptedVault
 	}
@@ -383,399 +524,152 @@ func unpackPlaintext(frame []byte) (*VaultState, error) {
 	if compLen <= 0 || 4+compLen > len(frame) {
 		return nil, ErrCorruptedVault
 	}
-	gzReader, err := gzip.NewReader(bytes.NewReader(frame[4 : 4+compLen]))
-	if err != nil {
-		return nil, ErrCorruptedVault
-	}
-	defer gzReader.Close()
-
-	rawJSON, err := io.ReadAll(io.LimitReader(gzReader, 256*1024*1024))
-	if err != nil {
-		return nil, ErrCorruptedVault
-	}
-	defer zeroBytes(rawJSON)
-
 	var state VaultState
-	if err := json.Unmarshal(rawJSON, &state); err != nil {
-		return nil, ErrCorruptedVault
+	if err := gunzipJSON(frame[4:4+compLen], &state); err != nil {
+		return nil, err
 	}
 	return &state, nil
 }
 
-// SealVaultContainer creates a full authenticated SNSVAULT v2 binary container with a fresh 24-byte XChaCha20-Poly1305 nonce.
-func SealVaultContainer(dek []byte, baseHeader *EnvelopeHeader, state *VaultState) ([]byte, *EnvelopeHeader, error) {
-	if baseHeader.VaultID == "" {
-		baseHeader.VaultID = uuid.NewString()
-	}
-	if baseHeader.Revision == 0 {
-		baseHeader.Revision = 1
-	}
-	state.SchemaVersion = 2
-	state.VaultID = baseHeader.VaultID
-	state.Revision = baseHeader.Revision
-
-	aead, err := chacha20poly1305.NewX(dek)
+// OpenLegacyVaultContainer decrypts a legacy v1 or v2 SNSVAULT container with its password.
+func OpenLegacyVaultContainer(raw []byte, password string) (*LegacyEnvelopeHeader, *VaultState, uint16, error) {
+	ver, prefix, hdr, ciphertext, err := parseLegacyContainer(raw)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	payloadNonce, err := randomBytes(aead.NonceSize())
-	if err != nil {
-		return nil, nil, err
+	if hdr.CipherAlgo != "xchacha20-poly1305" || hdr.WrapAlgo != "aes-256-gcm" || hdr.KDFAlgo != "argon2id" || len(hdr.KDFSalt) < 16 {
+		return nil, nil, 0, ErrCorruptedVault
 	}
-
-	hdr := *baseHeader
-	hdr.KDFSalt = slices.Clone(baseHeader.KDFSalt)
-	hdr.AuthPublicKey = slices.Clone(baseHeader.AuthPublicKey)
-	hdr.WrappedDEKNonce = slices.Clone(baseHeader.WrappedDEKNonce)
-	hdr.WrappedDEK = slices.Clone(baseHeader.WrappedDEK)
-	hdr.CipherAlgo = "xchacha20-poly1305"
-	hdr.PayloadNonce = payloadNonce
-
-	hdrBytes, err := json.Marshal(&hdr)
-	if err != nil {
-		return nil, nil, err
+	if err := checkKDFCeiling(hdr.KDFTime, hdr.KDFMemoryKiB, hdr.KDFThreads); err != nil {
+		return nil, nil, 0, err
 	}
 
-	// Prefix = magic(8) + version(2) + hdrLen(4) + hdrBytes
-	prefixLen := len(vaultMagic) + 2 + 4 + len(hdrBytes)
-	prefix := make([]byte, prefixLen)
-	copy(prefix[0:8], vaultMagic)
-	binary.BigEndian.PutUint16(prefix[8:10], vaultFormatVersion)
-	binary.BigEndian.PutUint32(prefix[10:14], uint32(len(hdrBytes)))
-	copy(prefix[14:], hdrBytes)
+	pwBytes := []byte(password)
+	master := argon2.IDKey(pwBytes, hdr.KDFSalt, hdr.KDFTime, hdr.KDFMemoryKiB, hdr.KDFThreads, dekSize)
+	zeroBytes(pwBytes)
+	defer zeroBytes(master)
 
-	plaintextFrame, err := packPlaintext(state)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer zeroBytes(plaintextFrame)
-
-	// Seal payload using full prefix as AAD so any header or revision tampering invalidates Poly1305 tag
-	ciphertext := aead.Seal(nil, payloadNonce, plaintextFrame, prefix)
-
-	out := make([]byte, len(prefix)+len(ciphertext))
-	copy(out, prefix)
-	copy(out[len(prefix):], ciphertext)
-	return out, &hdr, nil
-}
-
-// ParseVaultContainer extracts the format version, prefix bytes (AAD), parsed EnvelopeHeader, and ciphertext slice.
-func ParseVaultContainer(raw []byte) (ver uint16, prefix []byte, hdr *EnvelopeHeader, ciphertext []byte, err error) {
-	minLen := len(vaultMagic) + 2 + 4 + 2 + chacha20poly1305.Overhead
-	if len(raw) < minLen || len(raw) > maxVaultBlobBytes {
-		return 0, nil, nil, nil, ErrCorruptedVault
-	}
-	if string(raw[0:8]) != vaultMagic {
-		return 0, nil, nil, nil, ErrCorruptedVault
-	}
-	ver = binary.BigEndian.Uint16(raw[8:10])
-	if ver != vaultFormatVersion && ver != vaultFormatVersionV1 {
-		return 0, nil, nil, nil, fmt.Errorf("%w: unsupported version %d", ErrCorruptedVault, ver)
-	}
-	hdrLen := int(binary.BigEndian.Uint32(raw[10:14]))
-	if hdrLen <= 0 || hdrLen > maxHeaderBytes || 14+hdrLen >= len(raw) {
-		return 0, nil, nil, nil, ErrCorruptedVault
-	}
-	prefix = raw[:14+hdrLen]
-	ciphertext = raw[14+hdrLen:]
-	if len(ciphertext) <= chacha20poly1305.Overhead {
-		return 0, nil, nil, nil, ErrCorruptedVault
-	}
-
-	var parsed EnvelopeHeader
-	if err := json.Unmarshal(raw[14:14+hdrLen], &parsed); err != nil {
-		return 0, nil, nil, nil, ErrCorruptedVault
-	}
-	return ver, prefix, &parsed, ciphertext, nil
-}
-
-// ValidateV2HeaderStructural checks that an EnvelopeHeader has well-formed v2 cryptographic parameters
-// without requiring or possessing any secret key (used by BlindStore on the untrusted server).
-func ValidateV2HeaderStructural(ver uint16, h *EnvelopeHeader) error {
-	if ver != vaultFormatVersion || h == nil {
-		return ErrCorruptedVault
-	}
-	if h.VaultID == "" || h.Revision < 1 {
-		return ErrCorruptedVault
-	}
-	if h.KDFAlgo != "argon2id" || len(h.KDFSalt) != kdfSaltSize || h.KDFTime < 1 || h.KDFMemoryKiB < MinAllowedKDFMemoryKiB || h.KDFThreads < 1 {
-		return ErrCorruptedVault
-	}
-	if err := checkKDFCeiling(h.KDFTime, h.KDFMemoryKiB, h.KDFThreads); err != nil {
-		return err
-	}
-	if h.AuthAlgo != "ed25519" || len(h.AuthPublicKey) != ed25519.PublicKeySize {
-		return ErrCorruptedVault
-	}
-	if h.WrapAlgo != "aes-256-gcm" || len(h.WrappedDEKNonce) != 12 || len(h.WrappedDEK) != dekSize+16 {
-		return ErrCorruptedVault
-	}
-	if h.CipherAlgo != "xchacha20-poly1305" || len(h.PayloadNonce) != chacha20poly1305.NonceSizeX {
-		return ErrCorruptedVault
-	}
-	return nil
-}
-
-// OpenVaultContainer verifies password, derives keys, unwraps DEK, and authenticates + decrypts VaultState.
-// Supports both v2 zero-knowledge containers and v1 legacy backup containers for seamless migration.
-func OpenVaultContainer(raw []byte, password string, minMemoryKiB uint32) (
-	dek []byte,
-	authPriv ed25519.PrivateKey,
-	hdr *EnvelopeHeader,
-	state *VaultState,
-	ver uint16,
-	err error,
-) {
-	ver, prefix, hdr, ciphertext, err := ParseVaultContainer(raw)
-	if err != nil {
-		return nil, nil, nil, nil, 0, err
-	}
-	if hdr.CipherAlgo != "xchacha20-poly1305" {
-		return nil, nil, nil, nil, 0, ErrCorruptedVault
-	}
-
-	if ver == vaultFormatVersion {
-		if err := ValidateV2HeaderStructural(ver, hdr); err != nil {
-			return nil, nil, nil, nil, 0, err
+	var kek []byte
+	var wrapAAD []byte
+	if ver == vaultFormatVersionV2 {
+		var hErr error
+		kek, hErr = hkdfDerive32(master, hdr.KDFSalt, "SNSVAULT-v2-KEK")
+		if hErr != nil {
+			return nil, nil, 0, ErrCorruptedVault
 		}
-		dek, authPriv, err = unwrapDEKV2(password, hdr, minMemoryKiB)
-		if err != nil {
-			return nil, nil, nil, nil, 0, err
-		}
+		defer zeroBytes(kek)
+		wrapAAD = legacyDekWrapAADV2(hdr)
 	} else {
-		dek, err = unwrapDEKV1(password, hdr)
-		if err != nil {
-			return nil, nil, nil, nil, 0, err
-		}
-	}
-
-	aead, err := chacha20poly1305.NewX(dek)
-	if err != nil {
-		zeroBytes(dek)
-		zeroBytes(authPriv)
-		return nil, nil, nil, nil, 0, ErrCorruptedVault
-	}
-	if len(hdr.PayloadNonce) != aead.NonceSize() {
-		zeroBytes(dek)
-		zeroBytes(authPriv)
-		return nil, nil, nil, nil, 0, ErrCorruptedVault
-	}
-
-	frame, err := aead.Open(nil, hdr.PayloadNonce, ciphertext, prefix)
-	if err != nil {
-		zeroBytes(dek)
-		zeroBytes(authPriv)
-		return nil, nil, nil, nil, 0, ErrCorruptedVault
-	}
-	defer zeroBytes(frame)
-
-	state, err = unpackPlaintext(frame)
-	if err != nil {
-		zeroBytes(dek)
-		zeroBytes(authPriv)
-		return nil, nil, nil, nil, 0, err
-	}
-
-	if ver == vaultFormatVersion {
-		if state.VaultID != hdr.VaultID || state.Revision != hdr.Revision {
-			zeroBytes(dek)
-			zeroBytes(authPriv)
-			return nil, nil, nil, nil, 0, ErrCorruptedVault
-		}
-	}
-	return dek, authPriv, hdr, state, ver, nil
-}
-
-// OpenVaultWithKnownDEK authenticates and decrypts a v2 container using an already-unwrapped client DEK
-// and verifies that the header's VaultID and AuthPublicKey match the client's pinned session keys.
-func OpenVaultWithKnownDEK(raw []byte, dek []byte, expectedVaultID string, expectedAuthPub []byte) (*EnvelopeHeader, *VaultState, error) {
-	ver, prefix, hdr, ciphertext, err := ParseVaultContainer(raw)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := ValidateV2HeaderStructural(ver, hdr); err != nil {
-		return nil, nil, err
-	}
-	if hdr.VaultID != expectedVaultID || !constantTimeEqual(hdr.AuthPublicKey, expectedAuthPub) {
-		return nil, nil, ErrRollbackDetected
-	}
-	aead, err := chacha20poly1305.NewX(dek)
-	if err != nil {
-		return nil, nil, ErrCorruptedVault
-	}
-	frame, err := aead.Open(nil, hdr.PayloadNonce, ciphertext, prefix)
-	if err != nil {
-		return nil, nil, ErrCorruptedVault
-	}
-	defer zeroBytes(frame)
-
-	state, err := unpackPlaintext(frame)
-	if err != nil {
-		return nil, nil, err
-	}
-	if state.VaultID != hdr.VaultID || state.Revision != hdr.Revision {
-		return nil, nil, ErrCorruptedVault
-	}
-	return hdr, state, nil
-}
-
-// OpenVaultContainerPreDerived unwraps DEK and decrypts a v2 container using KEK + AuthKeyPair already derived
-// during the zero-knowledge login challenge step, avoiding a redundant second 64 MiB Argon2id pass.
-func OpenVaultContainerPreDerived(raw []byte, kek []byte, authPub []byte, expectedKDF *PublicKDFParams) ([]byte, *EnvelopeHeader, *VaultState, error) {
-	ver, prefix, hdr, ciphertext, err := ParseVaultContainer(raw)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if err := ValidateV2HeaderStructural(ver, hdr); err != nil {
-		return nil, nil, nil, err
-	}
-	if expectedKDF != nil {
-		if hdr.VaultID != expectedKDF.VaultID ||
-			hdr.KDFTime != expectedKDF.KDFTime ||
-			hdr.KDFMemoryKiB != expectedKDF.KDFMemoryKiB ||
-			hdr.KDFThreads != expectedKDF.KDFThreads ||
-			!constantTimeEqual(hdr.KDFSalt, expectedKDF.KDFSalt) {
-			return nil, nil, nil, ErrRollbackDetected
-		}
-	}
-	if !constantTimeEqual(hdr.AuthPublicKey, authPub) {
-		return nil, nil, nil, ErrInvalidPassword
+		kek = master
+		wrapAAD = legacyDekWrapAADV1(hdr)
 	}
 
 	block, err := aes.NewCipher(kek)
 	if err != nil {
-		return nil, nil, nil, ErrCorruptedVault
+		return nil, nil, 0, ErrCorruptedVault
 	}
 	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, nil, ErrCorruptedVault
+	if err != nil || len(hdr.WrappedDEKNonce) != gcm.NonceSize() {
+		return nil, nil, 0, ErrCorruptedVault
 	}
-	dek, err := gcm.Open(nil, hdr.WrappedDEKNonce, hdr.WrappedDEK, dekWrapAADV2(hdr))
-	if err != nil {
-		return nil, nil, nil, ErrInvalidPassword
+	dek, err := gcm.Open(nil, hdr.WrappedDEKNonce, hdr.WrappedDEK, wrapAAD)
+	if err != nil || len(dek) != dekSize {
+		return nil, nil, 0, ErrInvalidPassword
 	}
-	if len(dek) != dekSize {
-		zeroBytes(dek)
-		return nil, nil, nil, ErrCorruptedVault
-	}
+	defer zeroBytes(dek)
 
-	aead, err := chacha20poly1305.NewX(dek)
+	state, err := decryptLegacyPayloadWithDEK(dek, hdr, prefix, ciphertext)
 	if err != nil {
-		zeroBytes(dek)
-		return nil, nil, nil, ErrCorruptedVault
+		return nil, nil, 0, err
+	}
+	return hdr, state, ver, nil
+}
+
+// OpenLegacyVaultWithDEK decrypts a legacy v2 vault.sns using an unwrapped DEK from .vault.key.
+func OpenLegacyVaultWithDEK(raw []byte, dek []byte) (*LegacyEnvelopeHeader, *VaultState, error) {
+	if len(dek) != dekSize {
+		return nil, nil, ErrCorruptedVault
+	}
+	ver, prefix, hdr, ciphertext, err := parseLegacyContainer(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ver != vaultFormatVersionV2 {
+		return nil, nil, ErrCorruptedVault
+	}
+	state, err := decryptLegacyPayloadWithDEK(dek, hdr, prefix, ciphertext)
+	if err != nil {
+		return nil, nil, err
+	}
+	return hdr, state, nil
+}
+
+func decryptLegacyPayloadWithDEK(dek []byte, hdr *LegacyEnvelopeHeader, prefix, ciphertext []byte) (*VaultState, error) {
+	aead, err := chacha20poly1305.NewX(dek)
+	if err != nil || len(hdr.PayloadNonce) != aead.NonceSize() {
+		return nil, ErrCorruptedVault
 	}
 	frame, err := aead.Open(nil, hdr.PayloadNonce, ciphertext, prefix)
 	if err != nil {
-		zeroBytes(dek)
-		return nil, nil, nil, ErrCorruptedVault
+		return nil, ErrCorruptedVault
 	}
 	defer zeroBytes(frame)
+	return unpackLegacyPlaintext(frame)
+}
 
-	state, err := unpackPlaintext(frame)
-	if err != nil {
-		zeroBytes(dek)
-		return nil, nil, nil, err
+func legacyVaultStateToBackupBundle(st *VaultState) *BackupBundle {
+	if st == nil {
+		st = DefaultVaultState()
 	}
-	if state.VaultID != hdr.VaultID || state.Revision != hdr.Revision {
-		zeroBytes(dek)
-		return nil, nil, nil, ErrCorruptedVault
+	ensureMonitorInitialized(st)
+	EnsureStateDefaults(st)
+
+	monRT := DefaultMonitorRuntimeState()
+	if st.Monitor != nil {
+		monRT.LatestSnapshots = st.Monitor.LatestSnapshots
+		monRT.HistoryByServer = st.Monitor.HistoryByServer
+		monRT.Alerts = st.Monitor.Alerts
+		monRT.BreachStreaks = st.Monitor.BreachStreaks
+		monRT.PortBaselines = st.Monitor.PortBaselines
 	}
-	return dek, hdr, state, nil
-}
-
-func constantTimeEqual(a, b []byte) bool {
-	return len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1
-}
-
-// --- Domain-Separated Zero-Knowledge Ed25519 Request Signing & Verification ---
-
-func msgSetup(vaultID string, revision uint64, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-SETUP-v2:" + vaultID + ":" + strconv.FormatUint(revision, 10) + ":" + sha256Hex(rawBlob))
-}
-
-func SignSetup(authPriv ed25519.PrivateKey, vaultID string, revision uint64, rawBlob []byte) []byte {
-	return ed25519.Sign(authPriv, msgSetup(vaultID, revision, rawBlob))
-}
-
-func VerifySetup(authPub ed25519.PublicKey, vaultID string, revision uint64, rawBlob, sig []byte) bool {
-	return len(authPub) == ed25519.PublicKeySize && len(sig) == ed25519.SignatureSize &&
-		ed25519.Verify(authPub, msgSetup(vaultID, revision, rawBlob), sig)
-}
-
-func msgAuthChallenge(challengeID, nonceHex, vaultID string) []byte {
-	return []byte("SNS-ZK-AUTH-v2:" + challengeID + ":" + nonceHex + ":" + vaultID)
-}
-
-func SignAuthChallenge(authPriv ed25519.PrivateKey, challengeID, nonceHex, vaultID string) []byte {
-	return ed25519.Sign(authPriv, msgAuthChallenge(challengeID, nonceHex, vaultID))
-}
-
-func VerifyAuthChallenge(authPub ed25519.PublicKey, challengeID, nonceHex, vaultID string, sig []byte) bool {
-	return len(authPub) == ed25519.PublicKeySize && len(sig) == ed25519.SignatureSize &&
-		ed25519.Verify(authPub, msgAuthChallenge(challengeID, nonceHex, vaultID), sig)
-}
-
-func msgVaultPut(vaultID string, prevRev, newRev uint64, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-PUT-v2:" + vaultID + ":" + strconv.FormatUint(prevRev, 10) + "->" + strconv.FormatUint(newRev, 10) + ":" + sha256Hex(rawBlob))
-}
-
-func SignVaultPut(authPriv ed25519.PrivateKey, vaultID string, prevRev, newRev uint64, rawBlob []byte) []byte {
-	return ed25519.Sign(authPriv, msgVaultPut(vaultID, prevRev, newRev, rawBlob))
-}
-
-func VerifyVaultPut(authPub ed25519.PublicKey, vaultID string, prevRev, newRev uint64, rawBlob, sig []byte) bool {
-	return len(authPub) == ed25519.PublicKeySize && len(sig) == ed25519.SignatureSize &&
-		ed25519.Verify(authPub, msgVaultPut(vaultID, prevRev, newRev, rawBlob), sig)
-}
-
-func msgRotateOld(vaultID string, prevRev, newRev uint64, newAuthPub, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-ROTATE-OLD-v2:" + vaultID + ":" + strconv.FormatUint(prevRev, 10) + "->" + strconv.FormatUint(newRev, 10) + ":" + hex.EncodeToString(newAuthPub) + ":" + sha256Hex(rawBlob))
-}
-
-func msgRotateNew(vaultID string, prevRev, newRev uint64, oldAuthPub, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-ROTATE-NEW-v2:" + vaultID + ":" + strconv.FormatUint(prevRev, 10) + "->" + strconv.FormatUint(newRev, 10) + ":" + hex.EncodeToString(oldAuthPub) + ":" + sha256Hex(rawBlob))
-}
-
-func SignPasswordRotate(oldPriv, newPriv ed25519.PrivateKey, vaultID string, prevRev, newRev uint64, oldPub, newPub, rawBlob []byte) (oldSig, newSig []byte) {
-	oldSig = ed25519.Sign(oldPriv, msgRotateOld(vaultID, prevRev, newRev, newPub, rawBlob))
-	newSig = ed25519.Sign(newPriv, msgRotateNew(vaultID, prevRev, newRev, oldPub, rawBlob))
-	return oldSig, newSig
-}
-
-func VerifyPasswordRotate(oldPub, newPub ed25519.PublicKey, vaultID string, prevRev, newRev uint64, rawBlob, oldSig, newSig []byte) bool {
-	if len(oldPub) != ed25519.PublicKeySize || len(newPub) != ed25519.PublicKeySize {
-		return false
+	for _, srv := range st.Servers {
+		if srv.LastConnectedAt != nil || srv.LastLatencyMs > 0 || srv.LastOSInfo != "" {
+			monRT.ServerRuntime[srv.ID] = ServerRuntimeMeta{
+				LastConnectedAt: srv.LastConnectedAt,
+				LastLatencyMs:   srv.LastLatencyMs,
+				LastOSInfo:      srv.LastOSInfo,
+			}
+		}
 	}
-	if len(oldSig) != ed25519.SignatureSize || len(newSig) != ed25519.SignatureSize {
-		return false
+
+	return &BackupBundle{
+		SchemaVersion:  3,
+		IncludeRuntime: true,
+		ExportedAt:     time.Now().UTC(),
+		Config: CoreConfigSnapshot{
+			VaultID:         st.VaultID,
+			Revision:        st.Revision,
+			Groups:          st.Groups,
+			Servers:         st.Servers,
+			Credentials:     st.Credentials,
+			Snippets:        st.Snippets,
+			KnownHosts:      st.KnownHosts,
+			Settings:        st.Settings,
+			MonitorSettings: st.Monitor.Settings,
+			MonitorRules:    st.Monitor.Rules,
+			AISettings:      st.AISettings,
+		},
+		AIKnowledge: AIKnowledgeSnapshot{
+			HostMemories: st.HostMemories,
+			AIMemories:   st.AIMemories,
+			Runbooks:     st.Runbooks,
+		},
+		Runtime: &RuntimeDataSnapshot{
+			Monitor:         monRT,
+			AISessions:      st.AISessions,
+			PatrolBaselines: st.PatrolBaselines,
+			PatrolRecords:   st.PatrolRecords,
+			AuditLogs:       st.AuditLogs,
+		},
 	}
-	okOld := ed25519.Verify(oldPub, msgRotateOld(vaultID, prevRev, newRev, newPub, rawBlob), oldSig)
-	okNew := ed25519.Verify(newPub, msgRotateNew(vaultID, prevRev, newRev, oldPub, rawBlob), newSig)
-	return okOld && okNew
-}
-
-func msgImportNew(newVaultID string, newRev uint64, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-IMPORT-NEW-v2:" + newVaultID + ":" + strconv.FormatUint(newRev, 10) + ":" + sha256Hex(rawBlob))
-}
-
-func msgImportOverwrite(oldVaultID, newVaultID string, rawBlob []byte) []byte {
-	return []byte("SNS-ZK-IMPORT-OVERWRITE-v2:" + oldVaultID + "->" + newVaultID + ":" + sha256Hex(rawBlob))
-}
-
-func SignVaultImport(newPriv ed25519.PrivateKey, newVaultID string, newRev uint64, rawBlob []byte) []byte {
-	return ed25519.Sign(newPriv, msgImportNew(newVaultID, newRev, rawBlob))
-}
-
-func SignVaultImportOverwrite(currentPriv ed25519.PrivateKey, oldVaultID, newVaultID string, rawBlob []byte) []byte {
-	return ed25519.Sign(currentPriv, msgImportOverwrite(oldVaultID, newVaultID, rawBlob))
-}
-
-func VerifyVaultImportNew(newPub ed25519.PublicKey, newVaultID string, newRev uint64, rawBlob, sig []byte) bool {
-	return len(newPub) == ed25519.PublicKeySize && len(sig) == ed25519.SignatureSize &&
-		ed25519.Verify(newPub, msgImportNew(newVaultID, newRev, rawBlob), sig)
-}
-
-func VerifyVaultImportOverwrite(oldPub ed25519.PublicKey, oldVaultID, newVaultID string, rawBlob, sig []byte) bool {
-	return len(oldPub) == ed25519.PublicKeySize && len(sig) == ed25519.SignatureSize &&
-		ed25519.Verify(oldPub, msgImportOverwrite(oldVaultID, newVaultID, rawBlob), sig)
 }

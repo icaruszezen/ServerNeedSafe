@@ -16,7 +16,6 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
-	"github.com/icaruszezen/ServerNeedSafe/internal/relay"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 	"github.com/jchv/go-webview2"
@@ -24,7 +23,7 @@ import (
 )
 
 const (
-	windowTitle     = "ServerNeedSafe — 多服务器安全管理与零知识加密终端"
+	windowTitle     = "ServerNeedSafe — 多服务器安全运维与 7×24 智能巡检工作台"
 	singleMutexName = "Local\\ServerNeedSafe_Desktop_Singleton_v1"
 )
 
@@ -119,19 +118,19 @@ func main() {
 
 	dataDir, webviewDir, err := resolveLocalDataDir()
 	if err != nil {
-		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("无法创建本地加密数据目录:\n%v", err), 0x10)
+		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("无法创建本地数据目录:\n%v", err), 0x10)
 		return
 	}
 
-	vaultPath := filepath.Join(dataDir, "vault.sns")
-	blindStore, err := vault.NewBlindStore(vaultPath)
+	store, err := vault.NewStore(dataDir)
 	if err != nil {
-		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("初始化本地零知识加密保险库失败:\n%v", err), 0x10)
+		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("初始化本地加密存储失败:\n%v", err), 0x10)
 		return
 	}
+	vaultPath := store.SecretsPath()
 
-	// Enable strict desktop loopback instance guard so external local web pages cannot call /api/*
-	authMgr, err := auth.NewManager(12*time.Hour, true)
+	// Enable desktop loopback instance guard so external local web pages cannot call /api/*
+	authMgr, err := auth.NewManager(auth.DefaultSessionTTL, true)
 	if err != nil {
 		showMessageBox("ServerNeedSafe 启动失败", fmt.Sprintf("初始化安全认证引擎失败:\n%v", err), 0x10)
 		return
@@ -150,14 +149,10 @@ func main() {
 		return
 	}
 
-	relayMgr := relay.NewManager(ln.Addr().String())
-	keyMgr := vault.NewServerKeyManager(dataDir)
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "desktop",
-		BlindStore: blindStore,
-		KeyMgr:     keyMgr,
+		Store:      store,
 		Auth:       authMgr,
-		Relay:      relayMgr,
 		StaticFS:   staticFS,
 	})
 

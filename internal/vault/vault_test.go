@@ -2,466 +2,501 @@ package vault
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 func strPtr(s string) *string { return &s }
 
-func newFastTestClient(t *testing.T, bs *BlindStore) *ClientVault {
+// buildLegacyV2ContainerForTest synthesizes a real legacy v2.1 SNSVAULT container and optional .vault.key
+// so we can verify unattended migration and legacy .sns backup import end-to-end.
+func buildLegacyV2ContainerForTest(t *testing.T, password string, state *VaultState) (rawBlob []byte, dek []byte, authPriv ed25519.PrivateKey, vaultID string) {
 	t.Helper()
-	cv := NewClientVault(NewBlindStoreBackend(bs))
-	cv.SetKDFParams(1, 16*1024, 2)
-	return cv
-}
-
-func TestVaultZeroKnowledgeEncryptionAndTamperResistance(t *testing.T) {
-	tmpDir := t.TempDir()
-	vaultFile := filepath.Join(tmpDir, "vault.sns")
-
-	bs, err := NewBlindStore(vaultFile)
-	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
-	}
-	store := newFastTestClient(t, bs)
-
-	if store.Status() != StatusUninitialized {
-		t.Fatalf("expected uninitialized, got %s", store.Status())
-	}
-
-	if err := store.Setup("short", "127.0.0.1"); !errors.Is(err, ErrWeakPassword) {
-		t.Fatalf("expected ErrWeakPassword, got %v", err)
-	}
-
-	masterPass := "AdminMaster#2026!Safe"
-	if err := store.Setup(masterPass, "127.0.0.1"); err != nil {
-		t.Fatalf("Setup failed: %v", err)
-	}
-	if store.Status() != StatusUnlocked {
-		t.Fatalf("expected unlocked after setup, got %s", store.Status())
-	}
-
-	// Add sensitive SSH server, credential, snippet, known host
-	fakePEM := "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n-----END OPENSSH PRIVATE KEY-----"
-	cred, err := store.CreateCredential(CredentialMutationInput{
-		Name:         "CoreProdDeployKey",
-		Kind:         AuthPrivateKey,
-		UsernameHint: "secops_admin",
-		PrivateKey:   strPtr(fakePEM),
-		Passphrase:   strPtr("KeyPass#7788"),
-		Notes:        "Internal Bastion Key",
-	}, "127.0.0.1")
-	if err != nil {
-		t.Fatalf("CreateCredential: %v", err)
-	}
-
-	srv, err := store.CreateServer(ServerMutationInput{
-		Name:         "prod-core-postgres",
-		Group:        "核心机密集群",
-		Tags:         []string{"database", "tier-0"},
-		Host:         "10.240.88.19",
-		Port:         22022,
-		Username:     "secops_admin",
-		AuthType:     AuthPassword,
-		Password:     strPtr("SuperSecretSSHPass!99"),
-		CredentialID: cred.ID,
-		Notes:        "Primary financial database server",
-		Pinned:       true,
-	}, "127.0.0.1")
-	if err != nil {
-		t.Fatalf("CreateServer: %v", err)
-	}
-
-	_, err = store.UpsertSnippet(Snippet{
-		Title:    "Check Kernel Exploit Surface",
-		Category: "SecAudit",
-		Command:  "sysctl kernel.unprivileged_bpf_disabled",
-	}, "127.0.0.1")
-	if err != nil {
-		t.Fatalf("UpsertSnippet: %v", err)
-	}
-
-	if err := store.TrustKnownHost(KnownHost{
-		Address:      "10.240.88.19:22022",
-		ServerName:   "prod-core-postgres",
-		KeyType:      "ssh-ed25519",
-		Fingerprint:  "SHA256:UniqueFingerprintSecretXYZ123",
-		PublicKeyB64: "AAAAC3NzaC1lZDI1NTE5AAAAI...",
-	}, "127.0.0.1"); err != nil {
-		t.Fatalf("TrustKnownHost: %v", err)
-	}
-
-	// Simulate Server Root Breach #1: inspect raw bytes on server disk!
-	rawDiskBytes, err := os.ReadFile(vaultFile)
-	if err != nil {
-		t.Fatalf("ReadFile vault.sns: %v", err)
-	}
-	forbiddenPlaintexts := []string{
-		"prod-core-postgres",
-		"核心机密集群",
-		"10.240.88.19",
-		"22022",
-		"secops_admin",
-		"SuperSecretSSHPass!99",
-		"OPENSSH PRIVATE KEY",
-		"KeyPass#7788",
-		"CoreProdDeployKey",
-		"Primary financial database",
-		"unprivileged_bpf_disabled",
-		"UniqueFingerprintSecretXYZ123",
-		"生产环境",
-		"vault.setup",
-		masterPass,
-	}
-	for _, needle := range forbiddenPlaintexts {
-		if bytes.Contains(rawDiskBytes, []byte(needle)) {
-			t.Fatalf("SECURITY FAILURE: leaked plaintext %q inside raw vault.sns!", needle)
-		}
-	}
-
-	// Simulate Server Root Breach #2: inspect BlindStore struct fields in server RAM!
-	bsDump := fmt.Sprintf("%s %+v", bs.filePath, bs.header)
-	for _, needle := range forbiddenPlaintexts {
-		if bytes.Contains([]byte(bsDump), []byte(needle)) {
-			t.Fatalf("SECURITY FAILURE: BlindStore in server RAM leaked %q!", needle)
-		}
-	}
-	bsType := reflect.TypeFor[BlindStore]()
-	for i := 0; i < bsType.NumField(); i++ {
-		fName := bsType.Field(i).Name
-		if fName == "dek" || fName == "state" || fName == "authPriv" {
-			t.Fatalf("SECURITY FAILURE: BlindStore must never possess field %q", fName)
-		}
-	}
-
-	// Verify PublicChallengeParams exposes ZERO offline oracle (no AuthPublicKey, no WrappedDEK)
-	pubParams, err := bs.PublicChallengeParams()
-	if err != nil {
-		t.Fatalf("PublicChallengeParams: %v", err)
-	}
-	pubJSON, _ := json.Marshal(pubParams)
-	if bytes.Contains(pubJSON, []byte("auth_public_key")) || bytes.Contains(pubJSON, []byte("wrapped_dek")) {
-		t.Fatalf("SECURITY FAILURE: PublicChallengeParams leaked offline oracle fields: %s", string(pubJSON))
-	}
-
-	// Verify Zero-Knowledge Ed25519 Challenge-Response Auth on BlindStore
-	_, authPrivDerived, _, err := DeriveVaultKeys(masterPass, pubParams.KDFSalt, pubParams.KDFTime, pubParams.KDFMemoryKiB, pubParams.KDFThreads, MinAllowedKDFMemoryKiB)
-	if err != nil {
-		t.Fatalf("DeriveVaultKeys: %v", err)
-	}
-	chalSig := SignAuthChallenge(authPrivDerived, "chal-1", "deadbeef0102", pubParams.VaultID)
-	if _, err := bs.VerifyClientChallenge("chal-1", "deadbeef0102", chalSig); err != nil {
-		t.Fatalf("VerifyClientChallenge failed for valid proof: %v", err)
-	}
-	if _, err := bs.VerifyClientChallenge("chal-1", "wrongnonce", chalSig); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("expected ErrInvalidPassword on replayed/mismatched nonce, got %v", err)
-	}
-
-	// Verify UnlockOrVerify rejects wrong password even while unlocked
-	if err := store.UnlockOrVerify("WrongAdminPass!123", "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("expected ErrInvalidPassword while unlocked, got %v", err)
-	}
-	if err := store.UnlockOrVerify(masterPass, "127.0.0.1"); err != nil {
-		t.Fatalf("expected valid password verification while unlocked, got %v", err)
-	}
-
-	// Lock vault and verify client memory access is blocked
-	lockHookCalled := false
-	store.RegisterOnLock(func() { lockHookCalled = true })
-	store.Lock("manual lock test", "127.0.0.1")
-
-	if !lockHookCalled {
-		t.Fatalf("expected onLock callback to fire")
-	}
-	if store.Status() != StatusLocked {
-		t.Fatalf("expected StatusLocked, got %s", store.Status())
-	}
-	if _, err := store.ListServers(); !errors.Is(err, ErrVaultLocked) {
-		t.Fatalf("expected ErrVaultLocked on ListServers, got %v", err)
-	}
-	if _, err := store.GetServerSecret(srv.ID); !errors.Is(err, ErrVaultLocked) {
-		t.Fatalf("expected ErrVaultLocked on GetServerSecret, got %v", err)
-	}
-
-	// Simulate Attacker Brute Force / Wrong Password on leaked vault file
-	attackerStore := newFastTestClient(t, bs)
-	if err := attackerStore.UnlockOrVerify("AttackerGuessPassword999", "1.2.3.4"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("expected ErrInvalidPassword for attacker, got %v", err)
-	}
-
-	// Refresh rawDiskBytes after lock audit entry
-	rawDiskBytes, err = os.ReadFile(vaultFile)
-	if err != nil {
-		t.Fatalf("ReadFile after lock: %v", err)
-	}
-
-	// Simulate Tampering (1-bit flip in ciphertext and 1-bit flip in header)
-	tamperedCipher := bytes.Clone(rawDiskBytes)
-	tamperedCipher[len(tamperedCipher)-10] ^= 0x01
-	if _, _, _, _, _, err := OpenVaultContainer(tamperedCipher, masterPass, MinAllowedKDFMemoryKiB); err == nil {
-		t.Fatalf("SECURITY FAILURE: tampered ciphertext passed AEAD verification!")
-	}
-
-	tamperedHeader := bytes.Clone(rawDiskBytes)
-	tamperedHeader[20] ^= 0x01
-	if _, _, _, _, _, err := OpenVaultContainer(tamperedHeader, masterPass, MinAllowedKDFMemoryKiB); err == nil {
-		t.Fatalf("SECURITY FAILURE: tampered header AAD passed verification!")
-	}
-
-	// Legitimate Admin Unlocks Vault
-	if err := store.UnlockOrVerify(masterPass, "127.0.0.1"); err != nil {
-		t.Fatalf("Unlock with right password failed: %v", err)
-	}
-	secretSrv, err := store.GetServerSecret(srv.ID)
-	if err != nil {
-		t.Fatalf("GetServerSecret after unlock: %v", err)
-	}
-	if secretSrv.Password != "SuperSecretSSHPass!99" || secretSrv.Host != "10.240.88.19" {
-		t.Fatalf("decrypted server mismatch: %+v", secretSrv)
-	}
-
-	// Password Rotation + Master DEK + Ed25519 AuthKey Re-encryption
-	newPass := "RotatedMaster#2027$Ultra"
-	if err := store.ChangePassword("wrongOldPass", newPass, "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("expected ErrInvalidPassword on wrong old password, got %v", err)
-	}
-	if err := store.ChangePassword(masterPass, newPass, "127.0.0.1"); err != nil {
-		t.Fatalf("ChangePassword failed: %v", err)
-	}
-
-	backupBytes, err := store.ExportEncryptedBytes("127.0.0.1")
-	if err != nil {
-		t.Fatalf("ExportEncryptedBytes: %v", err)
-	}
-
-	store.Lock("lock before testing new password", "127.0.0.1")
-	if err := store.UnlockOrVerify(masterPass, "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("old password should no longer unlock rotated vault, got %v", err)
-	}
-	if err := store.UnlockOrVerify(newPass, "127.0.0.1"); err != nil {
-		t.Fatalf("new password failed to unlock rotated vault: %v", err)
-	}
-
-	// Test Importing Encrypted Backup into a Fresh Location
-	restoreBS, err := NewBlindStore(filepath.Join(t.TempDir(), "restored.sns"))
-	if err != nil {
-		t.Fatalf("NewBlindStore restore: %v", err)
-	}
-	restoreStore := newFastTestClient(t, restoreBS)
-	if err := restoreStore.ImportEncryptedVault(backupBytes, masterPass, "", "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("import with wrong password should fail, got %v", err)
-	}
-	if err := restoreStore.ImportEncryptedVault(backupBytes, newPass, "", "127.0.0.1"); err != nil {
-		t.Fatalf("ImportEncryptedVault failed: %v", err)
-	}
-	restoredServers, err := restoreStore.ListServers()
-	if err != nil || len(restoredServers) != 1 || restoredServers[0].Name != "prod-core-postgres" {
-		t.Fatalf("restored servers mismatch: %v, err=%v", restoredServers, err)
-	}
-}
-
-func TestBlindStoreBlocksUnauthenticatedOverwriteAndDowngradeAndRollback(t *testing.T) {
-	victimBS, err := NewBlindStore(filepath.Join(t.TempDir(), "victim.sns"))
-	if err != nil {
-		t.Fatalf("NewBlindStore victim: %v", err)
-	}
-	victimClient := newFastTestClient(t, victimBS)
-	if err := victimClient.Setup("VictimStrong#Pass2026", "127.0.0.1"); err != nil {
-		t.Fatalf("victim Setup: %v", err)
-	}
-	rev1Snapshot, _, _, err := victimBS.ReadBlob()
-	if err != nil {
-		t.Fatalf("ReadBlob rev1: %v", err)
-	}
-
-	// Advance victim vault to revision 2+
-	if _, err := victimClient.AddGroup("机密研发组"); err != nil {
-		t.Fatalf("AddGroup: %v", err)
-	}
-	pinnedAnchor := victimClient.GetAnchor()
-	if pinnedAnchor == nil || pinnedAnchor.MinRevision < 2 {
-		t.Fatalf("expected anchor MinRevision >= 2, got %+v", pinnedAnchor)
-	}
-
-	// 1. Attacker creates their own valid SNSVAULT v2 container and tries to overwrite victim's BlindStore via ImportBlob!
-	attackerBS, _ := NewBlindStore(filepath.Join(t.TempDir(), "attacker.sns"))
-	attackerClient := newFastTestClient(t, attackerBS)
-	if err := attackerClient.Setup("AttackerOwn#Pass999", "9.9.9.9"); err != nil {
-		t.Fatalf("attacker Setup: %v", err)
-	}
-	attackerBlob, _, _, _ := attackerBS.ReadBlob()
-	attackerPriv := attackerClient.AuthPrivateKeyCopy()
-	_, _, attackerHdr, _, _ := ParseVaultContainer(attackerBlob)
-	attackerNewSig := SignVaultImport(attackerPriv, attackerHdr.VaultID, attackerHdr.Revision, attackerBlob)
-	forgedOverwriteSig := SignVaultImportOverwrite(attackerPriv, pinnedAnchor.VaultID, attackerHdr.VaultID, attackerBlob)
-
-	if _, _, err := victimBS.ImportBlob(attackerBlob, attackerNewSig, nil); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("SECURITY FAILURE: ImportBlob allowed overwrite without overwriteSig: %v", err)
-	}
-	if _, _, err := victimBS.ImportBlob(attackerBlob, attackerNewSig, forgedOverwriteSig); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("SECURITY FAILURE: ImportBlob allowed overwrite with attacker's forged signature: %v", err)
-	}
-
-	// Legitimate overwrite WITH victim's current password succeeds when needed
-	lockedVictim := newFastTestClient(t, victimBS)
-	if err := lockedVictim.ImportEncryptedVault(attackerBlob, "AttackerOwn#Pass999", "WrongVictimPass", "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
-		t.Fatalf("expected ErrInvalidPassword when currentAdminPassword is wrong, got %v", err)
-	}
-
-	// 2. KDF Downgrade Attack: Compromised server returns kdf_memory_kib = 1024 (1 MiB)
-	salt := make([]byte, 32)
-	if _, _, _, err := DeriveVaultKeys("VictimStrong#Pass2026", salt, 1, 1024, 1, MinAllowedKDFMemoryKiB); !errors.Is(err, ErrKDFDowngrade) {
-		t.Fatalf("SECURITY FAILURE: expected ErrKDFDowngrade on 1 MiB KDF parameter, got %v", err)
-	}
-
-	// 3. Server Rollback Attack: Root attacker replaces victim.sns on disk with older rev1Snapshot!
-	if err := os.WriteFile(victimBS.FilePath(), rev1Snapshot, 0o600); err != nil {
-		t.Fatalf("WriteFile rollback: %v", err)
-	}
-	rolledBackBS, err := NewBlindStore(victimBS.FilePath())
-	if err != nil {
-		t.Fatalf("NewBlindStore rolled back: %v", err)
-	}
-	returningClient := newFastTestClient(t, rolledBackBS)
-	returningClient.SetAnchor(pinnedAnchor)
-	if err := returningClient.UnlockOrVerify("VictimStrong#Pass2026", "127.0.0.1"); !errors.Is(err, ErrRollbackDetected) {
-		t.Fatalf("SECURITY FAILURE: expected ErrRollbackDetected when server replayed older vault revision, got %v", err)
-	}
-
-	// 4. Server Wipe Attack: Root attacker deletes vault.sns to trick returning client into Setup!
-	emptyBS, _ := NewBlindStore(filepath.Join(t.TempDir(), "wiped.sns"))
-	wipedCheckClient := newFastTestClient(t, emptyBS)
-	wipedCheckClient.SetAnchor(pinnedAnchor)
-	if err := wipedCheckClient.Setup("VictimStrong#Pass2026", "127.0.0.1"); !errors.Is(err, ErrRollbackDetected) {
-		t.Fatalf("SECURITY FAILURE: expected ErrRollbackDetected when anchored server was wiped, got %v", err)
-	}
-}
-
-func TestConcurrentClientCASConflictAutoMerge(t *testing.T) {
-	bs, err := NewBlindStore(filepath.Join(t.TempDir(), "cas.sns"))
-	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
-	}
-	pass := "ConcurrentAdmin#2026"
-	clientA := newFastTestClient(t, bs)
-	if err := clientA.Setup(pass, "127.0.0.1"); err != nil {
-		t.Fatalf("Setup clientA: %v", err)
-	}
-
-	// Client B unlocks at revision 1/2
-	clientB := newFastTestClient(t, bs)
-	if err := clientB.UnlockOrVerify(pass, "127.0.0.2"); err != nil {
-		t.Fatalf("Unlock clientB: %v", err)
-	}
-
-	// Client A mutates vault (advances server revision behind Client B's back)
-	if _, err := clientA.CreateServer(ServerMutationInput{
-		Name:     "node-alpha",
-		Host:     "10.0.1.10",
-		Port:     22,
-		Username: "root",
-		AuthType: AuthPassword,
-		Password: strPtr("AlphaPass"),
-	}, "127.0.0.1"); err != nil {
-		t.Fatalf("clientA CreateServer: %v", err)
-	}
-
-	// Client B now mutates with stale revision -> should hit ErrRevisionConflict internally,
-	// fetch & authenticate Client A's latest ciphertext with its DEK, and preserve BOTH servers!
-	if _, err := clientB.CreateServer(ServerMutationInput{
-		Name:     "node-beta",
-		Host:     "10.0.1.11",
-		Port:     22,
-		Username: "ubuntu",
-		AuthType: AuthPassword,
-		Password: strPtr("BetaPass"),
-	}, "127.0.0.2"); err != nil {
-		t.Fatalf("clientB CreateServer auto-merge failed: %v", err)
-	}
-
-	servers, err := clientB.ListServers()
-	if err != nil || len(servers) != 2 {
-		t.Fatalf("expected both node-alpha and node-beta after CAS merge, got %d servers (err=%v)", len(servers), err)
-	}
-}
-
-func TestLegacyV1BackupMigrationToV2(t *testing.T) {
-	// Synthesize a genuine SNSVAULT v1 container and verify ImportEncryptedVault upgrades it seamlessly to v2
-	pass := "LegacyV1Pass#8899"
 	salt, _ := randomBytes(kdfSaltSize)
-	dek, _ := randomBytes(dekSize)
-	kek := argon2.IDKey([]byte(pass), salt, 1, 16*1024, 2, dekSize)
+	dek, _ = randomBytes(dekSize)
+	master := argon2.IDKey([]byte(password), salt, 2, 16*1024, 2, dekSize)
+	kek, _ := hkdfDerive32(master, salt, "SNSVAULT-v2-KEK")
+	authSeed, _ := hkdfDerive32(master, salt, "SNSVAULT-v2-AUTH-ED25519")
+	authPriv = ed25519.NewKeyFromSeed(authSeed)
+	authPub := authPriv.Public().(ed25519.PublicKey)
 
-	hdr := &EnvelopeHeader{
-		KDFAlgo:      "argon2id",
-		KDFTime:      1,
-		KDFMemoryKiB: 16 * 1024,
-		KDFThreads:   2,
-		KDFSalt:      salt,
-		WrapAlgo:     "aes-256-gcm",
-		CipherAlgo:   "xchacha20-poly1305",
+	vaultID = uuid.NewString()
+	state.VaultID = vaultID
+	state.Revision = 3
+	state.SchemaVersion = 2
+
+	hdr := LegacyEnvelopeHeader{
+		VaultID:       vaultID,
+		Revision:      3,
+		KDFAlgo:       "argon2id",
+		KDFTime:       2,
+		KDFMemoryKiB:  16 * 1024,
+		KDFThreads:    2,
+		KDFSalt:       salt,
+		AuthAlgo:      "ed25519",
+		AuthPublicKey: slices.Clone(authPub),
+		WrapAlgo:      "aes-256-gcm",
+		CipherAlgo:    "xchacha20-poly1305",
 	}
 	block, _ := aes.NewCipher(kek)
 	gcm, _ := cipher.NewGCM(block)
 	wrapNonce, _ := randomBytes(gcm.NonceSize())
 	hdr.WrappedDEKNonce = wrapNonce
-	hdr.WrappedDEK = gcm.Seal(nil, wrapNonce, dek, dekWrapAADV1(hdr))
+	hdr.WrappedDEK = gcm.Seal(nil, wrapNonce, dek, legacyDekWrapAADV2(&hdr))
 
 	aead, _ := chacha20poly1305.NewX(dek)
-	payNonce, _ := randomBytes(aead.NonceSize())
-	hdr.PayloadNonce = payNonce
-	hdrBytes, _ := json.Marshal(hdr)
+	pNonce, _ := randomBytes(aead.NonceSize())
+	hdr.PayloadNonce = pNonce
 
-	prefix := make([]byte, 14+len(hdrBytes))
+	hdrBytes, _ := json.Marshal(&hdr)
+	prefix := make([]byte, 8+2+4+len(hdrBytes))
 	copy(prefix[0:8], vaultMagic)
-	binary.BigEndian.PutUint16(prefix[8:10], vaultFormatVersionV1)
+	binary.BigEndian.PutUint16(prefix[8:10], vaultFormatVersionV2)
 	binary.BigEndian.PutUint32(prefix[10:14], uint32(len(hdrBytes)))
 	copy(prefix[14:], hdrBytes)
 
-	st := DefaultVaultState()
-	st.SchemaVersion = 1
-	st.VaultID = ""
-	st.Revision = 0
-	st.Servers = append(st.Servers, ServerConfig{
-		ID:       "v1-srv-1",
-		Name:     "legacy-v1-host",
-		Group:    "生产环境",
-		Host:     "192.168.50.10",
-		Port:     22,
-		Username: "admin",
-		AuthType: AuthPassword,
-		Password: "LegacySecret!1",
-	})
-	frame, err := packPlaintext(st)
-	if err != nil {
-		t.Fatalf("packPlaintext v1: %v", err)
-	}
-	ct := aead.Seal(nil, payNonce, frame, prefix)
-	v1Raw := append(prefix, ct...)
+	rawJSON, _ := json.Marshal(state)
+	var gz bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&gz, gzip.BestSpeed)
+	_, _ = zw.Write(rawJSON)
+	_ = zw.Close()
+	comp := gz.Bytes()
+	frame := make([]byte, 4+len(comp)+128)
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(comp)))
+	copy(frame[4:4+len(comp)], comp)
 
-	bs, _ := NewBlindStore(filepath.Join(t.TempDir(), "upgraded.sns"))
-	client := newFastTestClient(t, bs)
-	if err := client.ImportEncryptedVault(v1Raw, pass, "", "127.0.0.1"); err != nil {
-		t.Fatalf("ImportEncryptedVault v1->v2 failed: %v", err)
+	ct := aead.Seal(nil, pNonce, frame, prefix)
+	out := make([]byte, len(prefix)+len(ct))
+	copy(out, prefix)
+	copy(out[len(prefix):], ct)
+	return out, dek, authPriv, vaultID
+}
+
+func writeLegacyLocalKeyFile(t *testing.T, dir, vaultID string, dek []byte, authPriv ed25519.PrivateKey) {
+	t.Helper()
+	mk, _ := randomBytes(dekSize)
+	block, _ := aes.NewCipher(mk)
+	gcm, _ := cipher.NewGCM(block)
+	nonce, _ := randomBytes(gcm.NonceSize())
+	payload := append(slices.Clone(dek), authPriv...)
+	wrapped := gcm.Seal(nil, nonce, payload, []byte(legacySealAAD+vaultID))
+
+	seal := legacyLocalKeySealFile{
+		Version:           1,
+		VaultID:           vaultID,
+		MasterKeyB64:      base64.StdEncoding.EncodeToString(mk),
+		NonceB64:          base64.StdEncoding.EncodeToString(nonce),
+		WrappedSecretsB64: base64.StdEncoding.EncodeToString(wrapped),
 	}
-	info, _ := client.EncryptionInfo()
-	if info.FormatVersion != 2 || !info.ZeroKnowledge || len(ed25519.PrivateKey(client.AuthPrivateKeyCopy())) != ed25519.PrivateKeySize {
-		t.Fatalf("expected upgraded v2 zero-knowledge container, got %+v", info)
+	encoded, _ := json.MarshalIndent(&seal, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, legacyKeyFileName), encoded, 0o600); err != nil {
+		t.Fatalf("write legacy .vault.key: %v", err)
 	}
-	srvs, err := client.ListServers()
-	if err != nil || len(srvs) != 1 || srvs[0].Name != "legacy-v1-host" {
-		t.Fatalf("expected migrated server legacy-v1-host, got %+v (err=%v)", srvs, err)
+}
+
+func TestSplitStorageEncryptionDecoupledMonitoringAndNoRewriteOnTelemetry(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	store.SetFlushDebounce(30 * time.Millisecond)
+
+	if store.IsInitialized() || store.Status() != StatusUninitialized {
+		t.Fatalf("expected fresh uninitialized store")
+	}
+
+	adminPass := "AdminPass#2026!Decoupled"
+	if err := store.Setup(adminPass, "127.0.0.1"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if !store.IsReady() || store.Status() != StatusUnlocked {
+		t.Fatalf("expected ready store after setup")
+	}
+
+	// Verify 0600 master.key & secrets.enc created
+	mkInfo, err := os.Stat(filepath.Join(dir, masterKeyFileName))
+	if err != nil || mkInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600 master.key, got stat=%v err=%v", mkInfo, err)
+	}
+
+	// Create server with secret password & AI provider with secret API key
+	srv, err := store.CreateServer(ServerMutationInput{
+		Name:     "prod-core-01",
+		Group:    "生产环境",
+		Host:     "10.0.0.10",
+		Port:     22,
+		Username: "opsadmin",
+		AuthType: AuthPassword,
+		Password: strPtr("SuperSecretSSHPass!9988"),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	_, _, err = store.UpsertAIProvider(AIProviderMutationInput{
+		Name:      "DeepSeek",
+		Protocol:  AIProtocolOpenAI,
+		BaseURL:   "https://api.deepseek.com/v1",
+		APIKey:    strPtr("sk-ultra-secret-deepseek-998877"),
+		Model:     "deepseek-chat",
+		SetActive: true,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("UpsertAIProvider: %v", err)
+	}
+
+	// Verify secrets.enc has ZERO plaintext leakage of SSH password, AI API key, or admin password!
+	rawSecretsBefore, err := os.ReadFile(store.SecretsPath())
+	if err != nil {
+		t.Fatalf("read secrets.enc: %v", err)
+	}
+	for _, needle := range []string{
+		adminPass,
+		"SuperSecretSSHPass!9988",
+		"sk-ultra-secret-deepseek-998877",
+		"prod-core-01",
+	} {
+		if bytes.Contains(rawSecretsBefore, []byte(needle)) {
+			t.Fatalf("SECURITY FAILURE: secrets.enc leaked plaintext %q", needle)
+		}
+	}
+
+	// Record high-frequency monitor snapshots, server runtime meta, patrol records, and audit logs ->
+	// MUST NOT rewrite secrets.enc at all!
+	_, _, _, err = store.RecordMonitorSnapshots([]*ServerMonitorSnapshot{
+		{
+			ServerID:    srv.ID,
+			Reachable:   true,
+			LatencyMs:   18,
+			OS:          "Ubuntu 24.04 LTS",
+			CPUPercent:  32.5,
+			MemPercent:  48.0,
+			DiskPercent: 55.0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots: %v", err)
+	}
+	store.UpdateServerRuntimeMeta(srv.ID, 15, "Ubuntu 24.04 LTS", true)
+	store.RecordAudit("test.event", "runtime", "audit stays in runtime json", "127.0.0.1", true)
+	if err := store.AppendPatrolRecord(PatrolRecord{
+		ID:           "patrol-1",
+		Status:       "healthy",
+		TotalServers: 1,
+		HealthyCount: 1,
+	}); err != nil {
+		t.Fatalf("AppendPatrolRecord: %v", err)
+	}
+
+	if err := store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+
+	rawSecretsAfter, err := os.ReadFile(store.SecretsPath())
+	if err != nil {
+		t.Fatalf("read secrets.enc after telemetry: %v", err)
+	}
+	if !bytes.Equal(rawSecretsBefore, rawSecretsAfter) {
+		t.Fatalf("EXPECTED secrets.enc NOT to be rewritten during monitor/patrol/runtime/audit writes!")
+	}
+
+	// Verify runtime JSON files were persisted independently and contain zero secrets
+	for _, rtFile := range []string{monitorRuntimeFileName, aiopsRuntimeFileName, auditRuntimeFileName} {
+		rawRT, err := os.ReadFile(filepath.Join(dir, rtFile))
+		if err != nil || len(rawRT) == 0 {
+			t.Fatalf("expected runtime file %s to exist, err=%v", rtFile, err)
+		}
+		for _, secret := range []string{"SuperSecretSSHPass!9988", "sk-ultra-secret-deepseek-998877", adminPass} {
+			if bytes.Contains(rawRT, []byte(secret)) {
+				t.Fatalf("SECURITY FAILURE: runtime file %s leaked secret %q!", rtFile, secret)
+			}
+		}
+	}
+
+	// Change admin password -> increments AuthVersion, keeps masterKey & all secrets & runtime intact!
+	newPass := "NewAdminPass#2026!Rotated"
+	prevVer := store.AuthVersion()
+	if err := store.ChangePassword(adminPass, newPass, "127.0.0.1"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	if store.AuthVersion() != prevVer+1 {
+		t.Fatalf("expected AuthVersion to increment")
+	}
+	if err := store.VerifyPassword(adminPass); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("old password should fail after change")
+	}
+	if err := store.VerifyPassword(newPass); err != nil {
+		t.Fatalf("new password should succeed: %v", err)
+	}
+	store.Close()
+
+	// Re-open Store (simulating container/process restart) -> immediately ready with zero password unlock!
+	reopened, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("reopen NewStore: %v", err)
+	}
+	defer reopened.Close()
+
+	if !reopened.IsReady() || reopened.Status() != StatusUnlocked {
+		t.Fatalf("expected reopened store to be immediately ready without manual unlock")
+	}
+	servers, err := reopened.ListServers()
+	if err != nil || len(servers) != 1 || servers[0].LastLatencyMs != 15 || servers[0].LastOSInfo != "Ubuntu 24.04 LTS" {
+		t.Fatalf("expected merged server runtime metadata after restart, got %+v err=%v", servers, err)
+	}
+	overview, err := reopened.GetMonitorOverview()
+	if err != nil || overview.KPI.OnlineServers != 1 || overview.KPI.TotalSamples != 1 {
+		t.Fatalf("expected persisted monitor history after restart, got %+v err=%v", overview, err)
+	}
+	patrols, _, err := reopened.ListPatrolRecords(10, false)
+	if err != nil || len(patrols) != 1 {
+		t.Fatalf("expected persisted patrol record after restart, got %+v err=%v", patrols, err)
+	}
+
+	// Tampering with secrets.enc must be rejected by XChaCha20-Poly1305 AEAD!
+	tampered := slices.Clone(rawSecretsAfter)
+	tampered[len(tampered)-1] ^= 0xFF
+	if _, err := OpenSecretsBytes(reopened.masterKey, tampered); !errors.Is(err, ErrCorruptedVault) {
+		t.Fatalf("expected AEAD tamper rejection, got %v", err)
+	}
+}
+
+func TestLegacyV2AutoMigrationAndLegacyManualMigration(t *testing.T) {
+	legacyPass := "LegacyAdminPass#2025!"
+	legacyState := DefaultVaultState()
+	legacyState.Servers = []ServerConfig{
+		{
+			ID:       "srv-legacy-1",
+			Name:     "legacy-db-node",
+			Group:    "核心数据库",
+			Host:     "10.1.2.3",
+			Port:     22,
+			Username: "root",
+			AuthType: AuthPassword,
+			Password: "LegacySSHSecret!42",
+		},
+	}
+	legacyState.Monitor.LatestSnapshots["srv-legacy-1"] = &ServerMonitorSnapshot{
+		ServerID:   "srv-legacy-1",
+		ServerName: "legacy-db-node",
+		Reachable:  true,
+		CPUPercent: 44.2,
+	}
+
+	rawBlob, dek, authPriv, vaultID := buildLegacyV2ContainerForTest(t, legacyPass, legacyState)
+
+	// Case A: Legacy vault.sns + .vault.key -> unattended automatic migration on boot!
+	dirA := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirA, legacyVaultFileName), rawBlob, 0o600); err != nil {
+		t.Fatalf("write legacy vault.sns: %v", err)
+	}
+	writeLegacyLocalKeyFile(t, dirA, vaultID, dek, authPriv)
+
+	storeA, err := NewStore(dirA)
+	if err != nil {
+		t.Fatalf("NewStore auto-migration: %v", err)
+	}
+	defer storeA.Close()
+
+	if !storeA.IsReady() || storeA.IsLegacyMigrationPending() {
+		t.Fatalf("expected immediate unattended migration to ready state")
+	}
+	secSrv, err := storeA.GetServerSecret("srv-legacy-1")
+	if err != nil || secSrv.Password != "LegacySSHSecret!42" {
+		t.Fatalf("migrated server secret mismatch: %+v err=%v", secSrv, err)
+	}
+	// Existing admin password MUST still work and transparently upgrade to lightweight Argon2id hash!
+	if err := storeA.VerifyPassword("WrongPassword"); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("wrong password should fail after auto-migration")
+	}
+	if err := storeA.VerifyPassword(legacyPass); err != nil {
+		t.Fatalf("legacy password must keep working after auto-migration: %v", err)
+	}
+	// Verify legacy files archived/removed
+	if _, err := os.Stat(filepath.Join(dirA, legacyVaultFileName+".migrated.bak")); err != nil {
+		t.Fatalf("expected vault.sns.migrated.bak archive")
+	}
+	if _, err := os.Stat(filepath.Join(dirA, legacyKeyFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected obsolete .vault.key removed")
+	}
+
+	// Case B: Legacy vault.sns WITHOUT .vault.key -> one-time password login migrates permanently!
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirB, legacyVaultFileName), rawBlob, 0o600); err != nil {
+		t.Fatalf("write legacy vault.sns B: %v", err)
+	}
+	storeB, err := NewStore(dirB)
+	if err != nil {
+		t.Fatalf("NewStore pending migration: %v", err)
+	}
+	defer storeB.Close()
+	if storeB.IsReady() || !storeB.IsLegacyMigrationPending() {
+		t.Fatalf("expected legacyMigrationPending=true without .vault.key")
+	}
+	if err := storeB.LoginWithPassword("WrongPass", "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("expected invalid password on wrong legacy pass, got %v", err)
+	}
+	if err := storeB.LoginWithPassword(legacyPass, "127.0.0.1"); err != nil {
+		t.Fatalf("LoginWithPassword legacy migration failed: %v", err)
+	}
+	if !storeB.IsReady() || storeB.IsLegacyMigrationPending() {
+		t.Fatalf("expected storeB ready after one-time legacy password migration")
+	}
+	secSrvB, err := storeB.GetServerSecret("srv-legacy-1")
+	if err != nil || secSrvB.Password != "LegacySSHSecret!42" {
+		t.Fatalf("migrated server B mismatch: %+v err=%v", secSrvB, err)
+	}
+}
+
+func TestBackupExportImportV3AndLegacyV2Compatibility(t *testing.T) {
+	dir1 := t.TempDir()
+	s1, err := NewStore(dir1)
+	if err != nil {
+		t.Fatalf("NewStore s1: %v", err)
+	}
+	defer s1.Close()
+
+	if err := s1.Setup("SourceAdmin#2026!", "127.0.0.1"); err != nil {
+		t.Fatalf("Setup s1: %v", err)
+	}
+	srv, err := s1.CreateServer(ServerMutationInput{
+		Name:     "backup-node-01",
+		Group:    "生产环境",
+		Host:     "10.50.0.1",
+		Port:     22,
+		Username: "root",
+		AuthType: AuthPassword,
+		Password: strPtr("BackupNodeSSH#2026"),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer: %v", err)
+	}
+	_, _, _, _ = s1.RecordMonitorSnapshots([]*ServerMonitorSnapshot{
+		{ServerID: srv.ID, Reachable: true, CPUPercent: 61.5, MemPercent: 52.0},
+	})
+	_, _ = s1.UpsertAIMemory(AIMemoryEntry{
+		Scope:   "global",
+		Title:   "备份测试记忆",
+		Content: "所有核心服务均采用 systemd 管理",
+	}, false, "127.0.0.1")
+
+	// 1. Export v3 backup with custom passphrase (config + AI knowledge only, no runtime)
+	backupPass := "PortableBackupPass#99!"
+	configOnlyBytes, err := s1.ExportBackupBytes(backupPass, false, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ExportBackupBytes(config): %v", err)
+	}
+	if bytes.Contains(configOnlyBytes, []byte("BackupNodeSSH#2026")) {
+		t.Fatalf("backup leaked plaintext SSH password")
+	}
+
+	// 2. Export v3 full backup (including runtime monitor history)
+	fullBytes, err := s1.ExportBackupBytes(backupPass, true, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("ExportBackupBytes(full): %v", err)
+	}
+
+	// 3. Restore config-only backup onto a fresh server -> has server + AI memory, zero monitor samples
+	dir2 := t.TempDir()
+	s2, err := NewStore(dir2)
+	if err != nil {
+		t.Fatalf("NewStore s2: %v", err)
+	}
+	defer s2.Close()
+
+	if err := s2.ImportBackupBytes(configOnlyBytes, "WrongBackupPass", true, "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("expected ErrInvalidPassword on wrong backup passphrase, got %v", err)
+	}
+	if err := s2.ImportBackupBytes(configOnlyBytes, backupPass, true, "127.0.0.1"); err != nil {
+		t.Fatalf("ImportBackupBytes(configOnly): %v", err)
+	}
+	s2Srv, err := s2.GetServerSecret(srv.ID)
+	if err != nil || s2Srv.Password != "BackupNodeSSH#2026" {
+		t.Fatalf("restored server secret mismatch: %+v err=%v", s2Srv, err)
+	}
+	mems, _ := s2.ListAIMemories()
+	if len(mems) != 1 || mems[0].Title != "备份测试记忆" {
+		t.Fatalf("expected AI knowledge restored, got %+v", mems)
+	}
+	ov2, _ := s2.GetMonitorOverview()
+	if ov2.KPI.TotalSamples != 0 {
+		t.Fatalf("expected 0 monitor samples in config-only restore, got %d", ov2.KPI.TotalSamples)
+	}
+
+	// 4. Restore full backup onto s2 -> preserves s2's admin login password AND restores monitor sample!
+	if err := s2.ImportBackupBytes(fullBytes, backupPass, true, "127.0.0.1"); err != nil {
+		t.Fatalf("ImportBackupBytes(full): %v", err)
+	}
+	ov2Full, _ := s2.GetMonitorOverview()
+	if ov2Full.KPI.TotalSamples != 1 {
+		t.Fatalf("expected 1 monitor sample after full restore, got %d", ov2Full.KPI.TotalSamples)
+	}
+
+	// 5. Legacy v2 .sns backup import compatibility
+	legacyState := DefaultVaultState()
+	legacyState.Servers = []ServerConfig{
+		{ID: "leg-srv", Name: "legacy-backup-node", Group: "默认分组", Host: "10.9.9.9", Port: 22, Username: "root", AuthType: AuthPassword, Password: "LegacyBackupPassword!"},
+	}
+	legRaw, _, _, _ := buildLegacyV2ContainerForTest(t, "LegacyBakPass#2025", legacyState)
+	dir3 := t.TempDir()
+	s3, _ := NewStore(dir3)
+	defer s3.Close()
+	if err := s3.ImportBackupBytes(legRaw, "LegacyBakPass#2025", true, "127.0.0.1"); err != nil {
+		t.Fatalf("import legacy v2 backup failed: %v", err)
+	}
+	gotLeg, err := s3.GetServerSecret("leg-srv")
+	if err != nil || gotLeg.Password != "LegacyBackupPassword!" {
+		t.Fatalf("legacy backup server mismatch: %+v err=%v", gotLeg, err)
+	}
+}
+
+func TestEnvMasterKeyOverrideAndTransparentRekey(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SNS_MASTER_KEY", "")
+
+	// 1. Start in file-key mode (master.key)
+	s1, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore(file): %v", err)
+	}
+	if s1.MasterKeyMode() != MasterKeyModeFile {
+		t.Fatalf("expected file mode, got %s", s1.MasterKeyMode())
+	}
+	if err := s1.Setup("EnvRekeyAdmin#2026", "127.0.0.1"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	_, _ = s1.CreateServer(ServerMutationInput{
+		Name: "env-node", Group: "默认分组", Host: "10.0.0.2", Port: 22, Username: "root", AuthType: AuthPassword, Password: strPtr("EnvNodePass!"),
+	}, "127.0.0.1")
+	s1.Close()
+
+	// 2. Restart with SNS_MASTER_KEY set -> seamlessly re-seals secrets.enc under env key!
+	t.Setenv("SNS_MASTER_KEY", "custom-env-master-secret-2026-high-entropy")
+	s2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore(env rekey): %v", err)
+	}
+	defer s2.Close()
+	if s2.MasterKeyMode() != MasterKeyModeEnv {
+		t.Fatalf("expected env mode, got %s", s2.MasterKeyMode())
+	}
+	srvs, err := s2.ListServers()
+	if err != nil || len(srvs) != 1 || srvs[0].Name != "env-node" {
+		t.Fatalf("expected server preserved after env key migration, got %+v err=%v", srvs, err)
 	}
 }

@@ -65,15 +65,8 @@ func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
 		stopCh:       make(chan struct{}),
 	}
 
-	// When vault is sealed (Store.Lock), immediately clear next schedule
-	store.RegisterOnLock(func() {
-		svc.mu.Lock()
-		svc.nextPatrolAt = nil
-		svc.mu.Unlock()
-	})
-
-	// When vault is unlocked at startup, wake up patrol scheduler immediately
-	store.RegisterOnUnlock(func() {
+	// When store becomes ready at startup/setup, wake up patrol scheduler immediately
+	store.RegisterOnReady(func() {
 		svc.NotifyPatrolConfigUpdated()
 	})
 

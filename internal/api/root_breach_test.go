@@ -200,18 +200,53 @@ func handleBreachSSHConn(netConn net.Conn, cfg *ssh.ServerConfig) {
 	}
 }
 
-func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecurity(t *testing.T) {
+func TestSplitStorageProxyJumpWebSocketPTYBackgroundMonitorAndBackupSync(t *testing.T) {
+	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
 	primaryDir := t.TempDir()
-	primaryVaultPath := filepath.Join(primaryDir, "vault.sns")
+	primarySecretsPath := filepath.Join(primaryDir, "secrets.enc")
 	primarySrv, primaryTS := newTestServerInstance(t, primaryDir, 8*time.Hour)
 	defer primaryTS.Close()
 	defer primarySrv.Close()
 
 	secondaryDir := t.TempDir()
-	secondaryVaultPath := filepath.Join(secondaryDir, "vault.sns")
+	secondarySecretsPath := filepath.Join(secondaryDir, "secrets.enc")
 	secondarySrv, secondaryTS := newTestServerInstance(t, secondaryDir, 8*time.Hour)
 	defer secondaryTS.Close()
 	defer secondarySrv.Close()
+
+	// Initialize secondary instance with its own admin password and distinct local monitor telemetry
+	secondaryAdminPass := "SecondaryNodePass!2026"
+	secondaryHTTP := newCookieHTTPClient()
+	secSetupReq, _ := json.Marshal(map[string]string{"password": secondaryAdminPass})
+	sInitRes, err := secondaryHTTP.Post(secondaryTS.URL+"/api/auth/setup", "application/json", bytes.NewReader(secSetupReq))
+	if err != nil || sInitRes.StatusCode != http.StatusOK {
+		t.Fatalf("secondary POST /api/auth/setup: status=%v err=%v", sInitRes.StatusCode, err)
+	}
+	sInitRes.Body.Close()
+
+	// Create a local server and seed a local monitor snapshot on secondary so we can prove default sync (include_runtime=false) preserves it
+	secLocalSrv, err := secondarySrv.cfg.Store.CreateServer(vault.ServerMutationInput{
+		Name:     "secondary-local-sentinel",
+		Group:    "本地监控节点",
+		Host:     "10.250.0.1",
+		Port:     22,
+		Username: "ops",
+		AuthType: vault.AuthPassword,
+		Password: strPtrForTest("SecLocalPass!1"),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("create secondary local server: %v", err)
+	}
+	_, _, _, err = secondarySrv.cfg.Store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{{
+		ServerID:    secLocalSrv.ID,
+		ServerName:  "secondary-local-sentinel",
+		CollectedAt: time.Now().UTC(),
+		Reachable:   true,
+		CPUPercent:  77.7,
+	}})
+	if err != nil {
+		t.Fatalf("seed secondary monitor snapshot: %v", err)
+	}
 
 	// 1. Start Bastion SSH server + Internal CoreDB SSH server (reachable via Bastion ProxyJump)
 	var internalAuthorizedKeys sync.Map
@@ -357,24 +392,21 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		t.Fatalf("unexpected batch-exec output: %+v", batchOut)
 	}
 
-	// 3. Cross-Origin WebSocket Hijacking Guard + Live Native Binary WebSocket PTY (/api/ws/terminal)
+	// 3. Opaque null-origin WebSocket rejected + Live Native Binary WebSocket PTY (/api/ws/terminal)
 	wsURL := "ws" + strings.TrimPrefix(primaryTS.URL, "http") + "/api/ws/terminal?server_id=" + url.QueryEscape(targetOut.ID) + "&cols=100&rows=30"
-	evilDialer := websocket.Dialer{Jar: adminHTTP.Jar}
-	evilHeader := http.Header{"Origin": []string{"https://evil-attacker.example"}}
-	_, evilResp, evilErr := evilDialer.Dial(wsURL, evilHeader)
-	// Blocked either by the cookie same-origin guard in the auth layer (401) or by the WS origin check (403).
-	if evilErr == nil || evilResp == nil || (evilResp.StatusCode != http.StatusForbidden && evilResp.StatusCode != http.StatusUnauthorized) {
-		t.Fatalf("SECURITY FAILURE: cross-origin WebSocket hijack was not blocked with 401/403! resp=%v err=%v", evilResp, evilErr)
+	wsDialer := websocket.Dialer{Jar: adminHTTP.Jar}
+	_, nullResp, nullErr := wsDialer.Dial(wsURL, http.Header{"Origin": []string{"null"}})
+	if nullErr == nil || nullResp == nil || nullResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected opaque Origin: null WebSocket blocked with 403, resp=%v err=%v", nullResp, nullErr)
 	}
 
 	sameOriginHeader := http.Header{"Origin": []string{primaryTS.URL}}
-	wsConn, _, err := evilDialer.Dial(wsURL, sameOriginHeader)
+	wsConn, _, err := wsDialer.Dial(wsURL, sameOriginHeader)
 	if err != nil {
 		t.Fatalf("WebSocket /api/ws/terminal dial failed: %v", err)
 	}
 	defer wsConn.Close()
 
-	// Wait for {"type":"ready"} control frame, then execute command over binary frame
 	_ = wsConn.SetReadDeadline(time.Now().Add(8 * time.Second))
 	_, firstFrame, err := wsConn.ReadMessage()
 	if err != nil || !strings.Contains(string(firstFrame), `"ready"`) {
@@ -402,7 +434,7 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		t.Fatalf("did not receive PTY canary over /api/ws/terminal, got %q", ptyCombined.String())
 	}
 
-	// 4. Streaming SFTP Upload + ReadText + Download via REST endpoints
+	// 4. Streaming SFTP Upload + Download via REST endpoints
 	sftpRemoteDir := t.TempDir()
 	secretFileName := "top_secret_payroll_2026.txt"
 	secretFileContent := "CONFIDENTIAL_SFTP_PAYLOAD_991234"
@@ -439,8 +471,14 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		t.Fatalf("SFTP download mismatch: got %q", string(dlBytes))
 	}
 
-	// 5. 7x24 Background Daemon Decoupling Proof:
-	// Lock ALL Web sessions -> Web console gets 401, yet background Monitor Engine STILL collects SSH telemetry & persists to vault.sns!
+	// 5. 7x24 Background Daemon Decoupling Proof + Zero secrets.enc Rewrite During Monitoring:
+	// Lock ALL Web sessions -> Web console gets 401, yet background Monitor Engine STILL collects SSH telemetry
+	// and writes ONLY to monitor_runtime.json without touching secrets.enc!
+	secretsBeforeMonitor, err := os.ReadFile(primarySecretsPath)
+	if err != nil {
+		t.Fatalf("ReadFile secrets.enc before monitor: %v", err)
+	}
+
 	lockRes, err := adminHTTP.Post(primaryTS.URL+"/api/auth/lock", "application/json", bytes.NewReader([]byte(`{}`)))
 	if err != nil || lockRes.StatusCode != http.StatusOK {
 		t.Fatalf("POST /api/auth/lock: status=%v err=%v", lockRes.StatusCode, err)
@@ -453,13 +491,22 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		t.Fatalf("expected 401 on /api/monitor/overview while web console is locked, got %d", unauthMonRes.StatusCode)
 	}
 
-	// Background 7x24 Monitor Engine executes scheduled SSH collection while zero Web sessions exist!
 	bgSnap, err := primarySrv.cfg.Monitor.CollectServerNow(context.Background(), targetOut.ID, "", "daemon:patrol")
 	if err != nil || bgSnap == nil || !bgSnap.Reachable || bgSnap.CPUCores < 1 {
 		t.Fatalf("expected 7x24 background monitor collection to succeed while Web sessions are locked! snap=%+v err=%v", bgSnap, err)
 	}
+	if err := primarySrv.cfg.Store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+	secretsAfterMonitor, err := os.ReadFile(primarySecretsPath)
+	if err != nil {
+		t.Fatalf("ReadFile secrets.enc after monitor: %v", err)
+	}
+	if !bytes.Equal(secretsBeforeMonitor, secretsAfterMonitor) {
+		t.Fatalf("DECOUPLING VIOLATION: background monitoring/lock rewrote secrets.enc!")
+	}
 
-	// Re-login to Web console and verify fresh telemetry & Portable .sns Export + Remote Cloud Sync
+	// Re-login to Web console and verify Portable .sns v3 Backup Export + Simplified Cross-Instance Sync
 	loginReq, _ := json.Marshal(map[string]string{"password": adminPass})
 	reloginRes, err := adminHTTP.Post(primaryTS.URL+"/api/auth/login", "application/json", bytes.NewReader(loginReq))
 	if err != nil || reloginRes.StatusCode != http.StatusOK {
@@ -467,35 +514,60 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 	}
 	reloginRes.Body.Close()
 
-	expRes, err := adminHTTP.Get(primaryTS.URL + "/api/vault/export")
+	backupPass := "PortableBackupPass#2026!"
+	expReqBody, _ := json.Marshal(map[string]any{
+		"backup_password": backupPass,
+		"include_runtime": true,
+	})
+	expRes, err := adminHTTP.Post(primaryTS.URL+"/api/vault/export", "application/json", bytes.NewReader(expReqBody))
 	if err != nil || expRes.StatusCode != http.StatusOK {
-		t.Fatalf("GET /api/vault/export: status=%v err=%v", expRes.StatusCode, err)
+		t.Fatalf("POST /api/vault/export: status=%v err=%v", expRes.StatusCode, err)
 	}
 	exportedSNSBytes, _ := io.ReadAll(expRes.Body)
 	expRes.Body.Close()
 
-	// Push encrypted container to Secondary Server via /api/vault/sync/push
-	syncPushReq, _ := json.Marshal(map[string]string{"remote_url": secondaryTS.URL})
+	// Push core config + AI knowledge (default include_runtime=false) to Secondary Server via /api/vault/sync/push
+	syncPushReq, _ := json.Marshal(map[string]any{
+		"remote_url":      secondaryTS.URL,
+		"remote_password": secondaryAdminPass,
+		"include_runtime": false,
+	})
 	syncRes, err := adminHTTP.Post(primaryTS.URL+"/api/vault/sync/push", "application/json", bytes.NewReader(syncPushReq))
 	if err != nil || syncRes.StatusCode != http.StatusOK {
-		t.Fatalf("POST /api/vault/sync/push: status=%v err=%v", syncRes.StatusCode, err)
+		bodyTxt, _ := io.ReadAll(syncRes.Body)
+		t.Fatalf("POST /api/vault/sync/push: status=%v body=%s err=%v", syncRes.StatusCode, string(bodyTxt), err)
 	}
 	syncRes.Body.Close()
 
-	// =========================================================================
-	// AT-REST ENCRYPTION AUDIT: Disk vault.sns & Exported .sns Backup Zero Plaintext
-	// =========================================================================
-	primaryDiskBytes, err := os.ReadFile(primaryVaultPath)
-	if err != nil {
-		t.Fatalf("ReadFile primary vault.sns: %v", err)
+	// Verify secondary received primary's servers while PRESERVING secondary's own monitor runtime snapshot!
+	secServers, err := secondarySrv.cfg.Store.ListServers()
+	if err != nil || len(secServers) != 2 {
+		t.Fatalf("expected secondary to receive 2 synced servers, got %+v err=%v", secServers, err)
 	}
-	secondaryDiskBytes, err := os.ReadFile(secondaryVaultPath)
+	secBundle, err := secondarySrv.cfg.Store.BuildBackupBundle(true)
 	if err != nil {
-		t.Fatalf("ReadFile secondary vault.sns: %v", err)
+		t.Fatalf("secondary BuildBackupBundle: %v", err)
+	}
+	if secBundle.Runtime == nil || secBundle.Runtime.Monitor.LatestSnapshots[secLocalSrv.ID] == nil ||
+		secBundle.Runtime.Monitor.LatestSnapshots[secLocalSrv.ID].CPUPercent != 77.7 {
+		t.Fatalf("expected include_runtime=false sync to preserve secondary local monitor telemetry, got %+v", secBundle.Runtime)
+	}
+
+	// =========================================================================
+	// AT-REST ENCRYPTION AUDIT: Disk secrets.enc & Exported .sns Backup Zero Plaintext
+	// =========================================================================
+	primaryDiskBytes, err := os.ReadFile(primarySecretsPath)
+	if err != nil {
+		t.Fatalf("ReadFile primary secrets.enc: %v", err)
+	}
+	secondaryDiskBytes, err := os.ReadFile(secondarySecretsPath)
+	if err != nil {
+		t.Fatalf("ReadFile secondary secrets.enc: %v", err)
 	}
 
 	forbiddenCanaries := []string{
 		adminPass,
+		backupPass,
 		"Secret-Ed25519-Keychain-Item",
 		"OPENSSH PRIVATE KEY",
 		"secops-canary@sns",
@@ -510,9 +582,9 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		"secret-watched-daemon-canary",
 	}
 	for surfaceName, blob := range map[string][]byte{
-		"primary_disk(vault.sns)":   primaryDiskBytes,
-		"secondary_disk(vault.sns)": secondaryDiskBytes,
-		"exported_backup(.sns)":     exportedSNSBytes,
+		"primary_disk(secrets.enc)":   primaryDiskBytes,
+		"secondary_disk(secrets.enc)": secondaryDiskBytes,
+		"exported_backup(.sns)":       exportedSNSBytes,
 	} {
 		for _, canary := range forbiddenCanaries {
 			if bytes.Contains(blob, []byte(canary)) {
@@ -525,39 +597,32 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 		}
 	}
 
-	// Verify exported .sns backup is strictly password-wrapped (wrong password rejected on portable restore)
-	checkStore := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
-	if err := checkStore.ImportEncryptedVault(exportedSNSBytes, "WrongRestorePass!000", "", "restore-test"); !errors.Is(err, vault.ErrInvalidPassword) {
-		t.Fatalf("expected exported .sns backup to require admin password, got %v", err)
+	// Verify exported .sns backup is password-wrapped (wrong password rejected on portable restore)
+	checkStore, err := vault.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("checkStore NewStore: %v", err)
+	}
+	defer checkStore.Close()
+	if err := checkStore.ImportBackupBytes(exportedSNSBytes, "WrongRestorePass!000", true, "restore-test"); !errors.Is(err, vault.ErrInvalidPassword) {
+		t.Fatalf("expected exported .sns backup to require backup password, got %v", err)
 	}
 
 	// =========================================================================
-	// ACTIVE ATTACK #1: Unauthenticated Backup Overwrite via /import & /import/file -> 401
+	// ACTIVE ATTACK #1: Unauthenticated /api/vault/import/file Overwrite -> 401
 	// =========================================================================
-	rogueCV := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
-	rogueCV.SetKDFParams(1, 16*1024, 2)
-	if err := rogueCV.Setup("AttackerRoguePass!123", "attacker"); err != nil {
+	rogueStore, err := vault.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("rogue NewStore: %v", err)
+	}
+	defer rogueStore.Close()
+	if err := rogueStore.Setup("AttackerRoguePass!123", "attacker"); err != nil {
 		t.Fatalf("rogue Setup: %v", err)
 	}
-	rogueBlob, rogueHdr, _ := rogueCV.LastSealedBlob()
-	roguePriv := rogueCV.AuthPrivateKeyCopy()
-	rogueNewSig := vault.SignVaultImport(roguePriv, rogueHdr.VaultID, rogueHdr.Revision, rogueBlob)
-	forgedOverwriteSig := vault.SignVaultImportOverwrite(roguePriv, "forged-old-id", rogueHdr.VaultID, rogueBlob)
-	importPayload, _ := json.Marshal(map[string]string{
-		"blob_b64":                base64.StdEncoding.EncodeToString(rogueBlob),
-		"new_signature_b64":       base64.StdEncoding.EncodeToString(rogueNewSig),
-		"overwrite_signature_b64": base64.StdEncoding.EncodeToString(forgedOverwriteSig),
-	})
-	impRes, err := http.Post(primaryTS.URL+"/api/vault/import", "application/json", bytes.NewReader(importPayload))
+	rogueBlob, err := rogueStore.ExportBackupBytes("AttackerRoguePass!123", false, "attacker")
 	if err != nil {
-		t.Fatalf("POST /api/vault/import: %v", err)
-	}
-	impRes.Body.Close()
-	if impRes.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("SECURITY FAILURE: forged signed import overwrite was not rejected with 401! got %d", impRes.StatusCode)
+		t.Fatalf("rogue ExportBackupBytes: %v", err)
 	}
 
-	// Also verify unauthenticated multipart /api/vault/import/file WITHOUT current admin password is rejected with 401!
 	var rogueMP bytes.Buffer
 	rogueWriter := multipart.NewWriter(&rogueMP)
 	_ = rogueWriter.WriteField("password", "AttackerRoguePass!123")
@@ -575,21 +640,37 @@ func TestEncryptedVaultAtRestProxyJumpWebSocketPTYBackgroundMonitorAndBackupSecu
 	}
 
 	// =========================================================================
-	// ACTIVE ATTACK #2: Bit-Flip Ciphertext Tamper on Disk -> AEAD REJECTED
+	// ACTIVE ATTACK #2: Bit-Flip Ciphertext Tamper on Backup & Disk -> AEAD REJECTED
 	// =========================================================================
 	tampered := append([]byte(nil), exportedSNSBytes...)
 	tampered[len(tampered)-17] ^= 0xFF
-	tamperedStore := vault.NewClientVault(vault.NewBlindStoreBackend(mustNewTempBlindStore(t)))
-	if err := tamperedStore.ImportEncryptedVault(tampered, adminPass, "", "tamper-test"); !errors.Is(err, vault.ErrCorruptedVault) {
-		t.Fatalf("SECURITY FAILURE: tampered ciphertext was not rejected with ErrCorruptedVault! got %v", err)
+	tamperedStore, err := vault.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("tampered NewStore: %v", err)
+	}
+	defer tamperedStore.Close()
+	if err := tamperedStore.ImportBackupBytes(tampered, backupPass, true, "tamper-test"); !errors.Is(err, vault.ErrInvalidPassword) && !errors.Is(err, vault.ErrCorruptedVault) {
+		t.Fatalf("SECURITY FAILURE: tampered backup ciphertext was not rejected by AEAD! got %v", err)
+	}
+
+	tamperedSecrets := append([]byte(nil), primaryDiskBytes...)
+	tamperedSecrets[len(tamperedSecrets)-5] ^= 0xFF
+	tamperDir := t.TempDir()
+	primaryKeyBytes, err := os.ReadFile(filepath.Join(primaryDir, "master.key"))
+	if err != nil {
+		t.Fatalf("read master.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tamperDir, "master.key"), primaryKeyBytes, 0o600); err != nil {
+		t.Fatalf("write tamper master.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tamperDir, "secrets.enc"), tamperedSecrets, 0o600); err != nil {
+		t.Fatalf("write tamper secrets.enc: %v", err)
+	}
+	if _, err := vault.NewStore(tamperDir); !errors.Is(err, vault.ErrCorruptedVault) {
+		t.Fatalf("SECURITY FAILURE: tampered disk secrets.enc was not rejected with ErrCorruptedVault! got %v", err)
 	}
 }
 
-func mustNewTempBlindStore(t *testing.T) *vault.BlindStore {
-	t.Helper()
-	bs, err := vault.NewBlindStore(filepath.Join(t.TempDir(), "rogue.sns"))
-	if err != nil {
-		t.Fatalf("NewBlindStore: %v", err)
-	}
-	return bs
+func strPtrForTest(v string) *string {
+	return &v
 }

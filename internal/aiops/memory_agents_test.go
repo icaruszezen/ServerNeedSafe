@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,18 +16,18 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
-func setupMemoryTestEnv(t *testing.T, llmHandler http.HandlerFunc) (*vault.ClientVault, *Service, *vault.ServerView, *vault.ServerView, *httptest.Server) {
+func setupMemoryTestEnv(t *testing.T, llmHandler http.HandlerFunc) (*vault.Store, *Service, *vault.ServerView, *vault.ServerView, *httptest.Server) {
 	t.Helper()
 	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
 
 	mockLLM := httptest.NewServer(llmHandler)
 	t.Cleanup(mockLLM.Close)
 
-	vaultFile := filepath.Join(t.TempDir(), "vault.sns")
-	store, err := vault.NewStore(vaultFile)
+	store, err := vault.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(store.Close)
 	if err := store.Setup("StrongMasterPass!2026", "127.0.0.1"); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

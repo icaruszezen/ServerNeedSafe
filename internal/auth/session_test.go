@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestSessionLifecycleChallengeRateLimitAndDesktopGuard(t *testing.T) {
+func TestSessionLifecycleRateLimitAndDesktopGuard(t *testing.T) {
 	mgr, err := NewManager(2*time.Second, true)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -21,19 +21,6 @@ func TestSessionLifecycleChallengeRateLimitAndDesktopGuard(t *testing.T) {
 	}
 	if mgr.VerifyDesktopCookie("forged-cookie") {
 		t.Fatalf("expected forged desktop cookie to fail")
-	}
-
-	// Single-use zero-knowledge challenge
-	ch, err := mgr.IssueChallenge()
-	if err != nil || len(ch.Nonce) != 64 {
-		t.Fatalf("IssueChallenge failed: %+v, err=%v", ch, err)
-	}
-	nonce, err := mgr.ConsumeChallenge(ch.ID)
-	if err != nil || nonce != ch.Nonce {
-		t.Fatalf("ConsumeChallenge first use failed: nonce=%s err=%v", nonce, err)
-	}
-	if _, err := mgr.ConsumeChallenge(ch.ID); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("expected replay of challenge to fail, got %v", err)
 	}
 
 	// Rate limit after 5 failures
@@ -51,45 +38,41 @@ func TestSessionLifecycleChallengeRateLimitAndDesktopGuard(t *testing.T) {
 		t.Fatalf("expected rate limit cleared, got %v", err)
 	}
 
-	// Session bound to AuthPubSHA256 + Metadata-free One-time ticket
-	pubFP := "abc123fingerprint"
-	sess, err := mgr.CreateSession(pubFP, "127.0.0.1", "TestAgent")
+	// Session bound to AuthVersion
+	sess, err := mgr.CreateSession(1, "127.0.0.1", "TestAgent")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := mgr.ValidateSession(sess.Token, pubFP); err != nil {
+	if _, err := mgr.ValidateSession(sess.Token, 1); err != nil {
 		t.Fatalf("ValidateSession: %v", err)
 	}
-	// Rotating password changes AuthPubSHA256 -> old session must be rejected immediately!
-	if _, err := mgr.ValidateSession(sess.Token, "rotated_fingerprint"); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("expected rotated fingerprint to invalidate session, got %v", err)
+	// Changing password increments AuthVersion -> old session must be rejected immediately!
+	if _, err := mgr.ValidateSession(sess.Token, 2); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected incremented AuthVersion to invalidate session, got %v", err)
 	}
 
-	sess2, _ := mgr.CreateSession(pubFP, "127.0.0.1", "TestAgent")
-	ticket, err := mgr.IssueTicket("tcp_relay", pubFP)
-	if err != nil {
-		t.Fatalf("IssueTicket: %v", err)
-	}
-	if err := mgr.ConsumeTicket(ticket, "tcp_relay", pubFP); err != nil {
-		t.Fatalf("ConsumeTicket first use: %v", err)
-	}
-	if err := mgr.ConsumeTicket(ticket, "tcp_relay", pubFP); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("expected replay of one-time ticket to fail, got %v", err)
-	}
-
+	sess2, _ := mgr.CreateSession(2, "127.0.0.1", "TestAgent")
 	mgr.RevokeAll()
-	if _, err := mgr.ValidateSession(sess2.Token, pubFP); !errors.Is(err, ErrUnauthorized) {
+	if _, err := mgr.ValidateSession(sess2.Token, 2); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected revoked session to fail, got %v", err)
 	}
 
-	// Idle timeout vs Max TTL check
-	sess3, err := mgr.CreateSession(pubFP, "127.0.0.1", "TestAgent")
+	// Idle timeout check
+	sess3, err := mgr.CreateSession(2, "127.0.0.1", "TestAgent")
 	if err != nil {
 		t.Fatalf("CreateSession sess3: %v", err)
 	}
 	time.Sleep(60 * time.Millisecond)
-	if _, err := mgr.ValidateSessionWithIdle(sess3.Token, pubFP, 25*time.Millisecond, true); !errors.Is(err, ErrUnauthorized) {
+	if _, err := mgr.ValidateSessionWithIdle(sess3.Token, 2, 25*time.Millisecond, true); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected idle timeout to invalidate session, got %v", err)
 	}
-}
 
+	// Default TTL when 0 passed should be 7 days (168h)
+	defMgr, err := NewManager(0, false)
+	if err != nil {
+		t.Fatalf("NewManager default: %v", err)
+	}
+	if defMgr.SessionTTL() != DefaultSessionTTL {
+		t.Fatalf("expected default TTL %v, got %v", DefaultSessionTTL, defMgr.SessionTTL())
+	}
+}

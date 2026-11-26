@@ -433,7 +433,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   {agentsDirty && <span className="tag-chip amber">未保存修改</span>}
                 </h3>
                 <p className="sec-panel-desc" style={{ marginBottom: 0 }}>
-                  单一全局规范，加密存储于 <code className="mono">vault.sns</code>，统一作用于「AI 诊断中心」「SSH 终端副驾驶」与「后台定时巡检」。
+                  单一全局规范，加密存储于 <code className="mono">secrets.enc</code>，统一作用于「AI 诊断中心」「SSH 终端副驾驶」与「后台定时巡检」。
                 </p>
               </div>
 

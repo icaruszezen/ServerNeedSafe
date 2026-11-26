@@ -291,21 +291,36 @@ func TestOpenAIAndAnthropicStreamingHITLMemoryAndZeroKnowledgeDisk(t *testing.T)
 		t.Fatalf("SendPatrolAlertWebhook failed: err=%v count=%d", err, webhookReceived.Load())
 	}
 
-	// Verify ZERO plaintext leakage of AI API keys, Webhook secrets, SSH passwords, Memories, or Sessions on disk!
-	rawDisk, err := os.ReadFile(vaultFile)
+	// Verify ZERO plaintext leakage of AI API keys, Webhook secrets, and SSH passwords inside secrets.enc and aiops_runtime.json!
+	if err := store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+	rawDisk, err := os.ReadFile(store.SecretsPath())
 	if err != nil {
-		t.Fatalf("ReadFile vault.sns: %v", err)
+		t.Fatalf("ReadFile secrets.enc: %v", err)
 	}
 	for _, secret := range []string{
 		"sk-secret-deepseek-998877",
 		"sk-ant-secret-key-8899",
 		"whsec_super_secret_7766",
 		"UltraSecretSSHPassword#2026",
-		"Nginx 边缘网关节点",
-		"Nginx 502 快速恢复 SOP",
 	} {
 		if bytes.Contains(rawDisk, []byte(secret)) {
-			t.Fatalf("SECURITY FAILURE: leaked plaintext %q inside encrypted vault.sns!", secret)
+			t.Fatalf("SECURITY FAILURE: leaked plaintext %q inside encrypted secrets.enc!", secret)
+		}
+	}
+	rawRT, err := os.ReadFile(filepath.Join(store.DataDir(), "aiops_runtime.json"))
+	if err != nil || len(rawRT) == 0 {
+		t.Fatalf("ReadFile aiops_runtime.json: %v", err)
+	}
+	for _, secret := range []string{
+		"sk-secret-deepseek-998877",
+		"sk-ant-secret-key-8899",
+		"whsec_super_secret_7766",
+		"UltraSecretSSHPassword#2026",
+	} {
+		if bytes.Contains(rawRT, []byte(secret)) {
+			t.Fatalf("SECURITY FAILURE: leaked secret %q inside aiops_runtime.json!", secret)
 		}
 	}
 }

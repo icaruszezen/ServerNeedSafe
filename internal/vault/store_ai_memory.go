@@ -24,7 +24,7 @@ var (
 )
 
 // RedactSensitiveText strips private keys, API tokens, and inline credential assignments before
-// persisting any AI memory entry, HostMemory field, or AGENTS.md proposal inside vault.sns.
+// persisting any AI memory entry, HostMemory field, or AGENTS.md proposal.
 func RedactSensitiveText(raw string) string {
 	if raw == "" {
 		return ""
@@ -36,35 +36,30 @@ func RedactSensitiveText(raw string) string {
 	return out
 }
 
-// --- Global AGENTS.md Management ---
+// --- Global AGENTS.md Management (stored in secrets.enc) ---
 
-func (s *ClientVault) GetAgentsMD() (AgentsMDConfig, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetAgentsMD() (AgentsMDConfig, error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return AgentsMDConfig{}, ErrVaultLocked
 	}
-	if !s.state.AISettings.AgentsMD.Initialized && s.state.AISettings.AgentsMD.Revision == 0 && s.state.AISettings.AgentsMD.Content == "" {
+	if !s.secrets.AISettings.AgentsMD.Initialized && s.secrets.AISettings.AgentsMD.Revision == 0 && s.secrets.AISettings.AgentsMD.Content == "" {
 		return DefaultAgentsMDConfig(time.Now().UTC()), nil
 	}
-	return s.state.AISettings.AgentsMD, nil
+	return s.secrets.AISettings.AgentsMD, nil
 }
 
-func (s *ClientVault) UpdateAgentsMD(enabled bool, content string, resetDefault bool, clientIP string) (*AgentsMDConfig, error) {
+func (s *Store) UpdateAgentsMD(enabled bool, content string, resetDefault bool, clientIP string) (*AgentsMDConfig, error) {
 	if len(content) > maxAgentsMDBytes {
 		return nil, fmt.Errorf("%w: AGENTS.md 内容超过上限 (%d KB)", ErrInvalidInput, maxAgentsMDBytes/1024)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, ErrVaultLocked
-	}
 
 	var out AgentsMDConfig
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
+	var actionDetail string
+	err := s.mutateSecrets(func(sec *SecretsState) error {
 		now := time.Now().UTC()
-		cur := st.AISettings.AgentsMD
+		cur := sec.AISettings.AgentsMD
 		nextContent := content
 		if resetDefault {
 			nextContent = DefaultAgentsMDTemplate()
@@ -76,134 +71,157 @@ func (s *ClientVault) UpdateAgentsMD(enabled bool, content string, resetDefault 
 		if rev < 1 {
 			rev = 1
 		}
-		st.AISettings.AgentsMD = AgentsMDConfig{
+		sec.AISettings.AgentsMD = AgentsMDConfig{
 			Enabled:     enabled,
 			Content:     nextContent,
 			Revision:    rev,
 			Initialized: true,
 			UpdatedAt:   now,
 		}
-		actionDetail := fmt.Sprintf("更新全局 AGENTS.md 规范 (启用=%v, 版本=v%d, %d 字符)", enabled, rev, len([]rune(nextContent)))
+		actionDetail = fmt.Sprintf("更新全局 AGENTS.md 规范 (启用=%v, 版本=v%d, %d 字符)", enabled, rev, len([]rune(nextContent)))
 		if resetDefault {
 			actionDetail = fmt.Sprintf("重置全局 AGENTS.md 为默认 SRE 运维模板 (版本=v%d)", rev)
 		}
-		appendAuditLocked(st, "ai.agents_md_update", "AGENTS.md", actionDetail, clientIP, true)
-		out = st.AISettings.AgentsMD
+		out = sec.AISettings.AgentsMD
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	s.RecordAudit("ai.agents_md_update", "AGENTS.md", actionDetail, clientIP, true)
 	return &out, nil
 }
 
 // ResolveAgentsMDProposal accepts (merges into global AGENTS.md) or dismisses an AI-generated revision proposal.
-func (s *ClientVault) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP string) (*AgentsMDConfig, *AIAgentsMDProposal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP string) (*AgentsMDConfig, *AIAgentsMDProposal, error) {
+	if !s.IsReady() {
 		return nil, nil, ErrVaultLocked
 	}
 
-	var outCfg AgentsMDConfig
-	var outProp AIAgentsMDProposal
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		si, pi := -1, -1
-		for i := range st.AISessions {
-			for j := range st.AISessions[i].AgentsMDProposals {
-				if st.AISessions[i].AgentsMDProposals[j].ID == proposalID {
-					si, pi = i, j
+	// Step 1: Read pending proposal under rtMu.RLock
+	s.rtMu.RLock()
+	var prop AIAgentsMDProposal
+	found := false
+	if s.aiopsRT != nil {
+		for _, cs := range s.aiopsRT.AISessions {
+			for _, ap := range cs.AgentsMDProposals {
+				if ap.ID == proposalID {
+					prop = ap
+					found = true
 					break
 				}
 			}
-			if si >= 0 {
+			if found {
 				break
 			}
 		}
-		if si < 0 {
-			return ErrNotFound
-		}
+	}
+	s.rtMu.RUnlock()
+	if !found {
+		return nil, nil, ErrNotFound
+	}
+	if prop.Status != "pending" {
+		return nil, nil, fmt.Errorf("%w: 该 AGENTS.md 修订提案已处理 (%s)", ErrInvalidInput, prop.Status)
+	}
 
-		prop := st.AISessions[si].AgentsMDProposals[pi]
-		if prop.Status != "pending" {
-			return fmt.Errorf("%w: 该 AGENTS.md 修订提案已处理 (%s)", ErrInvalidInput, prop.Status)
-		}
-
-		now := time.Now().UTC()
-		prop.ResolvedAt = &now
-		if !accept {
-			prop.Status = "dismissed"
-			st.AISessions[si].AgentsMDProposals[pi] = prop
-			outCfg = st.AISettings.AgentsMD
-			outProp = prop
-			return nil
-		}
-
+	now := time.Now().UTC()
+	var outCfg AgentsMDConfig
+	if accept {
 		cleanContent := RedactSensitiveText(strings.ReplaceAll(prop.ProposedContent, "\r\n", "\n"))
 		if len(cleanContent) > maxAgentsMDBytes {
-			return fmt.Errorf("%w: 提议的 AGENTS.md 内容超过上限", ErrInvalidInput)
+			return nil, nil, fmt.Errorf("%w: 提议的 AGENTS.md 内容超过上限", ErrInvalidInput)
 		}
-		rev := st.AISettings.AgentsMD.Revision + 1
-		if rev < 1 {
-			rev = 1
+		err := s.mutateSecrets(func(sec *SecretsState) error {
+			rev := sec.AISettings.AgentsMD.Revision + 1
+			if rev < 1 {
+				rev = 1
+			}
+			sec.AISettings.AgentsMD = AgentsMDConfig{
+				Enabled:     true,
+				Content:     cleanContent,
+				Revision:    rev,
+				Initialized: true,
+				UpdatedAt:   now,
+			}
+			outCfg = sec.AISettings.AgentsMD
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
 		}
-		st.AISettings.AgentsMD = AgentsMDConfig{
-			Enabled:     true,
-			Content:     cleanContent,
-			Revision:    rev,
-			Initialized: true,
-			UpdatedAt:   now,
+	} else {
+		cfg, err := s.GetAgentsMD()
+		if err != nil {
+			return nil, nil, err
 		}
-		prop.Status = "accepted"
-		st.AISessions[si].AgentsMDProposals[pi] = prop
-		appendAuditLocked(st, "ai.agents_md_merge", "AGENTS.md", fmt.Sprintf("批准合入 AI 提议的 AGENTS.md 修订 (%s, v%d)", prop.Summary, rev), clientIP, true)
-		outCfg = st.AISettings.AgentsMD
-		outProp = prop
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
+		outCfg = cfg
 	}
+
+	// Step 2: Update proposal status in aiopsRT
+	var outProp AIAgentsMDProposal
+	s.rtMu.Lock()
+	si, pi := -1, -1
+	for i := range s.aiopsRT.AISessions {
+		for j := range s.aiopsRT.AISessions[i].AgentsMDProposals {
+			if s.aiopsRT.AISessions[i].AgentsMDProposals[j].ID == proposalID {
+				si, pi = i, j
+				break
+			}
+		}
+		if si >= 0 {
+			break
+		}
+	}
+	if si < 0 {
+		s.rtMu.Unlock()
+		return nil, nil, ErrNotFound
+	}
+	p := s.aiopsRT.AISessions[si].AgentsMDProposals[pi]
+	p.ResolvedAt = &now
+	if accept {
+		p.Status = "accepted"
+		s.appendAuditRuntimeLocked("ai.agents_md_merge", "AGENTS.md", fmt.Sprintf("批准合入 AI 提议的 AGENTS.md 修订 (%s, v%d)", p.Summary, outCfg.Revision), clientIP, true)
+	} else {
+		p.Status = "dismissed"
+	}
+	s.aiopsRT.AISessions[si].AgentsMDProposals[pi] = p
+	s.dirtyAIOps = true
+	outProp = p
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return &outCfg, &outProp, nil
 }
 
-// --- Memory & Context Budget Config ---
+// --- Memory & Context Budget Config (stored in secrets.enc) ---
 
-func (s *ClientVault) GetAIMemoryConfig() (AIMemoryConfig, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetAIMemoryConfig() (AIMemoryConfig, error) {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil {
 		return AIMemoryConfig{}, ErrVaultLocked
 	}
-	if !s.state.AISettings.MemoryConfig.Initialized && s.state.AISettings.MemoryConfig.AgentsMDMaxChars == 0 {
+	if !s.secrets.AISettings.MemoryConfig.Initialized && s.secrets.AISettings.MemoryConfig.AgentsMDMaxChars == 0 {
 		return DefaultAIMemoryConfig(), nil
 	}
-	return SanitizeAIMemoryConfig(s.state.AISettings.MemoryConfig), nil
+	return SanitizeAIMemoryConfig(s.secrets.AISettings.MemoryConfig), nil
 }
 
-func (s *ClientVault) UpdateAIMemoryConfig(in AIMemoryConfig, clientIP string) (*AIMemoryConfig, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, ErrVaultLocked
-	}
+func (s *Store) UpdateAIMemoryConfig(in AIMemoryConfig, clientIP string) (*AIMemoryConfig, error) {
 	var out AIMemoryConfig
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
+	err := s.mutateSecrets(func(sec *SecretsState) error {
 		clean := SanitizeAIMemoryConfig(in)
-		st.AISettings.MemoryConfig = clean
-		appendAuditLocked(st, "ai.memory_config", "memory", fmt.Sprintf("更新 AI 记忆与上下文预算配置 (AGENTS预算=%d, 记忆预算=%d, 压缩阈值=%.0f%%)", clean.AgentsMDMaxChars, clean.MemoryPromptBudgetChars, clean.CompactionTriggerRatio*100), clientIP, true)
+		sec.AISettings.MemoryConfig = clean
 		out = clean
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	s.RecordAudit("ai.memory_config", "memory", fmt.Sprintf("更新 AI 记忆与上下文预算配置 (AGENTS预算=%d, 记忆预算=%d, 压缩阈值=%.0f%%)", out.AgentsMDMaxChars, out.MemoryPromptBudgetChars, out.CompactionTriggerRatio*100), clientIP, true)
 	return &out, nil
 }
 
-// --- Long-Term Cross-Session Memory Entries (AIMemoryEntry) ---
+// --- Long-Term Cross-Session Memory Entries (stored in aiops_runtime.json) ---
 
 func normalizeMemoryCategory(cat string) string {
 	switch strings.ToLower(strings.TrimSpace(cat)) {
@@ -250,14 +268,17 @@ func cloneMemoryEntry(m AIMemoryEntry) AIMemoryEntry {
 	return cp
 }
 
-func (s *ClientVault) ListAIMemories() ([]AIMemoryEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) ListAIMemories() ([]AIMemoryEntry, error) {
+	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
-	out := make([]AIMemoryEntry, len(s.state.AIMemories))
-	for i, m := range s.state.AIMemories {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return []AIMemoryEntry{}, nil
+	}
+	out := make([]AIMemoryEntry, len(s.aiopsRT.AIMemories))
+	for i, m := range s.aiopsRT.AIMemories {
 		out[i] = cloneMemoryEntry(m)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -272,7 +293,10 @@ func (s *ClientVault) ListAIMemories() ([]AIMemoryEntry, error) {
 	return out, nil
 }
 
-func (s *ClientVault) UpsertAIMemory(in AIMemoryEntry, isAuto bool, clientIP string) (*AIMemoryEntry, error) {
+func (s *Store) UpsertAIMemory(in AIMemoryEntry, isAuto bool, clientIP string) (*AIMemoryEntry, error) {
+	if !s.IsReady() {
+		return nil, ErrVaultLocked
+	}
 	cleanTitle := RedactSensitiveText(strings.TrimSpace(in.Title))
 	cleanContent := RedactSensitiveText(strings.TrimSpace(in.Content))
 	if cleanTitle == "" || cleanContent == "" {
@@ -313,78 +337,70 @@ func (s *ClientVault) UpsertAIMemory(in AIMemoryEntry, isAuto bool, clientIP str
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return nil, ErrVaultLocked
+	now := time.Now().UTC()
+	var outEntry AIMemoryEntry
+
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
 	}
 
-	var outEntry AIMemoryEntry
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		now := time.Now().UTC()
-
-		// 1. Match by explicit ID
-		matchIdx := -1
-		if strings.TrimSpace(in.ID) != "" {
-			for i := range st.AIMemories {
-				if st.AIMemories[i].ID == in.ID {
+	matchIdx := -1
+	if strings.TrimSpace(in.ID) != "" {
+		for i := range s.aiopsRT.AIMemories {
+			if s.aiopsRT.AIMemories[i].ID == in.ID {
+				matchIdx = i
+				break
+			}
+		}
+	}
+	if matchIdx < 0 && isAuto {
+		normTitle := strings.ToLower(cleanTitle)
+		sortedSids := slices.Clone(serverIDs)
+		slices.Sort(sortedSids)
+		for i := range s.aiopsRT.AIMemories {
+			ex := s.aiopsRT.AIMemories[i]
+			if ex.Scope == scope && ex.Category == cat && strings.ToLower(strings.TrimSpace(ex.Title)) == normTitle {
+				exSids := slices.Clone(ex.ServerIDs)
+				slices.Sort(exSids)
+				if slices.Equal(exSids, sortedSids) {
 					matchIdx = i
 					break
 				}
 			}
 		}
+	}
 
-		// 2. For auto saves, deduplicate by normalized (scope, category, title, server_ids)
-		if matchIdx < 0 && isAuto {
-			normTitle := strings.ToLower(cleanTitle)
-			sortedSids := slices.Clone(serverIDs)
-			slices.Sort(sortedSids)
-			for i := range st.AIMemories {
-				ex := st.AIMemories[i]
-				if ex.Scope == scope && ex.Category == cat && strings.ToLower(strings.TrimSpace(ex.Title)) == normTitle {
-					exSids := slices.Clone(ex.ServerIDs)
-					slices.Sort(exSids)
-					if slices.Equal(exSids, sortedSids) {
-						matchIdx = i
-						break
-					}
-				}
-			}
-		}
-
-		if matchIdx >= 0 {
-			cur := st.AIMemories[matchIdx]
-			cur.Scope = scope
-			cur.ServerIDs = serverIDs
-			cur.Category = cat
-			cur.Title = cleanTitle
-			cur.Content = cleanContent
-			if isAuto {
-				cur.Tags = dedupClean(append(cur.Tags, tags...))
-				if imp > cur.Importance {
-					cur.Importance = imp
-				}
-				if in.Pinned {
-					cur.Pinned = true
-				}
-			} else {
-				cur.Tags = tags
+	if matchIdx >= 0 {
+		cur := s.aiopsRT.AIMemories[matchIdx]
+		cur.Scope = scope
+		cur.ServerIDs = serverIDs
+		cur.Category = cat
+		cur.Title = cleanTitle
+		cur.Content = cleanContent
+		if isAuto {
+			cur.Tags = dedupClean(append(cur.Tags, tags...))
+			if imp > cur.Importance {
 				cur.Importance = imp
-				cur.Pinned = in.Pinned
 			}
-			if in.SourceSessionID != "" {
-				cur.SourceSessionID = in.SourceSessionID
+			if in.Pinned {
+				cur.Pinned = true
 			}
-			cur.UpdatedAt = now
-			st.AIMemories[matchIdx] = cur
-			if !isAuto {
-				appendAuditLocked(st, "ai.long_memory_edit", cur.Title, fmt.Sprintf("编辑长期记忆 [%s/%s]", cur.Scope, cur.Category), clientIP, true)
-			}
-			outEntry = cloneMemoryEntry(cur)
-			return nil
+		} else {
+			cur.Tags = tags
+			cur.Importance = imp
+			cur.Pinned = in.Pinned
 		}
-
+		if in.SourceSessionID != "" {
+			cur.SourceSessionID = in.SourceSessionID
+		}
+		cur.UpdatedAt = now
+		s.aiopsRT.AIMemories[matchIdx] = cur
+		if !isAuto {
+			s.appendAuditRuntimeLocked("ai.long_memory_edit", cur.Title, fmt.Sprintf("编辑长期记忆 [%s/%s]", cur.Scope, cur.Category), clientIP, true)
+		}
+		outEntry = cloneMemoryEntry(cur)
+	} else {
 		created := AIMemoryEntry{
 			ID:              uuid.NewString(),
 			Scope:           scope,
@@ -401,57 +417,59 @@ func (s *ClientVault) UpsertAIMemory(in AIMemoryEntry, isAuto bool, clientIP str
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
-		st.AIMemories = append([]AIMemoryEntry{created}, st.AIMemories...)
+		s.aiopsRT.AIMemories = append([]AIMemoryEntry{created}, s.aiopsRT.AIMemories...)
 
-		// Enforce bounded memory size by evicting lowest-priority unpinned oldest entries
-		if len(st.AIMemories) > maxAIMemoryEntries {
+		if len(s.aiopsRT.AIMemories) > maxAIMemoryEntries {
 			evictIdx := -1
-			for i := len(st.AIMemories) - 1; i >= 0; i-- {
-				if !st.AIMemories[i].Pinned {
-					if evictIdx < 0 || st.AIMemories[i].Importance < st.AIMemories[evictIdx].Importance {
+			for i := len(s.aiopsRT.AIMemories) - 1; i >= 0; i-- {
+				if !s.aiopsRT.AIMemories[i].Pinned {
+					if evictIdx < 0 || s.aiopsRT.AIMemories[i].Importance < s.aiopsRT.AIMemories[evictIdx].Importance {
 						evictIdx = i
 					}
 				}
 			}
 			if evictIdx >= 0 {
-				st.AIMemories = slices.Delete(st.AIMemories, evictIdx, evictIdx+1)
+				s.aiopsRT.AIMemories = slices.Delete(s.aiopsRT.AIMemories, evictIdx, evictIdx+1)
 			}
 		}
 
 		if !isAuto {
-			appendAuditLocked(st, "ai.long_memory_create", created.Title, fmt.Sprintf("新增长期记忆 [%s/%s]", created.Scope, created.Category), clientIP, true)
+			s.appendAuditRuntimeLocked("ai.long_memory_create", created.Title, fmt.Sprintf("新增长期记忆 [%s/%s]", created.Scope, created.Category), clientIP, true)
 		}
 		outEntry = cloneMemoryEntry(created)
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
 	return &outEntry, nil
 }
 
-func (s *ClientVault) DeleteAIMemory(id, clientIP string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+func (s *Store) DeleteAIMemory(id, clientIP string) error {
+	if !s.IsReady() {
 		return ErrVaultLocked
 	}
-	return s.mutateLocked(func(st *VaultState) error {
-		for i, m := range st.AIMemories {
-			if m.ID == id {
-				st.AIMemories = slices.Delete(st.AIMemories, i, i+1)
-				appendAuditLocked(st, "ai.long_memory_delete", m.Title, "删除 AI 长期记忆条目", clientIP, true)
-				return nil
-			}
-		}
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.rtMu.Unlock()
 		return ErrNotFound
-	})
+	}
+	for i, m := range s.aiopsRT.AIMemories {
+		if m.ID == id {
+			s.aiopsRT.AIMemories = slices.Delete(s.aiopsRT.AIMemories, i, i+1)
+			s.dirtyAIOps = true
+			s.appendAuditRuntimeLocked("ai.long_memory_delete", m.Title, "删除 AI 长期记忆条目", clientIP, true)
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return nil
+		}
+	}
+	s.rtMu.Unlock()
+	return ErrNotFound
 }
 
-// TouchAIMemoryUsage increments in-memory usage counters without triggering an extra disk seal;
-// updated counters will naturally persist on the next vault write.
-func (s *ClientVault) TouchAIMemoryUsage(ids []string) {
-	if len(ids) == 0 {
+// TouchAIMemoryUsage increments usage counters in runtime state and marks aiops_runtime.json dirty.
+func (s *Store) TouchAIMemoryUsage(ids []string) {
+	if len(ids) == 0 || !s.IsReady() {
 		return
 	}
 	idSet := make(map[string]bool, len(ids))
@@ -460,29 +478,30 @@ func (s *ClientVault) TouchAIMemoryUsage(ids []string) {
 			idSet[id] = true
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
-		return
-	}
-	now := time.Now().UTC()
-	for i := range s.state.AIMemories {
-		if idSet[s.state.AIMemories[i].ID] {
-			s.state.AIMemories[i].UseCount++
-			t := now
-			s.state.AIMemories[i].LastUsedAt = &t
+	s.rtMu.Lock()
+	if s.aiopsRT != nil {
+		now := time.Now().UTC()
+		changed := false
+		for i := range s.aiopsRT.AIMemories {
+			if idSet[s.aiopsRT.AIMemories[i].ID] {
+				s.aiopsRT.AIMemories[i].UseCount++
+				t := now
+				s.aiopsRT.AIMemories[i].LastUsedAt = &t
+				changed = true
+			}
+		}
+		if changed {
+			s.dirtyAIOps = true
 		}
 	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
 }
 
 // --- Monitor Snapshot <-> HostMemory Objective Fact Sync & Live Context Lookup ---
 
-// mergeMonitorSnapshotIntoHostMemoryLocked merges objective telemetry facts (OS/Kernel/Arch,
-// active services/containers, listening ports) from a reachable ServerMonitorSnapshot into HostMemory.
-// It NEVER overwrites human-authored Summary, DeployPaths, Constraints, or Notes.
-// Returns true if HostMemory was created or meaningfully modified.
-func mergeMonitorSnapshotIntoHostMemoryLocked(st *VaultState, snap *ServerMonitorSnapshot, now time.Time) bool {
-	if st == nil || snap == nil || !snap.Reachable || snap.ServerID == "" {
+func mergeMonitorSnapshotIntoHostMemorySlice(memories *[]HostMemory, snap *ServerMonitorSnapshot, now time.Time) bool {
+	if memories == nil || snap == nil || !snap.Reachable || snap.ServerID == "" {
 		return false
 	}
 
@@ -494,9 +513,10 @@ func mergeMonitorSnapshotIntoHostMemoryLocked(st *VaultState, snap *ServerMonito
 		return false
 	}
 
-	for i := range st.HostMemories {
-		if st.HostMemories[i].ServerID == snap.ServerID {
-			cur := st.HostMemories[i]
+	list := *memories
+	for i := range list {
+		if list[i].ServerID == snap.ServerID {
+			cur := list[i]
 			changed := false
 
 			if snap.ServerName != "" && cur.ServerName != snap.ServerName {
@@ -530,14 +550,14 @@ func mergeMonitorSnapshotIntoHostMemoryLocked(st *VaultState, snap *ServerMonito
 				if changed {
 					cur.UpdatedAt = now
 				}
-				st.HostMemories[i] = cur
+				list[i] = cur
+				*memories = list
 				return true
 			}
 			return false
 		}
 	}
 
-	// Create an initial objective HostMemory entry from the monitor snapshot
 	summary := "受管 Linux 服务器（由 7×24 监控自动建立初始画像）"
 	if osArch != "" {
 		summary = fmt.Sprintf("%s 节点（由 7×24 监控自动建立初始画像）", osArch)
@@ -547,7 +567,7 @@ func mergeMonitorSnapshotIntoHostMemoryLocked(st *VaultState, snap *ServerMonito
 		taggedPorts = "[监控同步] " + portsNote
 	}
 	t := now
-	st.HostMemories = append(st.HostMemories, HostMemory{
+	*memories = append(list, HostMemory{
 		ServerID:        snap.ServerID,
 		ServerName:      snap.ServerName,
 		Summary:         summary,
@@ -632,75 +652,70 @@ func formatSnapshotPortsNote(snap *ServerMonitorSnapshot) string {
 	return strings.Join(items, ", ")
 }
 
-// SyncHostMemoriesFromMonitor manually synchronizes objective facts from the latest 7x24 monitor
-// snapshots into HostMemory for a single server (if serverID != "") or all monitored servers.
-func (s *ClientVault) SyncHostMemoriesFromMonitor(serverID, clientIP string) ([]HostMemory, int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.state == nil {
+// SyncHostMemoriesFromMonitor synchronizes objective facts from the latest 7x24 monitor snapshots into HostMemory.
+func (s *Store) SyncHostMemoriesFromMonitor(serverID, clientIP string) ([]HostMemory, int, error) {
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
 		return nil, 0, ErrVaultLocked
 	}
+	targetName := "全部受管主机"
+	if serverID != "" {
+		targetName = serverID
+		for _, srv := range s.secrets.Servers {
+			if srv.ID == serverID {
+				targetName = srv.Name
+				break
+			}
+		}
+	}
+	s.secMu.RUnlock()
 
+	now := time.Now().UTC()
 	syncedCount := 0
-	var out []HostMemory
-	err := s.mutateLocked(func(st *VaultState) error {
-		EnsureStateDefaults(st)
-		ensureMonitorInitialized(st)
-		now := time.Now().UTC()
-		for sid, snap := range st.Monitor.LatestSnapshots {
-			if serverID != "" && sid != serverID {
-				continue
-			}
-			if snap == nil || !snap.Reachable {
-				continue
-			}
-			if mergeMonitorSnapshotIntoHostMemoryLocked(st, snap, now) {
-				syncedCount++
-			}
+
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.monitorRT = DefaultMonitorRuntimeState()
+	}
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	for sid, snap := range s.monitorRT.LatestSnapshots {
+		if serverID != "" && sid != serverID {
+			continue
 		}
-		if syncedCount > 0 {
-			target := "全部受管主机"
-			if serverID != "" {
-				target = serverID
-				for _, srv := range st.Servers {
-					if srv.ID == serverID {
-						target = srv.Name
-						break
-					}
-				}
-			}
-			appendAuditLocked(st, "ai.memory_monitor_sync", target, fmt.Sprintf("从 7×24 监控快照同步更新 %d 台主机画像", syncedCount), clientIP, true)
+		if snap == nil || !snap.Reachable {
+			continue
 		}
-		out = make([]HostMemory, len(st.HostMemories))
-		for i, m := range st.HostMemories {
-			cp := m
-			cp.KeyServices = slices.Clone(m.KeyServices)
-			cp.DeployPaths = slices.Clone(m.DeployPaths)
-			if m.MonitorSyncedAt != nil {
-				t := *m.MonitorSyncedAt
-				cp.MonitorSyncedAt = &t
-			}
-			out[i] = cp
+		if mergeMonitorSnapshotIntoHostMemorySlice(&s.aiopsRT.HostMemories, snap, now) {
+			syncedCount++
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, 0, err
+	}
+	if syncedCount > 0 {
+		s.dirtyAIOps = true
+		s.appendAuditRuntimeLocked("ai.memory_monitor_sync", targetName, fmt.Sprintf("从 7×24 监控快照同步更新 %d 台主机画像", syncedCount), clientIP, true)
+	}
+	out := cloneHostMemories(s.aiopsRT.HostMemories)
+	s.rtMu.Unlock()
+	if syncedCount > 0 {
+		s.triggerFlush()
 	}
 	return out, syncedCount, nil
 }
 
 // GetLatestMonitorContext returns cloned latest monitor snapshots and active firing alerts
 // for the requested serverIDs (or all servers if serverIDs is empty).
-func (s *ClientVault) GetLatestMonitorContext(serverIDs []string) (map[string]*ServerMonitorSnapshot, []MonitorAlert, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.state == nil {
+func (s *Store) GetLatestMonitorContext(serverIDs []string) (map[string]*ServerMonitorSnapshot, []MonitorAlert, error) {
+	if !s.IsReady() {
 		return nil, nil, ErrVaultLocked
 	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+
 	snaps := make(map[string]*ServerMonitorSnapshot)
 	alerts := make([]MonitorAlert, 0)
-	if s.state.Monitor == nil {
+	if s.monitorRT == nil {
 		return snaps, alerts, nil
 	}
 
@@ -709,7 +724,7 @@ func (s *ClientVault) GetLatestMonitorContext(serverIDs []string) (map[string]*S
 		filter[id] = true
 	}
 
-	for sid, snap := range s.state.Monitor.LatestSnapshots {
+	for sid, snap := range s.monitorRT.LatestSnapshots {
 		if len(filter) > 0 && !filter[sid] {
 			continue
 		}
@@ -717,7 +732,7 @@ func (s *ClientVault) GetLatestMonitorContext(serverIDs []string) (map[string]*S
 			snaps[sid] = cloneSnapshot(snap)
 		}
 	}
-	for _, al := range s.state.Monitor.Alerts {
+	for _, al := range s.monitorRT.Alerts {
 		if al.Status != AlertStatusFiring {
 			continue
 		}

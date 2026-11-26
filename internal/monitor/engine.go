@@ -49,7 +49,7 @@ type Engine struct {
 	onPersist   func()
 }
 
-// NewEngine creates a new monitoring engine wired to vault lock/unlock lifecycle hooks.
+// NewEngine creates a new monitoring engine wired to store ready hooks.
 func NewEngine(store *vault.Store, sshMgr *sshmanager.Manager) *Engine {
 	e := &Engine{
 		store:        store,
@@ -63,13 +63,12 @@ func NewEngine(store *vault.Store, sshMgr *sshmanager.Manager) *Engine {
 	}
 
 	if store != nil {
-		store.RegisterOnLock(e.onVaultLocked)
-		store.RegisterOnUnlock(e.onVaultUnlocked)
+		store.RegisterOnReady(e.onStoreReady)
 	}
 	return e
 }
 
-// SetOnPersist registers a callback invoked after background sweeps persist encrypted snapshots.
+// SetOnPersist registers a callback invoked after background sweeps persist snapshots.
 func (e *Engine) SetOnPersist(fn func()) {
 	e.mu.Lock()
 	e.onPersist = fn
@@ -84,7 +83,7 @@ func (e *Engine) Start() {
 		return
 	}
 	e.started = true
-	if e.store != nil && e.store.Status() == vault.StatusUnlocked && e.unlockCancel == nil {
+	if e.store != nil && e.store.IsReady() && e.unlockCancel == nil {
 		_, cancel := context.WithCancel(context.Background())
 		e.unlockCancel = cancel
 	}
@@ -120,21 +119,7 @@ func (e *Engine) Wake() {
 	}
 }
 
-func (e *Engine) onVaultLocked() {
-	e.mu.Lock()
-	cancel := e.unlockCancel
-	e.unlockCancel = nil
-	clear(e.lastPolled)
-	e.nextSweepAt = nil
-	e.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	e.Wake()
-}
-
-func (e *Engine) onVaultUnlocked() {
+func (e *Engine) onStoreReady() {
 	e.mu.Lock()
 	if e.unlockCancel != nil {
 		e.unlockCancel()
@@ -146,9 +131,9 @@ func (e *Engine) onVaultUnlocked() {
 
 // Status returns the current runtime status of the background monitoring engine.
 func (e *Engine) Status() RuntimeStatus {
-	vaultUnlocked := e.store != nil && e.store.Status() == vault.StatusUnlocked
+	vaultReady := e.store != nil && e.store.IsReady()
 	var settings vault.MonitorSettings
-	if vaultUnlocked {
+	if vaultReady {
 		if s, _, err := e.store.GetMonitorPolicy(); err == nil {
 			settings = s
 		}
@@ -161,7 +146,7 @@ func (e *Engine) Status() RuntimeStatus {
 	st := RuntimeStatus{
 		Running:       e.started && !e.closed,
 		Collecting:    inFlightCnt > 0,
-		VaultUnlocked: vaultUnlocked,
+		VaultUnlocked: vaultReady,
 		Enabled:       settings.Enabled,
 		IntervalSec:   settings.IntervalSec,
 		InFlightCount: inFlightCnt,
@@ -170,7 +155,7 @@ func (e *Engine) Status() RuntimeStatus {
 		t := *e.lastSweepAt
 		st.LastSweepAt = &t
 	}
-	if vaultUnlocked && settings.Enabled && e.nextSweepAt != nil {
+	if vaultReady && settings.Enabled && e.nextSweepAt != nil {
 		t := *e.nextSweepAt
 		st.NextSweepAt = &t
 	}
@@ -212,7 +197,7 @@ func (e *Engine) schedulerLoop() {
 }
 
 func (e *Engine) evaluateDueSweep() {
-	if e.store == nil || e.sshMgr == nil || e.store.Status() != vault.StatusUnlocked {
+	if e.store == nil || e.sshMgr == nil || !e.store.IsReady() {
 		e.mu.Lock()
 		e.nextSweepAt = nil
 		e.mu.Unlock()
