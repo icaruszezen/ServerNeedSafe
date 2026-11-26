@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -67,6 +68,10 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "主机参数格式错误")
 		return
 	}
+	if err := validateServerPrivateKey(&in, ""); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 	srv, err := s.cfg.Store.CreateServer(in, extractClientIP(r))
 	if err != nil {
 		writeDomainError(w, err)
@@ -83,6 +88,16 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 	var in vault.ServerMutationInput
 	if err := decodeJSON(r, &in, 512*1024); err != nil {
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "主机更新参数格式错误")
+		return
+	}
+	existingPass := ""
+	if in.AuthType == vault.AuthPrivateKey && in.PrivateKey != nil && strings.TrimSpace(*in.PrivateKey) != "" && in.Passphrase == nil {
+		if existing, gErr := s.cfg.Store.GetServerSecret(id); gErr == nil && existing != nil {
+			existingPass = existing.Passphrase
+		}
+	}
+	if err := validateServerPrivateKey(&in, existingPass); err != nil {
+		writeDomainError(w, err)
 		return
 	}
 	srv, err := s.cfg.Store.UpdateServer(id, in, extractClientIP(r))
@@ -170,12 +185,103 @@ func (s *Server) handleCreateCredential(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "凭据参数格式错误")
 		return
 	}
+	if err := enrichCredentialInput(&in, "", true); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 	cred, err := s.cfg.Store.CreateCredential(in, extractClientIP(r))
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"credential": cred})
+}
+
+// handleImportCredentialFile imports an SSH private key (and optional .pub file) directly via multipart/form-data.
+func (s *Server) handleImportCredentialFile(w http.ResponseWriter, r *http.Request) {
+	const maxMultipartBytes = 1 * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBytes)
+	if err := r.ParseMultipartForm(maxMultipartBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_FORM", "解析密钥上传表单失败（单次上传请勿超过 1 MB）")
+		return
+	}
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+
+	privFile, privHeader, err := r.FormFile("private_key_file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MISSING_FILE", "请选择要上传的 SSH 私钥文件")
+		return
+	}
+	defer privFile.Close()
+
+	privBytes, err := io.ReadAll(io.LimitReader(privFile, sshmanager.MaxPrivateKeyBytes+1))
+	defer vault.ZeroBytes(privBytes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_FILE", "读取上传的私钥文件失败")
+		return
+	}
+	if len(privBytes) == 0 {
+		writeError(w, http.StatusBadRequest, "EMPTY_FILE", "上传的私钥文件内容为空")
+		return
+	}
+	if len(privBytes) > sshmanager.MaxPrivateKeyBytes {
+		writeError(w, http.StatusBadRequest, "FILE_TOO_LARGE", "私钥文件体积超过限制（最大支持 256 KB）")
+		return
+	}
+
+	pubKeyText := strings.TrimSpace(r.FormValue("public_key"))
+	if pubFile, _, pubErr := r.FormFile("public_key_file"); pubErr == nil {
+		defer pubFile.Close()
+		pubBytes, readErr := io.ReadAll(io.LimitReader(pubFile, sshmanager.MaxPublicKeyBytes+1))
+		if readErr != nil {
+			writeError(w, http.StatusBadRequest, "BAD_FILE", "读取上传的公钥文件失败")
+			return
+		}
+		if len(pubBytes) > sshmanager.MaxPublicKeyBytes {
+			writeError(w, http.StatusBadRequest, "FILE_TOO_LARGE", "公钥文件体积超过限制（最大支持 64 KB）")
+			return
+		}
+		pubKeyText = string(pubBytes)
+	}
+
+	safeFilename := ""
+	if privHeader != nil {
+		safeFilename = sanitizeUploadedFilename(privHeader.Filename)
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		name = suggestCredentialNameFromFilename(safeFilename)
+	}
+
+	privStr := string(privBytes)
+	passStr := r.FormValue("passphrase")
+	in := vault.CredentialMutationInput{
+		Name:         name,
+		Kind:         vault.AuthPrivateKey,
+		UsernameHint: strings.TrimSpace(r.FormValue("username_hint")),
+		PrivateKey:   &privStr,
+		Passphrase:   &passStr,
+		PublicKey:    pubKeyText,
+		Notes:        strings.TrimSpace(r.FormValue("notes")),
+	}
+	if err := enrichCredentialInput(&in, "", true); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+
+	cred, err := s.cfg.Store.CreateCredential(in, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"credential":        cred,
+		"imported_filename": safeFilename,
+	})
 }
 
 func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
@@ -185,12 +291,124 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "凭据更新参数格式错误")
 		return
 	}
+	existingPass := ""
+	if in.Kind == vault.AuthPrivateKey && in.PrivateKey != nil && strings.TrimSpace(*in.PrivateKey) != "" && in.Passphrase == nil {
+		if existing, gErr := s.cfg.Store.GetCredentialSecret(id); gErr == nil && existing != nil {
+			existingPass = existing.Passphrase
+		}
+	}
+	if err := enrichCredentialInput(&in, existingPass, false); err != nil {
+		writeDomainError(w, err)
+		return
+	}
 	cred, err := s.cfg.Store.UpdateCredential(id, in, extractClientIP(r))
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"credential": cred})
+}
+
+func validateServerPrivateKey(in *vault.ServerMutationInput, existingPassphrase string) error {
+	if in.AuthType != vault.AuthPrivateKey || in.PrivateKey == nil || strings.TrimSpace(*in.PrivateKey) == "" {
+		return nil
+	}
+	passphrase := existingPassphrase
+	if in.Passphrase != nil {
+		passphrase = *in.Passphrase
+	}
+	inspected, err := sshmanager.InspectPrivateKey(*in.PrivateKey, passphrase)
+	if err != nil {
+		return fmt.Errorf("%w: %v", vault.ErrInvalidInput, err)
+	}
+	*in.PrivateKey = inspected.NormalizedPEM
+	if !inspected.Encrypted && in.Passphrase != nil && *in.Passphrase != "" {
+		empty := ""
+		in.Passphrase = &empty
+	}
+	return nil
+}
+
+func enrichCredentialInput(in *vault.CredentialMutationInput, existingPassphrase string, requireSecret bool) error {
+	switch in.Kind {
+	case vault.AuthPassword:
+		if requireSecret && (in.Password == nil || *in.Password == "") {
+			return fmt.Errorf("%w: SSH 密码不能为空", vault.ErrInvalidInput)
+		}
+		return nil
+
+	case vault.AuthPrivateKey:
+		hasPriv := in.PrivateKey != nil && strings.TrimSpace(*in.PrivateKey) != ""
+		if !hasPriv {
+			if requireSecret {
+				return fmt.Errorf("%w: SSH 私钥内容不能为空", vault.ErrInvalidInput)
+			}
+			if strings.TrimSpace(in.PublicKey) != "" {
+				cleanedPub, err := sshmanager.ValidateAndMatchPublicKey(in.PublicKey, "")
+				if err != nil {
+					return fmt.Errorf("%w: %v", vault.ErrInvalidInput, err)
+				}
+				in.PublicKey = cleanedPub
+			}
+			return nil
+		}
+
+		passphrase := existingPassphrase
+		if in.Passphrase != nil {
+			passphrase = *in.Passphrase
+		}
+		inspected, err := sshmanager.InspectPrivateKey(*in.PrivateKey, passphrase)
+		if err != nil {
+			return fmt.Errorf("%w: %v", vault.ErrInvalidInput, err)
+		}
+		*in.PrivateKey = inspected.NormalizedPEM
+		if !inspected.Encrypted {
+			empty := ""
+			in.Passphrase = &empty
+		}
+		if strings.TrimSpace(in.PublicKey) != "" {
+			cleanedPub, err := sshmanager.ValidateAndMatchPublicKey(in.PublicKey, inspected.Fingerprint)
+			if err != nil {
+				return fmt.Errorf("%w: %v", vault.ErrInvalidInput, err)
+			}
+			in.PublicKey = cleanedPub
+		} else {
+			in.PublicKey = inspected.PublicKey
+		}
+		in.Fingerprint = inspected.Fingerprint
+		in.KeyAlgorithm = inspected.Algorithm
+		return nil
+	}
+	return nil
+}
+
+func sanitizeUploadedFilename(raw string) string {
+	normalized := strings.ReplaceAll(raw, "\\", "/")
+	base := filepath.Base(strings.TrimSpace(normalized))
+	if base == "." || base == "/" || base == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range base {
+		if r >= 0x20 && r != 0x7f {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func suggestCredentialNameFromFilename(filename string) string {
+	name := sanitizeUploadedFilename(filename)
+	if name == "" {
+		return "Imported-SSH-Key"
+	}
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".pem", ".key", ".pri", ".openssh", ".txt"} {
+		if strings.HasSuffix(lower, ext) && len(name) > len(ext) {
+			return name[:len(name)-len(ext)]
+		}
+	}
+	return name
 }
 
 func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {

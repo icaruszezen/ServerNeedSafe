@@ -521,6 +521,48 @@ export const api = {
   createCredential: (payload: Record<string, unknown>) =>
     requestJSON<{ credential: CredentialView }>('POST', '/api/credentials', payload),
 
+  importCredentialFile: async (payload: {
+    file: File;
+    publicKeyFile?: File | null;
+    name?: string;
+    passphrase?: string;
+    publicKey?: string;
+    usernameHint?: string;
+    notes?: string;
+  }) => {
+    const form = new FormData();
+    form.append('private_key_file', payload.file);
+    if (payload.publicKeyFile) {
+      form.append('public_key_file', payload.publicKeyFile);
+    } else if (payload.publicKey?.trim()) {
+      form.append('public_key', payload.publicKey.trim());
+    }
+    if (payload.name?.trim()) {
+      form.append('name', payload.name.trim());
+    }
+    if (payload.passphrase) {
+      form.append('passphrase', payload.passphrase);
+    }
+    if (payload.usernameHint?.trim()) {
+      form.append('username_hint', payload.usernameHint.trim());
+    }
+    if (payload.notes?.trim()) {
+      form.append('notes', payload.notes.trim());
+    }
+    const res = await fetch('/api/credentials/import-file', {
+      method: 'POST',
+      body: form,
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      await parseErrorResponse(res);
+    }
+    return (await res.json()) as {
+      credential: CredentialView;
+      imported_filename?: string;
+    };
+  },
+
   updateCredential: (id: string, payload: Record<string, unknown>) =>
     requestJSON<{ credential: CredentialView }>(
       'PUT',

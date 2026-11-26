@@ -1,6 +1,8 @@
 package sshmanager
 
 import (
+	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,7 +11,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"golang.org/x/crypto/ssh"
+)
+
+const (
+	// MaxPrivateKeyBytes caps imported SSH private key size to prevent memory abuse.
+	MaxPrivateKeyBytes = 256 * 1024
+	// MaxPublicKeyBytes caps imported SSH public key size.
+	MaxPublicKeyBytes = 64 * 1024
 )
 
 // GeneratedKeyPair holds an in-memory generated SSH key pair ready for encrypted storage.
@@ -18,6 +28,207 @@ type GeneratedKeyPair struct {
 	PrivateKey  string `json:"private_key"`
 	PublicKey   string `json:"public_key"`
 	Fingerprint string `json:"fingerprint"`
+}
+
+// InspectedPrivateKey describes a validated SSH private key and its derived public metadata.
+type InspectedPrivateKey struct {
+	NormalizedPEM string `json:"-"`
+	Algorithm     string `json:"algorithm"`
+	PublicKey     string `json:"public_key"`
+	Fingerprint   string `json:"fingerprint"`
+	Encrypted     bool   `json:"encrypted"`
+}
+
+// ErrPrivateKeyPassphraseRequired indicates an imported SSH private key is encrypted and requires a passphrase.
+var ErrPrivateKeyPassphraseRequired = errors.New("该 SSH 私钥受口令保护，请填写私钥口令 (Passphrase) 后再导入")
+
+// NormalizeKeyText removes UTF-8 BOM, normalizes CRLF/CR line endings to LF, and trims outer whitespace.
+func NormalizeKeyText(raw string) string {
+	s := strings.TrimPrefix(raw, "\uFEFF")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.TrimSpace(s)
+}
+
+// InspectPrivateKey validates an OpenSSH or PEM SSH private key (with optional passphrase)
+// and derives its normalized PEM, algorithm label, OpenSSH public key, and SHA-256 fingerprint.
+func InspectPrivateKey(rawPEM, passphrase string) (*InspectedPrivateKey, error) {
+	if len(rawPEM) > MaxPrivateKeyBytes {
+		return nil, errors.New("私钥文件体积超过限制（最大支持 256 KB）")
+	}
+	if strings.ContainsRune(rawPEM, '\x00') {
+		return nil, errors.New("检测到二进制文件内容，请上传有效的文本格式 SSH 私钥文件")
+	}
+
+	normalized := NormalizeKeyText(rawPEM)
+	if normalized == "" {
+		return nil, errors.New("SSH 私钥内容不能为空")
+	}
+	if strings.HasPrefix(normalized, "PuTTY-User-Key-File-") {
+		return nil, errors.New("暂不支持 PuTTY (.ppk) 格式，请先使用 PuTTYgen 转换为 OpenSSH 或 PEM 格式后再导入")
+	}
+	if looksLikeOpenSSHPublicKey(normalized) {
+		return nil, errors.New("检测到您提供的是 SSH 公钥内容 (.pub)，请上传或粘贴对应的私钥文件")
+	}
+
+	pemBytes := []byte(normalized + "\n")
+	defer vault.ZeroBytes(pemBytes)
+
+	var (
+		rawKey    interface{}
+		signer    ssh.Signer
+		encrypted bool
+		err       error
+	)
+
+	rawKey, err = ssh.ParseRawPrivateKey(pemBytes)
+	if err != nil {
+		var passMissing *ssh.PassphraseMissingError
+		if errors.As(err, &passMissing) {
+			encrypted = true
+			if passphrase == "" {
+				return nil, ErrPrivateKeyPassphraseRequired
+			}
+			passBytes := []byte(passphrase)
+			defer vault.ZeroBytes(passBytes)
+
+			rawKey, err = ssh.ParseRawPrivateKeyWithPassphrase(pemBytes, passBytes)
+			if err != nil {
+				// Fallback to ssh.ParsePrivateKeyWithPassphrase in case the key type is supported
+				// as an ssh.Signer (e.g., security keys) even if ParseRawPrivateKey cannot unwrap it.
+				signer, err = ssh.ParsePrivateKeyWithPassphrase(pemBytes, passBytes)
+				if err != nil {
+					return nil, errors.New("无法解密该 SSH 私钥，请检查私钥口令 (Passphrase) 或私钥文件是否正确")
+				}
+			}
+		} else {
+			// Fallback to ssh.ParsePrivateKey for non-raw-unwrappable key types.
+			var signerErr error
+			if passphrase != "" {
+				passBytes := []byte(passphrase)
+				defer vault.ZeroBytes(passBytes)
+				signer, signerErr = ssh.ParsePrivateKeyWithPassphrase(pemBytes, passBytes)
+				if signerErr == nil {
+					encrypted = bytes.Contains(pemBytes, []byte("ENCRYPTED"))
+				}
+			} else {
+				signer, signerErr = ssh.ParsePrivateKey(pemBytes)
+			}
+			if signerErr != nil {
+				if errors.As(signerErr, &passMissing) {
+					return nil, ErrPrivateKeyPassphraseRequired
+				}
+				return nil, errors.New("无法解析 SSH 私钥，请确认文件为有效的 OpenSSH 或 PEM 私钥格式")
+			}
+		}
+	}
+
+	if signer == nil {
+		signer, err = ssh.NewSignerFromKey(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("无法构造 SSH 私钥签名器: %w", err)
+		}
+	}
+
+	pub := signer.PublicKey()
+	return &InspectedPrivateKey{
+		NormalizedPEM: normalized + "\n",
+		Algorithm:     detectKeyAlgorithm(rawKey, pub),
+		PublicKey:     strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))),
+		Fingerprint:   ssh.FingerprintSHA256(pub),
+		Encrypted:     encrypted,
+	}, nil
+}
+
+// ValidateAndMatchPublicKey validates an OpenSSH authorized_keys public key line and
+// optionally verifies that its SHA-256 fingerprint matches expectedFingerprint.
+func ValidateAndMatchPublicKey(rawPub, expectedFingerprint string) (string, error) {
+	if len(rawPub) > MaxPublicKeyBytes {
+		return "", errors.New("公钥文件体积超过限制（最大支持 64 KB）")
+	}
+	if strings.ContainsRune(rawPub, '\x00') {
+		return "", errors.New("检测到二进制文件内容，请上传有效的 OpenSSH 公钥 (.pub) 文件")
+	}
+	cleaned := NormalizeKeyText(rawPub)
+	if cleaned == "" {
+		return "", nil
+	}
+	if strings.ContainsRune(cleaned, '\n') {
+		// Allow trailing comments/blank lines? Take only if single non-empty line to prevent ambiguity.
+		lines := make([]string, 0, 2)
+		for _, ln := range strings.Split(cleaned, "\n") {
+			trimmed := strings.TrimSpace(ln)
+			if trimmed != "" {
+				lines = append(lines, trimmed)
+			}
+		}
+		if len(lines) != 1 {
+			return "", errors.New("公钥内容须为单行有效的 OpenSSH 公钥")
+		}
+		cleaned = lines[0]
+	}
+
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cleaned))
+	if err != nil {
+		return "", errors.New("无效的 OpenSSH 公钥格式，请检查 .pub 文件内容")
+	}
+	if expectedFingerprint != "" && ssh.FingerprintSHA256(pub) != expectedFingerprint {
+		return "", errors.New("提供的公钥与私钥不匹配，请检查是否选错了公钥文件")
+	}
+	return cleaned, nil
+}
+
+func looksLikeOpenSSHPublicKey(s string) bool {
+	prefixes := []string{
+		"ssh-ed25519 ",
+		"ssh-rsa ",
+		"ssh-dss ",
+		"ecdsa-sha2-",
+		"sk-ssh-ed25519@",
+		"sk-ecdsa-sha2-",
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func detectKeyAlgorithm(rawKey interface{}, pub ssh.PublicKey) string {
+	switch k := rawKey.(type) {
+	case *ed25519.PrivateKey:
+		return "ed25519"
+	case ed25519.PrivateKey:
+		return "ed25519"
+	case *rsa.PrivateKey:
+		if k != nil && k.N != nil {
+			return fmt.Sprintf("rsa-%d", k.N.BitLen())
+		}
+		return "rsa"
+	case *ecdsa.PrivateKey:
+		if k != nil && k.Curve != nil {
+			return fmt.Sprintf("ecdsa-p%d", k.Curve.Params().BitSize)
+		}
+		return "ecdsa"
+	}
+	if pub != nil {
+		switch t := pub.Type(); t {
+		case ssh.KeyAlgoED25519:
+			return "ed25519"
+		case ssh.KeyAlgoRSA:
+			return "rsa"
+		case ssh.KeyAlgoECDSA256:
+			return "ecdsa-p256"
+		case ssh.KeyAlgoECDSA384:
+			return "ecdsa-p384"
+		case ssh.KeyAlgoECDSA521:
+			return "ecdsa-p521"
+		default:
+			return strings.TrimPrefix(t, "ssh-")
+		}
+	}
+	return "ssh-key"
 }
 
 // GenerateSSHKeyPair generates a cryptographically strong Ed25519 or RSA-4096 SSH key pair in memory.
