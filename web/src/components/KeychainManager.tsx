@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   KeyRound,
   Plus,
@@ -9,9 +9,17 @@ import {
   Lock,
   X,
   Check,
+  Upload,
+  FileText,
 } from 'lucide-react';
 import { api } from '../api';
 import type { CredentialView, ServerView } from '../types';
+import { PrivateKeyField } from './PrivateKeyField';
+import {
+  readPublicKeyFile,
+  type ParsedPrivateKeyFile,
+  type ParsedPublicKeyFile,
+} from '../utils/sshKeyFile';
 
 interface KeychainManagerProps {
   credentials: CredentialView[];
@@ -33,7 +41,7 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
   const [deploying, setDeploying] = useState(false);
   const [copiedId, setCopiedId] = useState('');
 
-  // Manual Credential Form
+  // Manual / File Import Credential Form
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'private_key' | 'password'>('private_key');
   const [usernameHint, setUsernameHint] = useState('root');
@@ -42,6 +50,10 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
   const [passphrase, setPassphrase] = useState('');
   const [publicKey, setPublicKey] = useState('');
   const [notes, setNotes] = useState('');
+  const [uploadedPrivKey, setUploadedPrivKey] = useState<ParsedPrivateKeyFile | null>(null);
+  const [uploadedPubKey, setUploadedPubKey] = useState<ParsedPublicKeyFile | null>(null);
+  const [pubFileError, setPubFileError] = useState('');
+  const pubFileInputRef = useRef<HTMLInputElement | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
@@ -52,23 +64,71 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
   const [genPassphrase, setGenPassphrase] = useState('');
   const [generating, setGenerating] = useState(false);
 
+  const openImportModal = () => {
+    setName('');
+    setKind('private_key');
+    setUsernameHint('root');
+    setPassword('');
+    setPrivateKey('');
+    setPassphrase('');
+    setPublicKey('');
+    setNotes('');
+    setUploadedPrivKey(null);
+    setUploadedPubKey(null);
+    setPubFileError('');
+    setError('');
+    setAddModalOpen(true);
+  };
+
+  const handleSelectPubFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setPubFileError('');
+    try {
+      const parsed = await readPublicKeyFile(file);
+      setUploadedPubKey(parsed);
+      setPublicKey(parsed.content);
+    } catch (err: any) {
+      setPubFileError(err?.message || '读取公钥文件失败');
+    }
+  };
+
   const handleCreateManual = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSaving(true);
     try {
-      await api.createCredential({
-        name,
-        kind,
-        username_hint: usernameHint,
-        password: kind === 'password' ? password : '',
-        private_key: kind === 'private_key' ? privateKey : '',
-        passphrase: kind === 'private_key' ? passphrase : '',
-        public_key: publicKey,
-        notes,
-      });
-      setAddModalOpen(false);
-      onNotify(`已加密存入凭据 ${name}`);
+      if (kind === 'private_key' && uploadedPrivKey && privateKey === uploadedPrivKey.content) {
+        const res = await api.importCredentialFile({
+          file: uploadedPrivKey.file,
+          publicKeyFile:
+            uploadedPubKey && publicKey === uploadedPubKey.content ? uploadedPubKey.file : null,
+          name,
+          passphrase,
+          publicKey,
+          usernameHint,
+          notes,
+        });
+        setAddModalOpen(false);
+        const algoSuffix = res.credential.key_algorithm
+          ? ` (${res.credential.key_algorithm.toUpperCase()})`
+          : '';
+        onNotify(`已从文件加密导入密钥凭据 ${res.credential.name}${algoSuffix}`);
+      } else {
+        const res = await api.createCredential({
+          name,
+          kind,
+          username_hint: usernameHint,
+          password: kind === 'password' ? password : '',
+          private_key: kind === 'private_key' ? privateKey : '',
+          passphrase: kind === 'private_key' ? passphrase : '',
+          public_key: kind === 'private_key' ? publicKey : '',
+          notes,
+        });
+        setAddModalOpen(false);
+        onNotify(`已加密存入凭据 ${res.credential.name}`);
+      }
       await onRefresh();
     } catch (err: any) {
       setError(err?.message || '保存凭据失败');
@@ -166,16 +226,7 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
             type="button"
             id="open-add-cred-btn"
             className="btn btn-primary"
-            onClick={() => {
-              setName('');
-              setPassword('');
-              setPrivateKey('');
-              setPassphrase('');
-              setPublicKey('');
-              setNotes('');
-              setError('');
-              setAddModalOpen(true);
-            }}
+            onClick={openImportModal}
           >
             <Plus size={15} /> 导入现有凭据
           </button>
@@ -190,18 +241,27 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
             </div>
             <h3>凭据保险库暂为空</h3>
             <p>
-              推荐一键生成高强度 Ed25519 密钥对并自动下发公钥至服务器，替代传统的弱口令登录方式。
+              推荐一键生成高强度 Ed25519 密钥对并自动下发公钥至服务器，或直接上传本地 SSH 私钥文件加密托管。
             </p>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => {
-                setGenSaveName('Master-Ed25519-Key');
-                setGenModalOpen(true);
-              }}
-            >
-              <Sparkles size={14} /> 立即生成 Ed25519 密钥对
-            </button>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  setGenSaveName('Master-Ed25519-Key');
+                  setGenModalOpen(true);
+                }}
+              >
+                <Sparkles size={14} /> 立即生成 Ed25519 密钥对
+              </button>
+              <button
+                type="button"
+                className="btn"
+                onClick={openImportModal}
+              >
+                <Upload size={14} /> 上传密钥文件导入
+              </button>
+            </div>
           </div>
         ) : (
           <div className="server-grid">
@@ -374,7 +434,7 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
       {/* Import Manual Credential Modal */}
       {addModalOpen && (
         <div className="modal-backdrop">
-          <form className="modal-panel" onSubmit={handleCreateManual}>
+          <form className="modal-panel" id="import-cred-modal" onSubmit={handleCreateManual}>
             <div className="modal-header">
               <h3>导入 SSH 私钥或密码凭据</h3>
               <button
@@ -388,8 +448,12 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
             <div className="modal-body">
               {error && <div className="alert alert-error">{error}</div>}
               <div className="field">
-                <label className="field-label">凭据名称 *</label>
+                <label className="field-label" htmlFor="cred-name-input">
+                  <span>凭据名称 *</span>
+                  <span className="field-hint">上传文件后如留空将自动填充文件名</span>
+                </label>
                 <input
+                  id="cred-name-input"
                   className="input"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
@@ -418,33 +482,113 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
               </div>
               {kind === 'private_key' ? (
                 <>
+                  <PrivateKeyField
+                    idPrefix="cred-privkey"
+                    textareaId="cred-privkey-input"
+                    label="SSH 私钥文件 / PEM 内容 *"
+                    value={privateKey}
+                    onChange={(nextVal) => {
+                      setPrivateKey(nextVal);
+                      if (!nextVal.trim()) {
+                        setUploadedPrivKey(null);
+                      }
+                    }}
+                    uploadedFile={uploadedPrivKey}
+                    onFileLoaded={(parsed) => {
+                      setUploadedPrivKey(parsed);
+                      setPrivateKey(parsed.content);
+                      setName((prev) => (prev.trim() ? prev : parsed.suggestedName));
+                      setError('');
+                    }}
+                    onClearFile={() => {
+                      setUploadedPrivKey(null);
+                      setPrivateKey('');
+                    }}
+                    onPublicKeyFileLoaded={(parsedPub) => {
+                      setUploadedPubKey(parsedPub);
+                      setPublicKey(parsedPub.content);
+                      setPubFileError('');
+                    }}
+                    required
+                  />
                   <div className="field">
-                    <label className="field-label">私钥 PEM 内容 *</label>
-                    <textarea
-                      className="textarea mono code-textarea"
-                      value={privateKey}
-                      onChange={(e) => setPrivateKey(e.target.value)}
-                      placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."
-                      required
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">私钥口令 (Passphrase，选填)</label>
+                    <label className="field-label" htmlFor="cred-passphrase-input">
+                      <span>私钥口令 (Passphrase，{uploadedPrivKey?.encrypted ? '此私钥已加密，必填' : '选填'})</span>
+                    </label>
                     <input
+                      id="cred-passphrase-input"
                       type="password"
                       className="input"
+                      placeholder={
+                        uploadedPrivKey?.encrypted
+                          ? '检测到私钥已加密，请输入解密口令'
+                          : '若私钥未设置口令保护请留空'
+                      }
                       value={passphrase}
                       onChange={(e) => setPassphrase(e.target.value)}
                     />
                   </div>
                   <div className="field">
-                    <label className="field-label">对应公钥 (选填，用于一键下发)</label>
+                    <div className="field-label">
+                      <label htmlFor="cred-pubkey-input">
+                        对应公钥 (选填，留空将自动从私钥推导)
+                      </label>
+                      <div className="key-pub-upload-inline">
+                        <input
+                          ref={pubFileInputRef}
+                          id="cred-pubkey-file-input"
+                          type="file"
+                          style={{ display: 'none' }}
+                          onChange={(e) => void handleSelectPubFile(e)}
+                        />
+                        {uploadedPubKey && (
+                          <span className="tag-chip teal key-pub-chip" title={uploadedPubKey.fileName}>
+                            <FileText size={11} />
+                            <span className="key-pub-chip-name mono">{uploadedPubKey.fileName}</span>
+                            <button
+                              type="button"
+                              className="key-pub-chip-clear"
+                              title="清除公钥文件"
+                              onClick={() => {
+                                setUploadedPubKey(null);
+                                setPublicKey('');
+                                setPubFileError('');
+                              }}
+                            >
+                              <X size={11} />
+                            </button>
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          id="cred-pubkey-choose-file-btn"
+                          className="btn btn-sm key-inline-upload-btn"
+                          onClick={() => {
+                            setPubFileError('');
+                            pubFileInputRef.current?.click();
+                          }}
+                        >
+                          <Upload size={11.5} /> 上传 .pub
+                        </button>
+                      </div>
+                    </div>
                     <input
+                      id="cred-pubkey-input"
                       className="input mono"
                       value={publicKey}
-                      onChange={(e) => setPublicKey(e.target.value)}
-                      placeholder="ssh-ed25519 AAAA..."
+                      onChange={(e) => {
+                        setPublicKey(e.target.value);
+                        if (!e.target.value.trim()) {
+                          setUploadedPubKey(null);
+                        }
+                      }}
+                      placeholder="留空自动提取；或上传 .pub / 粘贴 ssh-ed25519 AAAA..."
                     />
+                    {pubFileError && (
+                      <div className="key-upload-error" role="alert">
+                        <span>{pubFileError}</span>
+                      </div>
+                    )}
                   </div>
                 </>
               ) : (
@@ -473,8 +617,8 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
               <button type="button" className="btn" onClick={() => setAddModalOpen(false)}>
                 取消
               </button>
-              <button type="submit" className="btn btn-primary" disabled={saving}>
-                {saving ? '正在加密保存...' : '保存凭据'}
+              <button type="submit" id="cred-submit-btn" className="btn btn-primary" disabled={saving}>
+                {saving ? '正在校验并加密保存...' : '保存凭据'}
               </button>
             </div>
           </form>

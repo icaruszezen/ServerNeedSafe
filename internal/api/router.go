@@ -185,6 +185,7 @@ func (s *Server) registerRoutes() {
 
 	s.mux.HandleFunc("GET /api/credentials", s.requireAuth(s.handleListCredentials))
 	s.mux.HandleFunc("POST /api/credentials", s.requireAuth(s.handleCreateCredential))
+	s.mux.HandleFunc("POST /api/credentials/import-file", s.requireAuth(s.handleImportCredentialFile))
 	s.mux.HandleFunc("PUT /api/credentials/{id}", s.requireAuth(s.handleUpdateCredential))
 	s.mux.HandleFunc("DELETE /api/credentials/{id}", s.requireAuth(s.handleDeleteCredential))
 	s.mux.HandleFunc("POST /api/ssh/keygen", s.requireAuth(s.handleGenerateKeyPair))

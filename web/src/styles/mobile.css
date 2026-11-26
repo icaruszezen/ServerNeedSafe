@@ -550,6 +550,22 @@
     gap: 4px;
   }
 
+  .key-upload-zone {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    padding: 10px;
+  }
+
+  .key-upload-actions {
+    width: 100%;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
+
+  .key-pub-chip {
+    max-width: 150px;
+  }
+
   /* Horizontal Scrollable Pill & Sub-Tab Bars */
   .filter-bar {
     margin-bottom: 14px;

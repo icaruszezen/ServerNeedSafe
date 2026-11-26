@@ -25,7 +25,9 @@ import type {
   ServerView,
 } from '../types';
 import { HostKeyModal } from './HostKeyModal';
+import { PrivateKeyField } from './PrivateKeyField';
 import { SftpPanel } from './SftpPanel';
+import type { ParsedPrivateKeyFile } from '../utils/sshKeyFile';
 
 interface ServerManagerProps {
   servers: ServerView[];
@@ -81,6 +83,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   const [tagsText, setTagsText] = useState('');
   const [watchedServicesText, setWatchedServicesText] = useState('');
   const [watchedPortsText, setWatchedPortsText] = useState('');
+  const [uploadedServerKey, setUploadedServerKey] = useState<ParsedPrivateKeyFile | null>(null);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
 
@@ -140,6 +143,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     setTagsText('');
     setWatchedServicesText('');
     setWatchedPortsText('');
+    setUploadedServerKey(null);
     setFormError('');
     setModalOpen(true);
   };
@@ -171,6 +175,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     setTagsText((srv.tags || []).join(', '));
     setWatchedServicesText((srv.watched_services || []).join(', '));
     setWatchedPortsText((srv.watched_ports || []).join(', '));
+    setUploadedServerKey(null);
     setFormError('');
     setModalOpen(true);
   };
@@ -676,27 +681,46 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
 
               {form.auth_type === 'private_key' && (
                 <>
+                  <PrivateKeyField
+                    idPrefix="srv-privkey"
+                    textareaId="srv-privkey-input"
+                    label="SSH 私钥文件 / PEM 内容"
+                    labelHint={
+                      editingServer?.has_private_key
+                        ? '已加密保存，留空则保持不变'
+                        : undefined
+                    }
+                    value={form.private_key || ''}
+                    onChange={(nextVal) => {
+                      setForm({ ...form, private_key: nextVal });
+                      if (!nextVal.trim()) {
+                        setUploadedServerKey(null);
+                      }
+                    }}
+                    uploadedFile={uploadedServerKey}
+                    onFileLoaded={(parsed) => {
+                      setUploadedServerKey(parsed);
+                      setForm((prev) => ({ ...prev, private_key: parsed.content }));
+                      setFormError('');
+                    }}
+                    onClearFile={() => {
+                      setUploadedServerKey(null);
+                      setForm((prev) => ({ ...prev, private_key: '' }));
+                    }}
+                  />
                   <div className="field">
                     <label className="field-label">
-                      <span>PEM / OpenSSH 私钥内容</span>
-                      {editingServer?.has_private_key && (
-                        <span className="field-hint">已加密保存，留空则保持不变</span>
-                      )}
+                      私钥保护口令 (Passphrase，
+                      {uploadedServerKey?.encrypted ? '此私钥已加密，必填' : '选填'})
                     </label>
-                    <textarea
-                      id="srv-privkey-input"
-                      className="textarea mono code-textarea"
-                      placeholder="-----BEGIN OPENSSH PRIVATE KEY----- ..."
-                      value={form.private_key || ''}
-                      onChange={(e) => setForm({ ...form, private_key: e.target.value })}
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">私钥保护口令 (Passphrase，选填)</label>
                     <input
                       type="password"
                       className="input"
-                      placeholder="若私钥无口令保护请留空"
+                      placeholder={
+                        uploadedServerKey?.encrypted
+                          ? '检测到私钥已加密，请输入解密口令'
+                          : '若私钥无口令保护请留空'
+                      }
                       value={form.passphrase || ''}
                       onChange={(e) => setForm({ ...form, passphrase: e.target.value })}
                     />

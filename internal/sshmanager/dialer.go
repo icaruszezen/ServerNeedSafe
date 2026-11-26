@@ -342,7 +342,7 @@ func passwordAuthMethods(secret string) []ssh.AuthMethod {
 }
 
 func parsePrivateKeySigner(pemStr, passphrase string) (ssh.Signer, error) {
-	pemBytes := []byte(strings.TrimSpace(pemStr))
+	pemBytes := []byte(NormalizeKeyText(pemStr) + "\n")
 	defer vault.ZeroBytes(pemBytes)
 	if passphrase != "" {
 		passBytes := []byte(passphrase)
