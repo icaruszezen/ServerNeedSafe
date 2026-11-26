@@ -14,13 +14,16 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
-// PatrolStatusView reports live background scheduler state to the UI.
+// PatrolStatusView reports live background scheduler state and external AI queue counts to the UI.
 type PatrolStatusView struct {
-	Running      bool       `json:"running"`
-	VaultReady   bool       `json:"vault_ready"`
-	LastRunAt    *time.Time `json:"last_run_at,omitempty"`
-	NextRunAt    *time.Time `json:"next_run_at,omitempty"`
-	UnreadAlerts int        `json:"unread_alerts"`
+	Running               bool                     `json:"running"`
+	VaultReady            bool                     `json:"vault_ready"`
+	AnalysisMode          vault.PatrolAnalysisMode `json:"analysis_mode"`
+	LastRunAt             *time.Time               `json:"last_run_at,omitempty"`
+	NextRunAt             *time.Time               `json:"next_run_at,omitempty"`
+	UnreadAlerts          int                      `json:"unread_alerts"`
+	PendingExternalCount  int                      `json:"pending_external_count"`
+	PendingApprovalsCount int                      `json:"pending_approvals_count"`
 }
 
 const patrolReadOnlyShellScript = `
@@ -68,6 +71,10 @@ func (s *Service) patrolSchedulerLoop() {
 		if !s.store.IsReady() {
 			continue
 		}
+
+		// Always check expired external-AI patrol fallback deadlines regardless of periodic schedule toggle
+		s.ProcessExpiredExternalPatrolFallbacks(context.Background())
+
 		cfg, err := s.store.GetPatrolConfigSecret()
 		if err != nil || !cfg.Enabled {
 			s.mu.Lock()
@@ -123,15 +130,25 @@ func (s *Service) NotifyPatrolConfigUpdated() {
 func (s *Service) GetPatrolStatus() PatrolStatusView {
 	vaultReady := s.store.IsReady()
 	var unread int
+	var pendingExt int
+	var pendingAp int
+	mode := vault.PatrolAnalysisBuiltin
 	if vaultReady {
 		_, unread, _ = s.store.ListPatrolRecords(1, false)
+		pendingExt, pendingAp = s.store.CountExternalPending()
+		if cfg, err := s.store.GetPatrolConfigSecret(); err == nil && cfg != nil {
+			mode = vault.NormalizePatrolAnalysisMode(cfg.AnalysisMode)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := PatrolStatusView{
-		Running:      s.patrolRunning,
-		VaultReady:   vaultReady,
-		UnreadAlerts: unread,
+		Running:               s.patrolRunning,
+		VaultReady:            vaultReady,
+		AnalysisMode:          mode,
+		UnreadAlerts:          unread,
+		PendingExternalCount:  pendingExt,
+		PendingApprovalsCount: pendingAp,
 	}
 	if s.lastPatrolAt != nil {
 		t := *s.lastPatrolAt
@@ -145,8 +162,16 @@ func (s *Service) GetPatrolStatus() PatrolStatusView {
 }
 
 // RunPatrolNow executes a strictly read-only inspection across configured servers,
-// invokes the active LLM on-demand if anomalies exist (or forceAI is true), and dispatches webhooks.
+// invokes either the built-in LLM or queues for external MCP AI takeover according to PatrolConfig.AnalysisMode,
+// and dispatches configured Webhooks.
 func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool) (*vault.PatrolRecord, error) {
+	return s.RunPatrolForServers(ctx, trigger, forceAI, nil, "")
+}
+
+// RunPatrolForServers executes a read-only inspection across either serverIDsOverride (if non-empty) or configured patrol servers.
+// When trigger == "external_mcp", built-in LLM invocation is skipped and the record is immediately claimed by claimedBy so the
+// external AI client can perform deeper SSH/SFTP forensics and call SubmitExternalPatrolReport.
+func (s *Service) RunPatrolForServers(ctx context.Context, trigger string, forceAI bool, serverIDsOverride []string, claimedBy string) (*vault.PatrolRecord, error) {
 	if !s.store.IsReady() {
 		return nil, vault.ErrVaultLocked
 	}
@@ -182,9 +207,13 @@ func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool
 	}()
 
 	// Filter target servers
+	filterIDs := cfg.ServerIDs
+	if len(serverIDsOverride) > 0 {
+		filterIDs = serverIDsOverride
+	}
 	targets := make([]vault.ServerView, 0, len(servers))
 	for _, srv := range servers {
-		if len(cfg.ServerIDs) == 0 || slices.Contains(cfg.ServerIDs, srv.ID) {
+		if len(filterIDs) == 0 || slices.Contains(filterIDs, srv.ID) {
 			targets = append(targets, srv)
 		}
 	}
@@ -228,10 +257,11 @@ func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool
 		overall = "warning"
 	}
 
+	now := time.Now().UTC()
 	rec := vault.PatrolRecord{
 		ID:            uuid.NewString(),
 		StartedAt:     startedAt,
-		CompletedAt:   time.Now().UTC(),
+		CompletedAt:   now,
 		Trigger:       trigger,
 		TotalServers:  len(targets),
 		HealthyCount:  healthyCnt,
@@ -239,30 +269,57 @@ func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool
 		CriticalCount: critCnt,
 		Status:        overall,
 		Findings:      findings,
+		AnalysisState: "none",
 		Unread:        overall != "healthy",
 	}
 
-	// Stage 2: Wake up active LLM ONLY when anomalies are detected or explicitly requested
-	if (overall != "healthy" || forceAI) && len(targets) > 0 {
-		if prov, pErr := s.store.GetActiveAIProviderSecret(); pErr == nil && prov != nil {
-			s.enrichPatrolWithLLM(ctx, *prov, &rec)
+	mode := vault.NormalizePatrolAnalysisMode(cfg.AnalysisMode)
+	needsAI := (overall != "healthy" || forceAI) && len(targets) > 0
+
+	if trigger == "external_mcp" && len(targets) > 0 {
+		// External MCP client initiated the patrol and is actively analyzing it now.
+		claimer := strings.TrimSpace(claimedBy)
+		if claimer == "" {
+			claimer = "External MCP AI"
+		}
+		rec.AnalysisState = "claimed"
+		rec.ClaimedBy = claimer
+		rec.ClaimedAt = &now
+	} else if needsAI {
+		switch mode {
+		case vault.PatrolAnalysisExternal:
+			rec.AnalysisState = "pending_external"
+		case vault.PatrolAnalysisExternalWithFallback:
+			rec.AnalysisState = "pending_external"
+			fallbackMins := cfg.ExternalFallbackMinutes
+			if fallbackMins <= 0 {
+				fallbackMins = 15
+			}
+			deadline := now.Add(time.Duration(fallbackMins) * time.Minute)
+			rec.ExternalDeadlineAt = &deadline
+		default:
+			if prov, pErr := s.store.GetActiveAIProviderSecret(); pErr == nil && prov != nil {
+				s.enrichPatrolWithLLM(ctx, *prov, &rec)
+				if rec.AIAnalyzed {
+					analyzedAt := time.Now().UTC()
+					rec.AnalysisState = "completed"
+					rec.AISource = "builtin"
+					rec.AIAnalyzedAt = &analyzedAt
+				}
+			}
 		}
 	}
 
 	rec.CompletedAt = time.Now().UTC()
 
-	// Dispatch webhooks if warning or critical
-	if overall != "healthy" {
-		notified := false
-		for _, wh := range cfg.Webhooks {
-			if !wh.Enabled || wh.URL == "" {
-				continue
-			}
-			if wErr := SendPatrolAlertWebhook(ctx, s.llm.Transport(), wh, rec); wErr == nil {
-				notified = true
-			}
-		}
+	// Dispatch Stage 1 Webhooks for scheduled/manual runs when warning or critical.
+	// For external_mcp runs, SubmitExternalPatrolReport dispatches the enriched report to avoid duplicate pings.
+	if overall != "healthy" && trigger != "external_mcp" {
+		notified := s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, rec)
 		rec.WebhookNotified = notified
+		if notified && rec.AIAnalyzed {
+			rec.AIWebhookNotified = true
+		}
 	}
 
 	if err := s.store.AppendPatrolRecord(rec); err != nil {
@@ -270,6 +327,71 @@ func (s *Service) RunPatrolNow(ctx context.Context, trigger string, forceAI bool
 	}
 	s.notifyPersist()
 	return &rec, nil
+}
+
+func (s *Service) dispatchPatrolWebhooks(ctx context.Context, webhooks []vault.WebhookChannel, rec vault.PatrolRecord) bool {
+	notified := false
+	for _, wh := range webhooks {
+		if !wh.Enabled || wh.URL == "" {
+			continue
+		}
+		if wErr := SendPatrolAlertWebhook(ctx, s.llm.Transport(), wh, rec); wErr == nil {
+			notified = true
+		}
+	}
+	return notified
+}
+
+// ProcessExpiredExternalPatrolFallbacks checks pending external patrol records past their ExternalDeadlineAt
+// and enriches them via the built-in LLM provider when configured in external_with_fallback mode.
+func (s *Service) ProcessExpiredExternalPatrolFallbacks(ctx context.Context) int {
+	if !s.store.IsReady() {
+		return 0
+	}
+	expired, err := s.store.ListExpiredExternalPatrols(time.Now().UTC())
+	if err != nil || len(expired) == 0 {
+		return 0
+	}
+	prov, pErr := s.store.GetActiveAIProviderSecret()
+	if pErr != nil || prov == nil {
+		return 0
+	}
+	cfg, _ := s.store.GetPatrolConfigSecret()
+
+	processed := 0
+	for _, rec := range expired {
+		working := rec
+		s.enrichPatrolWithLLM(ctx, *prov, &working)
+		if !working.AIAnalyzed {
+			continue
+		}
+		working.AnalysisState = "fallback_completed"
+		working.AISource = "builtin"
+		analyzedAt := time.Now().UTC()
+		working.AIAnalyzedAt = &analyzedAt
+
+		aiNotified := false
+		if cfg != nil && len(cfg.Webhooks) > 0 && working.Status != "healthy" {
+			aiNotified = s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, working)
+		}
+		markUnread := working.Status != "healthy"
+		if _, uErr := s.store.UpdatePatrolRecordAnalysis(working.ID, vault.PatrolAnalysisUpdate{
+			AnalysisState:     "fallback_completed",
+			AISource:          "builtin",
+			AIModel:           working.AIModel,
+			AISummary:         working.AISummary,
+			AIRootCause:       working.AIRootCause,
+			AIRecommendations: working.AIRecommendations,
+			AIWebhookNotified: &aiNotified,
+			MarkUnread:        &markUnread,
+		}, "patrol-fallback"); uErr == nil {
+			processed++
+		}
+	}
+	if processed > 0 {
+		s.notifyPersist()
+	}
+	return processed
 }
 
 func (s *Service) evaluateServerPatrol(

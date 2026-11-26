@@ -17,8 +17,14 @@ import type {
   CompactionInfo,
   CredentialView,
   EncryptionInfo,
+  ExternalApproval,
   HostKeyUntrustedInfo,
   HostMemory,
+  MCPConfigView,
+  MCPOverviewResponse,
+  MCPRuntimeStatus,
+  MCPTokenScope,
+  MCPTokenView,
   MonitorAlert,
   MonitorAlertRule,
   MonitorOverviewResponse,
@@ -940,4 +946,70 @@ export const api = {
     url?: string;
     secret?: string;
   }) => requestJSON<{ ok: boolean }>('POST', '/api/ai/test-webhook', payload),
+
+  // External AI Takeover (MCP Gateway, Persistent Scoped Tokens & External HITL Approvals)
+  getMCPOverview: () => requestJSON<MCPOverviewResponse>('GET', '/api/ai/mcp/overview'),
+
+  updateMCPConfig: (payload: {
+    enabled?: boolean;
+    desktop_loopback_enabled?: boolean;
+    desktop_loopback_port?: number;
+    public_endpoint_hint?: string;
+  }) =>
+    requestJSON<{
+      ok: boolean;
+      mcp_config: MCPConfigView;
+      mcp_runtime: MCPRuntimeStatus;
+      skill_markdown: string;
+    }>('PUT', '/api/ai/mcp/config', payload),
+
+  createMCPToken: (payload: {
+    name: string;
+    client_hint?: string;
+    scope: MCPTokenScope;
+    allowed_servers?: string[];
+  }) =>
+    requestJSON<{
+      ok: boolean;
+      token: MCPTokenView;
+      raw_token: string;
+      mcp_config: MCPConfigView;
+      mcp_runtime: MCPRuntimeStatus;
+    }>('POST', '/api/ai/mcp/tokens', payload),
+
+  updateMCPToken: (
+    id: string,
+    payload: {
+      name?: string;
+      client_hint?: string;
+      scope?: MCPTokenScope;
+      allowed_servers?: string[];
+      enabled?: boolean;
+    }
+  ) =>
+    requestJSON<{
+      ok: boolean;
+      token: MCPTokenView;
+      mcp_config: MCPConfigView;
+    }>('PUT', `/api/ai/mcp/tokens/${encodeURIComponent(id)}`, payload),
+
+  deleteMCPToken: (id: string) =>
+    requestJSON<{ ok: boolean; mcp_config: MCPConfigView }>(
+      'DELETE',
+      `/api/ai/mcp/tokens/${encodeURIComponent(id)}`
+    ),
+
+  listExternalApprovals: (status = 'all', limit = 60) =>
+    requestJSON<{ approvals: ExternalApproval[]; pending_count: number }>(
+      'GET',
+      `/api/ai/external-approvals?status=${encodeURIComponent(status)}&limit=${limit}`
+    ),
+
+  resolveExternalApproval: (id: string, approve: boolean) =>
+    requestJSON<{
+      ok: boolean;
+      approval: ExternalApproval;
+      approvals: ExternalApproval[];
+      pending_count: number;
+    }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/resolve`, { approve }),
 };

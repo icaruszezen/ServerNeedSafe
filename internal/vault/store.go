@@ -812,11 +812,12 @@ func (s *Store) BuildBackupBundle(includeRuntime bool) (*BackupBundle, error) {
 	var rtSnap *RuntimeDataSnapshot
 	if includeRuntime {
 		rtSnap = &RuntimeDataSnapshot{
-			Monitor:         cloneMonitorRuntimeState(s.monitorRT),
-			AISessions:      cloneAISessions(s.aiopsRT.AISessions),
-			PatrolBaselines: clonePatrolBaselines(s.aiopsRT.PatrolBaselines),
-			PatrolRecords:   clonePatrolRecords(s.aiopsRT.PatrolRecords),
-			AuditLogs:       slices.Clone(s.auditRT.AuditLogs),
+			Monitor:           cloneMonitorRuntimeState(s.monitorRT),
+			AISessions:        cloneAISessions(s.aiopsRT.AISessions),
+			PatrolBaselines:   clonePatrolBaselines(s.aiopsRT.PatrolBaselines),
+			PatrolRecords:     clonePatrolRecords(s.aiopsRT.PatrolRecords),
+			ExternalApprovals: cloneExternalApprovals(s.aiopsRT.ExternalApprovals),
+			AuditLogs:         slices.Clone(s.auditRT.AuditLogs),
 		}
 	}
 	s.rtMu.RUnlock()
@@ -957,6 +958,9 @@ func (s *Store) ApplySyncSnapshot(bundle *BackupBundle, includeRuntime bool, ini
 		}
 		if bundle.Runtime.PatrolRecords != nil {
 			s.aiopsRT.PatrolRecords = clonePatrolRecords(bundle.Runtime.PatrolRecords)
+		}
+		if bundle.Runtime.ExternalApprovals != nil {
+			s.aiopsRT.ExternalApprovals = cloneExternalApprovals(bundle.Runtime.ExternalApprovals)
 		}
 		if bundle.Runtime.AuditLogs != nil {
 			s.auditRT.AuditLogs = slices.Clone(bundle.Runtime.AuditLogs)
@@ -1099,12 +1103,25 @@ func ensureSecretsDefaults(sec *SecretsState) {
 		sec.AISettings.Patrol.SSHFailWarnCount = def.SSHFailWarnCount
 		sec.AISettings.Patrol.CheckListeningPorts = def.CheckListeningPorts
 		sec.AISettings.Patrol.CheckPrivilegedUsers = def.CheckPrivilegedUsers
+		sec.AISettings.Patrol.AnalysisMode = def.AnalysisMode
+		sec.AISettings.Patrol.ExternalFallbackMinutes = def.ExternalFallbackMinutes
+		sec.AISettings.Patrol.NotifyPendingApprovals = def.NotifyPendingApprovals
+	}
+	sec.AISettings.Patrol.AnalysisMode = NormalizePatrolAnalysisMode(sec.AISettings.Patrol.AnalysisMode)
+	if sec.AISettings.Patrol.ExternalFallbackMinutes <= 0 {
+		sec.AISettings.Patrol.ExternalFallbackMinutes = 15
 	}
 	if sec.AISettings.Patrol.ServerIDs == nil {
 		sec.AISettings.Patrol.ServerIDs = []string{}
 	}
 	if sec.AISettings.Patrol.Webhooks == nil {
 		sec.AISettings.Patrol.Webhooks = []WebhookChannel{}
+	}
+	if sec.AISettings.MCP.DesktopLoopbackPort < 1024 || sec.AISettings.MCP.DesktopLoopbackPort > 65535 {
+		sec.AISettings.MCP.DesktopLoopbackPort = DefaultMCPConfig().DesktopLoopbackPort
+	}
+	if sec.AISettings.MCP.Tokens == nil {
+		sec.AISettings.MCP.Tokens = []MCPToken{}
 	}
 	if !sec.AISettings.AgentsMD.Initialized && sec.AISettings.AgentsMD.Revision == 0 && sec.AISettings.AgentsMD.Content == "" {
 		sec.AISettings.AgentsMD = DefaultAgentsMDConfig(now)
@@ -1165,6 +1182,12 @@ func ensureAIOpsRuntimeDefaults(a *AIOpsRuntimeState) {
 	if a.PatrolRecords == nil {
 		a.PatrolRecords = []PatrolRecord{}
 	}
+	if a.ExternalApprovals == nil {
+		a.ExternalApprovals = []ExternalApproval{}
+	}
+	if a.MCPTokenUsage == nil {
+		a.MCPTokenUsage = make(map[string]MCPTokenRuntimeUsage)
+	}
 }
 
 func cloneServersWithoutRuntime(servers []ServerConfig) []ServerConfig {
@@ -1187,6 +1210,7 @@ func cloneAISettings(src AISettings) AISettings {
 	dst.Providers = slices.Clone(src.Providers)
 	dst.Patrol.ServerIDs = slices.Clone(src.Patrol.ServerIDs)
 	dst.Patrol.Webhooks = slices.Clone(src.Patrol.Webhooks)
+	dst.MCP.Tokens = cloneMCPTokens(src.MCP.Tokens)
 	return dst
 }
 
@@ -1319,10 +1343,7 @@ func clonePatrolBaselines(in []ServerBaselineSnapshot) []ServerBaselineSnapshot 
 func clonePatrolRecords(in []PatrolRecord) []PatrolRecord {
 	out := make([]PatrolRecord, len(in))
 	for i, r := range in {
-		cp := r
-		cp.Findings = slices.Clone(r.Findings)
-		cp.AIRecommendations = slices.Clone(r.AIRecommendations)
-		out[i] = cp
+		out[i] = cloneSinglePatrolRecord(r)
 	}
 	return out
 }

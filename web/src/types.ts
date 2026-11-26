@@ -656,6 +656,9 @@ export interface WebhookChannelView {
   enabled: boolean;
 }
 
+export type PatrolAnalysisMode = 'builtin' | 'external' | 'external_with_fallback';
+export type MCPTokenScope = 'patrol_readonly' | 'ops_propose';
+
 export interface PatrolConfigView {
   enabled: boolean;
   interval_minutes: number;
@@ -666,15 +669,21 @@ export interface PatrolConfigView {
   ssh_fail_warn_count: number;
   check_listening_ports: boolean;
   check_privileged_users: boolean;
+  analysis_mode?: PatrolAnalysisMode;
+  external_fallback_minutes?: number;
+  notify_pending_approvals?: boolean;
   webhooks: WebhookChannelView[];
 }
 
 export interface PatrolStatusView {
   running: boolean;
   vault_ready: boolean;
+  analysis_mode?: PatrolAnalysisMode;
   last_run_at?: string;
   next_run_at?: string;
   unread_alerts: number;
+  pending_external_count?: number;
+  pending_approvals_count?: number;
 }
 
 export interface PatrolFinding {
@@ -695,7 +704,7 @@ export interface PatrolFinding {
 
 export interface PatrolRecord {
   id: string;
-  trigger: 'scheduled' | 'manual';
+  trigger: 'scheduled' | 'manual' | 'external_mcp';
   started_at: string;
   completed_at: string;
   status: 'healthy' | 'warning' | 'critical';
@@ -704,13 +713,87 @@ export interface PatrolRecord {
   warning_count: number;
   critical_count: number;
   findings: PatrolFinding[];
+  analysis_state?: '' | 'none' | 'pending_external' | 'claimed' | 'completed' | 'fallback_completed';
+  ai_source?: 'builtin' | 'external_mcp' | string;
+  external_client?: string;
+  claimed_by?: string;
+  claimed_at?: string;
+  external_deadline_at?: string;
   ai_analyzed: boolean;
+  ai_analyzed_at?: string;
   ai_model?: string;
   ai_summary?: string;
   ai_root_cause?: string;
   ai_recommendations?: string[];
+  deep_evidence?: string[];
   webhook_notified: boolean;
+  ai_webhook_notified?: boolean;
   unread: boolean;
+}
+
+export interface MCPTokenView {
+  id: string;
+  name: string;
+  client_hint?: 'claude_code' | 'codex' | 'antigravity' | 'cursor' | 'custom' | string;
+  scope: MCPTokenScope;
+  token_prefix: string;
+  allowed_servers: string[];
+  enabled: boolean;
+  created_at: string;
+  last_used_at?: string;
+  last_client_name?: string;
+  last_client_ip?: string;
+  call_count: number;
+}
+
+export interface MCPConfigView {
+  enabled: boolean;
+  desktop_loopback_enabled: boolean;
+  desktop_loopback_port: number;
+  public_endpoint_hint?: string;
+  tokens: MCPTokenView[];
+}
+
+export interface MCPRuntimeStatus {
+  deploy_mode: 'server' | 'desktop' | string;
+  server_endpoint_path: string;
+  effective_endpoint_url: string;
+  desktop_loopback_running: boolean;
+  desktop_loopback_addr?: string;
+  desktop_loopback_error?: string;
+}
+
+export interface ExternalApproval {
+  id: string;
+  patrol_record_id?: string;
+  token_id: string;
+  token_name: string;
+  client_name: string;
+  tool_name: 'exec_ssh_command' | 'sftp_write_file' | string;
+  server_ids: string[];
+  server_names: string[];
+  risk_level: string;
+  reason: string;
+  command?: string;
+  file_path?: string;
+  new_content?: string;
+  diff_preview?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  execution_out?: string;
+  execution_error?: string;
+  duration_ms?: number;
+  webhook_notified?: boolean;
+  created_at: string;
+  resolved_at?: string;
+}
+
+export interface MCPOverviewResponse {
+  mcp_config: MCPConfigView;
+  mcp_runtime: MCPRuntimeStatus;
+  external_approvals: ExternalApproval[];
+  pending_approvals_count: number;
+  pending_patrols_count: number;
+  skill_markdown: string;
 }
 
 export interface AgentsMDConfig {
@@ -973,6 +1056,11 @@ export interface AIOverviewResponse {
   patrol_config: PatrolConfigView;
   patrol_status: PatrolStatusView;
   patrol_records: PatrolRecord[];
+  mcp_config?: MCPConfigView;
+  mcp_runtime?: MCPRuntimeStatus;
+  external_approvals?: ExternalApproval[];
+  pending_external_approvals?: number;
+  skill_markdown?: string;
   host_memories: HostMemory[];
   memories: AIMemoryEntry[];
   runbooks: AIRunbook[];

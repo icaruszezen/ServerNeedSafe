@@ -828,16 +828,19 @@ type WebhookMutationInput struct {
 }
 
 type PatrolConfigMutationInput struct {
-	Enabled              bool                   `json:"enabled"`
-	IntervalMinutes      int                    `json:"interval_minutes"`
-	ServerIDs            []string               `json:"server_ids"`
-	CPUWarnPercent       float64                `json:"cpu_warn_percent"`
-	MemWarnPercent       float64                `json:"mem_warn_percent"`
-	DiskWarnPercent      float64                `json:"disk_warn_percent"`
-	SSHFailWarnCount     int                    `json:"ssh_fail_warn_count"`
-	CheckListeningPorts  bool                   `json:"check_listening_ports"`
-	CheckPrivilegedUsers bool                   `json:"check_privileged_users"`
-	Webhooks             []WebhookMutationInput `json:"webhooks"`
+	Enabled                 bool                   `json:"enabled"`
+	IntervalMinutes         int                    `json:"interval_minutes"`
+	ServerIDs               []string               `json:"server_ids"`
+	CPUWarnPercent          float64                `json:"cpu_warn_percent"`
+	MemWarnPercent          float64                `json:"mem_warn_percent"`
+	DiskWarnPercent         float64                `json:"disk_warn_percent"`
+	SSHFailWarnCount        int                    `json:"ssh_fail_warn_count"`
+	CheckListeningPorts     bool                   `json:"check_listening_ports"`
+	CheckPrivilegedUsers    bool                   `json:"check_privileged_users"`
+	AnalysisMode            PatrolAnalysisMode     `json:"analysis_mode"`
+	ExternalFallbackMinutes int                    `json:"external_fallback_minutes"`
+	NotifyPendingApprovals  *bool                  `json:"notify_pending_approvals,omitempty"`
+	Webhooks                []WebhookMutationInput `json:"webhooks"`
 }
 
 func (s *Store) GetPatrolConfigSecret() (*PatrolConfig, error) {
@@ -856,6 +859,13 @@ func (s *Store) GetPatrolConfigSecret() (*PatrolConfig, error) {
 		cp.SSHFailWarnCount = def.SSHFailWarnCount
 		cp.CheckListeningPorts = def.CheckListeningPorts
 		cp.CheckPrivilegedUsers = def.CheckPrivilegedUsers
+		cp.AnalysisMode = def.AnalysisMode
+		cp.ExternalFallbackMinutes = def.ExternalFallbackMinutes
+		cp.NotifyPendingApprovals = def.NotifyPendingApprovals
+	}
+	cp.AnalysisMode = NormalizePatrolAnalysisMode(cp.AnalysisMode)
+	if cp.ExternalFallbackMinutes <= 0 {
+		cp.ExternalFallbackMinutes = 15
 	}
 	cp.ServerIDs = slices.Clone(s.secrets.AISettings.Patrol.ServerIDs)
 	if cp.ServerIDs == nil {
@@ -883,6 +893,11 @@ func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string
 	}
 	if in.SSHFailWarnCount < 1 {
 		in.SSHFailWarnCount = 15
+	}
+	analysisMode := NormalizePatrolAnalysisMode(in.AnalysisMode)
+	fallbackMins := in.ExternalFallbackMinutes
+	if fallbackMins < 1 || fallbackMins > 1440 {
+		fallbackMins = 15
 	}
 
 	var outView PatrolConfigView
@@ -932,17 +947,25 @@ func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string
 			sids = []string{}
 		}
 
+		notifyApprovals := sec.AISettings.Patrol.NotifyPendingApprovals
+		if in.NotifyPendingApprovals != nil {
+			notifyApprovals = *in.NotifyPendingApprovals
+		}
+
 		sec.AISettings.Patrol = PatrolConfig{
-			Enabled:              in.Enabled,
-			IntervalMinutes:      in.IntervalMinutes,
-			ServerIDs:            slices.Clone(sids),
-			CPUWarnPercent:       in.CPUWarnPercent,
-			MemWarnPercent:       in.MemWarnPercent,
-			DiskWarnPercent:      in.DiskWarnPercent,
-			SSHFailWarnCount:     in.SSHFailWarnCount,
-			CheckListeningPorts:  in.CheckListeningPorts,
-			CheckPrivilegedUsers: in.CheckPrivilegedUsers,
-			Webhooks:             mergedWebhooks,
+			Enabled:                 in.Enabled,
+			IntervalMinutes:         in.IntervalMinutes,
+			ServerIDs:               slices.Clone(sids),
+			CPUWarnPercent:          in.CPUWarnPercent,
+			MemWarnPercent:          in.MemWarnPercent,
+			DiskWarnPercent:         in.DiskWarnPercent,
+			SSHFailWarnCount:        in.SSHFailWarnCount,
+			CheckListeningPorts:     in.CheckListeningPorts,
+			CheckPrivilegedUsers:    in.CheckPrivilegedUsers,
+			AnalysisMode:            analysisMode,
+			ExternalFallbackMinutes: fallbackMins,
+			NotifyPendingApprovals:  notifyApprovals,
+			Webhooks:                mergedWebhooks,
 		}
 		outView = sec.AISettings.Patrol.ToView()
 		return nil
@@ -950,7 +973,7 @@ func (s *Store) UpdatePatrolConfig(in PatrolConfigMutationInput, clientIP string
 	if err != nil {
 		return nil, err
 	}
-	s.RecordAudit("ai.patrol_config", "patrol", fmt.Sprintf("更新后台定时巡检策略 (启用=%v, 周期=%d分钟)", in.Enabled, in.IntervalMinutes), clientIP, true)
+	s.RecordAudit("ai.patrol_config", "patrol", fmt.Sprintf("更新后台定时巡检策略 (启用=%v, 周期=%d分钟, 研判引擎=%s)", in.Enabled, in.IntervalMinutes, analysisMode), clientIP, true)
 	return &outView, nil
 }
 
@@ -1009,15 +1032,23 @@ func (s *Store) AppendPatrolRecord(rec PatrolRecord) error {
 	if s.aiopsRT == nil {
 		s.aiopsRT = DefaultAIOpsRuntimeState(time.Now().UTC())
 	}
-	s.aiopsRT.PatrolRecords = append([]PatrolRecord{rec}, s.aiopsRT.PatrolRecords...)
+	s.aiopsRT.PatrolRecords = append([]PatrolRecord{cloneSinglePatrolRecord(rec)}, s.aiopsRT.PatrolRecords...)
 	if len(s.aiopsRT.PatrolRecords) > maxPatrolRecords {
 		s.aiopsRT.PatrolRecords = s.aiopsRT.PatrolRecords[:maxPatrolRecords]
 	}
 	s.dirtyAIOps = true
+	triggerLabel := map[string]string{
+		"scheduled":    "后台定时",
+		"manual":       "手动即时",
+		"external_mcp": "外部 AI (MCP)",
+	}[rec.Trigger]
+	if triggerLabel == "" {
+		triggerLabel = rec.Trigger
+	}
 	s.appendAuditRuntimeLocked(
 		"ai.patrol_run",
 		fmt.Sprintf("%d 台服务器", rec.TotalServers),
-		fmt.Sprintf("执行%s巡检: 状态=%s (异常=%d, 严重=%d)", map[string]string{"scheduled": "后台定时", "manual": "手动即时"}[rec.Trigger], rec.Status, rec.WarningCount, rec.CriticalCount),
+		fmt.Sprintf("执行%s巡检: 状态=%s (异常=%d, 严重=%d)", triggerLabel, rec.Status, rec.WarningCount, rec.CriticalCount),
 		"patrol-daemon",
 		true,
 	)

@@ -123,32 +123,57 @@ func (w WebhookChannel) ToView() WebhookChannelView {
 	}
 }
 
+// PatrolAnalysisMode controls which AI engine performs root-cause analysis on patrol anomalies.
+type PatrolAnalysisMode string
+
+const (
+	PatrolAnalysisBuiltin              PatrolAnalysisMode = "builtin"                // Default: built-in HTTP LLM provider
+	PatrolAnalysisExternal             PatrolAnalysisMode = "external"               // External MCP AI takeover only (zero built-in API cost)
+	PatrolAnalysisExternalWithFallback PatrolAnalysisMode = "external_with_fallback" // External MCP AI first; fallback to built-in LLM on timeout
+)
+
+// NormalizePatrolAnalysisMode validates and normalizes a PatrolAnalysisMode value.
+func NormalizePatrolAnalysisMode(m PatrolAnalysisMode) PatrolAnalysisMode {
+	switch m {
+	case PatrolAnalysisExternal, PatrolAnalysisExternalWithFallback:
+		return m
+	default:
+		return PatrolAnalysisBuiltin
+	}
+}
+
 // PatrolConfig defines periodic unattended read-only inspection & alert rules.
 type PatrolConfig struct {
-	Enabled              bool             `json:"enabled"`
-	IntervalMinutes      int              `json:"interval_minutes"`       // e.g. 15, 30, 60, 360, 1440
-	ServerIDs            []string         `json:"server_ids"`             // empty = patrol all servers
-	CPUWarnPercent       float64          `json:"cpu_warn_percent"`       // load/cores * 100 threshold
-	MemWarnPercent       float64          `json:"mem_warn_percent"`       // default 85
-	DiskWarnPercent      float64          `json:"disk_warn_percent"`      // default 85
-	SSHFailWarnCount     int              `json:"ssh_fail_warn_count"`    // recent failed SSH logins threshold
-	CheckListeningPorts  bool             `json:"check_listening_ports"`  // alert on new listening TCP/UDP ports
-	CheckPrivilegedUsers bool             `json:"check_privileged_users"` // alert on non-root UID=0 accounts
-	Webhooks             []WebhookChannel `json:"webhooks"`
+	Enabled                 bool               `json:"enabled"`
+	IntervalMinutes         int                `json:"interval_minutes"`          // e.g. 15, 30, 60, 360, 1440
+	ServerIDs               []string           `json:"server_ids"`                // empty = patrol all servers
+	CPUWarnPercent          float64            `json:"cpu_warn_percent"`          // load/cores * 100 threshold
+	MemWarnPercent          float64            `json:"mem_warn_percent"`          // default 85
+	DiskWarnPercent         float64            `json:"disk_warn_percent"`         // default 85
+	SSHFailWarnCount        int                `json:"ssh_fail_warn_count"`       // recent failed SSH logins threshold
+	CheckListeningPorts     bool               `json:"check_listening_ports"`     // alert on new listening TCP/UDP ports
+	CheckPrivilegedUsers    bool               `json:"check_privileged_users"`    // alert on non-root UID=0 accounts
+	AnalysisMode            PatrolAnalysisMode `json:"analysis_mode,omitempty"`   // "builtin", "external", "external_with_fallback"
+	ExternalFallbackMinutes int                `json:"external_fallback_minutes"` // timeout in minutes before built-in fallback (default 15)
+	NotifyPendingApprovals  bool               `json:"notify_pending_approvals"`  // dispatch webhook when external AI submits HITL approval
+	Webhooks                []WebhookChannel   `json:"webhooks"`
 }
 
 // PatrolConfigView returns PatrolConfig with masked webhook secrets for frontend display.
 type PatrolConfigView struct {
-	Enabled              bool                 `json:"enabled"`
-	IntervalMinutes      int                  `json:"interval_minutes"`
-	ServerIDs            []string             `json:"server_ids"`
-	CPUWarnPercent       float64              `json:"cpu_warn_percent"`
-	MemWarnPercent       float64              `json:"mem_warn_percent"`
-	DiskWarnPercent      float64              `json:"disk_warn_percent"`
-	SSHFailWarnCount     int                  `json:"ssh_fail_warn_count"`
-	CheckListeningPorts  bool                 `json:"check_listening_ports"`
-	CheckPrivilegedUsers bool                 `json:"check_privileged_users"`
-	Webhooks             []WebhookChannelView `json:"webhooks"`
+	Enabled                 bool                 `json:"enabled"`
+	IntervalMinutes         int                  `json:"interval_minutes"`
+	ServerIDs               []string             `json:"server_ids"`
+	CPUWarnPercent          float64              `json:"cpu_warn_percent"`
+	MemWarnPercent          float64              `json:"mem_warn_percent"`
+	DiskWarnPercent         float64              `json:"disk_warn_percent"`
+	SSHFailWarnCount        int                  `json:"ssh_fail_warn_count"`
+	CheckListeningPorts     bool                 `json:"check_listening_ports"`
+	CheckPrivilegedUsers    bool                 `json:"check_privileged_users"`
+	AnalysisMode            PatrolAnalysisMode   `json:"analysis_mode"`
+	ExternalFallbackMinutes int                  `json:"external_fallback_minutes"`
+	NotifyPendingApprovals  bool                 `json:"notify_pending_approvals"`
+	Webhooks                []WebhookChannelView `json:"webhooks"`
 }
 
 func (c PatrolConfig) ToView() PatrolConfigView {
@@ -160,18 +185,134 @@ func (c PatrolConfig) ToView() PatrolConfigView {
 	for i, w := range c.Webhooks {
 		whViews[i] = w.ToView()
 	}
-	return PatrolConfigView{
-		Enabled:              c.Enabled,
-		IntervalMinutes:      c.IntervalMinutes,
-		ServerIDs:            sids,
-		CPUWarnPercent:       c.CPUWarnPercent,
-		MemWarnPercent:       c.MemWarnPercent,
-		DiskWarnPercent:      c.DiskWarnPercent,
-		SSHFailWarnCount:     c.SSHFailWarnCount,
-		CheckListeningPorts:  c.CheckListeningPorts,
-		CheckPrivilegedUsers: c.CheckPrivilegedUsers,
-		Webhooks:             whViews,
+	fallbackMins := c.ExternalFallbackMinutes
+	if fallbackMins <= 0 {
+		fallbackMins = 15
 	}
+	return PatrolConfigView{
+		Enabled:                 c.Enabled,
+		IntervalMinutes:         c.IntervalMinutes,
+		ServerIDs:               sids,
+		CPUWarnPercent:          c.CPUWarnPercent,
+		MemWarnPercent:          c.MemWarnPercent,
+		DiskWarnPercent:         c.DiskWarnPercent,
+		SSHFailWarnCount:        c.SSHFailWarnCount,
+		CheckListeningPorts:     c.CheckListeningPorts,
+		CheckPrivilegedUsers:    c.CheckPrivilegedUsers,
+		AnalysisMode:            NormalizePatrolAnalysisMode(c.AnalysisMode),
+		ExternalFallbackMinutes: fallbackMins,
+		NotifyPendingApprovals:  c.NotifyPendingApprovals,
+		Webhooks:                whViews,
+	}
+}
+
+// MCPTokenScope limits what an external AI client can invoke through /api/mcp.
+type MCPTokenScope string
+
+const (
+	MCPScopePatrolReadOnly MCPTokenScope = "patrol_readonly" // Telemetry, patrol queue/report, read-only SSH/SFTP forensics, memory updates
+	MCPScopeOpsPropose     MCPTokenScope = "ops_propose"     // All of patrol_readonly + submit mutating SSH/SFTP proposals into HITL approval queue
+)
+
+// NormalizeMCPTokenScope validates and defaults an MCPTokenScope value.
+func NormalizeMCPTokenScope(sc MCPTokenScope) MCPTokenScope {
+	if sc == MCPScopeOpsPropose {
+		return MCPScopeOpsPropose
+	}
+	return MCPScopePatrolReadOnly
+}
+
+// MCPToken stores a revocable scoped API token hash for external AI MCP clients inside secrets.enc.
+// The raw token is returned only once at creation time and never persisted in plaintext.
+type MCPToken struct {
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	ClientHint     string        `json:"client_hint,omitempty"` // "claude_code", "codex", "antigravity", "cursor", "custom"
+	Scope          MCPTokenScope `json:"scope"`
+	TokenHash      string        `json:"token_hash"`
+	TokenPrefix    string        `json:"token_prefix"`
+	AllowedServers []string      `json:"allowed_servers,omitempty"` // empty = all managed servers
+	Enabled        bool          `json:"enabled"`
+	CreatedAt      time.Time     `json:"created_at"`
+}
+
+// MCPTokenRuntimeUsage records high-frequency MCP call telemetry in aiops_runtime.json (never touches secrets.enc).
+type MCPTokenRuntimeUsage struct {
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
+	LastClientName string     `json:"last_client_name,omitempty"`
+	LastClientIP   string     `json:"last_client_ip,omitempty"`
+	CallCount      int64      `json:"call_count,omitempty"`
+}
+
+// MCPTokenView redacts TokenHash and merges live runtime usage stats for frontend display.
+type MCPTokenView struct {
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	ClientHint     string        `json:"client_hint,omitempty"`
+	Scope          MCPTokenScope `json:"scope"`
+	TokenPrefix    string        `json:"token_prefix"`
+	AllowedServers []string      `json:"allowed_servers"`
+	Enabled        bool          `json:"enabled"`
+	CreatedAt      time.Time     `json:"created_at"`
+	LastUsedAt     *time.Time    `json:"last_used_at,omitempty"`
+	LastClientName string        `json:"last_client_name,omitempty"`
+	LastClientIP   string        `json:"last_client_ip,omitempty"`
+	CallCount      int64         `json:"call_count"`
+}
+
+// MCPConfig configures the built-in MCP Streamable HTTP gateway for external AI clients.
+type MCPConfig struct {
+	Enabled                bool       `json:"enabled"`
+	DesktopLoopbackEnabled bool       `json:"desktop_loopback_enabled"`
+	DesktopLoopbackPort    int        `json:"desktop_loopback_port"`
+	PublicEndpointHint     string     `json:"public_endpoint_hint,omitempty"`
+	Tokens                 []MCPToken `json:"tokens"`
+}
+
+// MCPConfigView exposes redacted MCP settings and token metadata to the admin UI.
+type MCPConfigView struct {
+	Enabled                bool           `json:"enabled"`
+	DesktopLoopbackEnabled bool           `json:"desktop_loopback_enabled"`
+	DesktopLoopbackPort    int            `json:"desktop_loopback_port"`
+	PublicEndpointHint     string         `json:"public_endpoint_hint,omitempty"`
+	Tokens                 []MCPTokenView `json:"tokens"`
+}
+
+// DefaultMCPConfig returns secure defaults for the built-in MCP gateway.
+func DefaultMCPConfig() MCPConfig {
+	return MCPConfig{
+		Enabled:                false,
+		DesktopLoopbackEnabled: false,
+		DesktopLoopbackPort:    18900,
+		PublicEndpointHint:     "",
+		Tokens:                 []MCPToken{},
+	}
+}
+
+// ExternalApproval represents a mutating SSH command or SFTP file change proposed by an external AI via MCP.
+// Proposals NEVER auto-execute remotely; an administrator must explicitly approve them in the Web console.
+type ExternalApproval struct {
+	ID              string     `json:"id"`
+	PatrolRecordID  string     `json:"patrol_record_id,omitempty"`
+	TokenID         string     `json:"token_id"`
+	TokenName       string     `json:"token_name"`
+	ClientName      string     `json:"client_name"`
+	ToolName        string     `json:"tool_name"` // "exec_ssh_command" or "sftp_write_file"
+	ServerIDs       []string   `json:"server_ids"`
+	ServerNames     []string   `json:"server_names"`
+	RiskLevel       string     `json:"risk_level"` // "medium" or "high"
+	Reason          string     `json:"reason"`
+	Command         string     `json:"command,omitempty"`
+	FilePath        string     `json:"file_path,omitempty"`
+	NewContent      string     `json:"new_content,omitempty"`
+	DiffPreview     string     `json:"diff_preview,omitempty"`
+	Status          string     `json:"status"` // "pending", "approved", "rejected"
+	ExecutionOut    string     `json:"execution_out,omitempty"`
+	ExecutionError  string     `json:"execution_error,omitempty"`
+	DurationMs      int64      `json:"duration_ms,omitempty"`
+	WebhookNotified bool       `json:"webhook_notified,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
 }
 
 // AgentsMDConfig stores the encrypted global AGENTS.md operational charter for all AI surfaces.
@@ -195,12 +336,13 @@ type AIMemoryConfig struct {
 }
 
 // AISettings holds global single-active LLM selection, providers, default HITL mode, patrol rules,
-// global AGENTS.md charter, and memory/context budget preferences.
+// MCP external AI gateway configuration, global AGENTS.md charter, and memory/context budget preferences.
 type AISettings struct {
 	ActiveProviderID string             `json:"active_provider_id"`
 	DefaultMode      AIExecutionMode    `json:"default_mode"`
 	Providers        []AIProviderConfig `json:"providers"`
 	Patrol           PatrolConfig       `json:"patrol"`
+	MCP              MCPConfig          `json:"mcp"`
 	AgentsMD         AgentsMDConfig     `json:"agents_md"`
 	MemoryConfig     AIMemoryConfig     `json:"memory_config"`
 }
@@ -424,40 +566,52 @@ type PatrolFinding struct {
 	Anomalies      []string `json:"anomalies"`
 }
 
-// PatrolRecord archives a scheduled or manual inspection run and its optional AI root-cause report.
+// PatrolRecord archives a scheduled, manual, or external-MCP inspection run and its optional AI root-cause report.
 type PatrolRecord struct {
-	ID                string          `json:"id"`
-	StartedAt         time.Time       `json:"started_at"`
-	CompletedAt       time.Time       `json:"completed_at"`
-	Trigger           string          `json:"trigger"` // "scheduled" or "manual"
-	TotalServers      int             `json:"total_servers"`
-	HealthyCount      int             `json:"healthy_count"`
-	WarningCount      int             `json:"warning_count"`
-	CriticalCount     int             `json:"critical_count"`
-	Status            string          `json:"status"` // "healthy", "warning", "critical"
-	Findings          []PatrolFinding `json:"findings"`
-	AIAnalyzed        bool            `json:"ai_analyzed"`
-	AIModel           string          `json:"ai_model,omitempty"`
-	AISummary         string          `json:"ai_summary,omitempty"`
-	AIRootCause       string          `json:"ai_root_cause,omitempty"`
-	AIRecommendations []string        `json:"ai_recommendations,omitempty"`
-	WebhookNotified   bool            `json:"webhook_notified"`
-	Unread            bool            `json:"unread"`
+	ID                 string          `json:"id"`
+	StartedAt          time.Time       `json:"started_at"`
+	CompletedAt        time.Time       `json:"completed_at"`
+	Trigger            string          `json:"trigger"` // "scheduled", "manual", or "external_mcp"
+	TotalServers       int             `json:"total_servers"`
+	HealthyCount       int             `json:"healthy_count"`
+	WarningCount       int             `json:"warning_count"`
+	CriticalCount      int             `json:"critical_count"`
+	Status             string          `json:"status"` // "healthy", "warning", "critical"
+	Findings           []PatrolFinding `json:"findings"`
+	AnalysisState      string          `json:"analysis_state,omitempty"` // "", "none", "pending_external", "claimed", "completed", "fallback_completed"
+	AISource           string          `json:"ai_source,omitempty"`      // "builtin" or "external_mcp"
+	ExternalClient     string          `json:"external_client,omitempty"`
+	ClaimedBy          string          `json:"claimed_by,omitempty"`
+	ClaimedAt          *time.Time      `json:"claimed_at,omitempty"`
+	ExternalDeadlineAt *time.Time      `json:"external_deadline_at,omitempty"`
+	AIAnalyzed         bool            `json:"ai_analyzed"`
+	AIAnalyzedAt       *time.Time      `json:"ai_analyzed_at,omitempty"`
+	AIModel            string          `json:"ai_model,omitempty"`
+	AISummary          string          `json:"ai_summary,omitempty"`
+	AIRootCause        string          `json:"ai_root_cause,omitempty"`
+	AIRecommendations  []string        `json:"ai_recommendations,omitempty"`
+	DeepEvidence       []string        `json:"deep_evidence,omitempty"`
+	WebhookNotified    bool            `json:"webhook_notified"`
+	AIWebhookNotified  bool            `json:"ai_webhook_notified,omitempty"`
+	Unread             bool            `json:"unread"`
 }
 
 // DefaultPatrolConfig returns safe default thresholds for periodic read-only server patrol.
 func DefaultPatrolConfig() PatrolConfig {
 	return PatrolConfig{
-		Enabled:              false,
-		IntervalMinutes:      60,
-		ServerIDs:            []string{},
-		CPUWarnPercent:       85,
-		MemWarnPercent:       85,
-		DiskWarnPercent:      85,
-		SSHFailWarnCount:     15,
-		CheckListeningPorts:  true,
-		CheckPrivilegedUsers: true,
-		Webhooks:             []WebhookChannel{},
+		Enabled:                 false,
+		IntervalMinutes:         60,
+		ServerIDs:               []string{},
+		CPUWarnPercent:          85,
+		MemWarnPercent:          85,
+		DiskWarnPercent:         85,
+		SSHFailWarnCount:        15,
+		CheckListeningPorts:     true,
+		CheckPrivilegedUsers:    true,
+		AnalysisMode:            PatrolAnalysisBuiltin,
+		ExternalFallbackMinutes: 15,
+		NotifyPendingApprovals:  true,
+		Webhooks:                []WebhookChannel{},
 	}
 }
 
@@ -597,12 +751,25 @@ func EnsureStateDefaults(st *VaultState) {
 		st.AISettings.Patrol.SSHFailWarnCount = def.SSHFailWarnCount
 		st.AISettings.Patrol.CheckListeningPorts = def.CheckListeningPorts
 		st.AISettings.Patrol.CheckPrivilegedUsers = def.CheckPrivilegedUsers
+		st.AISettings.Patrol.AnalysisMode = def.AnalysisMode
+		st.AISettings.Patrol.ExternalFallbackMinutes = def.ExternalFallbackMinutes
+		st.AISettings.Patrol.NotifyPendingApprovals = def.NotifyPendingApprovals
+	}
+	st.AISettings.Patrol.AnalysisMode = NormalizePatrolAnalysisMode(st.AISettings.Patrol.AnalysisMode)
+	if st.AISettings.Patrol.ExternalFallbackMinutes <= 0 {
+		st.AISettings.Patrol.ExternalFallbackMinutes = 15
 	}
 	if st.AISettings.Patrol.ServerIDs == nil {
 		st.AISettings.Patrol.ServerIDs = []string{}
 	}
 	if st.AISettings.Patrol.Webhooks == nil {
 		st.AISettings.Patrol.Webhooks = []WebhookChannel{}
+	}
+	if st.AISettings.MCP.DesktopLoopbackPort < 1024 || st.AISettings.MCP.DesktopLoopbackPort > 65535 {
+		st.AISettings.MCP.DesktopLoopbackPort = DefaultMCPConfig().DesktopLoopbackPort
+	}
+	if st.AISettings.MCP.Tokens == nil {
+		st.AISettings.MCP.Tokens = []MCPToken{}
 	}
 	if !st.AISettings.AgentsMD.Initialized && st.AISettings.AgentsMD.Revision == 0 && st.AISettings.AgentsMD.Content == "" {
 		st.AISettings.AgentsMD = DefaultAgentsMDConfig(now)
@@ -644,6 +811,9 @@ func scrubAIData(st *VaultState) {
 		st.AISettings.Patrol.Webhooks[i].URL = ""
 		st.AISettings.Patrol.Webhooks[i].Secret = ""
 	}
+	for i := range st.AISettings.MCP.Tokens {
+		st.AISettings.MCP.Tokens[i].TokenHash = ""
+	}
 	st.AISettings.AgentsMD.Content = ""
 	st.HostMemories = nil
 	st.AIMemories = nil
@@ -661,6 +831,7 @@ func cloneAIData(dst, src *VaultState) {
 	dst.AISettings.Providers = slices.Clone(src.AISettings.Providers)
 	dst.AISettings.Patrol.ServerIDs = slices.Clone(src.AISettings.Patrol.ServerIDs)
 	dst.AISettings.Patrol.Webhooks = slices.Clone(src.AISettings.Patrol.Webhooks)
+	dst.AISettings.MCP.Tokens = cloneMCPTokens(src.AISettings.MCP.Tokens)
 
 	dst.HostMemories = make([]HostMemory, len(src.HostMemories))
 	for i, m := range src.HostMemories {
@@ -710,15 +881,67 @@ func cloneAIData(dst, src *VaultState) {
 
 	dst.PatrolRecords = make([]PatrolRecord, len(src.PatrolRecords))
 	for i, rec := range src.PatrolRecords {
-		rc := rec
-		rc.Findings = make([]PatrolFinding, len(rec.Findings))
-		for fi, f := range rec.Findings {
-			fc := f
-			fc.NewPorts = slices.Clone(f.NewPorts)
-			fc.Anomalies = slices.Clone(f.Anomalies)
-			rc.Findings[fi] = fc
-		}
-		rc.AIRecommendations = slices.Clone(rec.AIRecommendations)
-		dst.PatrolRecords[i] = rc
+		dst.PatrolRecords[i] = cloneSinglePatrolRecord(rec)
 	}
+}
+
+func cloneMCPTokens(in []MCPToken) []MCPToken {
+	if in == nil {
+		return []MCPToken{}
+	}
+	out := make([]MCPToken, len(in))
+	for i, t := range in {
+		cp := t
+		cp.AllowedServers = slices.Clone(t.AllowedServers)
+		out[i] = cp
+	}
+	return out
+}
+
+func cloneSinglePatrolRecord(rec PatrolRecord) PatrolRecord {
+	rc := rec
+	rc.Findings = make([]PatrolFinding, len(rec.Findings))
+	for fi, f := range rec.Findings {
+		fc := f
+		fc.NewPorts = slices.Clone(f.NewPorts)
+		fc.Anomalies = slices.Clone(f.Anomalies)
+		rc.Findings[fi] = fc
+	}
+	rc.AIRecommendations = slices.Clone(rec.AIRecommendations)
+	rc.DeepEvidence = slices.Clone(rec.DeepEvidence)
+	if rec.ClaimedAt != nil {
+		t := *rec.ClaimedAt
+		rc.ClaimedAt = &t
+	}
+	if rec.ExternalDeadlineAt != nil {
+		t := *rec.ExternalDeadlineAt
+		rc.ExternalDeadlineAt = &t
+	}
+	if rec.AIAnalyzedAt != nil {
+		t := *rec.AIAnalyzedAt
+		rc.AIAnalyzedAt = &t
+	}
+	return rc
+}
+
+func cloneExternalApproval(ap ExternalApproval) ExternalApproval {
+	cp := ap
+	cp.ServerIDs = slices.Clone(ap.ServerIDs)
+	cp.ServerNames = slices.Clone(ap.ServerNames)
+	if ap.ResolvedAt != nil {
+		t := *ap.ResolvedAt
+		cp.ResolvedAt = &t
+	}
+	return cp
+}
+
+func cloneExternalApprovals(in []ExternalApproval) []ExternalApproval {
+	if in == nil {
+		return []ExternalApproval{}
+	}
+	out := make([]ExternalApproval, len(in))
+	for i, ap := range in {
+		out[i] = cloneExternalApproval(ap)
+	}
+	return out
 }
