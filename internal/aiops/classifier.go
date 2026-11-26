@@ -21,10 +21,11 @@ var (
 		regexp.MustCompile(`(?i)(^|[;&|\s])rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive|--no-preserve-root)[a-zA-Z\s-]*\s+(/|/\*)\s*($|[;&|])`),
 		regexp.MustCompile(`(?i)--no-preserve-root`),
 		regexp.MustCompile(`(?i)(^|[;&|\s])(mkfs(\.[a-z0-9]+)?|wipefs|fdisk|parted|sfdisk)\b`),
-		regexp.MustCompile(`(?i)(^|[;&|\s])dd\s+[^;&|]*of=/dev/(sd|vd|nvme|xvd|mmcblk|loop|dm-)`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])diskutil\s+(eraseDisk|eraseVolume|zeroDisk|randomDisk|partitionDisk|apfs\s+deleteContainer|apfs\s+deleteVolume)\b`),
+		regexp.MustCompile(`(?i)(^|[;&|\s])dd\s+[^;&|]*of=/dev/(sd|vd|nvme|xvd|mmcblk|loop|dm-|disk|rdisk)`),
 		regexp.MustCompile(`:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:`),
 		regexp.MustCompile(`(?i)(^|[;&|\s])(shutdown|poweroff|halt|init\s+0|reboot\s+-f)\b`),
-		regexp.MustCompile(`(?i)>\s*/dev/(sd|vd|nvme|xvd)[a-z0-9]*`),
+		regexp.MustCompile(`(?i)>\s*/dev/(sd|vd|nvme|xvd|disk|rdisk)[a-z0-9]*`),
 		regexp.MustCompile(`(?i)(^|[;&|\s])(chmod|chown)\s+(-[a-zA-Z]*R[a-zA-Z]*\s+)\S+\s+/\s*($|[;&|])`),
 	}
 
@@ -78,12 +79,17 @@ var (
 		"lspci":      true,
 		"dmesg":      true,
 		"journalctl": true,
-		"getenforce": true,
-		"sestatus":   true,
-		"aa-status":  true,
-		"echo":       true,
-		"printf":     true,
-		"true":       true,
+		"getenforce":      true,
+		"sestatus":        true,
+		"aa-status":       true,
+		"sw_vers":         true,
+		"vm_stat":         true,
+		"pagesize":        true,
+		"ioreg":           true,
+		"system_profiler": true,
+		"echo":            true,
+		"printf":          true,
+		"true":            true,
 	}
 
 	safeRedirectCleaner = regexp.MustCompile(`2>\s*/dev/null|2>&1|>&2`)
@@ -215,7 +221,16 @@ func isSegmentReadOnly(seg string) (bool, string) {
 		if slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "b") && strings.HasPrefix(a, "-") }) {
 			return true, ""
 		}
-		return false, "交互式 top 缺少批处理参数 (-bn1)"
+		// macOS non-interactive batch mode: top -l <positive_count> (reject -l 0 which streams infinitely)
+		for i, a := range args {
+			if a == "-l" && i+1 < len(args) && isPositiveIntArg(args[i+1]) {
+				return true, ""
+			}
+			if strings.HasPrefix(a, "-l") && len(a) > 2 && isPositiveIntArg(a[2:]) {
+				return true, ""
+			}
+		}
+		return false, "交互式 top 缺少批处理参数 (-bn1 或 macOS -l <次数>)"
 	case "ping":
 		if slices.Contains(args, "-c") {
 			return true, ""
@@ -334,9 +349,150 @@ func isSegmentReadOnly(seg string) (bool, string) {
 			return true, ""
 		}
 		return false, "rpm 软件包操作需人工审批"
+	case "memory_pressure":
+		for _, a := range args {
+			if a == "-S" || a == "-l" || a == "-p" {
+				return false, "memory_pressure 压力模拟参数需人工审批"
+			}
+		}
+		return true, ""
+	case "csrutil":
+		if len(args) == 1 && args[0] == "status" {
+			return true, ""
+		}
+		return false, "csrutil 安全配置变更需人工审批"
+	case "launchctl":
+		if len(args) > 0 {
+			switch args[0] {
+			case "list", "print", "blame", "procinfo", "dumpstate":
+				return true, ""
+			}
+		}
+		return false, "launchctl 服务状态变更操作需人工审批"
+	case "diskutil":
+		if len(args) > 0 {
+			switch args[0] {
+			case "list", "info":
+				return true, ""
+			case "apfs", "cs":
+				if len(args) >= 2 && args[1] == "list" {
+					return true, ""
+				}
+			}
+		}
+		return false, "diskutil 磁盘变更操作需人工审批"
+	case "scutil":
+		if len(args) > 0 && !slices.Contains(args, "--set") {
+			switch args[0] {
+			case "--dns", "--proxy", "--nwi", "--get":
+				return true, ""
+			}
+		}
+		return false, "scutil 系统网络配置变更需人工审批"
+	case "networksetup":
+		if len(args) > 0 && (strings.HasPrefix(args[0], "-list") || strings.HasPrefix(args[0], "-get")) {
+			for _, a := range args[1:] {
+				if strings.HasPrefix(a, "-set") || strings.HasPrefix(a, "-create") || strings.HasPrefix(a, "-delete") || strings.HasPrefix(a, "-remove") || strings.HasPrefix(a, "-rename") {
+					return false, "networksetup 网络变更操作需人工审批"
+				}
+			}
+			return true, ""
+		}
+		return false, "networksetup 网络变更操作需人工审批"
+	case "pmset":
+		if len(args) >= 1 && args[0] == "-g" {
+			for _, a := range args[1:] {
+				if a == "-a" || a == "-b" || a == "-c" || a == "-u" || a == "sleepnow" || a == "schedule" || a == "repeat" {
+					return false, "pmset 电源策略变更操作需人工审批"
+				}
+			}
+			return true, ""
+		}
+		return false, "pmset 电源策略变更操作需人工审批"
+	case "log":
+		if len(args) > 0 && args[0] == "show" {
+			return true, ""
+		}
+		return false, "log 流式监听或配置变更操作需人工审批"
+	case "dscl":
+		hasReadOp := false
+		for _, a := range args {
+			switch a {
+			case "-create", "-delete", "-append", "-merge", "-change", "-changei", "-passwd", "-createprop", "-deleteprop":
+				return false, "dscl 目录账户变更操作需人工审批"
+			case "-list", "-read", "-readall", "-search":
+				hasReadOp = true
+			}
+		}
+		if hasReadOp {
+			return true, ""
+		}
+		return false, "dscl 目录操作需人工审批"
+	case "defaults":
+		if len(args) > 0 {
+			switch args[0] {
+			case "read", "read-type", "find", "domains":
+				return true, ""
+			}
+		}
+		return false, "defaults 系统偏好写入操作需人工审批"
+	case "plutil":
+		if len(args) > 0 && (args[0] == "-p" || args[0] == "-lint") {
+			return true, ""
+		}
+		return false, "plutil 属性表修改操作需人工审批"
+	case "pfctl":
+		hasShow := false
+		for _, a := range args {
+			if a == "-s" || a == "-sr" || a == "-sn" || a == "-si" || a == "-sa" || a == "-ss" || a == "-sm" || a == "-st" {
+				hasShow = true
+			} else if a == "-e" || a == "-d" || a == "-f" || a == "-F" || a == "-k" || a == "-K" || a == "-X" || a == "-T" {
+				return false, "pfctl 防火墙规则变更需人工审批"
+			}
+		}
+		if hasShow {
+			return true, ""
+		}
+		return false, "pfctl 防火墙规则变更需人工审批"
+	case "brew":
+		if len(args) > 0 {
+			switch args[0] {
+			case "list", "info", "outdated", "config", "doctor", "--version", "-v":
+				return true, ""
+			case "services":
+				if len(args) >= 2 && (args[1] == "list" || args[1] == "info") {
+					return true, ""
+				}
+			}
+		}
+		return false, "brew 软件包或服务变更操作需人工审批"
+	case "socketfilterfw", "/usr/libexec/ApplicationFirewall/socketfilterfw":
+		if len(args) == 1 {
+			switch args[0] {
+			case "--getglobalstate", "--getblockall", "--getstealthmode", "--getallowsigned", "--listapps":
+				return true, ""
+			}
+		}
+		return false, "socketfilterfw 防火墙规则变更需人工审批"
 	}
 
 	return false, fmt.Sprintf("涉及状态变更或未列入只读白名单的指令 (%s)", bin)
+}
+
+func isPositiveIntArg(s string) bool {
+	if s == "" {
+		return false
+	}
+	nonZero := false
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+		if ch != '0' {
+			nonZero = true
+		}
+	}
+	return nonZero
 }
 
 // BuildUnifiedDiff computes a compact, readable unified diff between oldContent and newContent.

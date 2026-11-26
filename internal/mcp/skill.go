@@ -22,10 +22,10 @@ description: 使用 ServerNeedSafe MCP 网关接管多服务器安全巡检、�
 
 1. **检查待研判任务**：调用 `+"`list_patrol_records(pending_only=true)`"+` 查看后台 7×24 巡检发现的异常记录。
 2. **认领任务与加载上下文**：对目标异常记录调用 `+"`claim_patrol(patrol_record_id)`"+`，系统会返回巡检指标、全局 `+"`AGENTS.md`"+` 规范、受检主机环境画像（端口用途、避坑红线）及长期记忆。
-3. **只读深度钻取取证**：不要停留在表层阈值告警，优先用只读工具核实真实根因：
-   - 进程与负载：`+"`exec_readonly_ssh`"+` 执行 `+"`ps aux --sort=-%%cpu | head -n 15`"+`、`+"`free -h`"+`、`+"`uptime`"+`
-   - 端口与网络：`+"`exec_readonly_ssh`"+` 执行 `+"`ss -tulnp`"+`（对比主机画像已知业务端口，避免误报）
-   - 磁盘与日志：`+"`exec_readonly_ssh`"+` 执行 `+"`df -hT`"+`、`+"`journalctl -n 60 --no-pager`"+`
+3. **只读深度钻取取证**：不要停留在表层阈值告警，优先用只读工具核实真实根因（注意按主机 OS 区分 Linux 与 macOS/Darwin 命令）：
+   - 进程与负载：`+"`exec_readonly_ssh`"+` 执行 Linux `+"`ps aux --sort=-%%cpu | head -n 15`"+`、`+"`free -h`"+`、`+"`uptime`"+`；或 macOS `+"`ps -axr -o pid,user,pcpu,pmem,rss,comm | head -n 15`"+`、`+"`vm_stat`"+`、`+"`sysctl -n vm.loadavg`"+`
+   - 端口与网络：`+"`exec_readonly_ssh`"+` 执行 Linux `+"`ss -tulnp`"+` 或 macOS `+"`netstat -anv -p tcp`"+` / `+"`lsof -nP -iTCP -sTCP:LISTEN`"+`（对比主机画像已知业务端口，避免误报）
+   - 磁盘与日志：`+"`exec_readonly_ssh`"+` 执行 Linux `+"`df -hT`"+`、`+"`journalctl -n 60 --no-pager`"+`；或 macOS `+"`df -h`"+`、`+"`launchctl list`"+`、`+"`log show --last 1h`"+`
    - 关键配置核查：`+"`sftp_read_file`"+` 查看 Nginx / SSH / Systemd 配置
 4. **回写结构化巡检报告**：调用 `+"`submit_patrol_report`"+` 提交：
    - `+"`summary`"+`：一句话核心结论（80 字以内）

@@ -130,7 +130,7 @@ func (s *Server) listToolsForToken(tok *vault.MCPToken) []mcpToolDef {
 		},
 		{
 			Name:        "exec_readonly_ssh",
-			Description: "在受管服务器上执行严格只读的 Linux 诊断命令（强制经由 ServerNeedSafe ClassifyCommand 只读白名单校验，如 ss、journalctl、ps、df、free、systemctl status、docker ps/logs、nginx -t 等；任何变更或高危命令都会被立即拒绝）。",
+			Description: "在受管服务器上执行严格只读的 Linux / macOS 诊断命令（强制经由 ServerNeedSafe ClassifyCommand 只读白名单校验，如 Linux 的 ss、journalctl、ps、df、free、systemctl status，以及 macOS 的 sw_vers、vm_stat、sysctl、netstat、lsof、launchctl list、log show、docker ps/logs、nginx -t 等；任何变更或高危命令都会被立即拒绝）。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
