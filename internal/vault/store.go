@@ -2172,6 +2172,13 @@ func (s *Store) GetSettings() (*AppSettings, error) {
 		return nil, ErrVaultLocked
 	}
 	cp := s.secrets.Settings
+	var upd UpdateSettings
+	if cp.Update != nil {
+		upd = NormalizeUpdateSettings(*cp.Update)
+	} else {
+		upd = DefaultUpdateSettings()
+	}
+	cp.Update = &upd
 	return &cp, nil
 }
 
@@ -2192,6 +2199,15 @@ func (s *Store) UpdateSettings(in AppSettings, clientIP string) (*AppSettings, e
 
 	var out AppSettings
 	err := s.mutateSecrets(func(sec *SecretsState) error {
+		if in.Update == nil {
+			// Preserve existing update preferences when general settings form omits `update`.
+			in.Update = sec.Settings.Update
+		} else {
+			norm := NormalizeUpdateSettings(*in.Update)
+			norm.CustomMirrorURL = strings.TrimSpace(norm.CustomMirrorURL)
+			norm.SkippedVersion = strings.TrimSpace(norm.SkippedVersion)
+			in.Update = &norm
+		}
 		sec.Settings = in
 		out = sec.Settings
 		return nil
@@ -2199,6 +2215,43 @@ func (s *Store) UpdateSettings(in AppSettings, clientIP string) (*AppSettings, e
 	if err != nil {
 		return nil, err
 	}
+	var upd UpdateSettings
+	if out.Update != nil {
+		upd = NormalizeUpdateSettings(*out.Update)
+	} else {
+		upd = DefaultUpdateSettings()
+	}
+	out.Update = &upd
 	s.RecordAudit("settings.update", "app", "更新安全策略与终端偏好设置", clientIP, true)
 	return &out, nil
+}
+
+// GetUpdateSettings returns normalized release-check & auto-update preferences.
+func (s *Store) GetUpdateSettings() UpdateSettings {
+	s.secMu.RLock()
+	defer s.secMu.RUnlock()
+	if s.secrets == nil || s.secrets.Settings.Update == nil {
+		return DefaultUpdateSettings()
+	}
+	return NormalizeUpdateSettings(*s.secrets.Settings.Update)
+}
+
+// UpdateUpdateSettings persists release-check & auto-update preferences inside secrets.enc.
+func (s *Store) UpdateUpdateSettings(in UpdateSettings, clientIP string) (UpdateSettings, error) {
+	norm := NormalizeUpdateSettings(in)
+	norm.CustomMirrorURL = strings.TrimSpace(norm.CustomMirrorURL)
+	norm.SkippedVersion = strings.TrimSpace(norm.SkippedVersion)
+
+	var out UpdateSettings
+	err := s.mutateSecrets(func(sec *SecretsState) error {
+		cp := norm
+		sec.Settings.Update = &cp
+		out = cp
+		return nil
+	})
+	if err != nil {
+		return UpdateSettings{}, err
+	}
+	s.RecordAudit("update.config", "system", fmt.Sprintf("更新版本检测与国内加速策略 (mode=%s, interval=%dh, prerelease=%v)", out.MirrorMode, out.CheckIntervalHours, out.IncludePrerelease), clientIP, true)
+	return out, nil
 }

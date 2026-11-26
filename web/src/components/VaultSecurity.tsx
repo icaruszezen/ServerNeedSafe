@@ -15,11 +15,24 @@ import {
   Database,
   ShieldCheck,
   Activity,
+  ArrowUpCircle,
+  Globe,
+  Gauge,
+  RotateCcw,
 } from 'lucide-react';
 import { api } from '../api';
-import type { AppSettings, VaultSecurityOverview } from '../types';
+import type {
+  AppSettings,
+  UpdateMirrorMode,
+  UpdateOverviewResponse,
+  UpdateSettings,
+  VaultSecurityOverview,
+} from '../types';
 
 interface VaultSecurityProps {
+  updateOverview: UpdateOverviewResponse | null;
+  onUpdateOverviewChange: (ov: UpdateOverviewResponse) => void;
+  onOpenUpdateModal: () => void;
   onSettingsChanged: (s: AppSettings) => void;
   onLogoutSession: () => Promise<void>;
   onRevokeAllSessions: () => Promise<void>;
@@ -34,6 +47,9 @@ function formatBytes(n?: number): string {
 }
 
 export const VaultSecurity: React.FC<VaultSecurityProps> = ({
+  updateOverview,
+  onUpdateOverviewChange,
+  onOpenUpdateModal,
   onSettingsChanged,
   onLogoutSession,
   onRevokeAllSessions,
@@ -49,6 +65,19 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
     show_hidden_files: true,
     remote_sync_url: '',
   });
+
+  // Version Auto-Check & China Mirror Settings
+  const [updateForm, setUpdateForm] = useState<UpdateSettings>({
+    auto_check_enabled: true,
+    check_interval_hours: 6,
+    mirror_mode: 'auto',
+    custom_mirror_url: '',
+    include_prerelease: false,
+    skipped_version: '',
+  });
+  const [savingUpdateCfg, setSavingUpdateCfg] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [probingMirrors, setProbingMirrors] = useState(false);
 
   // Admin Login Password Update
   const [oldPass, setOldPass] = useState('');
@@ -77,20 +106,110 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
   const loadOverview = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await api.getVaultSecurity();
+      const [res, upd] = await Promise.all([
+        api.getVaultSecurity(),
+        api.getUpdateStatus().catch(() => null),
+      ]);
       setData(res);
       setSettingsForm(res.settings);
       setSyncUrl((prev) => prev || res.settings.remote_sync_url || '');
+      if (upd) {
+        onUpdateOverviewChange(upd);
+        setUpdateForm({
+          auto_check_enabled: upd.settings.auto_check_enabled !== false,
+          check_interval_hours: upd.settings.check_interval_hours || 6,
+          mirror_mode: (upd.settings.mirror_mode as UpdateMirrorMode) || 'auto',
+          custom_mirror_url: upd.settings.custom_mirror_url || '',
+          include_prerelease: Boolean(upd.settings.include_prerelease),
+          skipped_version: upd.settings.skipped_version || '',
+        });
+      }
     } catch (err: any) {
       onNotify(err?.message || '读取安全与存储中心状态失败');
     } finally {
       setLoading(false);
     }
-  }, [onNotify]);
+  }, [onNotify, onUpdateOverviewChange]);
 
   useEffect(() => {
     void loadOverview();
   }, [loadOverview]);
+
+  useEffect(() => {
+    if (!updateOverview?.settings) return;
+    setUpdateForm({
+      auto_check_enabled: updateOverview.settings.auto_check_enabled !== false,
+      check_interval_hours: updateOverview.settings.check_interval_hours || 6,
+      mirror_mode: (updateOverview.settings.mirror_mode as UpdateMirrorMode) || 'auto',
+      custom_mirror_url: updateOverview.settings.custom_mirror_url || '',
+      include_prerelease: Boolean(updateOverview.settings.include_prerelease),
+      skipped_version: updateOverview.settings.skipped_version || '',
+    });
+  }, [updateOverview?.settings]);
+
+  const handleSaveUpdateSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingUpdateCfg(true);
+    try {
+      const res = await api.updateUpdateConfig({
+        auto_check_enabled: updateForm.auto_check_enabled !== false,
+        check_interval_hours: Number(updateForm.check_interval_hours) || 6,
+        mirror_mode: updateForm.mirror_mode || 'auto',
+        custom_mirror_url: (updateForm.custom_mirror_url || '').trim(),
+        include_prerelease: Boolean(updateForm.include_prerelease),
+        skipped_version: updateForm.skipped_version || '',
+      });
+      onUpdateOverviewChange(res.status);
+      onNotify('版本检测与国内加速策略已保存');
+    } catch (err: any) {
+      onNotify(err?.message || '保存更新配置失败');
+    } finally {
+      setSavingUpdateCfg(false);
+    }
+  };
+
+  const handleManualCheckUpdate = async () => {
+    setCheckingUpdate(true);
+    try {
+      const ov = await api.checkUpdateNow(true);
+      onUpdateOverviewChange(ov);
+      if (ov.last_error) {
+        onNotify(`检查更新失败：${ov.last_error}`);
+      } else if (ov.update_available && ov.latest_release) {
+        onNotify(`发现新版本 ${ov.latest_release.tag_name}`);
+      } else {
+        onNotify(`当前版本 (${ov.current.version}) 已是最新`);
+      }
+    } catch (err: any) {
+      onNotify(err?.message || '检查更新失败');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleProbeMirrors = async () => {
+    setProbingMirrors(true);
+    try {
+      const res = await api.probeUpdateMirrors();
+      onUpdateOverviewChange(res.status);
+      const reachable = res.mirrors.filter((m) => m.reachable).length;
+      onNotify(`线路测速完成：${reachable}/${res.mirrors.length} 条线路可用`);
+    } catch (err: any) {
+      onNotify(err?.message || '测速失败');
+    } finally {
+      setProbingMirrors(false);
+    }
+  };
+
+  const handleClearSkippedVersion = async () => {
+    try {
+      const res = await api.skipUpdateVersion('');
+      onUpdateOverviewChange(res.status);
+      onNotify('已取消忽略版本，重新恢复提醒');
+    } catch (err: any) {
+      onNotify(err?.message || '操作失败');
+    }
+  };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -359,6 +478,309 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                   </div>
                 </div>
               </div>
+            </section>
+
+            {/* Version Auto-Detection & China-Accelerated Self-Update Panel */}
+            <section className="sec-panel" style={{ marginBottom: 18 }} id="system-update-panel">
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: 10,
+                  marginBottom: 8,
+                }}
+              >
+                <h3 style={{ margin: 0 }}>
+                  <ArrowUpCircle size={16} style={{ color: 'var(--accent-teal)' }} />
+                  版本检测与国内加速自动更新
+                </h3>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    id="vault-check-update-btn"
+                    className="btn btn-sm"
+                    disabled={checkingUpdate}
+                    onClick={() => void handleManualCheckUpdate()}
+                  >
+                    <RefreshCw size={13.5} className={checkingUpdate ? 'spin' : ''} />
+                    {checkingUpdate ? '正在检测...' : '立即检查更新'}
+                  </button>
+                  <button
+                    type="button"
+                    id="vault-probe-mirrors-btn"
+                    className="btn btn-sm"
+                    disabled={probingMirrors}
+                    onClick={() => void handleProbeMirrors()}
+                  >
+                    <Gauge size={13.5} />
+                    {probingMirrors ? '测速中...' : '测试加速线路'}
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${updateOverview?.update_available ? 'btn-teal' : 'btn-primary'}`}
+                    onClick={onOpenUpdateModal}
+                  >
+                    <ArrowUpCircle size={13.5} />
+                    {updateOverview?.update_available && updateOverview.latest_release
+                      ? `查看更新 (${updateOverview.latest_release.tag_name})`
+                      : '查看版本详情'}
+                  </button>
+                </div>
+              </div>
+
+              <p className="sec-panel-desc" style={{ marginBottom: 12 }}>
+                自动定时探测 GitHub 仓库最新 Release，并发测速官方直连与多组国内 GitHub 加速镜像自动择优；Windows 桌面版与 Linux 独立二进制支持强制{' '}
+                <code className="mono">SHA256SUMS.txt</code> 校验、自检与一键自动替换重启，Docker 容器提供宿主机国内镜像升级指引。
+              </p>
+
+              <div className="security-grid" style={{ marginBottom: 14 }}>
+                <div className="kv-list">
+                  <div className="kv-row">
+                    <span className="kv-key">当前版本 / 构建</span>
+                    <span className="kv-val mono">
+                      {updateOverview?.current.version || 'dev'}
+                      {updateOverview?.current.commit ? ` (${updateOverview.current.commit.slice(0, 8)})` : ''}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">GitHub 最新版本</span>
+                    <span
+                      className="kv-val mono"
+                      style={{
+                        color: updateOverview?.update_available ? 'var(--accent-teal)' : undefined,
+                        fontWeight: updateOverview?.update_available ? 600 : undefined,
+                      }}
+                    >
+                      {updateOverview?.latest_release
+                        ? `${updateOverview.latest_release.tag_name}${updateOverview.update_available ? '（有新版本）' : '（最新）'}`
+                        : '尚未检测'}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">最近检测时间</span>
+                    <span className="kv-val" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      {updateOverview?.last_checked_at
+                        ? new Date(updateOverview.last_checked_at).toLocaleString('zh-CN')
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="kv-list">
+                  <div className="kv-row">
+                    <span className="kv-key">运行环境与更新方式</span>
+                    <span className="kv-val" style={{ fontSize: 12.5 }}>
+                      {updateOverview?.capabilities.in_docker
+                        ? 'Docker 容器（检测提示 + 宿主机升级命令）'
+                        : updateOverview?.capabilities.can_self_update
+                          ? `支持一键自更新 (${updateOverview.capabilities.asset_name})`
+                          : updateOverview?.capabilities.cannot_update_reason || '仅检测提示'}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">当前优选加速线路</span>
+                    <span className="kv-val" style={{ fontSize: 12.5 }}>
+                      <Globe size={12.5} style={{ verticalAlign: 'middle', marginRight: 5, color: 'var(--accent-teal)' }} />
+                      {updateOverview?.active_mirror
+                        ? `${updateOverview.active_mirror.name}${updateOverview.active_mirror.latency_ms > 0 ? ` (${updateOverview.active_mirror.latency_ms} ms)` : ''}`
+                        : '等待探测'}
+                    </span>
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-key">已忽略版本</span>
+                    <span className="kv-val" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span className="mono">{updateOverview?.settings.skipped_version || '无'}</span>
+                      {updateOverview?.settings.skipped_version && (
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-ghost"
+                          style={{ height: 22, padding: '0 6px', fontSize: 11.5 }}
+                          onClick={() => void handleClearSkippedVersion()}
+                        >
+                          <RotateCcw size={11.5} /> 恢复提醒
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <form onSubmit={handleSaveUpdateSettings}>
+                <div className="field-row">
+                  <div className="field">
+                    <label className="field-label">GitHub 线路与国内加速策略</label>
+                    <select
+                      className="select"
+                      value={updateForm.mirror_mode || 'auto'}
+                      onChange={(e) =>
+                        setUpdateForm({
+                          ...updateForm,
+                          mirror_mode: e.target.value as UpdateMirrorMode,
+                        })
+                      }
+                    >
+                      <option value="auto">自动竞速择优（推荐：并发测速官方直连与多组国内镜像）</option>
+                      <option value="direct">仅使用 GitHub 官方直连</option>
+                      <option value="custom">仅使用下方指定的国内加速镜像</option>
+                    </select>
+                  </div>
+
+                  <div className="field">
+                    <label className="field-label">后台自动检测周期</label>
+                    <select
+                      className="select"
+                      value={updateForm.check_interval_hours || 6}
+                      onChange={(e) =>
+                        setUpdateForm({
+                          ...updateForm,
+                          check_interval_hours: Number(e.target.value) || 6,
+                        })
+                      }
+                    >
+                      <option value={1}>每 1 小时</option>
+                      <option value={6}>每 6 小时（默认）</option>
+                      <option value={12}>每 12 小时</option>
+                      <option value={24}>每 24 小时</option>
+                      <option value={72}>每 3 天</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="field-label">
+                    自定义国内 GitHub 加速前缀（可选；在「自动」模式下将加入竞速池，在「指定」模式下独占使用）
+                  </label>
+                  <input
+                    type="text"
+                    className="input mono"
+                    placeholder="例如 https://gh-proxy.com/ 或 https://mirror.example.cn/?u={url}"
+                    value={updateForm.custom_mirror_url || ''}
+                    onChange={(e) =>
+                      setUpdateForm({
+                        ...updateForm,
+                        custom_mirror_url: e.target.value,
+                      })
+                    }
+                  />
+                  {updateOverview?.builtin_mirrors && updateOverview.builtin_mirrors.length > 0 && (
+                    <div className="update-preset-row">
+                      <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>常用国内加速预设：</span>
+                      {updateOverview.builtin_mirrors
+                        .filter((m) => Boolean(m.prefix))
+                        .map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            className={`mcp-server-chip ${updateForm.custom_mirror_url === m.prefix ? 'active' : ''}`}
+                            onClick={() =>
+                              setUpdateForm({
+                                ...updateForm,
+                                custom_mirror_url: m.prefix,
+                              })
+                            }
+                          >
+                            {m.name}
+                          </button>
+                        ))}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 18, alignItems: 'center', marginBottom: 12 }}>
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 7,
+                      fontSize: 12.5,
+                      color: 'var(--text-secondary)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={updateForm.auto_check_enabled !== false}
+                      onChange={(e) =>
+                        setUpdateForm({
+                          ...updateForm,
+                          auto_check_enabled: e.target.checked,
+                        })
+                      }
+                    />
+                    启用后台定时自动检测新版本
+                  </label>
+
+                  <label
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 7,
+                      fontSize: 12.5,
+                      color: 'var(--text-secondary)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={Boolean(updateForm.include_prerelease)}
+                      onChange={(e) =>
+                        setUpdateForm({
+                          ...updateForm,
+                          include_prerelease: e.target.checked,
+                        })
+                      }
+                    />
+                    接收预发布版本 (Pre-release / RC)
+                  </label>
+                </div>
+
+                <button type="submit" className="btn btn-primary" disabled={savingUpdateCfg}>
+                  {savingUpdateCfg ? '正在保存更新策略...' : '保存版本检测与加速设置'}
+                </button>
+              </form>
+
+              {updateOverview?.mirrors && updateOverview.mirrors.length > 0 && (
+                <div style={{ marginTop: 14, overflowX: 'auto' }}>
+                  <table className="data-table update-mirror-table">
+                    <thead>
+                      <tr>
+                        <th>线路名称</th>
+                        <th>区域</th>
+                        <th>加速前缀</th>
+                        <th>探测结果与延迟</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {updateOverview.mirrors.map((m) => (
+                        <tr key={m.id + m.prefix}>
+                          <td style={{ fontWeight: 550, whiteSpace: 'nowrap' }}>{m.name}</td>
+                          <td>
+                            <span className={`tag-chip ${m.region === 'cn' ? 'teal' : ''}`}>
+                              {m.region === 'cn' ? '国内加速' : '官方直连'}
+                            </span>
+                          </td>
+                          <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                            {m.prefix || 'https://github.com/ (Direct)'}
+                          </td>
+                          <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                            {m.reachable ? (
+                              <span style={{ color: 'var(--accent-teal)', fontWeight: 600 }}>
+                                可用 · {m.latency_ms} ms
+                              </span>
+                            ) : (
+                              <span style={{ color: 'var(--danger-text)' }}>
+                                不可用{m.error ? ` (${m.error})` : ''}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </section>
 
             <div className="security-grid">

@@ -13,9 +13,16 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/api"
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
+	"github.com/icaruszezen/ServerNeedSafe/internal/updater"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 	"github.com/icaruszezen/ServerNeedSafe/web"
 )
+
+type restartRequest struct {
+	exePath    string
+	backupPath string
+}
 
 func envOrDefault(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
@@ -29,10 +36,18 @@ func main() {
 	defaultDataDir := envOrDefault("SNS_DATA_DIR", "./data")
 	defaultTTL := envOrDefault("SNS_SESSION_TTL", "168h")
 
+	showVersion := flag.Bool("version", false, "打印当前版本号并退出")
 	addr := flag.String("addr", defaultAddr, "HTTP 监听地址 (例如 0.0.0.0:8080)")
 	dataDir := flag.String("data-dir", defaultDataDir, "数据持久化目录（secrets.enc + master.key + 运行态 JSON）")
 	ttlStr := flag.String("session-ttl", defaultTTL, "Web 管理会话最长有效期（默认 168h / 7 天）")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
+
+	updater.CleanupPreviousBackup()
 
 	sessionTTL, err := time.ParseDuration(*ttlStr)
 	if err != nil || sessionTTL <= 0 {
@@ -54,11 +69,21 @@ func main() {
 		log.Fatalf("[ServerNeedSafe] 加载内置 Web 静态资源失败: %v", err)
 	}
 
+	restartCh := make(chan restartRequest, 1)
+
 	apiServer := api.NewServer(api.Config{
 		DeployMode: "server",
 		Store:      store,
 		Auth:       authMgr,
 		StaticFS:   staticFS,
+		OnRestart: func(exePath, backupPath string) error {
+			select {
+			case restartCh <- restartRequest{exePath: exePath, backupPath: backupPath}:
+				return nil
+			default:
+				return fmt.Errorf("重启指令已在队列中")
+			}
+		},
 	})
 
 	httpServer := &http.Server{
@@ -74,7 +99,7 @@ func main() {
 
 	go func() {
 		fmt.Printf("====================================================================\n")
-		fmt.Printf("  ServerNeedSafe — 多服务器运维管理与 7×24 智能监控巡检平台\n")
+		fmt.Printf("  ServerNeedSafe %s — 多服务器运维管理与 7×24 智能监控巡检平台\n", version.Current().Version)
 		fmt.Printf("  监听地址: http://%s\n", *addr)
 		fmt.Printf("  敏感加密: %s (XChaCha20-Poly1305)\n", store.SecretsPath())
 		fmt.Printf("  主密钥源: %s（启动即自动挂载，永不锁定后台任务）\n", keyDesc)
@@ -88,13 +113,32 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
 
-	log.Println("[ServerNeedSafe] 收到停止信号，正在同步刷盘运行态数据并停止 7×24 守护协程...")
-	authMgr.RevokeAll()
-	apiServer.Close()
+	select {
+	case <-sigCh:
+		log.Println("[ServerNeedSafe] 收到停止信号，正在同步刷盘运行态数据并停止 7×24 守护协程...")
+		authMgr.RevokeAll()
+		apiServer.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(ctx)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
+
+	case req := <-restartCh:
+		log.Printf("[ServerNeedSafe] 正在同步刷盘运行态数据并原地重启至新版本 (%s)...", req.exePath)
+		authMgr.RevokeAll()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = httpServer.Shutdown(ctx)
+		cancel()
+		apiServer.Close()
+
+		if err := updater.ReexecCurrentProcess(req.exePath, os.Args, os.Environ()); err != nil {
+			log.Printf("[ServerNeedSafe] 原地重启新版本失败 (%v)，正在自动回滚旧版本...", err)
+			if rErr := updater.RestoreBinaryBackup(req.exePath, req.backupPath); rErr != nil {
+				log.Fatalf("[ServerNeedSafe] 回滚旧版本失败: %v", rErr)
+			}
+			_ = updater.ReexecCurrentProcess(req.exePath, os.Args, os.Environ())
+			log.Fatalf("[ServerNeedSafe] 回滚后重启仍失败: %v", err)
+		}
+	}
 }

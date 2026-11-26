@@ -33,6 +33,28 @@ export interface EncryptionInfo {
   vault_size_bytes: number;
 }
 
+export interface VersionInfo {
+  version: string;
+  commit?: string;
+  build_time?: string;
+  go_version?: string;
+  goos?: string;
+  goarch?: string;
+  repo?: string;
+  is_dev?: boolean;
+}
+
+export type UpdateMirrorMode = 'auto' | 'direct' | 'custom';
+
+export interface UpdateSettings {
+  auto_check_enabled?: boolean;
+  check_interval_hours?: number;
+  mirror_mode?: UpdateMirrorMode;
+  custom_mirror_url?: string;
+  include_prerelease?: boolean;
+  skipped_version?: string;
+}
+
 export interface AppSettings {
   auto_lock_minutes: number;
   host_key_policy: HostKeyPolicy;
@@ -40,6 +62,7 @@ export interface AppSettings {
   terminal_scrollback: number;
   show_hidden_files: boolean;
   remote_sync_url?: string;
+  update?: UpdateSettings;
 }
 
 export interface AuthStatusResponse {
@@ -47,6 +70,7 @@ export interface AuthStatusResponse {
   vault_status: VaultStatus;
   authenticated: boolean;
   deploy_mode: 'server' | 'desktop';
+  version?: VersionInfo;
   daemon_running?: boolean;
   legacy_migration_pending?: boolean;
   session_ttl_hours?: number;
@@ -1092,5 +1116,123 @@ export interface AIStreamEvent {
   session?: AIChatSession;
   error?: string;
 }
+
+// ============================================================================
+// GitHub Release Auto-Detection, China Acceleration Mirrors & Self-Update Types
+// ============================================================================
+
+export interface MirrorNode {
+  id: string;
+  name: string;
+  prefix: string;
+  region: 'global' | 'cn' | string;
+  supports_api?: boolean;
+  is_custom?: boolean;
+}
+
+export interface MirrorProbeResult {
+  id: string;
+  name: string;
+  prefix: string;
+  region: 'global' | 'cn' | string;
+  is_custom?: boolean;
+  reachable: boolean;
+  latency_ms: number;
+  error?: string;
+  checked_at?: string;
+}
+
+export interface ReleaseAsset {
+  name: string;
+  size: number;
+  download_url: string;
+}
+
+export interface ReleaseInfo {
+  tag_name: string;
+  name: string;
+  body: string;
+  html_url: string;
+  published_at?: string;
+  prerelease: boolean;
+  assets: ReleaseAsset[];
+  source: string;
+}
+
+export interface UpdateCapabilities {
+  deploy_mode: 'server' | 'desktop' | string;
+  in_docker: boolean;
+  can_self_update: boolean;
+  cannot_update_reason?: string;
+  executable_path?: string;
+  asset_name?: string;
+  goos: string;
+  goarch: string;
+}
+
+export type UpdateJobStage =
+  | 'idle'
+  | 'probing'
+  | 'downloading'
+  | 'verifying'
+  | 'self_checking'
+  | 'replacing'
+  | 'restarting'
+  | 'completed'
+  | 'failed';
+
+export interface UpdateJobState {
+  stage: UpdateJobStage;
+  target_version?: string;
+  asset_name?: string;
+  mirror_id?: string;
+  mirror_name?: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  speed_bps: number;
+  progress_percent: number;
+  expected_sha256?: string;
+  checksum_source?: string;
+  message?: string;
+  error?: string;
+  started_at?: string;
+  updated_at?: string;
+}
+
+export interface DockerMirrorCommand {
+  name: string;
+  image: string;
+  command: string;
+}
+
+export interface DockerUpgradeCommands {
+  tag: string;
+  official_image: string;
+  official_pull: string;
+  compose_upgrade: string;
+  china_mirrors: DockerMirrorCommand[];
+}
+
+export interface UpdateOverviewResponse {
+  ok?: boolean;
+  error?: string;
+  current: VersionInfo;
+  capabilities: UpdateCapabilities;
+  settings: UpdateSettings;
+  latest_release?: ReleaseInfo;
+  update_available: boolean;
+  skipped: boolean;
+  checking: boolean;
+  last_checked_at?: string;
+  next_check_at?: string;
+  last_error?: string;
+  active_mirror?: MirrorProbeResult;
+  mirrors: MirrorProbeResult[];
+  builtin_mirrors: MirrorNode[];
+  job: UpdateJobState;
+  docker_commands?: DockerUpgradeCommands;
+  active_ssh_tabs?: number;
+}
+
 
 

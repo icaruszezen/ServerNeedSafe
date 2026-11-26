@@ -13,8 +13,11 @@ RUN npm run build
 # Stage 2: Build Self-Contained 7x24 Go Server Binary
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS go-builder
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
+ARG SNS_VERSION=dev
+ARG SNS_COMMIT=""
+ARG SNS_BUILD_TIME=""
 ENV GOTOOLCHAIN=auto \
     CGO_ENABLED=0
 WORKDIR /src
@@ -22,8 +25,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . ./
 COPY --from=web-builder /src/web/dist ./web/dist
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/sns-server ./cmd/server
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-$(go env GOARCH)} \
+    go build -trimpath -ldflags="-s -w -X github.com/icaruszezen/ServerNeedSafe/internal/version.Version=${SNS_VERSION} -X github.com/icaruszezen/ServerNeedSafe/internal/version.Commit=${SNS_COMMIT} -X github.com/icaruszezen/ServerNeedSafe/internal/version.BuildTime=${SNS_BUILD_TIME}" -o /out/sns-server ./cmd/server
 
 # ==============================================================================
 # Stage 3: Minimal Non-Root Production Runtime Image
@@ -45,7 +48,8 @@ WORKDIR /data
 
 ENV SNS_ADDR="0.0.0.0:8080" \
     SNS_DATA_DIR="/data" \
-    SNS_SESSION_TTL="168h"
+    SNS_SESSION_TTL="168h" \
+    SNS_IN_DOCKER="1"
 
 VOLUME ["/data"]
 EXPOSE 8080

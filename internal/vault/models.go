@@ -218,14 +218,61 @@ type AuditEntry struct {
 	Success   bool      `json:"success"`
 }
 
+// UpdateSettings stores user preferences for GitHub release checking and China-accelerated auto-updating.
+type UpdateSettings struct {
+	AutoCheckEnabled   *bool  `json:"auto_check_enabled,omitempty"`   // nil defaults to true
+	CheckIntervalHours int    `json:"check_interval_hours,omitempty"` // default 6 (1..168)
+	MirrorMode         string `json:"mirror_mode,omitempty"`          // "auto" | "direct" | "custom"
+	CustomMirrorURL    string `json:"custom_mirror_url,omitempty"`    // optional custom proxy prefix e.g. https://gh-proxy.com/
+	IncludePrerelease  bool   `json:"include_prerelease,omitempty"`   // opt-in to GitHub pre-releases
+	SkippedVersion     string `json:"skipped_version,omitempty"`      // tag name muted by user
+}
+
+// DefaultUpdateSettings returns the recommended defaults for release checking and auto-updating.
+func DefaultUpdateSettings() UpdateSettings {
+	enabled := true
+	return UpdateSettings{
+		AutoCheckEnabled:   &enabled,
+		CheckIntervalHours: 6,
+		MirrorMode:         "auto",
+		CustomMirrorURL:    "",
+		IncludePrerelease:  false,
+		SkippedVersion:     "",
+	}
+}
+
+// NormalizeUpdateSettings fills defaults and clamps out-of-range values.
+func NormalizeUpdateSettings(in UpdateSettings) UpdateSettings {
+	out := in
+	if out.AutoCheckEnabled == nil {
+		enabled := true
+		out.AutoCheckEnabled = &enabled
+	} else {
+		v := *out.AutoCheckEnabled
+		out.AutoCheckEnabled = &v
+	}
+	if out.CheckIntervalHours <= 0 {
+		out.CheckIntervalHours = 6
+	} else if out.CheckIntervalHours > 168 {
+		out.CheckIntervalHours = 168
+	}
+	switch out.MirrorMode {
+	case "auto", "direct", "custom":
+	default:
+		out.MirrorMode = "auto"
+	}
+	return out
+}
+
 // AppSettings stores all user preferences inside the encrypted vault.
 type AppSettings struct {
-	AutoLockMinutes    int           `json:"auto_lock_minutes"`             // 0 = disabled, default 30
-	HostKeyPolicy      HostKeyPolicy `json:"host_key_policy"`               // "tofu" or "ask_new"
-	TerminalFontSize   int           `json:"terminal_font_size"`            // default 14
-	TerminalScrollback int           `json:"terminal_scrollback"`           // default 5000
-	ShowHiddenFiles    bool          `json:"show_hidden_files"`             // SFTP hidden files
-	RemoteSyncURL      string        `json:"remote_sync_url,omitempty"`     // Optional remote zero-knowledge server URL
+	AutoLockMinutes    int             `json:"auto_lock_minutes"`         // 0 = disabled, default 30
+	HostKeyPolicy      HostKeyPolicy   `json:"host_key_policy"`           // "tofu" or "ask_new"
+	TerminalFontSize   int             `json:"terminal_font_size"`        // default 14
+	TerminalScrollback int             `json:"terminal_scrollback"`       // default 5000
+	ShowHiddenFiles    bool            `json:"show_hidden_files"`         // SFTP hidden files
+	RemoteSyncURL      string          `json:"remote_sync_url,omitempty"` // Optional remote zero-knowledge server URL
+	Update             *UpdateSettings `json:"update,omitempty"`          // Auto-check & China mirror update preferences
 }
 
 // LegacyPasswordVerifier preserves password verification compatibility when an existing

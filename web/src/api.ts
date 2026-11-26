@@ -25,6 +25,7 @@ import type {
   MCPRuntimeStatus,
   MCPTokenScope,
   MCPTokenView,
+  MirrorProbeResult,
   MonitorAlert,
   MonitorAlertRule,
   MonitorOverviewResponse,
@@ -44,6 +45,8 @@ import type {
   Snippet,
   SyncSummary,
   TerminalReadyInfo,
+  UpdateOverviewResponse,
+  UpdateSettings,
   VaultSecurityOverview,
   WorkspaceBootstrapResponse,
 } from './types';
@@ -53,19 +56,22 @@ export class ApiError extends Error {
   code: string;
   hostKeyInfo?: HostKeyUntrustedInfo;
   retryAfterSec?: number;
+  activeSSHTabs?: number;
 
   constructor(
     message: string,
     status: number,
     code = 'ERROR',
     hostKeyInfo?: HostKeyUntrustedInfo,
-    retryAfterSec?: number
+    retryAfterSec?: number,
+    activeSSHTabs?: number
   ) {
     super(message);
     this.status = status;
     this.code = code;
     this.hostKeyInfo = hostKeyInfo;
     this.retryAfterSec = retryAfterSec;
+    this.activeSSHTabs = activeSSHTabs;
   }
 }
 
@@ -80,6 +86,7 @@ interface ErrorResponsePayload {
   code?: string;
   host_key?: HostKeyUntrustedInfo;
   retry_after_sec?: number;
+  active_ssh_tabs?: number;
 }
 
 async function parseErrorResponse(res: Response): Promise<never> {
@@ -94,7 +101,14 @@ async function parseErrorResponse(res: Response): Promise<never> {
   if (res.status === 401 && (code === 'UNAUTHORIZED' || code === 'VAULT_NOT_INIT')) {
     onUnauthorizedCallback?.();
   }
-  throw new ApiError(msg, res.status, code, payload.host_key, payload.retry_after_sec);
+  throw new ApiError(
+    msg,
+    res.status,
+    code,
+    payload.host_key,
+    payload.retry_after_sec,
+    payload.active_ssh_tabs
+  );
 }
 
 async function requestJSON<T>(
@@ -1054,4 +1068,44 @@ export const api = {
       approvals: ExternalApproval[];
       pending_count: number;
     }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/resolve`, { approve }),
+
+  // GitHub Release Auto-Detection, China Mirror Probing & Self-Update
+  getHealth: () =>
+    requestJSON<{ ok: boolean; version?: string; mode?: string; daemon_running?: boolean }>(
+      'GET',
+      '/api/health'
+    ),
+
+  getUpdateStatus: () => requestJSON<UpdateOverviewResponse>('GET', '/api/system/update/status'),
+
+  checkUpdateNow: (force_probe = false) =>
+    requestJSON<UpdateOverviewResponse>('POST', '/api/system/update/check', { force_probe }),
+
+  probeUpdateMirrors: () =>
+    requestJSON<{ ok: boolean; mirrors: MirrorProbeResult[]; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/mirrors/probe',
+      {}
+    ),
+
+  updateUpdateConfig: (payload: UpdateSettings) =>
+    requestJSON<{ ok: boolean; settings: UpdateSettings; status: UpdateOverviewResponse }>(
+      'PUT',
+      '/api/system/update/config',
+      payload
+    ),
+
+  skipUpdateVersion: (version: string) =>
+    requestJSON<{ ok: boolean; settings: UpdateSettings; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/skip',
+      { version }
+    ),
+
+  applyUpdate: (confirm_disconnect_ssh = false) =>
+    requestJSON<{ ok: boolean; status: UpdateOverviewResponse }>(
+      'POST',
+      '/api/system/update/apply',
+      { confirm_disconnect_ssh }
+    ),
 };
