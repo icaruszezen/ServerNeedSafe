@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
@@ -47,22 +48,28 @@ type Service struct {
 	ssh   *sshmanager.Manager
 	llm   *LLMClient
 
-	mu            sync.Mutex
-	patrolRunning bool
-	lastPatrolAt  *time.Time
-	nextPatrolAt  *time.Time
-	patrolWakeCh  chan struct{}
-	stopCh        chan struct{}
-	onPersist     func()
+	mu               sync.Mutex
+	patrolRunning    bool
+	lastPatrolAt     *time.Time
+	nextPatrolAt     *time.Time
+	patrolWakeCh     chan struct{}
+	stopCh           chan struct{}
+	onPersist        func()
+	sessionLocksMu   sync.Mutex
+	sessionLocks     map[string]*sync.Mutex
+	extApprovalMu    sync.Mutex
+	extApprovalLocks map[string]*sync.Mutex
 }
 
 func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
 	svc := &Service{
-		store:        store,
-		ssh:          sshMgr,
-		llm:          NewLLMClient(),
-		patrolWakeCh: make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
+		store:            store,
+		ssh:              sshMgr,
+		llm:              NewLLMClient(),
+		patrolWakeCh:     make(chan struct{}, 1),
+		stopCh:           make(chan struct{}),
+		sessionLocks:     make(map[string]*sync.Mutex),
+		extApprovalLocks: make(map[string]*sync.Mutex),
 	}
 
 	// When store becomes ready at startup/setup, wake up patrol scheduler immediately
@@ -72,6 +79,61 @@ func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
 
 	go svc.patrolSchedulerLoop()
 	return svc
+}
+
+func (s *Service) lockSession(sessionID string) func() {
+	s.sessionLocksMu.Lock()
+	if s.sessionLocks == nil {
+		s.sessionLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := s.sessionLocks[sessionID]
+	if !ok {
+		m = &sync.Mutex{}
+		s.sessionLocks[sessionID] = m
+	}
+	s.sessionLocksMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+func (s *Service) lockExternalApproval(approvalID string) func() {
+	s.extApprovalMu.Lock()
+	if s.extApprovalLocks == nil {
+		s.extApprovalLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := s.extApprovalLocks[approvalID]
+	if !ok {
+		m = &sync.Mutex{}
+		s.extApprovalLocks[approvalID] = m
+	}
+	s.extApprovalMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+// UpdateSession safely updates a session's execution mode, target servers, or title while serialized
+// against concurrent chat streams, approval resolutions, and context compactions on the same session.
+func (s *Service) UpdateSession(sessionID string, mode vault.AIExecutionMode, serverIDs *[]string, title *string) (*vault.AIChatSession, error) {
+	unlock := s.lockSession(sessionID)
+	defer unlock()
+
+	sess, err := s.store.GetAISession(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if mode == vault.AIModeSuggest || mode == vault.AIModeStandard || mode == vault.AIModeAutonomous {
+		sess.Mode = mode
+	}
+	if serverIDs != nil {
+		sess.ServerIDs = slices.Clone(*serverIDs)
+	}
+	if title != nil && strings.TrimSpace(*title) != "" {
+		sess.Title = strings.TrimSpace(*title)
+	}
+	if err := s.store.SaveAISession(*sess); err != nil {
+		return nil, err
+	}
+	return sess, nil
 }
 
 func (s *Service) SetOnPersist(fn func()) {
@@ -103,6 +165,9 @@ func (s *Service) LLM() *LLMClient {
 
 // RunChatStream appends a user turn and runs the ReAct tool-calling loop, streaming SSE events via emit.
 func (s *Service) RunChatStream(ctx context.Context, req ChatRequest, emit func(StreamEvent)) error {
+	if emit == nil {
+		emit = func(StreamEvent) {}
+	}
 	msgText := strings.TrimSpace(req.Message)
 	if msgText == "" {
 		return fmt.Errorf("请输入运维指令或问题描述")
@@ -113,23 +178,28 @@ func (s *Service) RunChatStream(ctx context.Context, req ChatRequest, emit func(
 		return fmt.Errorf("尚未配置可用的大模型供应商，请先前往「模型与网关配置」添加并激活模型")
 	}
 
+	unlock := s.lockSession(req.SessionID)
+	defer unlock()
+
 	sess, err := s.store.GetAISession(req.SessionID)
 	if err != nil {
 		return err
 	}
 
-	// Reject new turns if session still has unresolved pending approvals; auto-reject stale ones if user sends new instruction
+	// Auto-reject stale pending approvals when user sends a new instruction, keeping assistant tool records in sync
 	now := time.Now().UTC()
 	for i := range sess.PendingApprovals {
 		if sess.PendingApprovals[i].Status == "pending" {
+			const rejectReason = "管理员未批准该待定变更操作，已跳过并发送了新指令。"
 			sess.PendingApprovals[i].Status = "rejected"
 			sess.PendingApprovals[i].ResolvedAt = &now
+			updateAssistantToolRecordStatus(sess, sess.PendingApprovals[i].ToolCallID, "rejected", rejectReason, 0)
 			sess.Messages = append(sess.Messages, vault.AIChatMessage{
 				ID:         uuid.NewString(),
 				Role:       "tool",
 				ToolCallID: sess.PendingApprovals[i].ToolCallID,
 				ToolName:   sess.PendingApprovals[i].ToolName,
-				Content:    "管理员未批准该待定变更操作，已跳过并发送了新指令。",
+				Content:    rejectReason,
 				IsError:    true,
 				Timestamp:  now,
 			})
@@ -177,6 +247,12 @@ func (s *Service) ResolveApprovalStream(
 	clientIP string,
 	emit func(StreamEvent),
 ) error {
+	if emit == nil {
+		emit = func(StreamEvent) {}
+	}
+	unlock := s.lockSession(sessionID)
+	defer unlock()
+
 	sess, err := s.store.GetAISession(sessionID)
 	if err != nil {
 		return err
@@ -332,6 +408,9 @@ func (s *Service) continueAgentLoop(
 	clientIP string,
 	emit func(StreamEvent),
 ) error {
+	if emit == nil {
+		emit = func(StreamEvent) {}
+	}
 	tools := s.agentToolsSchema()
 	memCfg, _ := s.store.GetAIMemoryConfig()
 	if memCfg.CompactionKeepRecent <= 0 {
@@ -364,7 +443,6 @@ func (s *Service) continueAgentLoop(
 			emit(StreamEvent{Type: "delta", Delta: chunk})
 		})
 		if err != nil {
-			emit(StreamEvent{Type: "error", Error: err.Error()})
 			return err
 		}
 
@@ -449,6 +527,14 @@ func (s *Service) continueAgentLoop(
 		}
 	}
 
+	const limitNotice = "已达到单轮最大自动工具调用步数上限（8 步），以上为目前采集到的全部诊断与执行结果。如需继续深度排查或执行后续操作，请发送进一步指令。"
+	emit(StreamEvent{Type: "delta", Delta: limitNotice})
+	sess.Messages = append(sess.Messages, vault.AIChatMessage{
+		ID:        uuid.NewString(),
+		Role:      "assistant",
+		Content:   limitNotice,
+		Timestamp: time.Now().UTC(),
+	})
 	_ = s.store.SaveAISession(*sess)
 	emit(StreamEvent{Type: "session_sync", Session: sess})
 	emit(StreamEvent{Type: "done", Session: sess})
@@ -593,13 +679,24 @@ func (s *Service) dispatchToolCall(
 			timeout = 25 * time.Second
 		}
 		results := s.ssh.BatchExecute(args.ServerIDs, args.Command, timeout, clientIP)
-		s.store.RecordAudit("ai.exec", strings.Join(names, ","), fmt.Sprintf("AI 执行命令(%s): %.70s", risk, args.Command), clientIP, true)
+		hasTransportErr := false
+		for _, r := range results {
+			if r.Error != "" {
+				hasTransportErr = true
+				break
+			}
+		}
+		s.store.RecordAudit("ai.exec", strings.Join(names, ","), fmt.Sprintf("AI 执行命令(%s): %.70s", risk, args.Command), clientIP, !hasTransportErr)
 
 		rec.DurationMs = time.Since(start).Milliseconds()
 		outStr := formatBatchExecResults(results)
-		rec.Status = "completed"
+		if hasTransportErr {
+			rec.Status = "error"
+		} else {
+			rec.Status = "completed"
+		}
 		rec.Output = truncateStr(outStr, 4000)
-		return toolDispatchOutcome{record: rec, toolOutput: outStr}
+		return toolDispatchOutcome{record: rec, toolOutput: outStr, isError: hasTransportErr}
 
 	case "sftp_list_dir":
 		var args struct {
@@ -658,10 +755,11 @@ func (s *Service) dispatchToolCall(
 		rec.RiskLevel = string(RiskReadOnly)
 		rec.Summary = fmt.Sprintf("读取配置文件 %s:%s", srvName, args.Path)
 
-		if strings.TrimSpace(args.Path) == "/etc/shadow" || strings.TrimSpace(args.Path) == "/etc/gshadow" {
+		if IsBlockedReadPath(args.Path) {
 			rec.RiskLevel = string(RiskBlocked)
 			rec.Status = "blocked"
-			rec.Output = "禁止直接读取系统密码哈希文件 (/etc/shadow)"
+			rec.Output = fmt.Sprintf("安全护栏禁止读取敏感凭据/密钥文件 (%s)", strings.TrimSpace(args.Path))
+			s.store.RecordAudit("ai.blocked", srvName+":"+strings.TrimSpace(args.Path), rec.Output, clientIP, false)
 			return toolDispatchOutcome{record: rec, toolOutput: rec.Output, isError: true}
 		}
 
@@ -712,10 +810,10 @@ func (s *Service) dispatchToolCall(
 		rec.Summary = fmt.Sprintf("修改远程文件 %s:%s", srvName, args.Path)
 
 		cleanPath := strings.TrimSpace(args.Path)
-		if cleanPath == "/etc/shadow" || cleanPath == "/etc/passwd" || cleanPath == "/etc/sudoers" {
+		if IsBlockedWritePath(cleanPath) {
 			rec.RiskLevel = string(RiskBlocked)
 			rec.Status = "blocked"
-			rec.Output = fmt.Sprintf("安全熔断器禁止 AI 直接覆写系统核心鉴权文件 (%s)", cleanPath)
+			rec.Output = fmt.Sprintf("安全熔断器禁止 AI 直接覆写系统核心鉴权或保险库文件 (%s)", cleanPath)
 			s.store.RecordAudit("ai.blocked", srvName+":"+cleanPath, rec.Output, clientIP, false)
 			return toolDispatchOutcome{record: rec, toolOutput: rec.Output, isError: true}
 		}
@@ -878,7 +976,7 @@ func (s *Service) dispatchToolCall(
 		rec.RiskLevel = string(RiskReadOnly)
 		rec.Summary = fmt.Sprintf("检索历史运维记忆 (%s)", nonEmpty(args.Query, "全部"))
 
-		out, hitIDs := s.executeSearchMemory(args.Query, args.ServerID, args.Category, args.Limit)
+		out, hitIDs := s.executeSearchMemory(args.Query, args.ServerID, args.Category, args.Limit, nil)
 		if len(hitIDs) > 0 {
 			s.store.TouchAIMemoryUsage(hitIDs)
 		}
@@ -984,7 +1082,7 @@ func (s *Service) dispatchToolCall(
 	}
 }
 
-func (s *Service) executeSearchMemory(query, serverID, category string, limit int) (string, []string) {
+func (s *Service) executeSearchMemory(query, serverID, category string, limit int, allowedServers []string) (string, []string) {
 	longMems, _ := s.store.ListAIMemories()
 	hostMems, _ := s.store.ListHostMemories()
 	srvNames := s.serverNameLookup()
@@ -992,6 +1090,22 @@ func (s *Service) executeSearchMemory(query, serverID, category string, limit in
 	terms := strings.Fields(strings.ToLower(strings.TrimSpace(query)))
 	catFilter := strings.ToLower(strings.TrimSpace(category))
 	srvFilter := strings.TrimSpace(serverID)
+
+	allowedSet := make(map[string]bool, len(allowedServers))
+	for _, sid := range allowedServers {
+		allowedSet[sid] = true
+	}
+	isMemAllowed := func(m vault.AIMemoryEntry) bool {
+		if len(allowedSet) == 0 || m.Scope != "server" {
+			return true
+		}
+		for _, sid := range m.ServerIDs {
+			if allowedSet[sid] {
+				return true
+			}
+		}
+		return false
+	}
 
 	matchTerms := func(haystack string) int {
 		if len(terms) == 0 {
@@ -1013,6 +1127,9 @@ func (s *Service) executeSearchMemory(query, serverID, category string, limit in
 	}
 	var hits []memHit
 	for _, m := range longMems {
+		if !isMemAllowed(m) {
+			continue
+		}
 		if catFilter != "" && strings.ToLower(m.Category) != catFilter {
 			continue
 		}
@@ -1054,6 +1171,9 @@ func (s *Service) executeSearchMemory(query, serverID, category string, limit in
 			if m.Scope == "server" && len(m.ServerIDs) > 0 {
 				var names []string
 				for _, sid := range m.ServerIDs {
+					if len(allowedSet) > 0 && !allowedSet[sid] {
+						continue
+					}
 					names = append(names, nonEmpty(srvNames[sid], sid))
 				}
 				scopeDesc = "主机:" + strings.Join(names, ",")
@@ -1069,6 +1189,9 @@ func (s *Service) executeSearchMemory(query, serverID, category string, limit in
 	var matchedHosts []vault.HostMemory
 	if catFilter == "" {
 		for _, hm := range hostMems {
+			if len(allowedSet) > 0 && !allowedSet[hm.ServerID] {
+				continue
+			}
 			if srvFilter != "" && hm.ServerID != srvFilter {
 				continue
 			}
@@ -1175,8 +1298,16 @@ func (s *Service) executeApprovedAction(ap vault.AIPendingApproval, clientIP str
 			return "", fmt.Errorf("安全熔断器拦截: %s", why)
 		}
 		results := s.ssh.BatchExecute(ap.ServerIDs, ap.Command, 45*time.Second, clientIP)
-		s.store.RecordAudit("ai.approved_exec", strings.Join(ap.ServerNames, ","), fmt.Sprintf("管理员批准执行 AI 命令: %.75s", ap.Command), clientIP, true)
-		return formatBatchExecResults(results), nil
+		out := formatBatchExecResults(results)
+		var execErr error
+		for _, r := range results {
+			if r.Error != "" || r.ExitCode != 0 {
+				execErr = fmt.Errorf("部分或全部主机命令执行失败（存在连接错误或非零退出码）")
+				break
+			}
+		}
+		s.store.RecordAudit("ai.approved_exec", strings.Join(ap.ServerNames, ","), fmt.Sprintf("管理员批准执行 AI 命令: %.75s", ap.Command), clientIP, execErr == nil)
+		return out, execErr
 
 	case "sftp_list_dir":
 		if len(ap.ServerIDs) == 0 {
@@ -1193,11 +1324,17 @@ func (s *Service) executeApprovedAction(ap vault.AIPendingApproval, clientIP str
 		if len(ap.ServerIDs) == 0 {
 			return "", fmt.Errorf("缺少目标服务器 ID")
 		}
+		if IsBlockedReadPath(ap.FilePath) {
+			return "", fmt.Errorf("安全护栏禁止读取敏感凭据/密钥文件 (%s)", ap.FilePath)
+		}
 		return s.ssh.SFTPReadText(ap.ServerIDs[0], ap.FilePath, clientIP)
 
 	case "sftp_write_file":
 		if len(ap.ServerIDs) == 0 {
 			return "", fmt.Errorf("缺少目标服务器 ID")
+		}
+		if IsBlockedWritePath(ap.FilePath) {
+			return "", fmt.Errorf("安全熔断器禁止修改系统核心鉴权或保险库文件 (%s)", ap.FilePath)
 		}
 		if err := s.ssh.SFTPWriteText(ap.ServerIDs[0], ap.FilePath, ap.NewContent, clientIP); err != nil {
 			return "", err
@@ -1458,11 +1595,26 @@ func summarizeTitle(s string) string {
 	return string(runes[:24]) + "..."
 }
 
+// TruncateUTF8Bytes truncates s to at most maxBytes bytes without splitting a multi-byte UTF-8 character.
+func TruncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 func truncateStr(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
 	}
-	return s[:maxBytes] + "\n... [输出过长已截断]"
+	return TruncateUTF8Bytes(s, maxBytes) + "\n... [输出过长已截断]"
 }
 
 func nonEmpty(val, fallback string) string {

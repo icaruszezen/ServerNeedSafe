@@ -1869,6 +1869,19 @@ func (s *Store) DeleteServer(id, clientIP string) error {
 		})
 		s.dirtyMonitor = true
 	}
+	if s.aiopsRT != nil {
+		prevBaseLen := len(s.aiopsRT.PatrolBaselines)
+		s.aiopsRT.PatrolBaselines = slices.DeleteFunc(s.aiopsRT.PatrolBaselines, func(b ServerBaselineSnapshot) bool {
+			return b.ServerID == id
+		})
+		prevHostMemLen := len(s.aiopsRT.HostMemories)
+		s.aiopsRT.HostMemories = slices.DeleteFunc(s.aiopsRT.HostMemories, func(hm HostMemory) bool {
+			return hm.ServerID == id
+		})
+		if len(s.aiopsRT.PatrolBaselines) != prevBaseLen || len(s.aiopsRT.HostMemories) != prevHostMemLen {
+			s.dirtyAIOps = true
+		}
+	}
 	s.appendAuditRuntimeLocked("server.delete", deletedTarget, "删除服务器配置", clientIP, true)
 	s.rtMu.Unlock()
 	s.triggerFlush()

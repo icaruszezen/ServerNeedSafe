@@ -270,7 +270,7 @@ func sendFormattedWebhook(
 	if statusCode >= 400 {
 		msg := strings.TrimSpace(string(respBody))
 		if len(msg) > 512 {
-			msg = msg[:512]
+			msg = TruncateUTF8Bytes(msg, 512) + "..."
 		}
 		return fmt.Errorf("Webhook 响应 HTTP %d: %s", statusCode, msg)
 	}

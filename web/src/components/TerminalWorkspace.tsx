@@ -30,6 +30,8 @@ import type {
 import { SftpPanel } from './SftpPanel';
 import { TerminalCopilotPanel } from './TerminalCopilotPanel';
 import { HostKeyModal } from './HostKeyModal';
+import type { CenterTab } from './AIOpsCenter';
+import type { MemorySubSection } from './AIMemoryAgentsTab';
 
 // Strip ANSI escape codes from rolling terminal text buffer before attaching as AI context
 function stripAnsi(str: string): string {
@@ -50,7 +52,8 @@ interface TerminalWorkspaceProps {
   onCloseTab: (tabId: string) => void;
   onOpenServerTab: (server: ServerView) => void;
   onNavigateServers: () => void;
-  onNavigateAICenter?: () => void;
+  onNavigateAICenter?: (tab?: CenterTab, memorySection?: MemorySubSection) => void;
+  onRefreshWorkspace?: () => Promise<void>;
   onNotify: (msg: string) => void;
 }
 
@@ -438,6 +441,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   onOpenServerTab,
   onNavigateServers,
   onNavigateAICenter,
+  onRefreshWorkspace,
   onNotify,
 }) => {
   const handlesRef = useRef<Record<string, SinglePaneHandle | null>>({});
@@ -1092,8 +1096,12 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
                   handlesRef.current[activeTab.tabId]?.sendCommand(cmd);
                 }}
                 onNavigateAIConfig={() => {
-                  onNavigateAICenter?.();
+                  onNavigateAICenter?.('providers');
                 }}
+                onOpenAgentsMD={() => {
+                  onNavigateAICenter?.('memory', 'agents_md');
+                }}
+                onRefreshWorkspace={onRefreshWorkspace}
                 onNotify={onNotify}
                 onClose={() => setSideDrawer('none')}
               />

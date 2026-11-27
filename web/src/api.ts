@@ -169,29 +169,37 @@ async function postSSEStream(
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
 
+  const dispatchBlock = (rawBlock: string) => {
+    for (const line of rawBlock.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('data:')) {
+        const jsonStr = trimmed.slice(5).trim();
+        if (!jsonStr) continue;
+        try {
+          onEvent(JSON.parse(jsonStr) as AIStreamEvent);
+        } catch {
+          // ignore malformed chunk
+        }
+      }
+    }
+  };
+
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
 
       let sepIdx: number;
       while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
         const rawBlock = buffer.slice(0, sepIdx);
         buffer = buffer.slice(sepIdx + 2);
-        for (const line of rawBlock.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('data:')) {
-            const jsonStr = trimmed.slice(5).trim();
-            if (!jsonStr) continue;
-            try {
-              onEvent(JSON.parse(jsonStr) as AIStreamEvent);
-            } catch {
-              // ignore malformed chunk
-            }
-          }
-        }
+        dispatchBlock(rawBlock);
       }
+    }
+    buffer += decoder.decode().replace(/\r\n/g, '\n');
+    if (buffer.trim()) {
+      dispatchBlock(buffer);
     }
   } finally {
     reader.releaseLock();

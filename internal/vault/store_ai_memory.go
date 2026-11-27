@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -98,16 +99,23 @@ func (s *Store) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP
 		return nil, nil, ErrVaultLocked
 	}
 
-	// Step 1: Read pending proposal under rtMu.RLock
-	s.rtMu.RLock()
+	// Step 1: Atomically verify pending status and mark "resolving" under rtMu.Lock
+	s.rtMu.Lock()
 	var prop AIAgentsMDProposal
 	found := false
+	alreadyResolved := ""
 	if s.aiopsRT != nil {
-		for _, cs := range s.aiopsRT.AISessions {
-			for _, ap := range cs.AgentsMDProposals {
+		for si := range s.aiopsRT.AISessions {
+			for pi := range s.aiopsRT.AISessions[si].AgentsMDProposals {
+				ap := &s.aiopsRT.AISessions[si].AgentsMDProposals[pi]
 				if ap.ID == proposalID {
-					prop = ap
 					found = true
+					if ap.Status != "pending" {
+						alreadyResolved = ap.Status
+						break
+					}
+					ap.Status = "resolving"
+					prop = *ap
 					break
 				}
 			}
@@ -116,12 +124,28 @@ func (s *Store) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP
 			}
 		}
 	}
-	s.rtMu.RUnlock()
+	s.rtMu.Unlock()
 	if !found {
 		return nil, nil, ErrNotFound
 	}
-	if prop.Status != "pending" {
-		return nil, nil, fmt.Errorf("%w: 该 AGENTS.md 修订提案已处理 (%s)", ErrInvalidInput, prop.Status)
+	if alreadyResolved != "" {
+		return nil, nil, fmt.Errorf("%w: 该 AGENTS.md 修订提案已处理 (%s)", ErrInvalidInput, alreadyResolved)
+	}
+
+	rollbackPending := func() {
+		s.rtMu.Lock()
+		if s.aiopsRT != nil {
+			for si := range s.aiopsRT.AISessions {
+				for pi := range s.aiopsRT.AISessions[si].AgentsMDProposals {
+					if s.aiopsRT.AISessions[si].AgentsMDProposals[pi].ID == proposalID &&
+						s.aiopsRT.AISessions[si].AgentsMDProposals[pi].Status == "resolving" {
+						s.aiopsRT.AISessions[si].AgentsMDProposals[pi].Status = "pending"
+						break
+					}
+				}
+			}
+		}
+		s.rtMu.Unlock()
 	}
 
 	now := time.Now().UTC()
@@ -129,6 +153,7 @@ func (s *Store) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP
 	if accept {
 		cleanContent := RedactSensitiveText(strings.ReplaceAll(prop.ProposedContent, "\r\n", "\n"))
 		if len(cleanContent) > maxAgentsMDBytes {
+			rollbackPending()
 			return nil, nil, fmt.Errorf("%w: 提议的 AGENTS.md 内容超过上限", ErrInvalidInput)
 		}
 		err := s.mutateSecrets(func(sec *SecretsState) error {
@@ -147,11 +172,13 @@ func (s *Store) ResolveAgentsMDProposal(proposalID string, accept bool, clientIP
 			return nil
 		})
 		if err != nil {
+			rollbackPending()
 			return nil, nil, err
 		}
 	} else {
 		cfg, err := s.GetAgentsMD()
 		if err != nil {
+			rollbackPending()
 			return nil, nil, err
 		}
 		outCfg = cfg
@@ -303,7 +330,11 @@ func (s *Store) UpsertAIMemory(in AIMemoryEntry, isAuto bool, clientIP string) (
 		return nil, fmt.Errorf("%w: 记忆标题与内容不能为空", ErrInvalidInput)
 	}
 	if len(cleanContent) > 8000 {
-		cleanContent = cleanContent[:8000]
+		cut := 8000
+		for cut > 0 && !utf8.RuneStart(cleanContent[cut]) {
+			cut--
+		}
+		cleanContent = cleanContent[:cut]
 	}
 
 	dedupClean := func(items []string) []string {

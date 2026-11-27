@@ -52,14 +52,15 @@ type AIProviderView struct {
 }
 
 func maskSecretPreview(secret string) string {
-	n := len(secret)
+	runes := []rune(secret)
+	n := len(runes)
 	if n == 0 {
 		return ""
 	}
 	if n <= 8 {
 		return "••••••••"
 	}
-	return secret[:4] + "••••" + secret[n-4:]
+	return string(runes[:4]) + "••••" + string(runes[n-4:])
 }
 
 func (p AIProviderConfig) ToView() AIProviderView {
@@ -106,10 +107,11 @@ func maskWebhookURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	if len(raw) <= 28 {
-		return raw[:len(raw)/2] + "••••"
+	runes := []rune(raw)
+	if len(runes) <= 28 {
+		return string(runes[:len(runes)/2]) + "••••"
 	}
-	return raw[:24] + "••••" + raw[len(raw)-6:]
+	return string(runes[:24]) + "••••" + string(runes[len(runes)-6:])
 }
 
 func (w WebhookChannel) ToView() WebhookChannelView {

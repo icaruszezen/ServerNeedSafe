@@ -17,6 +17,7 @@ import (
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
+	"github.com/icaruszezen/ServerNeedSafe/internal/version"
 )
 
 func postMCPJSONRPC(t *testing.T, url, bearerToken, sessionID string, payload any) (*http.Response, map[string]any) {
@@ -747,3 +748,240 @@ func extractMCPToolIsError(t *testing.T, body map[string]any) bool {
 	isErr, _ := res["isError"].(bool)
 	return isErr
 }
+
+func TestMCPReviewSecurityAndIsolationFixes(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := vault.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.Setup("MCPSecurityAdmin!2026", "127.0.0.1"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	srv := NewServer(Config{DeployMode: "server", Store: store})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	mcpURL := ts.URL + "/api/mcp"
+
+	srvA, err := store.CreateServer(vault.ServerMutationInput{
+		Name: "web-a", Host: "10.10.0.1", Port: 22, Username: "root",
+		AuthType: vault.AuthPassword, Password: strPtr("PassA!123"),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer A: %v", err)
+	}
+	srvB, err := store.CreateServer(vault.ServerMutationInput{
+		Name: "db-b", Host: "10.10.0.2", Port: 22, Username: "root",
+		AuthType: vault.AuthPassword, Password: strPtr("PassB!456"),
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateServer B: %v", err)
+	}
+
+	// Seed memories & host profiles for srvA, srvB, and global
+	_, _ = store.UpsertHostMemory(vault.HostMemory{ServerID: srvA.ID, Summary: "SRV_A_PROFILE_PUBLIC"}, false, "127.0.0.1")
+	_, _ = store.UpsertHostMemory(vault.HostMemory{ServerID: srvB.ID, Summary: "SRV_B_SECRET_DB_PROFILE"}, false, "127.0.0.1")
+	_, _ = store.UpsertAIMemory(vault.AIMemoryEntry{
+		Title: "Global Rule", Category: "preference", Scope: "global", Content: "GLOBAL_RULE_VISIBLE",
+	}, false, "127.0.0.1")
+	_, _ = store.UpsertAIMemory(vault.AIMemoryEntry{
+		Title: "Server A Note", Category: "architecture", Scope: "server", ServerIDs: []string{srvA.ID}, Content: "SRV_A_MEM_VISIBLE",
+	}, false, "127.0.0.1")
+	_, _ = store.UpsertAIMemory(vault.AIMemoryEntry{
+		Title: "Server B Note", Category: "architecture", Scope: "server", ServerIDs: []string{srvB.ID}, Content: "SRV_B_MEM_CONFIDENTIAL",
+	}, false, "127.0.0.1")
+
+	// Seed a multi-server patrol record containing both srvA and srvB
+	now := time.Now().UTC()
+	patrolID := "patrol-scope-check-1"
+	if err := store.AppendPatrolRecord(vault.PatrolRecord{
+		ID:            patrolID,
+		StartedAt:     now.Add(-time.Minute),
+		CompletedAt:   now,
+		Trigger:       "scheduled",
+		TotalServers:  2,
+		WarningCount:  1,
+		Status:        "warning",
+		AnalysisState: "pending_external",
+		Findings: []vault.PatrolFinding{
+			{ServerID: srvA.ID, ServerName: srvA.Name, Host: "10.10.0.1:22", Reachable: true, Severity: "healthy"},
+			{ServerID: srvB.ID, ServerName: srvB.Name, Host: "10.10.0.2:22", Reachable: true, Severity: "warning", Anomalies: []string{"DB 磁盘偏高"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendPatrolRecord: %v", err)
+	}
+
+	_, rawScoped, err := store.CreateMCPToken(vault.CreateMCPTokenInput{
+		Name:           "Scoped Ops A",
+		Scope:          vault.MCPScopeOpsPropose,
+		AllowedServers: []string{srvA.ID},
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateMCPToken scoped: %v", err)
+	}
+	_, rawFull, err := store.CreateMCPToken(vault.CreateMCPTokenInput{
+		Name:  "Full Ops",
+		Scope: vault.MCPScopeOpsPropose,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateMCPToken full: %v", err)
+	}
+
+	// 1. Initialize reports dynamic version.Current().Version and binds session to token
+	initRes, initBody := postMCPJSONRPC(t, mcpURL, rawFull, "", map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-03-26",
+			"clientInfo":      map[string]any{"name": "cursor", "version": "1.0"},
+		},
+	})
+	if initRes.StatusCode != http.StatusOK {
+		t.Fatalf("initialize full failed: %d", initRes.StatusCode)
+	}
+	fullSessionID := initRes.Header.Get("Mcp-Session-Id")
+	srvInfo := initBody["result"].(map[string]any)["serverInfo"].(map[string]any)
+	if srvInfo["version"] != version.Current().Version {
+		t.Fatalf("expected MCP serverInfo.version=%q, got %v", version.Current().Version, srvInfo["version"])
+	}
+
+	// Token B attempting to DELETE Token A's session must NOT delete Token A's session
+	delReq, _ := http.NewRequest(http.MethodDelete, mcpURL, nil)
+	delReq.Header.Set("Authorization", "Bearer "+rawScoped)
+	delReq.Header.Set("Mcp-Session-Id", fullSessionID)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE /api/mcp: %v", err)
+	}
+	delResp.Body.Close()
+
+	// Verify fullSessionID still belongs to rawFull by proposing an approval under fullSessionID
+	_, propBBody := postMCPJSONRPC(t, mcpURL, rawFull, fullSessionID, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+		"params": map[string]any{
+			"name": "propose_sftp_write",
+			"arguments": map[string]any{
+				"server_id":   srvB.ID,
+				"path":        "/etc/nginx/conf.d/db-proxy.conf",
+				"new_content": "SUPER_SENSITIVE_FILE_PAYLOAD_999",
+				"reason":      "update db proxy",
+			},
+		},
+	})
+	if extractMCPToolIsError(t, propBBody) {
+		t.Fatalf("propose_sftp_write on srvB failed: %v", propBBody)
+	}
+	// If fullSessionID had been deleted by rawScoped, client_name would have fallen back away from "Cursor".
+	apsAll, _, _ := store.ListExternalApprovals("pending", 20)
+	if len(apsAll) != 1 || apsAll[0].ClientName != "Cursor" {
+		t.Fatalf("expected fullSessionID to remain intact with ClientName=Cursor, got %+v", apsAll)
+	}
+
+	// Also create a pending approval on srvA
+	_, propABody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+		"params": map[string]any{
+			"name": "propose_ssh_command",
+			"arguments": map[string]any{
+				"server_ids": []string{srvA.ID},
+				"command":    "systemctl reload nginx",
+				"reason":     "reload web-a",
+			},
+		},
+	})
+	if extractMCPToolIsError(t, propABody) {
+		t.Fatalf("propose_ssh_command on srvA failed: %v", propABody)
+	}
+
+	// 2. list_approvals and approvals/pending MUST strip new_content even for fullToken,
+	//    and compute token-scoped pending_total for scopedToken!
+	_, fullListApBody := postMCPJSONRPC(t, mcpURL, rawFull, fullSessionID, map[string]any{
+		"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+		"params": map[string]any{"name": "list_approvals", "arguments": map[string]any{"status": "pending"}},
+	})
+	fullListApText := extractMCPToolText(t, fullListApBody)
+	if strings.Contains(fullListApText, "SUPER_SENSITIVE_FILE_PAYLOAD_999") {
+		t.Fatalf("SECURITY FAILURE: list_approvals leaked raw new_content for unrestricted token!")
+	}
+
+	_, scopedListApBody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+		"params": map[string]any{"name": "list_approvals", "arguments": map[string]any{"status": "pending"}},
+	})
+	scopedListApText := extractMCPToolText(t, scopedListApBody)
+	var scopedApResp struct {
+		PendingTotal int `json:"pending_total"`
+		Approvals    []any `json:"approvals"`
+	}
+	if err := json.Unmarshal([]byte(scopedListApText), &scopedApResp); err != nil {
+		t.Fatalf("unmarshal scoped list_approvals: %v text=%s", err, scopedListApText)
+	}
+	if scopedApResp.PendingTotal != 1 || len(scopedApResp.Approvals) != 1 {
+		t.Fatalf("expected scoped token pending_total=1 and 1 approval, got pending_total=%d len=%d", scopedApResp.PendingTotal, len(scopedApResp.Approvals))
+	}
+
+	// 3. search_memory without server_id MUST filter out srvB memories & host profile for scopedToken
+	_, memBody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+		"params": map[string]any{"name": "search_memory", "arguments": map[string]any{"query": ""}},
+	})
+	memText := extractMCPToolText(t, memBody)
+	if !strings.Contains(memText, "GLOBAL_RULE_VISIBLE") || !strings.Contains(memText, "SRV_A_MEM_VISIBLE") {
+		t.Fatalf("expected scoped search_memory to include global and srvA memories, got:\n%s", memText)
+	}
+	if strings.Contains(memText, "SRV_B_MEM_CONFIDENTIAL") || strings.Contains(memText, "SRV_B_SECRET_DB_PROFILE") {
+		t.Fatalf("SECURITY FAILURE: scoped search_memory leaked srvB memory/host profile!\n%s", memText)
+	}
+
+	// 4. get_ops_context with unauthorized server_ids:[srvB] MUST error instead of falling back to all servers
+	_, ctxDenyBody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+		"params": map[string]any{"name": "get_ops_context", "arguments": map[string]any{"server_ids": []string{srvB.ID}}},
+	})
+	if !extractMCPToolIsError(t, ctxDenyBody) {
+		t.Fatalf("expected get_ops_context for unauthorized srvB to return error, got: %v", ctxDenyBody)
+	}
+
+	// 5. claim_patrol and submit_patrol_report MUST reject patrol records containing out-of-scope srvB
+	_, claimDenyBody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+		"params": map[string]any{"name": "claim_patrol", "arguments": map[string]any{"patrol_id": patrolID}},
+	})
+	if !extractMCPToolIsError(t, claimDenyBody) {
+		t.Fatalf("expected claim_patrol on out-of-scope patrol to be rejected, got: %v", claimDenyBody)
+	}
+	_, submitDenyBody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+		"params": map[string]any{
+			"name": "submit_patrol_report",
+			"arguments": map[string]any{
+				"patrol_id": patrolID,
+				"summary":   "unauthorized write attempt",
+			},
+		},
+	})
+	if !extractMCPToolIsError(t, submitDenyBody) {
+		t.Fatalf("expected submit_patrol_report on out-of-scope patrol to be rejected, got: %v", submitDenyBody)
+	}
+	recAfter, _ := store.GetPatrolRecord(patrolID)
+	if recAfter.AnalysisState != "pending_external" || recAfter.AIAnalyzed {
+		t.Fatalf("out-of-scope patrol was mutated despite denial! got %+v", recAfter)
+	}
+
+	// 6. sftp_read_file MUST block path traversal (/tmp/../etc/shadow) and SSH private keys
+	for i, badPath := range []string{"/tmp/../etc/shadow", "/home/ops/.ssh/id_ed25519", "/opt/sns/secrets.enc"} {
+		_, readDeny := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+			"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call",
+			"params": map[string]any{
+				"name":      "sftp_read_file",
+				"arguments": map[string]any{"server_id": srvA.ID, "path": badPath},
+			},
+		})
+		if !extractMCPToolIsError(t, readDeny) {
+			t.Fatalf("expected sftp_read_file to reject sensitive path %q, got: %v", badPath, readDeny)
+		}
+	}
+}
+
+func strPtr(s string) *string { return &s }

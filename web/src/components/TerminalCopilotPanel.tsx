@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   Layers,
   Minimize2,
+  Square,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -35,6 +36,8 @@ interface TerminalCopilotPanelProps {
   getTerminalContext: () => string;
   onInjectCommand: (cmd: string) => void;
   onNavigateAIConfig: () => void;
+  onOpenAgentsMD?: () => void;
+  onRefreshWorkspace?: () => Promise<void>;
   onNotify: (msg: string) => void;
   onClose: () => void;
 }
@@ -45,6 +48,8 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   getTerminalContext,
   onInjectCommand,
   onNavigateAIConfig,
+  onOpenAgentsMD,
+  onRefreshWorkspace,
   onNotify,
   onClose,
 }) => {
@@ -54,6 +59,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   const [attachPtyContext, setAttachPtyContext] = useState(true);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
+  const [pendingUserMessage, setPendingUserMessage] = useState('');
   const [streamDelta, setStreamDelta] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const [contextInspection, setContextInspection] = useState<SessionContextInspection | null>(null);
@@ -61,6 +67,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   const [loadingContext, setLoadingContext] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const refreshContext = useCallback(async (sid?: string) => {
     const targetId = sid ?? session?.id;
@@ -100,7 +107,17 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   }, [serverId]);
 
   useEffect(() => {
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    setStreaming(false);
+    setPendingUserMessage('');
+    setStreamDelta('');
+    setStreamTools([]);
     void loadBoundSession();
+    return () => {
+      streamAbortRef.current?.abort();
+      streamAbortRef.current = null;
+    };
   }, [loadBoundSession]);
 
   useEffect(() => {
@@ -198,6 +215,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         case 'session_sync':
           if (ev.session) {
             setSession(ev.session);
+            setPendingUserMessage('');
             setStreamDelta('');
             setStreamTools([]);
           }
@@ -226,11 +244,14 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     }
 
     if (!overrideMsg) setInput('');
+    setPendingUserMessage(text);
     setStreaming(true);
     setStreamDelta('');
     setStreamTools([]);
 
     const ptyText = attachPtyContext || forceAttachPty ? getTerminalContext() : '';
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
 
     try {
       await api.streamAIChat(
@@ -241,12 +262,22 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           mode,
           terminal_context: ptyText || undefined,
         },
-        handleStreamEvent
+        handleStreamEvent,
+        ac.signal
       );
     } catch (err: any) {
-      onNotify(err?.message || '终端副驾驶响应中断');
+      if (err?.name === 'AbortError') {
+        onNotify('已停止终端副驾驶本次生成');
+      } else {
+        onNotify(err?.message || '终端副驾驶响应中断');
+      }
+      await loadBoundSession();
     } finally {
+      if (streamAbortRef.current === ac) {
+        streamAbortRef.current = null;
+      }
       setStreaming(false);
+      setPendingUserMessage('');
       setStreamDelta('');
       setStreamTools([]);
     }
@@ -257,11 +288,21 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     setStreaming(true);
     setStreamDelta('');
     setStreamTools([]);
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
     try {
-      await api.streamAIApproval(session.id, approvalId, approve, handleStreamEvent);
+      await api.streamAIApproval(session.id, approvalId, approve, handleStreamEvent, ac.signal);
     } catch (err: any) {
-      onNotify(err?.message || '审批执行失败');
+      if (err?.name === 'AbortError') {
+        onNotify('已停止本次生成');
+      } else {
+        onNotify(err?.message || '审批执行失败');
+      }
+      await loadBoundSession();
     } finally {
+      if (streamAbortRef.current === ac) {
+        streamAbortRef.current = null;
+      }
       setStreaming(false);
       setStreamDelta('');
       setStreamTools([]);
@@ -305,8 +346,12 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                 onClick={async () => {
                   setMode(m);
                   if (session) {
-                    const updated = await api.updateAISessionMode(session.id, { mode: m });
-                    setSession(updated.session);
+                    try {
+                      const updated = await api.updateAISessionMode(session.id, { mode: m });
+                      setSession(updated.session);
+                    } catch (err: any) {
+                      onNotify(err?.message || '切换执行模式失败');
+                    }
                   }
                 }}
               >
@@ -445,7 +490,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
               前往配置大模型
             </button>
           </div>
-        ) : !session || session.messages.length === 0 ? (
+        ) : (!session || session.messages.length === 0) && !streaming && !pendingUserMessage ? (
           <div className="empty-state" style={{ padding: '36px 14px' }}>
             <TerminalSquare size={22} style={{ marginBottom: 8, color: 'var(--accent-teal)' }} />
             <h3>同屏感知终端上下文与记忆</h3>
@@ -458,7 +503,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           </div>
         ) : (
           <>
-            {(() => {
+            {session && (() => {
               const compactedUntil = session.compacted_until_count || 0;
               const visibleItems = session.messages
                 .map((msg, rawIdx) => ({ msg, rawIdx }))
@@ -546,31 +591,50 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
               });
             })()}
 
-            {(session.agents_md_proposals || []).map((prop) => (
+            {(session?.agents_md_proposals || []).map((prop) => (
               <AgentsMDProposalCard
                 key={prop.id}
                 proposal={prop}
                 busy={streaming}
                 onResolve={async (id, accept) => {
-                  await api.resolveAgentsMDProposal(id, accept);
-                  onNotify(accept ? '已合入全局 AGENTS.md' : '已忽略 AGENTS.md 修订建议');
-                  await loadBoundSession();
+                  try {
+                    await api.resolveAgentsMDProposal(id, accept);
+                    onNotify(accept ? '已合入全局 AGENTS.md' : '已忽略 AGENTS.md 修订建议');
+                    await loadBoundSession();
+                  } catch (err: any) {
+                    onNotify(err?.message || '处理 AGENTS.md 修订建议失败');
+                  }
                 }}
               />
             ))}
 
-            {(session.runbook_proposals || []).map((prop) => (
+            {(session?.runbook_proposals || []).map((prop) => (
               <RunbookProposalCard
                 key={prop.id}
                 proposal={prop}
                 busy={streaming}
                 onResolve={async (id, accept, sync) => {
-                  await api.resolveRunbookProposal(id, accept, sync);
-                  onNotify(accept ? '已保存至 Runbook 技能库' : '已忽略草案');
-                  await loadBoundSession();
+                  try {
+                    await api.resolveRunbookProposal(id, accept, sync);
+                    onNotify(accept ? '已保存至 Runbook 技能库' : '已忽略草案');
+                    if (accept && sync && onRefreshWorkspace) {
+                      await onRefreshWorkspace();
+                    }
+                    await loadBoundSession();
+                  } catch (err: any) {
+                    onNotify(err?.message || '处理 Runbook 草案失败');
+                  }
                 }}
               />
             ))}
+
+            {pendingUserMessage && (
+              <div className="ai-msg-row user" style={{ maxWidth: '88%' }}>
+                <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '8px 12px' }}>
+                  {pendingUserMessage}
+                </div>
+              </div>
+            )}
 
             {streaming && (
               <div className="ai-msg-row assistant">
@@ -582,7 +646,11 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                   </div>
                 )}
                 <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '9px 12px' }}>
-                  {streamDelta || '正在分析终端上下文...'}
+                  {streamDelta ? (
+                    <FormattedMarkdownText text={streamDelta} />
+                  ) : (
+                    <span style={{ color: 'var(--text-muted)' }}>正在分析终端上下文...</span>
+                  )}
                 </div>
               </div>
             )}
@@ -606,13 +674,26 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           value={input}
           onChange={(e) => setInput(e.target.value)}
         />
-        <button
-          type="submit"
-          className="btn btn-primary btn-sm copilot-composer-send"
-          disabled={streaming || !input.trim()}
-        >
-          <Send size={13} />
-        </button>
+        {streaming ? (
+          <button
+            type="button"
+            className="btn btn-sm copilot-composer-send"
+            style={{ color: 'var(--danger-text)' }}
+            title="停止本次生成"
+            aria-label="停止本次生成"
+            onClick={() => streamAbortRef.current?.abort()}
+          >
+            <Square size={12} />
+          </button>
+        ) : (
+          <button
+            type="submit"
+            className="btn btn-primary btn-sm copilot-composer-send"
+            disabled={!input.trim()}
+          >
+            <Send size={13} />
+          </button>
+        )}
       </form>
 
       {showInspector && (
@@ -623,7 +704,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           onRefresh={() => void refreshContext(session?.id)}
           onCompact={(reset) => void handleCompact(Boolean(reset))}
           onClose={() => setShowInspector(false)}
-          onOpenAgentsMD={onNavigateAIConfig}
+          onOpenAgentsMD={onOpenAgentsMD || onNavigateAIConfig}
         />
       )}
     </div>

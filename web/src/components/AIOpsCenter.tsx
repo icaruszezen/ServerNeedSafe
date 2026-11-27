@@ -25,6 +25,7 @@ import {
   Minimize2,
   PlugZap,
   Clock,
+  Square,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -56,10 +57,13 @@ import {
 import { AIMemoryAgentsTab, type MemorySubSection } from './AIMemoryAgentsTab';
 import { ExternalAIMCPTab } from './ExternalAIMCPTab';
 
-type CenterTab = 'diagnosis' | 'patrol' | 'mcp' | 'memory' | 'providers';
+export type CenterTab = 'diagnosis' | 'patrol' | 'mcp' | 'memory' | 'providers';
 
 interface AIOpsCenterProps {
   servers: ServerView[];
+  initialTab?: CenterTab;
+  initialMemorySection?: MemorySubSection;
+  onConsumeInitialTab?: () => void;
   onRefreshWorkspace: () => Promise<void>;
   onBadgeChange?: (unreadCount: number) => void;
   onNotify: (msg: string) => void;
@@ -101,12 +105,17 @@ const QUICK_DIAGNOSTIC_PROMPTS = [
 
 export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   servers,
+  initialTab,
+  initialMemorySection,
+  onConsumeInitialTab,
   onRefreshWorkspace,
   onBadgeChange,
   onNotify,
 }) => {
-  const [subTab, setSubTab] = useState<CenterTab>('diagnosis');
-  const [memorySubSection, setMemorySubSection] = useState<MemorySubSection>('agents_md');
+  const [subTab, setSubTab] = useState<CenterTab>(initialTab || 'diagnosis');
+  const [memorySubSection, setMemorySubSection] = useState<MemorySubSection>(
+    initialMemorySection || 'agents_md'
+  );
   const [overview, setOverview] = useState<AIOverviewResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false);
@@ -118,9 +127,28 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [sessionMode, setSessionMode] = useState<AIExecutionMode>('standard');
   const [promptInput, setPromptInput] = useState('');
   const [streaming, setStreaming] = useState(false);
+  const [pendingUserMessage, setPendingUserMessage] = useState('');
   const [streamDelta, setStreamDelta] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (initialTab) {
+      setSubTab(initialTab);
+      if (initialMemorySection) {
+        setMemorySubSection(initialMemorySection);
+      }
+      onConsumeInitialTab?.();
+    }
+  }, [initialTab, initialMemorySection, onConsumeInitialTab]);
+
+  useEffect(() => {
+    return () => {
+      streamAbortRef.current?.abort();
+      streamAbortRef.current = null;
+    };
+  }, []);
 
   // Context Inspector & Rolling Compaction State
   const [contextInspection, setContextInspection] = useState<SessionContextInspection | null>(null);
@@ -134,14 +162,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [patrolEnabled, setPatrolEnabled] = useState(false);
   const [patrolInterval, setPatrolInterval] = useState(60);
   const [patrolServerIds, setPatrolServerIds] = useState<string[]>([]);
-  const [cpuWarn, setCpuWarn] = useState(85);
-  const [memWarn, setMemWarn] = useState(85);
-  const [diskWarn, setDiskWarn] = useState(85);
-  const [sshFailWarn, setSshFailWarn] = useState(15);
+  const [cpuWarnStr, setCpuWarnStr] = useState('85');
+  const [memWarnStr, setMemWarnStr] = useState('85');
+  const [diskWarnStr, setDiskWarnStr] = useState('85');
+  const [sshFailWarnStr, setSshFailWarnStr] = useState('15');
   const [checkPorts, setCheckPorts] = useState(true);
   const [checkPrivUsers, setCheckPrivUsers] = useState(true);
   const [patrolAnalysisMode, setPatrolAnalysisMode] = useState<PatrolAnalysisMode>('builtin');
-  const [patrolFallbackMinutes, setPatrolFallbackMinutes] = useState(15);
+  const [patrolFallbackStr, setPatrolFallbackStr] = useState('15');
   const [notifyPendingApprovals, setNotifyPendingApprovals] = useState(true);
   const [webhookDrafts, setWebhookDrafts] = useState<WebhookDraft[]>([]);
   const [testingWebhookIdx, setTestingWebhookIdx] = useState<number | null>(null);
@@ -154,8 +182,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     base_url: string;
     api_key: string;
     model: string;
-    max_tokens: number;
-    context_window: number;
+    max_tokens: string;
+    context_window: string;
     set_active: boolean;
   }>({
     id: '',
@@ -164,8 +192,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     base_url: 'https://api.deepseek.com/v1',
     api_key: '',
     model: 'deepseek-chat',
-    max_tokens: 4096,
-    context_window: 0,
+    max_tokens: '4096',
+    context_window: '0',
     set_active: true,
   });
   const [testingProvId, setTestingProvId] = useState<string>('');
@@ -179,14 +207,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     setPatrolEnabled(pc.enabled);
     setPatrolInterval(pc.interval_minutes || 60);
     setPatrolServerIds(pc.server_ids || []);
-    setCpuWarn(pc.cpu_warn_percent || 85);
-    setMemWarn(pc.mem_warn_percent || 85);
-    setDiskWarn(pc.disk_warn_percent || 85);
-    setSshFailWarn(pc.ssh_fail_warn_count || 15);
+    setCpuWarnStr(String(pc.cpu_warn_percent || 85));
+    setMemWarnStr(String(pc.mem_warn_percent || 85));
+    setDiskWarnStr(String(pc.disk_warn_percent || 85));
+    setSshFailWarnStr(String(pc.ssh_fail_warn_count || 15));
     setCheckPorts(pc.check_listening_ports);
     setCheckPrivUsers(pc.check_privileged_users);
     setPatrolAnalysisMode(pc.analysis_mode || 'builtin');
-    setPatrolFallbackMinutes(pc.external_fallback_minutes || 15);
+    setPatrolFallbackStr(String(pc.external_fallback_minutes || 15));
     setNotifyPendingApprovals(pc.notify_pending_approvals ?? true);
     setWebhookDrafts(
       (pc.webhooks || []).map((w) => ({
@@ -202,8 +230,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     );
   }, []);
 
+  useEffect(() => {
+    if (!showPatrolConfigModal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowPatrolConfigModal(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showPatrolConfigModal]);
+
   const loadOverview = useCallback(
-    async (preferSessionId?: string) => {
+    async (preferSessionId?: string | null) => {
       try {
         const ov = await api.getAIOverview('center');
         setOverview(ov);
@@ -218,10 +255,12 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           (ov.patrol_status?.unread_alerts || 0) + pendingApprovalsCount + pendingExtApprovals
         );
 
+        const firstAvailableId =
+          ov.sessions && ov.sessions.length > 0 ? ov.sessions[0].id : '';
         const targetId =
-          preferSessionId ||
-          activeSessionId ||
-          (ov.sessions && ov.sessions.length > 0 ? ov.sessions[0].id : '');
+          preferSessionId === null
+            ? firstAvailableId
+            : preferSessionId || activeSessionId || firstAvailableId;
         if (targetId) {
           setActiveSessionId(targetId);
           const { session } = await api.getAISession(targetId);
@@ -234,8 +273,12 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               : []
           );
           setSessionMode(session.mode || ov.default_mode || 'standard');
-        } else if (servers.length > 0 && selectedServerIds.length === 0) {
-          setSelectedServerIds([servers[0].id]);
+        } else {
+          setActiveSessionId('');
+          setActiveSession(null);
+          if (servers.length > 0 && selectedServerIds.length === 0) {
+            setSelectedServerIds([servers[0].id]);
+          }
         }
       } catch (err: any) {
         onNotify(err?.message || '加载 AI 运维中心数据失败');
@@ -287,10 +330,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           (acc, s) => acc + (s.pending_approval_count || 0),
           0
         );
-        onBadgeChange?.(pendingCnt);
+        const pendingExtApprovals = overview?.pending_external_approvals || 0;
+        onBadgeChange?.(pendingCnt + pendingExtApprovals);
       });
     }
-  }, [subTab, overview?.patrol_status?.unread_alerts, overview?.sessions, onBadgeChange]);
+  }, [
+    subTab,
+    overview?.patrol_status?.unread_alerts,
+    overview?.sessions,
+    overview?.pending_external_approvals,
+    onBadgeChange,
+  ]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -321,13 +371,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     }
   }, [activeSessionId]);
 
+  const activeServerIdsKey = (activeSession?.server_ids || []).join(',');
   useEffect(() => {
     if (activeSession?.id) {
       void refreshSessionContext(activeSession.id);
     } else {
       setContextInspection(null);
     }
-  }, [activeSession?.id, activeSession?.messages.length, activeSession?.compaction_count, activeSession?.server_ids?.length, refreshSessionContext]);
+  }, [activeSession?.id, activeSession?.messages.length, activeSession?.compaction_count, activeServerIdsKey, refreshSessionContext]);
 
   const handleCompactSession = async (reset = false) => {
     if (!activeSession || compactingContext) return;
@@ -371,6 +422,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   };
 
   const handleSelectSession = async (summary: AIChatSessionSummary) => {
+    if (streaming) {
+      streamAbortRef.current?.abort();
+    }
     setMobileSessionsOpen(false);
     setActiveSessionId(summary.id);
     try {
@@ -387,6 +441,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     initialTitle = '新建 AI 运维排障会话',
     serverIds?: string[]
   ): Promise<AIChatSession | null> => {
+    if (streaming) {
+      streamAbortRef.current?.abort();
+    }
     setMobileSessionsOpen(false);
     try {
       const sids =
@@ -415,13 +472,17 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
   const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const deletingActive = activeSessionId === id;
+    if (deletingActive && streaming) {
+      streamAbortRef.current?.abort();
+    }
     try {
       await api.deleteAISession(id);
-      if (activeSessionId === id) {
+      if (deletingActive) {
         setActiveSessionId('');
         setActiveSession(null);
       }
-      await loadOverview('');
+      await loadOverview(deletingActive ? null : activeSessionId);
       onNotify('已删除排障会话记录');
     } catch (err: any) {
       onNotify(err?.message || '删除会话失败');
@@ -443,10 +504,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     }
   };
 
-  const toggleServerTarget = async (srvId: string) => {
-    const next = selectedServerIds.includes(srvId)
-      ? selectedServerIds.filter((id) => id !== srvId)
-      : [...selectedServerIds, srvId];
+  const updateSelectedServers = async (next: string[]) => {
     setSelectedServerIds(next);
     if (activeSession) {
       try {
@@ -459,6 +517,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         // ignore
       }
     }
+  };
+
+  const toggleServerTarget = async (srvId: string) => {
+    const next = selectedServerIds.includes(srvId)
+      ? selectedServerIds.filter((id) => id !== srvId)
+      : [...selectedServerIds, srvId];
+    await updateSelectedServers(next);
   };
 
   const processStreamEvents = useCallback(
@@ -519,6 +584,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         case 'session_sync':
           if (ev.session) {
             setActiveSession(ev.session);
+            setPendingUserMessage('');
             setStreamDelta('');
             setStreamTools([]);
           }
@@ -551,9 +617,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     }
 
     if (!overridePrompt) setPromptInput('');
+    setPendingUserMessage(text);
     setStreaming(true);
     setStreamDelta('');
     setStreamTools([]);
+
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
 
     try {
       await api.streamAIChat(
@@ -563,13 +633,23 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           server_ids: targetServers,
           mode: sessionMode,
         },
-        processStreamEvents
+        processStreamEvents,
+        ac.signal
       );
       await loadOverview(sess.id);
     } catch (err: any) {
-      onNotify(err?.message || 'AI 诊断对话中断');
+      if (err?.name === 'AbortError') {
+        onNotify('已停止本次 AI 生成');
+      } else {
+        onNotify(err?.message || 'AI 诊断对话中断');
+      }
+      await loadOverview(sess.id);
     } finally {
+      if (streamAbortRef.current === ac) {
+        streamAbortRef.current = null;
+      }
       setStreaming(false);
+      setPendingUserMessage('');
       setStreamDelta('');
       setStreamTools([]);
     }
@@ -577,20 +657,32 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
   const handleResolveApproval = async (approvalId: string, approve: boolean) => {
     if (!activeSession || streaming) return;
+    const sessId = activeSession.id;
     setStreaming(true);
     setStreamDelta('');
     setStreamTools([]);
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
     try {
       await api.streamAIApproval(
-        activeSession.id,
+        sessId,
         approvalId,
         approve,
-        processStreamEvents
+        processStreamEvents,
+        ac.signal
       );
-      await loadOverview(activeSession.id);
+      await loadOverview(sessId);
     } catch (err: any) {
-      onNotify(err?.message || '处理变更审批失败');
+      if (err?.name === 'AbortError') {
+        onNotify('已停止本次 AI 生成');
+      } else {
+        onNotify(err?.message || '处理变更审批失败');
+      }
+      await loadOverview(sessId);
     } finally {
+      if (streamAbortRef.current === ac) {
+        streamAbortRef.current = null;
+      }
       setStreaming(false);
       setStreamDelta('');
       setStreamTools([]);
@@ -636,19 +728,24 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
   const handleSavePatrolConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    const clampNum = (raw: string, fallback: number, lo: number, hi: number) => {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.min(hi, Math.max(lo, n));
+    };
     try {
       await api.updatePatrolConfig({
         enabled: patrolEnabled,
         interval_minutes: patrolInterval,
         server_ids: patrolServerIds,
-        cpu_warn_percent: cpuWarn,
-        mem_warn_percent: memWarn,
-        disk_warn_percent: diskWarn,
-        ssh_fail_warn_count: sshFailWarn,
+        cpu_warn_percent: clampNum(cpuWarnStr, 85, 20, 100),
+        mem_warn_percent: clampNum(memWarnStr, 85, 20, 100),
+        disk_warn_percent: clampNum(diskWarnStr, 85, 20, 100),
+        ssh_fail_warn_count: Math.round(clampNum(sshFailWarnStr, 15, 1, 10000)),
         check_listening_ports: checkPorts,
         check_privileged_users: checkPrivUsers,
         analysis_mode: patrolAnalysisMode,
-        external_fallback_minutes: patrolFallbackMinutes,
+        external_fallback_minutes: Math.round(clampNum(patrolFallbackStr, 15, 1, 1440)),
         notify_pending_approvals: notifyPendingApprovals,
         webhooks: webhookDrafts.map((w) => ({
           id: w.id,
@@ -696,8 +793,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       base_url: preset.base_url,
       api_key: '',
       model: preset.default_model,
-      max_tokens: 4096,
-      context_window: 0,
+      max_tokens: '4096',
+      context_window: '0',
       set_active: true,
     });
     setTestResultBanner(null);
@@ -711,8 +808,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       base_url: p.base_url,
       api_key: '',
       model: p.model,
-      max_tokens: p.max_tokens || 4096,
-      context_window: p.context_window || 0,
+      max_tokens: String(p.max_tokens || 4096),
+      context_window: String(p.context_window || 0),
       set_active: overview?.active_provider_id === p.id,
     });
     setTestResultBanner(null);
@@ -720,6 +817,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
   const handleSaveProvider = async (e: React.FormEvent) => {
     e.preventDefault();
+    const parsedMaxTok = Number(provForm.max_tokens);
+    const parsedCtxWin = Number(provForm.context_window);
     try {
       await api.upsertAIProvider({
         id: provForm.id || undefined,
@@ -728,8 +827,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         base_url: provForm.base_url,
         api_key: provForm.api_key || undefined,
         model: provForm.model,
-        max_tokens: provForm.max_tokens,
-        context_window: provForm.context_window || 0,
+        max_tokens:
+          Number.isFinite(parsedMaxTok) && parsedMaxTok >= 256
+            ? Math.min(32768, Math.round(parsedMaxTok))
+            : 4096,
+        context_window:
+          Number.isFinite(parsedCtxWin) && parsedCtxWin > 0
+            ? Math.min(2000000, Math.round(parsedCtxWin))
+            : 0,
         set_active: provForm.set_active,
       });
       setProvForm((prev) => ({ ...prev, id: '', api_key: '' }));
@@ -789,7 +894,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     <div className="workspace-surface" id="aiops-center-view">
       {/* Page Header */}
       <div className="page-header" style={{ flexWrap: 'wrap', rowGap: 10 }}>
-        <div className="page-header-title" style={{ minWidth: 320 }}>
+        <div className="page-header-title" style={{ minWidth: 'min(320px, 100%)' }}>
           <div
             style={{
               display: 'flex',
@@ -827,7 +932,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   {activeProvider.name} · {activeProvider.model}
                 </span>
               </button>
-            ) : overview?.mcp_config?.enabled || overview?.mcp_runtime?.desktop_loopback_running ? (
+            ) : (
+              overview?.mcp_runtime?.deploy_mode === 'desktop'
+                ? Boolean(
+                    overview?.mcp_config?.desktop_loopback_enabled &&
+                      overview?.mcp_runtime?.desktop_loopback_running
+                  )
+                : Boolean(overview?.mcp_config?.enabled)
+            ) ? (
               <button
                 type="button"
                 className="tag-chip teal"
@@ -958,6 +1070,12 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                     key={s.id}
                     className={`ai-session-item ${activeSessionId === s.id ? 'active' : ''}`}
                     onClick={() => void handleSelectSession(s)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        void handleSelectSession(s);
+                      }
+                    }}
                     role="button"
                     tabIndex={0}
                   >
@@ -1053,7 +1171,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                             selectedServerIds.length === servers.length
                               ? [servers[0].id]
                               : servers.map((s) => s.id);
-                          setSelectedServerIds(allIds);
+                          void updateSelectedServers(allIds);
                         }}
                       >
                         {selectedServerIds.length === servers.length ? '仅选首台' : '全选集群'}
@@ -1142,7 +1260,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             <div className="ai-messages-scroll">
               {loading ? (
                 <div className="empty-state">正在读取加密会话与排障上下文...</div>
-              ) : !activeSession || activeSession.messages.length === 0 ? (
+              ) : (!activeSession || activeSession.messages.length === 0) &&
+                !streaming &&
+                !pendingUserMessage ? (
                 <div className="empty-state" style={{ margin: 'auto' }}>
                   <div className="empty-state-icon">
                     <Bot size={22} style={{ color: 'var(--accent-teal)' }} />
@@ -1171,7 +1291,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                 </div>
               ) : (
                 <>
-                  {(() => {
+                  {activeSession && (() => {
                     const compactedUntil = activeSession.compacted_until_count || 0;
                     const visibleItems = activeSession.messages
                       .map((msg, rawIdx) => ({ msg, rawIdx }))
@@ -1249,7 +1369,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   })()}
 
                   {/* Render AGENTS.md Revision Proposals attached to this session */}
-                  {(activeSession.agents_md_proposals || []).map((prop) => (
+                  {(activeSession?.agents_md_proposals || []).map((prop) => (
                     <div key={prop.id} className="ai-msg-row assistant">
                       <AgentsMDProposalCard
                         proposal={prop}
@@ -1260,7 +1380,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   ))}
 
                   {/* Render Runbook Proposals attached to this session */}
-                  {(activeSession.runbook_proposals || []).map((prop) => (
+                  {(activeSession?.runbook_proposals || []).map((prop) => (
                     <div key={prop.id} className="ai-msg-row assistant">
                       <RunbookProposalCard
                         proposal={prop}
@@ -1269,6 +1389,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       />
                     </div>
                   ))}
+
+                  {/* Optimistic Pending User Prompt (immediately visible even on Turn 1) */}
+                  {pendingUserMessage && (
+                    <div className="ai-msg-row user">
+                      <div className="ai-msg-bubble">{pendingUserMessage}</div>
+                    </div>
+                  )}
 
                   {/* Live Streaming Turn */}
                   {streaming && (
@@ -1281,7 +1408,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                         </div>
                       )}
                       <div className="ai-msg-bubble">
-                        {streamDelta || '正在连接远程探针并推理诊断方案...'}
+                        {streamDelta ? (
+                          <FormattedMarkdownText text={streamDelta} />
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>
+                            正在连接远程探针并推理诊断方案...
+                          </span>
+                        )}
                       </div>
                     </div>
                   )}
@@ -1320,22 +1453,40 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   value={promptInput}
                   onChange={(e) => setPromptInput(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
+                    if (
+                      e.key === 'Enter' &&
+                      !e.shiftKey &&
+                      !e.nativeEvent.isComposing &&
+                      e.keyCode !== 229
+                    ) {
                       e.preventDefault();
                       void handleSendMessage();
                     }
                   }}
                 />
-                <button
-                  type="submit"
-                  id="ai-center-send-btn"
-                  className="btn btn-primary ai-composer-send-btn"
-                  style={{ height: 44, padding: '0 18px' }}
-                  disabled={streaming || !promptInput.trim()}
-                >
-                  <Send size={14} />
-                  {streaming ? '诊断中...' : '发送指令'}
-                </button>
+                {streaming ? (
+                  <button
+                    type="button"
+                    id="ai-center-stop-btn"
+                    className="btn ai-composer-send-btn"
+                    style={{ height: 44, padding: '0 18px', color: 'var(--danger-text)' }}
+                    onClick={() => streamAbortRef.current?.abort()}
+                  >
+                    <Square size={13} />
+                    停止生成
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    id="ai-center-send-btn"
+                    className="btn btn-primary ai-composer-send-btn"
+                    style={{ height: 44, padding: '0 18px' }}
+                    disabled={!promptInput.trim()}
+                  >
+                    <Send size={14} />
+                    发送指令
+                  </button>
+                )}
               </form>
             </div>
           </section>
@@ -1418,7 +1569,10 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               <button
                 type="button"
                 className="btn"
-                onClick={() => setShowPatrolConfigModal(true)}
+                onClick={() => {
+                  if (overview) syncPatrolDraftFromOverview(overview);
+                  setShowPatrolConfigModal(true);
+                }}
               >
                 <Sliders size={14} /> 巡检策略与告警通道 ({overview?.patrol_config.webhooks?.length || 0})
               </button>
@@ -1842,9 +1996,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       min={256}
                       max={32768}
                       value={provForm.max_tokens}
-                      onChange={(e) =>
-                        setProvForm({ ...provForm, max_tokens: Number(e.target.value) || 4096 })
-                      }
+                      onChange={(e) => setProvForm({ ...provForm, max_tokens: e.target.value })}
                     />
                   </div>
                 </div>
@@ -1875,7 +2027,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       onChange={(e) =>
                         setProvForm({
                           ...provForm,
-                          context_window: Math.max(0, Number(e.target.value) || 0),
+                          context_window: e.target.value,
                         })
                       }
                       placeholder="0 (默认按模型推算/65536)"
@@ -1908,8 +2060,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                           base_url: '',
                           api_key: '',
                           model: '',
-                          max_tokens: 4096,
-                          context_window: 0,
+                          max_tokens: '4096',
+                          context_window: '0',
                           set_active: true,
                         })
                       }
@@ -2016,9 +2168,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                                 type="button"
                                 className="btn btn-teal btn-sm"
                                 onClick={async () => {
-                                  await api.setActiveAIProvider(p.id);
-                                  onNotify(`已切换全局激活模型为 ${p.name}`);
-                                  await loadOverview(activeSessionId);
+                                  try {
+                                    await api.setActiveAIProvider(p.id);
+                                    onNotify(`已切换全局激活模型为 ${p.name}`);
+                                    await loadOverview(activeSessionId);
+                                  } catch (err: any) {
+                                    onNotify(err?.message || '切换激活模型失败');
+                                  }
                                 }}
                               >
                                 设为激活
@@ -2045,9 +2201,13 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                               className="btn btn-ghost btn-sm btn-icon"
                               style={{ color: 'var(--danger-text)' }}
                               onClick={async () => {
-                                await api.deleteAIProvider(p.id);
-                                onNotify('已删除模型供应商配置');
-                                await loadOverview(activeSessionId);
+                                try {
+                                  await api.deleteAIProvider(p.id);
+                                  onNotify('已删除模型供应商配置');
+                                  await loadOverview(activeSessionId);
+                                } catch (err: any) {
+                                  onNotify(err?.message || '删除模型供应商失败');
+                                }
                               }}
                               title="删除"
                             >
@@ -2143,50 +2303,96 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       max={1440}
                       className="input mono"
                       disabled={patrolAnalysisMode !== 'external_with_fallback'}
-                      value={patrolFallbackMinutes}
-                      onChange={(e) => setPatrolFallbackMinutes(Number(e.target.value) || 15)}
+                      value={patrolFallbackStr}
+                      onChange={(e) => setPatrolFallbackStr(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                {servers.length > 0 && (
+                  <div className="field" style={{ marginBottom: 12 }}>
+                    <label className="field-label">
+                      巡检目标服务器范围（不勾选 = 巡检全部纳管服务器，勾选则仅巡检选定主机）
+                    </label>
+                    <div className="mcp-server-chips">
+                      {servers.map((srv) => {
+                        const checked = patrolServerIds.includes(srv.id);
+                        return (
+                          <button
+                            key={srv.id}
+                            type="button"
+                            className={`mcp-server-chip ${checked ? 'active' : ''}`}
+                            onClick={() =>
+                              setPatrolServerIds((prev) =>
+                                checked ? prev.filter((id) => id !== srv.id) : [...prev, srv.id]
+                              )
+                            }
+                          >
+                            <ServerIcon size={11} />
+                            {srv.name}
+                          </button>
+                        );
+                      })}
+                      {patrolServerIds.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          style={{ height: 26, fontSize: 11.5 }}
+                          onClick={() => setPatrolServerIds([])}
+                        >
+                          清空（恢复全量）
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="field-row">
+                  <div className="field">
+                    <label className="field-label">CPU 负载预警阈值 (%, 20–100)</label>
+                    <input
+                      type="number"
+                      min={20}
+                      max={100}
+                      className="input mono"
+                      value={cpuWarnStr}
+                      onChange={(e) => setCpuWarnStr(e.target.value)}
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label">内存使用预警阈值 (%, 20–100)</label>
+                    <input
+                      type="number"
+                      min={20}
+                      max={100}
+                      className="input mono"
+                      value={memWarnStr}
+                      onChange={(e) => setMemWarnStr(e.target.value)}
                     />
                   </div>
                 </div>
 
                 <div className="field-row">
                   <div className="field">
-                    <label className="field-label">CPU 负载预警阈值 (%)</label>
+                    <label className="field-label">根分区磁盘预警阈值 (%, 20–100)</label>
                     <input
                       type="number"
+                      min={20}
+                      max={100}
                       className="input mono"
-                      value={cpuWarn}
-                      onChange={(e) => setCpuWarn(Number(e.target.value) || 85)}
+                      value={diskWarnStr}
+                      onChange={(e) => setDiskWarnStr(e.target.value)}
                     />
                   </div>
                   <div className="field">
-                    <label className="field-label">内存使用预警阈值 (%)</label>
+                    <label className="field-label">1 小时内 SSH 失败登录告警次数 (≥1)</label>
                     <input
                       type="number"
+                      min={1}
+                      max={10000}
                       className="input mono"
-                      value={memWarn}
-                      onChange={(e) => setMemWarn(Number(e.target.value) || 85)}
-                    />
-                  </div>
-                </div>
-
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">根分区磁盘预警阈值 (%)</label>
-                    <input
-                      type="number"
-                      className="input mono"
-                      value={diskWarn}
-                      onChange={(e) => setDiskWarn(Number(e.target.value) || 85)}
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">1 小时内 SSH 失败登录告警次数</label>
-                    <input
-                      type="number"
-                      className="input mono"
-                      value={sshFailWarn}
-                      onChange={(e) => setSshFailWarn(Number(e.target.value) || 15)}
+                      value={sshFailWarnStr}
+                      onChange={(e) => setSshFailWarnStr(e.target.value)}
                     />
                   </div>
                 </div>
