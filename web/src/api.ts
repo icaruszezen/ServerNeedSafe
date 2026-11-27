@@ -27,6 +27,7 @@ import type {
   MCPTokenView,
   MirrorProbeResult,
   MonitorAlert,
+  MonitorAlertsListResponse,
   MonitorAlertRule,
   MonitorOverviewResponse,
   MonitorPolicyResponse,
@@ -792,18 +793,40 @@ export const api = {
       { webhook_url, reuse_ai_patrol_webhooks }
     ),
 
-  listMonitorAlerts: (status = '', server_id = '', limit = 300) => {
+  listMonitorAlerts: (
+    status = '',
+    server_id = '',
+    limit = 300,
+    extra?: { severity?: string; category?: string; search?: string }
+  ) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     if (status) qs.set('status', status);
     if (server_id) qs.set('server_id', server_id);
-    return requestJSON<{ alerts: MonitorAlert[] }>('GET', `/api/monitor/alerts?${qs.toString()}`);
+    if (extra?.severity && extra.severity !== 'all') qs.set('severity', extra.severity);
+    if (extra?.category && extra.category !== 'all') qs.set('category', extra.category);
+    if (extra?.search?.trim()) qs.set('search', extra.search.trim());
+    return requestJSON<MonitorAlertsListResponse>('GET', `/api/monitor/alerts?${qs.toString()}`);
   },
 
   ackMonitorAlert: (id: string) =>
     requestJSON<{ ok: boolean; alert: MonitorAlert }>('POST', '/api/monitor/alerts/ack', { id }),
 
-  clearResolvedMonitorAlerts: () =>
-    requestJSON<{ ok: boolean; removed: number }>('POST', '/api/monitor/alerts/clear-resolved', {}),
+  ackMonitorAlertsBulk: (payload: { ids?: string[]; server_id?: string }) =>
+    requestJSON<{ ok: boolean; acknowledged: number }>(
+      'POST',
+      '/api/monitor/alerts/ack-bulk',
+      payload
+    ),
+
+  resolveMonitorAlert: (id: string) =>
+    requestJSON<{ ok: boolean; alert: MonitorAlert }>('POST', '/api/monitor/alerts/resolve', {
+      id,
+    }),
+
+  clearResolvedMonitorAlerts: (server_id = '') =>
+    requestJSON<{ ok: boolean; removed: number }>('POST', '/api/monitor/alerts/clear-resolved', {
+      server_id,
+    }),
 
   getMonitorPolicy: () => requestJSON<MonitorPolicyResponse>('GET', '/api/monitor/policy'),
 

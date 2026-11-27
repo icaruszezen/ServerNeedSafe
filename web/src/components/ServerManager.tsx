@@ -38,10 +38,12 @@ interface ServerManagerProps {
   groups: string[];
   credentials: CredentialView[];
   activeServerIds: Set<string>;
+  activeAlertsByServer?: Record<string, number>;
   showHiddenFiles?: boolean;
   onRefresh: () => Promise<void>;
   onConnectTerminal: (server: ServerView, openSftp?: boolean) => void;
   onOpenMonitor?: (serverId: string) => void;
+  onOpenServerAlerts?: (serverId: string) => void;
   onNotify: (msg: string) => void;
 }
 
@@ -82,10 +84,12 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   groups,
   credentials,
   activeServerIds,
+  activeAlertsByServer,
   showHiddenFiles = true,
   onRefresh,
   onConnectTerminal,
   onOpenMonitor,
+  onOpenServerAlerts,
   onNotify,
 }) => {
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
@@ -426,6 +430,17 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                             <span className="tag-chip teal" style={{ padding: '1px 6px' }}>
                               会话在线
                             </span>
+                          )}
+                          {(activeAlertsByServer?.[srv.id] || 0) > 0 && (
+                            <button
+                              type="button"
+                              className="tag-chip danger tabular clickable-alert-chip"
+                              style={{ padding: '1px 6px' }}
+                              onClick={() => onOpenServerAlerts?.(srv.id)}
+                              title={`查看 ${srv.name} 的活跃告警与修复建议`}
+                            >
+                              <AlertTriangle size={10.5} /> {activeAlertsByServer?.[srv.id]} 告警
+                            </button>
                           )}
                         </div>
                         <div

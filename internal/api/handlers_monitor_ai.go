@@ -161,16 +161,71 @@ func (s *Server) handleListMonitorAlerts(w http.ResponseWriter, r *http.Request)
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
 	serverID := strings.TrimSpace(q.Get("server_id"))
+	severity := strings.TrimSpace(strings.ToLower(q.Get("severity")))
+	category := strings.TrimSpace(strings.ToLower(q.Get("category")))
+	search := strings.TrimSpace(strings.ToLower(q.Get("search")))
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 {
 		limit = 300
 	}
-	alerts, err := s.cfg.Store.ListMonitorAlerts(status, serverID, limit)
+
+	allAlerts, err := s.cfg.Store.ListMonitorAlerts("", "", 0)
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts})
+	summary := monitor.BuildAlertSummary(allAlerts, "")
+	var scopedSummary *monitor.AlertSummaryStats
+	if serverID != "" {
+		sc := monitor.BuildAlertSummary(allAlerts, serverID)
+		scopedSummary = &sc
+	}
+
+	filtered := make([]vault.MonitorAlert, 0, min(len(allAlerts), limit))
+	for _, al := range allAlerts {
+		if serverID != "" && al.ServerID != serverID {
+			continue
+		}
+		switch status {
+		case "active":
+			if al.Status == vault.AlertStatusResolved {
+				continue
+			}
+		case string(vault.AlertStatusFiring), string(vault.AlertStatusAcknowledged), string(vault.AlertStatusResolved):
+			if string(al.Status) != status {
+				continue
+			}
+		}
+		if severity != "" && severity != "all" && strings.ToLower(string(al.Severity)) != severity {
+			continue
+		}
+		if category != "" && category != "all" && monitor.RuleCategoryForKind(al.RuleKind) != category {
+			continue
+		}
+		if search != "" {
+			hay := strings.ToLower(al.Title + " " + al.Detail + " " + al.ServerName + " " + al.Host + " " + al.RuleName + " " + al.RuleKind + " " + al.MetricText)
+			if !strings.Contains(hay, search) {
+				continue
+			}
+		}
+		filtered = append(filtered, al)
+		if len(filtered) >= limit {
+			break
+		}
+	}
+
+	snapshots := s.cfg.Store.GetLatestMonitorSnapshotsMap()
+	runbooks, _ := s.cfg.Store.ListRunbooks()
+	enriched := monitor.EnrichAlerts(filtered, snapshots, runbooks)
+
+	payload := map[string]any{
+		"alerts":  enriched,
+		"summary": summary,
+	}
+	if scopedSummary != nil {
+		payload["scoped_summary"] = scopedSummary
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleAckMonitorAlert(w http.ResponseWriter, r *http.Request) {
@@ -192,8 +247,51 @@ func (s *Server) handleAckMonitorAlert(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAckMonitorAlertsBulk(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs      []string `json:"ids"`
+		ServerID string   `json:"server_id"`
+	}
+	if err := decodeJSON(r, &req, 128*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "批量确认告警参数格式错误")
+		return
+	}
+	acked, err := s.cfg.Store.AcknowledgeMonitorAlertsBulk(req.IDs, strings.TrimSpace(req.ServerID), extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"acknowledged": acked,
+	})
+}
+
+func (s *Server) handleResolveMonitorAlert(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := decodeJSON(r, &req, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "解决告警参数格式错误")
+		return
+	}
+	al, err := s.cfg.Store.ResolveMonitorAlert(strings.TrimSpace(req.ID), extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"alert": al,
+	})
+}
+
 func (s *Server) handleClearResolvedMonitorAlerts(w http.ResponseWriter, r *http.Request) {
-	removed, err := s.cfg.Store.ClearResolvedMonitorAlerts(extractClientIP(r))
+	var req struct {
+		ServerID string `json:"server_id"`
+	}
+	_ = decodeJSON(r, &req, 32*1024)
+	removed, err := s.cfg.Store.ClearResolvedMonitorAlertsForServer(strings.TrimSpace(req.ServerID), extractClientIP(r))
 	if err != nil {
 		writeDomainError(w, err)
 		return

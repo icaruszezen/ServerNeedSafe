@@ -59,11 +59,19 @@ import { ExternalAIMCPTab } from './ExternalAIMCPTab';
 
 export type CenterTab = 'diagnosis' | 'patrol' | 'mcp' | 'memory' | 'providers';
 
+export interface AIDiagnosisDraft {
+  serverId: string;
+  prompt: string;
+  nonce: number;
+}
+
 interface AIOpsCenterProps {
   servers: ServerView[];
   initialTab?: CenterTab;
   initialMemorySection?: MemorySubSection;
+  initialDraft?: AIDiagnosisDraft | null;
   onConsumeInitialTab?: () => void;
+  onConsumeInitialDraft?: () => void;
   onRefreshWorkspace: () => Promise<void>;
   onBadgeChange?: (unreadCount: number) => void;
   onNotify: (msg: string) => void;
@@ -107,7 +115,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   servers,
   initialTab,
   initialMemorySection,
+  initialDraft,
   onConsumeInitialTab,
+  onConsumeInitialDraft,
   onRefreshWorkspace,
   onBadgeChange,
   onNotify,
@@ -123,15 +133,19 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   // Active Chat Session State
   const [activeSessionId, setActiveSessionId] = useState<string>('');
   const [activeSession, setActiveSession] = useState<AIChatSession | null>(null);
-  const [selectedServerIds, setSelectedServerIds] = useState<string[]>([]);
+  const [selectedServerIds, setSelectedServerIds] = useState<string[]>(
+    initialDraft?.serverId ? [initialDraft.serverId] : []
+  );
   const [sessionMode, setSessionMode] = useState<AIExecutionMode>('standard');
-  const [promptInput, setPromptInput] = useState('');
+  const [promptInput, setPromptInput] = useState(initialDraft?.prompt || '');
   const [streaming, setStreaming] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState('');
   const [streamDelta, setStreamDelta] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const preferBlankDraftRef = useRef<boolean>(Boolean(initialDraft));
+  const consumedDraftNonceRef = useRef<number>(0);
 
   useEffect(() => {
     if (initialTab) {
@@ -142,6 +156,21 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       onConsumeInitialTab?.();
     }
   }, [initialTab, initialMemorySection, onConsumeInitialTab]);
+
+  useEffect(() => {
+    if (initialDraft && consumedDraftNonceRef.current !== initialDraft.nonce) {
+      consumedDraftNonceRef.current = initialDraft.nonce;
+      preferBlankDraftRef.current = true;
+      setSubTab('diagnosis');
+      setActiveSessionId('');
+      setActiveSession(null);
+      if (initialDraft.serverId) {
+        setSelectedServerIds([initialDraft.serverId]);
+      }
+      setPromptInput(initialDraft.prompt);
+      onConsumeInitialDraft?.();
+    }
+  }, [initialDraft, onConsumeInitialDraft]);
 
   useEffect(() => {
     return () => {
@@ -255,29 +284,36 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           (ov.patrol_status?.unread_alerts || 0) + pendingApprovalsCount + pendingExtApprovals
         );
 
-        const firstAvailableId =
-          ov.sessions && ov.sessions.length > 0 ? ov.sessions[0].id : '';
-        const targetId =
-          preferSessionId === null
-            ? firstAvailableId
-            : preferSessionId || activeSessionId || firstAvailableId;
-        if (targetId) {
-          setActiveSessionId(targetId);
-          const { session } = await api.getAISession(targetId);
-          setActiveSession(session);
-          setSelectedServerIds(
-            session.server_ids?.length
-              ? session.server_ids
-              : servers.length > 0
-              ? [servers[0].id]
-              : []
-          );
-          setSessionMode(session.mode || ov.default_mode || 'standard');
-        } else {
+        if (preferBlankDraftRef.current && !preferSessionId) {
+          preferBlankDraftRef.current = false;
           setActiveSessionId('');
           setActiveSession(null);
-          if (servers.length > 0 && selectedServerIds.length === 0) {
-            setSelectedServerIds([servers[0].id]);
+          setSessionMode(ov.default_mode || 'standard');
+        } else {
+          const firstAvailableId =
+            ov.sessions && ov.sessions.length > 0 ? ov.sessions[0].id : '';
+          const targetId =
+            preferSessionId === null
+              ? firstAvailableId
+              : preferSessionId || activeSessionId || firstAvailableId;
+          if (targetId) {
+            setActiveSessionId(targetId);
+            const { session } = await api.getAISession(targetId);
+            setActiveSession(session);
+            setSelectedServerIds(
+              session.server_ids?.length
+                ? session.server_ids
+                : servers.length > 0
+                ? [servers[0].id]
+                : []
+            );
+            setSessionMode(session.mode || ov.default_mode || 'standard');
+          } else {
+            setActiveSessionId('');
+            setActiveSession(null);
+            if (servers.length > 0 && selectedServerIds.length === 0) {
+              setSelectedServerIds([servers[0].id]);
+            }
           }
         }
       } catch (err: any) {

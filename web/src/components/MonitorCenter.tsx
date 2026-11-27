@@ -3,7 +3,6 @@ import {
   Activity,
   AlertTriangle,
   Bell,
-  CheckCircle2,
   Clock,
   Cpu,
   Download,
@@ -27,7 +26,6 @@ import {
 import { api, ApiError } from '../api';
 import type {
   HostKeyUntrustedInfo,
-  MonitorAlert,
   MonitorAlertRule,
   MonitorHealthLevel,
   MonitorOverviewResponse,
@@ -48,16 +46,20 @@ import {
   TimeSeriesChart,
 } from './MonitorCharts';
 
-type MonitorSubTab = 'overview' | 'detail' | 'alerts' | 'policy';
+export type MonitorSubTab = 'overview' | 'detail' | 'policy';
 type DetailSectionTab = 'metrics' | 'procs_ports' | 'services_security';
 
 interface MonitorCenterProps {
   servers: ServerView[];
   initialServerId?: string;
+  initialSubTab?: MonitorSubTab;
   onClearInitialServer?: () => void;
+  onClearInitialSubTab?: () => void;
   onConnectTerminal: (server: ServerView, openSftp?: boolean) => void;
   onNavigateServers: () => void;
+  onOpenServerAlerts: (serverId?: string) => void;
   onFiringCountChange?: (count: number) => void;
+  onActiveByServerChange?: (byServer: Record<string, number>) => void;
   onNotify: (msg: string) => void;
 }
 
@@ -133,13 +135,17 @@ function exposureScopeLabel(scope?: string, publicExposed?: boolean): { text: st
 export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   servers,
   initialServerId,
+  initialSubTab,
   onClearInitialServer,
+  onClearInitialSubTab,
   onConnectTerminal,
   onNavigateServers,
+  onOpenServerAlerts,
   onFiringCountChange,
+  onActiveByServerChange,
   onNotify,
 }) => {
-  const [subTab, setSubTab] = useState<MonitorSubTab>('overview');
+  const [subTab, setSubTab] = useState<MonitorSubTab>(initialSubTab || 'overview');
   const [detailTab, setDetailTab] = useState<DetailSectionTab>('metrics');
   const [viewMode, setViewMode] = useState<'grid' | 'table'>('grid');
 
@@ -158,12 +164,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   const [nodeDetail, setNodeDetail] = useState<ServerMonitorDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [runtime, setRuntime] = useState<MonitorRuntimeStatus | null>(null);
-
-  // Alerts tab state
-  const [alertsList, setAlertsList] = useState<MonitorAlert[]>([]);
-  const [alertStatusFilter, setAlertStatusFilter] = useState<string>('active');
-  const [alertServerFilter, setAlertServerFilter] = useState<string>('');
-  const [loadingAlerts, setLoadingAlerts] = useState(false);
 
   // Policy tab state
   const [policySettings, setPolicySettings] = useState<MonitorSettings | null>(null);
@@ -187,6 +187,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       if (onFiringCountChange) {
         onFiringCountChange(res.kpi.firing_alerts || 0);
       }
+      if (onActiveByServerChange) {
+        const bySrv: Record<string, number> = {};
+        for (const n of res.nodes || []) {
+          if (n.active_alerts > 0) bySrv[n.server.id] = n.active_alerts;
+        }
+        onActiveByServerChange(bySrv);
+      }
       if (!selectedServerId && res.nodes.length > 0) {
         setSelectedServerId(res.nodes[0].server.id);
       }
@@ -195,7 +202,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     } finally {
       setLoadingOverview(false);
     }
-  }, [onFiringCountChange, selectedServerId]);
+  }, [onActiveByServerChange, onFiringCountChange, selectedServerId]);
 
   const loadServerDetail = useCallback(
     async (srvId: string, range: string, silent = false) => {
@@ -214,22 +221,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     []
   );
 
-  const loadAlerts = useCallback(
-    async (statusF = alertStatusFilter, srvF = alertServerFilter) => {
-      setLoadingAlerts(true);
-      try {
-        const statusParam = statusF === 'all' ? '' : statusF;
-        const res = await api.listMonitorAlerts(statusParam, srvF, 400);
-        setAlertsList(res.alerts || []);
-      } catch {
-        // ignore
-      } finally {
-        setLoadingAlerts(false);
-      }
-    },
-    [alertServerFilter, alertStatusFilter]
-  );
-
   const loadPolicy = useCallback(async () => {
     try {
       const res = await api.getMonitorPolicy();
@@ -241,7 +232,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     }
   }, []);
 
-  // Handle deep-link jump from ServerManager
+  // Handle deep-link jump from ServerManager or AlertCenter
   useEffect(() => {
     if (initialServerId) {
       setSelectedServerId(initialServerId);
@@ -249,6 +240,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       if (onClearInitialServer) onClearInitialServer();
     }
   }, [initialServerId, onClearInitialServer]);
+
+  useEffect(() => {
+    if (initialSubTab) {
+      setSubTab(initialSubTab);
+      if (onClearInitialSubTab) onClearInitialSubTab();
+    }
+  }, [initialSubTab, onClearInitialSubTab]);
 
   // Initial & tab-driven loads
   useEffect(() => {
@@ -258,8 +256,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   useEffect(() => {
     if (subTab === 'detail' && selectedServerId) {
       void loadServerDetail(selectedServerId, historyRange);
-    } else if (subTab === 'alerts') {
-      void loadAlerts(alertStatusFilter, alertServerFilter);
     } else if (subTab === 'policy' && !policySettings) {
       void loadPolicy();
     }
@@ -267,10 +263,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     subTab,
     selectedServerId,
     historyRange,
-    alertStatusFilter,
-    alertServerFilter,
     loadServerDetail,
-    loadAlerts,
     loadPolicy,
     policySettings,
   ]);
@@ -281,8 +274,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       void loadOverview();
       if (subTab === 'detail' && selectedServerId) {
         void loadServerDetail(selectedServerId, historyRange, true);
-      } else if (subTab === 'alerts') {
-        void loadAlerts(alertStatusFilter, alertServerFilter);
       }
     }, 8000);
     return () => window.clearInterval(timer);
@@ -290,11 +281,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     subTab,
     selectedServerId,
     historyRange,
-    alertStatusFilter,
-    alertServerFilter,
     loadOverview,
     loadServerDetail,
-    loadAlerts,
   ]);
 
   const handleCollectAll = async () => {
@@ -306,8 +294,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       await loadOverview();
       if (subTab === 'detail' && selectedServerId) {
         await loadServerDetail(selectedServerId, historyRange, true);
-      } else if (subTab === 'alerts') {
-        await loadAlerts();
       }
       onNotify(`已完成 ${res.count} 台服务器全维状态采集并加密归档`);
     } catch (err: any) {
@@ -406,29 +392,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       onNotify(`Webhook 测试失败：${err?.message || '请检查地址与网络连通性'}`);
     } finally {
       setTestingWebhook(false);
-    }
-  };
-
-  const handleAckAlert = async (alertId: string) => {
-    try {
-      await api.ackMonitorAlert(alertId);
-      onNotify('已确认该条告警记录');
-      await Promise.all([loadAlerts(), loadOverview()]);
-      if (subTab === 'detail' && selectedServerId) {
-        await loadServerDetail(selectedServerId, historyRange, true);
-      }
-    } catch (err: any) {
-      onNotify(err?.message || '确认告警失败');
-    }
-  };
-
-  const handleClearResolvedAlerts = async () => {
-    try {
-      const res = await api.clearResolvedMonitorAlerts();
-      onNotify(`已清理 ${res.removed} 条已恢复告警记录`);
-      await Promise.all([loadAlerts(), loadOverview()]);
-    } catch (err: any) {
-      onNotify(err?.message || '清理告警记录失败');
     }
   };
 
@@ -631,18 +594,6 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
 
           <button
             type="button"
-            id="mon-tab-alerts"
-            className={`mon-subtab-btn ${subTab === 'alerts' ? 'active' : ''}`}
-            onClick={() => setSubTab('alerts')}
-          >
-            <Bell size={14} /> 告警与事件记录
-            {(kpi?.firing_alerts || 0) > 0 && (
-              <span className="mon-tab-count danger tabular">{kpi?.firing_alerts}</span>
-            )}
-          </button>
-
-          <button
-            type="button"
             id="mon-tab-policy"
             className={`mon-subtab-btn ${subTab === 'policy' ? 'active' : ''}`}
             onClick={() => setSubTab('policy')}
@@ -766,7 +717,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
 
                   <div
                     className={`mon-kpi-card clickable ${(kpi?.firing_alerts || 0) > 0 ? 'alerting' : ''}`}
-                    onClick={() => setSubTab('alerts')}
+                    onClick={() => onOpenServerAlerts()}
                   >
                     <div className="mon-kpi-top">
                       <span>未恢复活跃告警</span>
@@ -925,9 +876,18 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                     </span>
                                   )}
                                   {item.active_alerts > 0 && (
-                                    <span className="tag-chip danger tabular">
-                                      {item.active_alerts} 告警
-                                    </span>
+                                    <button
+                                      type="button"
+                                      id={`mon-card-alert-badge-${item.server.id}`}
+                                      className="tag-chip danger tabular clickable-alert-chip"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onOpenServerAlerts(item.server.id);
+                                      }}
+                                      title={`点击跳转到「告警信息」查看 ${item.server.name} 的告警列表与修复建议`}
+                                    >
+                                      <AlertTriangle size={10.5} /> {item.active_alerts} 告警
+                                    </button>
                                   )}
                                 </div>
                                 <div className="mon-node-sub mono">
@@ -1159,10 +1119,22 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                   </div>
                                 </td>
                                 <td>
-                                  <span className={`tag-chip ${healthBadgeClass(lvl)}`}>
-                                    {s?.reachable ? `${s.health_score}分 · ` : ''}
-                                    {healthLabel(lvl)}
-                                  </span>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                    <span className={`tag-chip ${healthBadgeClass(lvl)}`}>
+                                      {s?.reachable ? `${s.health_score}分 · ` : ''}
+                                      {healthLabel(lvl)}
+                                    </span>
+                                    {item.active_alerts > 0 && (
+                                      <button
+                                        type="button"
+                                        className="tag-chip danger tabular clickable-alert-chip"
+                                        onClick={() => onOpenServerAlerts(item.server.id)}
+                                        title={`点击查看 ${item.server.name} 的告警列表`}
+                                      >
+                                        <AlertTriangle size={10.5} /> {item.active_alerts} 告警
+                                      </button>
+                                    )}
+                                  </div>
                                 </td>
                                 <td className="tabular">
                                   {s?.reachable
@@ -1333,6 +1305,37 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <span className={`tag-chip ${healthBadgeClass(snap?.health_level)}`}>
                               {healthLabel(snap?.health_level)}
                             </span>
+                            {(() => {
+                              const activeCnt = (nodeDetail.alerts || []).filter(
+                                (a) => a.status !== 'resolved'
+                              ).length;
+                              if (activeCnt > 0) {
+                                return (
+                                  <button
+                                    type="button"
+                                    id="mon-detail-alert-badge"
+                                    className="tag-chip danger tabular clickable-alert-chip"
+                                    onClick={() => onOpenServerAlerts(nodeDetail.server.id)}
+                                    title="点击跳转到「告警信息」查看本机活跃告警与智能修复建议"
+                                  >
+                                    <AlertTriangle size={11} /> {activeCnt} 条活跃告警
+                                  </button>
+                                );
+                              }
+                              if ((nodeDetail.alerts || []).length > 0) {
+                                return (
+                                  <button
+                                    type="button"
+                                    className="tag-chip clickable-alert-chip"
+                                    onClick={() => onOpenServerAlerts(nodeDetail.server.id)}
+                                    title="查看本机历史告警记录"
+                                  >
+                                    <Bell size={11} /> 历史告警 ({nodeDetail.alerts.length})
+                                  </button>
+                                );
+                              }
+                              return null;
+                            })()}
                             {snap?.route_label &&
                               (snap.route_fallback || snap.route_label !== '直连') && (
                                 <span
@@ -2520,204 +2523,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
             )}
 
             {/* ================================================================
-                TAB 3: ALERTS & INCIDENT CENTER
-               ================================================================ */}
-            {subTab === 'alerts' && (
-              <div id="monitor-alerts-pane">
-                <div className="mon-toolbar" style={{ marginTop: 0 }}>
-                  <div className="group-pills">
-                    {[
-                      ['active', '未恢复活跃告警'],
-                      ['firing', '触发中 (Firing)'],
-                      ['acknowledged', '已确认 (Ack)'],
-                      ['resolved', '已自动恢复'],
-                      ['all', '全部历史记录'],
-                    ].map(([k, label]) => (
-                      <button
-                        key={k}
-                        type="button"
-                        className={`group-pill ${alertStatusFilter === k ? 'active' : ''}`}
-                        onClick={() => setAlertStatusFilter(k)}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      flexWrap: 'wrap',
-                      minWidth: 0,
-                      maxWidth: '100%',
-                    }}
-                  >
-                    <select
-                      className="select mon-alert-server-select"
-                      value={alertServerFilter}
-                      onChange={(e) => setAlertServerFilter(e.target.value)}
-                    >
-                      <option value="">全部服务器节点</option>
-                      {servers.map((srv) => (
-                        <option key={srv.id} value={srv.id}>
-                          {srv.name} ({srv.host})
-                        </option>
-                      ))}
-                    </select>
-
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      onClick={() => void handleClearResolvedAlerts()}
-                    >
-                      <Trash2 size={13} /> 清理已恢复记录
-                    </button>
-                  </div>
-                </div>
-
-                {loadingAlerts && alertsList.length === 0 ? (
-                  <div className="empty-state">正在读取加密告警事件日志...</div>
-                ) : alertsList.length === 0 ? (
-                  <div className="empty-state">
-                    <div className="empty-state-icon">
-                      <CheckCircle2 size={22} style={{ color: 'var(--status-online)' }} />
-                    </div>
-                    <h3>当前没有匹配的监控告警事件</h3>
-                    <p>所有纳管主机各项资源阈值、守护服务与安全基线均处于正常范围内。</p>
-                  </div>
-                ) : (
-                  <div className="mon-panel-card" style={{ padding: 0, overflow: 'hidden' }}>
-                    <div style={{ overflowX: 'auto' }}>
-                      <table className="data-table mon-alerts-table">
-                        <thead>
-                          <tr>
-                            <th>级别 / 状态</th>
-                            <th>关联节点</th>
-                            <th>告警规则与事件详情</th>
-                            <th>当前指标 / 阈值</th>
-                            <th>累计次数</th>
-                            <th>触发 / 恢复时间</th>
-                            <th style={{ textAlign: 'right' }}>处置</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {alertsList.map((al) => (
-                            <tr key={al.id}>
-                              <td data-label="级别 / 状态">
-                                <div className="mon-alert-badges">
-                                  <span
-                                    className={`tag-chip ${
-                                      al.severity === 'critical' ? 'danger' : 'amber'
-                                    }`}
-                                  >
-                                    {al.severity === 'critical' ? '严重 CRITICAL' : '警告 WARNING'}
-                                  </span>
-                                  <span
-                                    className={`tag-chip ${
-                                      al.status === 'resolved'
-                                        ? 'teal'
-                                        : al.status === 'acknowledged'
-                                        ? ''
-                                        : 'danger'
-                                    }`}
-                                  >
-                                    {al.status === 'firing'
-                                      ? '触发中'
-                                      : al.status === 'acknowledged'
-                                      ? '已知晓'
-                                      : '已自动恢复'}
-                                  </span>
-                                </div>
-                              </td>
-                              <td data-label="关联节点">
-                                <div style={{ minWidth: 0 }}>
-                                  <div
-                                    style={{
-                                      fontWeight: 600,
-                                      cursor: 'pointer',
-                                      color: 'var(--accent-teal)',
-                                      overflowWrap: 'anywhere',
-                                      wordBreak: 'break-word',
-                                    }}
-                                    onClick={() => handleOpenServerInspector(al.server_id)}
-                                  >
-                                    {al.server_name}
-                                  </div>
-                                  <div
-                                    className="mono mon-alert-host"
-                                    style={{ fontSize: 11.5, color: 'var(--text-muted)' }}
-                                  >
-                                    {al.host}
-                                  </div>
-                                </div>
-                              </td>
-                              <td data-label="告警详情" className="mon-alert-detail-cell">
-                                <div style={{ fontWeight: 600, marginBottom: 2 }}>{al.title}</div>
-                                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                  [{al.rule_name}] {al.detail}
-                                </div>
-                              </td>
-                              <td data-label="当前指标 / 阈值" className="mono" style={{ fontSize: 12 }}>
-                                <div>
-                                  <div>
-                                    实测: <strong>{al.metric_text}</strong>
-                                  </div>
-                                  {al.threshold_text && (
-                                    <div style={{ color: 'var(--text-muted)' }}>
-                                      条件: {al.threshold_text}
-                                    </div>
-                                  )}
-                                </div>
-                              </td>
-                              <td data-label="累计次数" className="tabular">{al.occurrences} 次</td>
-                              <td data-label="触发 / 恢复时间" className="mono" style={{ fontSize: 11.5 }}>
-                                <div>
-                                  <div>触发: {formatDateTime(al.triggered_at)}</div>
-                                  {al.resolved_at ? (
-                                    <div style={{ color: 'var(--status-online)' }}>
-                                      恢复: {formatDateTime(al.resolved_at)}
-                                    </div>
-                                  ) : (
-                                    <div style={{ color: 'var(--text-muted)' }}>
-                                      持续: {formatDateTime(al.last_seen_at)}
-                                    </div>
-                                  )}
-                                </div>
-                              </td>
-                              <td data-label="处置" className="mon-alert-actions-cell" style={{ textAlign: 'right' }}>
-                                <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
-                                  {al.status === 'firing' && (
-                                    <button
-                                      type="button"
-                                      className="btn btn-sm"
-                                      onClick={() => void handleAckAlert(al.id)}
-                                    >
-                                      确认知晓
-                                    </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    className="btn btn-sm"
-                                    onClick={() => handleOpenServerInspector(al.server_id)}
-                                  >
-                                    透视
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* ================================================================
-                TAB 4: SCHEDULE & MULTI-DIMENSIONAL ALERT POLICY EDITOR
+                TAB 3: SCHEDULE & MULTI-DIMENSIONAL ALERT POLICY EDITOR
                ================================================================ */}
             {subTab === 'policy' && policySettings && (
               <form id="monitor-policy-pane" onSubmit={handleSavePolicy}>

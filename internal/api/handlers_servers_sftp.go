@@ -25,8 +25,14 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 	snippets, _ := s.cfg.Store.ListSnippets()
 
 	firingAlerts := 0
+	activeAlertsByServer := make(map[string]int)
 	if monOv, mErr := s.cfg.Store.GetMonitorOverview(); mErr == nil && monOv != nil {
 		firingAlerts = monOv.KPI.FiringAlerts
+		for _, node := range monOv.Nodes {
+			if node.ActiveAlerts > 0 {
+				activeAlertsByServer[node.Server.ID] = node.ActiveAlerts
+			}
+		}
 	}
 	_, patrolUnread, _ := s.cfg.Store.ListPatrolRecords(1, false)
 	pendingExtPatrols, pendingExtApprovals := s.cfg.Store.CountExternalPending()
@@ -38,6 +44,7 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 		"snippets":                   snippets,
 		"active_sessions":            s.cfg.SSH.ListActiveSessions(),
 		"firing_alerts":              firingAlerts,
+		"active_alerts_by_server":    activeAlertsByServer,
 		"patrol_unread":              patrolUnread + pendingExtApprovals,
 		"pending_external_patrols":   pendingExtPatrols,
 		"pending_external_approvals": pendingExtApprovals,
