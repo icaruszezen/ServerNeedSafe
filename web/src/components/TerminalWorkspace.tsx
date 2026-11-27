@@ -47,6 +47,12 @@ export interface PendingTerminalCommand {
   nonce: number;
 }
 
+export interface PendingCopilotTarget {
+  serverId: string;
+  sessionId?: string;
+  nonce: number;
+}
+
 interface TerminalWorkspaceProps {
   tabs: OpenTerminalTab[];
   activeTabId: string;
@@ -56,6 +62,8 @@ interface TerminalWorkspaceProps {
   settings?: AppSettings;
   defaultOpenSftp?: boolean;
   onConsumeDefaultSftp?: () => void;
+  copilotTarget?: PendingCopilotTarget | null;
+  onConsumeCopilotTarget?: () => void;
   pendingCommand?: PendingTerminalCommand | null;
   onConsumePendingCommand?: () => void;
   onSelectTab: (tabId: string) => void;
@@ -64,6 +72,7 @@ interface TerminalWorkspaceProps {
   onNavigateServers: () => void;
   onNavigateAICenter?: (tab?: CenterTab, memorySection?: MemorySubSection) => void;
   onRefreshWorkspace?: () => Promise<void>;
+  onApprovalMutated?: () => void;
   onNotify: (msg: string) => void;
 }
 
@@ -446,6 +455,8 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   settings,
   defaultOpenSftp,
   onConsumeDefaultSftp,
+  copilotTarget,
+  onConsumeCopilotTarget,
   pendingCommand,
   onConsumePendingCommand,
   onSelectTab,
@@ -454,10 +465,16 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   onNavigateServers,
   onNavigateAICenter,
   onRefreshWorkspace,
+  onApprovalMutated,
   onNotify,
 }) => {
   const handlesRef = useRef<Record<string, SinglePaneHandle | null>>({});
   const consumedCommandNonceRef = useRef<number>(0);
+  const [copilotSessionTarget, setCopilotSessionTarget] = useState<{
+    serverId: string;
+    sessionId: string;
+    nonce: number;
+  } | null>(null);
   const [tabMeta, setTabMeta] = useState<
     Record<
       string,
@@ -665,6 +682,18 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
       onConsumeDefaultSftp?.();
     }
   }, [defaultOpenSftp, onConsumeDefaultSftp]);
+
+  useEffect(() => {
+    if (copilotTarget) {
+      setSideDrawer('ai');
+      setCopilotSessionTarget({
+        serverId: copilotTarget.serverId,
+        sessionId: copilotTarget.sessionId || '',
+        nonce: copilotTarget.nonce,
+      });
+      onConsumeCopilotTarget?.();
+    }
+  }, [copilotTarget, onConsumeCopilotTarget]);
 
   useEffect(() => {
     clearModifierLatches();
@@ -1135,6 +1164,16 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
               <TerminalCopilotPanel
                 serverId={activeTab.server.id}
                 serverName={activeTab.server.name}
+                preferredSessionId={
+                  copilotSessionTarget && copilotSessionTarget.serverId === activeTab.server.id
+                    ? copilotSessionTarget.sessionId
+                    : undefined
+                }
+                preferredSessionNonce={
+                  copilotSessionTarget && copilotSessionTarget.serverId === activeTab.server.id
+                    ? copilotSessionTarget.nonce
+                    : undefined
+                }
                 getTerminalContext={() =>
                   handlesRef.current[activeTab.tabId]?.getRecentOutput() || ''
                 }
@@ -1148,6 +1187,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
                   onNavigateAICenter?.('memory', 'agents_md');
                 }}
                 onRefreshWorkspace={onRefreshWorkspace}
+                onApprovalMutated={onApprovalMutated}
                 onNotify={onNotify}
                 onClose={() => setSideDrawer('none')}
               />

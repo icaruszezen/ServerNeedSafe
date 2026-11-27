@@ -1634,3 +1634,268 @@ func TestMCPBatchChangePlanSequentialExecutionAndWait(t *testing.T) {
 		t.Fatalf("expected restart recovery partial_failed (succeeded/failed/cancelled), got status=%s steps=%+v", recOrphan.Status, recOrphan.Steps)
 	}
 }
+
+func TestUnifiedExecutionApprovalCenterAPIAndBootstrapDecoupling(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := vault.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	srv := NewServer(Config{DeployMode: "server", Store: store})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Setup vault & obtain admin token
+	setupBody, _ := json.Marshal(map[string]string{"password": "ApprovalCenterAdmin!2026"})
+	res, err := http.Post(ts.URL+"/api/auth/setup", "application/json", bytes.NewReader(setupBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("setup failed: %v %v", err, res)
+	}
+	var setupResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&setupResp)
+	res.Body.Close()
+	adminToken := setupResp.Token
+
+	// Unauthenticated request to /api/ai/approvals MUST be rejected with 401
+	unauthResp, err := http.Get(ts.URL + "/api/ai/approvals")
+	if err != nil {
+		t.Fatalf("unauth GET /api/ai/approvals: %v", err)
+	}
+	unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /api/ai/approvals, got %d", unauthResp.StatusCode)
+	}
+
+	adminGet := func(path string) (*http.Response, []byte) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, b
+	}
+
+	// Seed 1 unread patrol record
+	now := time.Now().UTC()
+	if err := store.AppendPatrolRecord(vault.PatrolRecord{
+		ID:           "patrol-unread-01",
+		StartedAt:    now,
+		CompletedAt:  now,
+		Trigger:      "scheduled",
+		TotalServers: 1,
+		WarningCount: 1,
+		Status:       "warning",
+		Unread:       true,
+	}); err != nil {
+		t.Fatalf("AppendPatrolRecord: %v", err)
+	}
+
+	// Seed 1 pending MCP external approval + 1 completed MCP external approval
+	if _, err := store.CreateExternalApproval(vault.ExternalApproval{
+		ID:         "ext-ap-pending",
+		Title:      "重启 Nginx 服务",
+		ClientName: "Claude Code",
+		TokenName:  "MacBook",
+		Reason:     "应用新配置",
+		Status:     "pending",
+		Steps: []vault.ExternalApprovalStep{
+			{
+				ID:          "st-1",
+				Index:       1,
+				ToolName:    "exec_ssh_command",
+				ServerIDs:   []string{"srv-1"},
+				ServerNames: []string{"prod-web-01"},
+				Command:     "systemctl reload nginx",
+				Selected:    true,
+				Status:      "pending",
+			},
+		},
+		CreatedAt: now,
+	}, "127.0.0.1"); err != nil {
+		t.Fatalf("CreateExternalApproval pending: %v", err)
+	}
+	doneAt := now.Add(-10 * time.Minute)
+	doneAp, err := store.CreateExternalApproval(vault.ExternalApproval{
+		ID:         "ext-ap-done",
+		Title:      "清理旧日志",
+		ClientName: "Codex",
+		TokenName:  "CI",
+		Reason:     "释放磁盘空间",
+		Status:     "completed",
+		Steps: []vault.ExternalApprovalStep{
+			{
+				ID:          "st-done-1",
+				Index:       1,
+				ToolName:    "exec_ssh_command",
+				ServerIDs:   []string{"srv-1"},
+				ServerNames: []string{"prod-web-01"},
+				Command:     "journalctl --vacuum-time=7d",
+				Selected:    true,
+				Status:      "succeeded",
+			},
+		},
+		CreatedAt:  doneAt,
+		ResolvedAt: &doneAt,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateExternalApproval done: %v", err)
+	}
+	doneAp.Status = "completed"
+	doneAp.Steps[0].Status = "succeeded"
+	doneAp.ResolvedAt = &doneAt
+	if err := store.UpdateExternalApproval(*doneAp); err != nil {
+		t.Fatalf("UpdateExternalApproval done: %v", err)
+	}
+
+	// Seed built-in AI sessions (center + terminal) with pending and historical approvals
+	centerSess, err := store.CreateAISession("线上高负载排障", "center", []string{"srv-1"}, vault.AIModeStandard)
+	if err != nil {
+		t.Fatalf("CreateAISession center: %v", err)
+	}
+	centerSess.PendingApprovals = []vault.AIPendingApproval{
+		{
+			ID:          "sess-ap-center-pending",
+			SessionID:   centerSess.ID,
+			ToolCallID:  "tc-1",
+			ToolName:    "exec_ssh_command",
+			ServerIDs:   []string{"srv-1"},
+			ServerNames: []string{"prod-web-01"},
+			RiskLevel:   "high",
+			Reason:      "重启异常 worker 进程",
+			Command:     "systemctl restart worker",
+			Status:      "pending",
+			CreatedAt:   now.Add(-2 * time.Minute),
+		},
+		{
+			ID:          "sess-ap-center-approved",
+			SessionID:   centerSess.ID,
+			ToolCallID:  "tc-2",
+			ToolName:    "sftp_write_file",
+			ServerIDs:   []string{"srv-1"},
+			ServerNames: []string{"prod-web-01"},
+			RiskLevel:   "medium",
+			Reason:      "调整连接超时",
+			FilePath:    "/etc/nginx/nginx.conf",
+			Status:      "approved",
+			CreatedAt:   now.Add(-20 * time.Minute),
+			ResolvedAt:  &doneAt,
+		},
+	}
+	if err := store.SaveAISession(*centerSess); err != nil {
+		t.Fatalf("SaveAISession center: %v", err)
+	}
+
+	termSess, err := store.CreateAISession("终端副驾驶 · prod-web-01", "terminal", []string{"srv-1"}, vault.AIModeStandard)
+	if err != nil {
+		t.Fatalf("CreateAISession terminal: %v", err)
+	}
+	termSess.PendingApprovals = []vault.AIPendingApproval{
+		{
+			ID:          "sess-ap-term-pending",
+			SessionID:   termSess.ID,
+			ToolCallID:  "tc-3",
+			ToolName:    "exec_ssh_command",
+			ServerIDs:   []string{"srv-1"},
+			ServerNames: []string{"prod-web-01"},
+			RiskLevel:   "high",
+			Reason:      "重载防火墙规则",
+			Command:     "ufw reload",
+			Status:      "pending",
+			CreatedAt:   now.Add(-1 * time.Minute),
+		},
+	}
+	if err := store.SaveAISession(*termSess); err != nil {
+		t.Fatalf("SaveAISession terminal: %v", err)
+	}
+
+	// 1. Verify /api/workspace/bootstrap decouples patrol_unread from pending approvals
+	bootResp, bootBytes := adminGet("/api/workspace/bootstrap")
+	if bootResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/workspace/bootstrap failed: %d %s", bootResp.StatusCode, string(bootBytes))
+	}
+	var boot struct {
+		PatrolUnread             int `json:"patrol_unread"`
+		PendingExternalApprovals int `json:"pending_external_approvals"`
+		RunningExternalApprovals int `json:"running_external_approvals"`
+		PendingSessionApprovals  int `json:"pending_session_approvals"`
+		PendingApprovalsTotal    int `json:"pending_approvals_total"`
+	}
+	if err := json.Unmarshal(bootBytes, &boot); err != nil {
+		t.Fatalf("unmarshal bootstrap: %v", err)
+	}
+	if boot.PatrolUnread != 1 {
+		t.Fatalf("expected patrol_unread=1 (decoupled from approvals), got %d", boot.PatrolUnread)
+	}
+	if boot.PendingExternalApprovals != 1 || boot.RunningExternalApprovals != 0 ||
+		boot.PendingSessionApprovals != 2 || boot.PendingApprovalsTotal != 3 {
+		t.Fatalf("unexpected bootstrap approval counts: %+v", boot)
+	}
+
+	// 2. Verify GET /api/ai/approvals returns unified MCP + built-in session approvals (pending & history)
+	apResp, apBytes := adminGet("/api/ai/approvals?limit=50")
+	if apResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/ai/approvals failed: %d %s", apResp.StatusCode, string(apBytes))
+	}
+	var unified struct {
+		ExternalApprovals    []vault.ExternalApproval    `json:"external_approvals"`
+		SessionApprovals     []vault.SessionApprovalItem `json:"session_approvals"`
+		PendingExternalCount int                         `json:"pending_external_count"`
+		RunningExternalCount int                         `json:"running_external_count"`
+		PendingSessionCount  int                         `json:"pending_session_count"`
+		PendingTotal         int                         `json:"pending_total"`
+	}
+	if err := json.Unmarshal(apBytes, &unified); err != nil {
+		t.Fatalf("unmarshal unified approvals: %v", err)
+	}
+	if len(unified.ExternalApprovals) != 2 || len(unified.SessionApprovals) != 3 {
+		t.Fatalf("expected 2 external and 3 session approvals, got ext=%d sess=%d",
+			len(unified.ExternalApprovals), len(unified.SessionApprovals))
+	}
+	if unified.PendingExternalCount != 1 || unified.PendingSessionCount != 2 || unified.PendingTotal != 3 {
+		t.Fatalf("unexpected unified pending counts: %+v", unified)
+	}
+	// Pending session approvals MUST sort before historical resolved ones, newest first
+	if unified.SessionApprovals[0].ID != "sess-ap-term-pending" ||
+		unified.SessionApprovals[0].SessionScope != "terminal" ||
+		unified.SessionApprovals[1].ID != "sess-ap-center-pending" ||
+		unified.SessionApprovals[1].SessionScope != "center" ||
+		unified.SessionApprovals[2].ID != "sess-ap-center-approved" {
+		t.Fatalf("unexpected session approvals ordering/metadata: %+v", unified.SessionApprovals)
+	}
+
+	// 3. Verify GET /api/ai/approvals?summary_only=1 returns lightweight counts only
+	sumResp, sumBytes := adminGet("/api/ai/approvals?summary_only=1")
+	if sumResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/ai/approvals?summary_only=1 failed: %d %s", sumResp.StatusCode, string(sumBytes))
+	}
+	var sumRaw map[string]any
+	if err := json.Unmarshal(sumBytes, &sumRaw); err != nil {
+		t.Fatalf("unmarshal summary_only: %v", err)
+	}
+	if _, hasFullExt := sumRaw["external_approvals"]; hasFullExt {
+		t.Fatalf("summary_only response should not include external_approvals array")
+	}
+	if int(sumRaw["pending_total"].(float64)) != 3 || int(sumRaw["patrol_unread"].(float64)) != 1 {
+		t.Fatalf("unexpected summary_only counts: %v", sumRaw)
+	}
+
+	// 4. Verify SKILL.md guidance points to standalone 「执行审批」
+	ovResp, ovBytes := adminGet("/api/ai/mcp/overview")
+	if ovResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/ai/mcp/overview failed: %d", ovResp.StatusCode)
+	}
+	var mcpOv struct {
+		SkillMarkdown string `json:"skill_markdown"`
+	}
+	_ = json.Unmarshal(ovBytes, &mcpOv)
+	if !strings.Contains(mcpOv.SkillMarkdown, "左侧「执行审批」") {
+		t.Fatalf("expected SKILL.md to point to 左侧「执行审批」, got:\n%s", mcpOv.SkillMarkdown)
+	}
+}

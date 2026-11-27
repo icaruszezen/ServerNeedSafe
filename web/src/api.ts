@@ -19,6 +19,7 @@ import type {
   AIStreamEvent,
   AITokenUsage,
   AppSettings,
+  ApprovalSummaryResponse,
   AuthStatusResponse,
   BatchExecResult,
   CompactionInfo,
@@ -54,6 +55,7 @@ import type {
   Snippet,
   SyncSummary,
   TerminalReadyInfo,
+  UnifiedApprovalsResponse,
   UpdateOverviewResponse,
   UpdateSettings,
   VaultSecurityOverview,
@@ -1201,6 +1203,12 @@ export const api = {
       'DELETE',
       `/api/ai/mcp/tokens/${encodeURIComponent(id)}`
     ),
+
+  listUnifiedApprovals: (limit = 120) =>
+    requestJSON<UnifiedApprovalsResponse>('GET', `/api/ai/approvals?limit=${limit}`),
+
+  getApprovalSummary: () =>
+    requestJSON<ApprovalSummaryResponse>('GET', '/api/ai/approvals?summary_only=1'),
 
   listExternalApprovals: (status = 'all', limit = 60) =>
     requestJSON<{ approvals: ExternalApproval[]; pending_count: number; running_count?: number }>(

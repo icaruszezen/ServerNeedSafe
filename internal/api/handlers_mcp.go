@@ -91,6 +91,7 @@ func (s *Server) handleGetMCPOverview(w http.ResponseWriter, r *http.Request) {
 		"mcp_runtime":              runtime,
 		"external_approvals":       approvals,
 		"pending_approvals_count":  pendingAp,
+		"running_approvals_count":  countRunningExternalApprovals(approvals),
 		"pending_patrols_count":    pendingPatrols,
 		"skill_markdown":           mcp.StandardPatrolSkillMarkdown(runtime.EffectiveEndpointURL),
 	})
@@ -180,6 +181,52 @@ func countRunningExternalApprovals(approvals []vault.ExternalApproval) int {
 		}
 	}
 	return n
+}
+
+func (s *Server) handleListUnifiedApprovals(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	summaryOnly := strings.EqualFold(strings.TrimSpace(q.Get("summary_only")), "1") ||
+		strings.EqualFold(strings.TrimSpace(q.Get("summary_only")), "true")
+	if summaryOnly {
+		if !s.cfg.Store.IsReady() {
+			writeDomainError(w, vault.ErrVaultLocked)
+			return
+		}
+		pendingExt, runningExt, pendingSess := s.cfg.Store.CountApprovalSummary()
+		_, patrolUnread, _ := s.cfg.Store.ListPatrolRecords(1, false)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"pending_external_count": pendingExt,
+			"running_external_count": runningExt,
+			"pending_session_count":  pendingSess,
+			"pending_total":          pendingExt + pendingSess,
+			"patrol_unread":          patrolUnread,
+		})
+		return
+	}
+
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 200 {
+		limit = 80
+	}
+	extApprovals, pendingExt, err := s.cfg.Store.ListExternalApprovals("all", limit)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	sessApprovals, pendingSess, err := s.cfg.Store.ListSessionApprovals(limit)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	runningExt := countRunningExternalApprovals(extApprovals)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"external_approvals":     extApprovals,
+		"session_approvals":      sessApprovals,
+		"pending_external_count": pendingExt,
+		"running_external_count": runningExt,
+		"pending_session_count":  pendingSess,
+		"pending_total":          pendingExt + pendingSess,
+	})
 }
 
 func (s *Server) handleListExternalApprovals(w http.ResponseWriter, r *http.Request) {

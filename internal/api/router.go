@@ -312,6 +312,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/ai/mcp/tokens", s.requireAuth(s.handleCreateMCPToken))
 	s.mux.HandleFunc("PUT /api/ai/mcp/tokens/{id}", s.requireAuth(s.handleUpdateMCPToken))
 	s.mux.HandleFunc("DELETE /api/ai/mcp/tokens/{id}", s.requireAuth(s.handleDeleteMCPToken))
+	s.mux.HandleFunc("GET /api/ai/approvals", s.requireAuth(s.handleListUnifiedApprovals))
 	s.mux.HandleFunc("GET /api/ai/external-approvals", s.requireAuth(s.handleListExternalApprovals))
 	s.mux.HandleFunc("POST /api/ai/external-approvals/{id}/resolve", s.requireAuth(s.handleResolveExternalApproval))
 	s.mux.HandleFunc("POST /api/ai/external-approvals/{id}/cancel", s.requireAuth(s.handleCancelExternalApproval))

@@ -778,3 +778,31 @@ func (s *Store) CountExternalPending() (pendingPatrols int, pendingApprovals int
 	}
 	return pendingPatrols, pendingApprovals
 }
+
+// CountApprovalSummary returns pending/running counts for external MCP change plans and built-in AI session approvals.
+func (s *Store) CountApprovalSummary() (pendingExternal int, runningExternal int, pendingSession int) {
+	if !s.IsReady() {
+		return 0, 0, 0
+	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return 0, 0, 0
+	}
+	for _, ap := range s.aiopsRT.ExternalApprovals {
+		switch ap.Status {
+		case "pending":
+			pendingExternal++
+		case "running":
+			runningExternal++
+		}
+	}
+	for _, cs := range s.aiopsRT.AISessions {
+		for _, ap := range cs.PendingApprovals {
+			if ap.Status == "pending" {
+				pendingSession++
+			}
+		}
+	}
+	return pendingExternal, runningExternal, pendingSession
+}

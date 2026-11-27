@@ -800,6 +800,69 @@ func (s *Store) ListAISessions(scope string) ([]AIChatSessionSummary, error) {
 	return out, nil
 }
 
+// ListSessionApprovals flattens HITL approvals across all built-in AI sessions (center & terminal),
+// ordering pending approvals first and newest entries first.
+func (s *Store) ListSessionApprovals(limit int) ([]SessionApprovalItem, int, error) {
+	if !s.IsReady() {
+		return nil, 0, ErrVaultLocked
+	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil {
+		return []SessionApprovalItem{}, 0, nil
+	}
+	items := make([]SessionApprovalItem, 0, 16)
+	pendingCount := 0
+	for _, cs := range s.aiopsRT.AISessions {
+		scope := cs.Scope
+		if scope != "terminal" {
+			scope = "center"
+		}
+		for _, ap := range cs.PendingApprovals {
+			ac := ap
+			ac.ServerIDs = slices.Clone(ap.ServerIDs)
+			ac.ServerNames = slices.Clone(ap.ServerNames)
+			if ap.ResolvedAt != nil {
+				t := *ap.ResolvedAt
+				ac.ResolvedAt = &t
+			}
+			if ac.SessionID == "" {
+				ac.SessionID = cs.ID
+			}
+			if ac.Status == "pending" {
+				pendingCount++
+			}
+			items = append(items, SessionApprovalItem{
+				AIPendingApproval: ac,
+				SessionTitle:      cs.Title,
+				SessionScope:      scope,
+				SessionServerIDs:  slices.Clone(cs.ServerIDs),
+			})
+		}
+	}
+	slices.SortStableFunc(items, func(a, b SessionApprovalItem) int {
+		aPending := a.Status == "pending"
+		bPending := b.Status == "pending"
+		if aPending != bPending {
+			if aPending {
+				return -1
+			}
+			return 1
+		}
+		if a.CreatedAt.After(b.CreatedAt) {
+			return -1
+		}
+		if b.CreatedAt.After(a.CreatedAt) {
+			return 1
+		}
+		return 0
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, pendingCount, nil
+}
+
 func (s *Store) GetAISession(id string) (*AIChatSession, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked

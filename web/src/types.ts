@@ -284,6 +284,11 @@ export interface WorkspaceBootstrapResponse {
   firing_alerts: number;
   active_alerts_by_server?: Record<string, number>;
   patrol_unread: number;
+  pending_external_patrols?: number;
+  pending_external_approvals?: number;
+  running_external_approvals?: number;
+  pending_session_approvals?: number;
+  pending_approvals_total?: number;
 }
 
 export interface TerminalReadyInfo {
@@ -1110,8 +1115,32 @@ export interface MCPOverviewResponse {
   mcp_runtime: MCPRuntimeStatus;
   external_approvals: ExternalApproval[];
   pending_approvals_count: number;
+  running_approvals_count?: number;
   pending_patrols_count: number;
   skill_markdown: string;
+}
+
+export interface SessionApprovalItem extends AIPendingApproval {
+  session_title: string;
+  session_scope: 'center' | 'terminal' | string;
+  session_server_ids?: string[];
+}
+
+export interface UnifiedApprovalsResponse {
+  external_approvals: ExternalApproval[];
+  session_approvals: SessionApprovalItem[];
+  pending_external_count: number;
+  running_external_count: number;
+  pending_session_count: number;
+  pending_total: number;
+}
+
+export interface ApprovalSummaryResponse {
+  pending_external_count: number;
+  running_external_count: number;
+  pending_session_count: number;
+  pending_total: number;
+  patrol_unread: number;
 }
 
 export interface AgentsMDConfig {

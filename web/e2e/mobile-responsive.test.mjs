@@ -1542,13 +1542,14 @@ async function runSuite() {
     await page.keyboard.press('Escape');
     await page.waitForSelector('.term-dropdown-newtab', { state: 'hidden' });
 
-    // Sweep all 8 sections across all 8 viewports (including tablet-820 & landscape-844x390!) in BOTH dark and light themes!
+    // Sweep all 9 sections across all 8 viewports (including tablet-820 & landscape-844x390!) in BOTH dark and light themes!
     const sectionBtns = [
       ['servers', '#nav-servers-btn'],
       ['monitor', '#nav-monitor-btn'],
       ['alerts', '#nav-alerts-btn'],
       ['terminals', '#nav-terminals-btn'],
       ['ai', '#nav-ai-btn'],
+      ['approvals', '#nav-approvals-btn'],
       ['keychain', '#nav-keychain-btn'],
       ['snippets', '#nav-snippets-btn'],
       ['vault', '#nav-vault-btn'],

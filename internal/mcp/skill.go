@@ -48,6 +48,6 @@ description: 使用 ServerNeedSafe MCP 网关接管多服务器安全巡检、�
 - **受控修复变更计划**：若令牌具备 `+"`ops_propose`"+` 权限且确实需要清理日志、修改配置文件或重载服务：
   1. 严禁直接尝试在 `+"`exec_readonly_ssh`"+` 中执行变更命令。
   2. 调用 `+"`propose_change_plan`"+` 一次性提交完整的有序步骤列表 `+"`steps`"+`（单步操作传 1 步，多步可在同一列表内混合编排 `+"`sftp_write_file`"+` 配置文件修改与 `+"`exec_ssh_command`"+` 语法校验/服务重载，并按需为非关键步骤设置 `+"`continue_on_error: true`"+`，默认遇错即停）。系统会自动生成链式 Unified Diff 并推送聚合审批通知至 ServerNeedSafe Web 端队列。
-  3. 管理员在控制台「AI 智能运维 → 外部 AI 接管 (MCP)」审阅整份列表后，可直接一键批准并按你给定的顺序依次执行；随后调用 `+"`wait_for_approval(approval_id)`"+` 或 `+"`get_approval_status(approval_id)`"+` 获取每步执行回显并做二次健康核验。
+  3. 管理员在控制台左侧「执行审批」审阅整份列表后，可直接一键批准并按你给定的顺序依次执行；随后调用 `+"`wait_for_approval(approval_id)`"+` 或 `+"`get_approval_status(approval_id)`"+` 获取每步执行回显并做二次健康核验。
 `, endpointURL)
 }

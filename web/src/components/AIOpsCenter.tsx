@@ -66,9 +66,15 @@ interface AIOpsCenterProps {
   servers: ServerView[];
   initialTab?: CenterTab;
   initialMemorySection?: MemorySubSection;
+  initialSessionId?: string;
   initialDraft?: AIDiagnosisDraft | null;
+  pendingApprovalsCount?: number;
+  runningApprovalsCount?: number;
   onConsumeInitialTab?: () => void;
+  onConsumeInitialSessionId?: () => void;
   onConsumeInitialDraft?: () => void;
+  onOpenApprovals?: () => void;
+  onApprovalsMutated?: () => void;
   onRefreshWorkspace: () => Promise<void>;
   onBadgeChange?: (unreadCount: number) => void;
   onNotify: (msg: string) => void;
@@ -112,9 +118,15 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   servers,
   initialTab,
   initialMemorySection,
+  initialSessionId,
   initialDraft,
+  pendingApprovalsCount,
+  runningApprovalsCount,
   onConsumeInitialTab,
+  onConsumeInitialSessionId,
   onConsumeInitialDraft,
+  onOpenApprovals,
+  onApprovalsMutated,
   onRefreshWorkspace,
   onBadgeChange,
   onNotify,
@@ -144,6 +156,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const streamAbortRef = useRef<AbortController | null>(null);
   const preferBlankDraftRef = useRef<boolean>(Boolean(initialDraft));
   const consumedDraftNonceRef = useRef<number>(0);
+  const pendingInitialSessionIdRef = useRef<string>(initialSessionId || '');
 
   useEffect(() => {
     if (initialTab) {
@@ -154,6 +167,42 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       onConsumeInitialTab?.();
     }
   }, [initialTab, initialMemorySection, onConsumeInitialTab]);
+
+  useEffect(() => {
+    if (!initialSessionId) return;
+    pendingInitialSessionIdRef.current = initialSessionId;
+    preferBlankDraftRef.current = false;
+    setSubTab('diagnosis');
+    setActiveSessionId(initialSessionId);
+    let cancelled = false;
+    void api
+      .getAISession(initialSessionId)
+      .then(({ session }) => {
+        if (cancelled) return;
+        setActiveSession(session);
+        setSelectedServerIds(
+          session.server_ids?.length
+            ? session.server_ids
+            : servers.length > 0
+            ? [servers[0].id]
+            : []
+        );
+        setSessionMode(session.mode || 'standard');
+      })
+      .catch((err: any) => {
+        if (!cancelled) {
+          onNotify(err?.message || '定位目标排障会话失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          onConsumeInitialSessionId?.();
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [initialSessionId, onConsumeInitialSessionId, onNotify, servers]);
 
   useEffect(() => {
     if (initialDraft && consumedDraftNonceRef.current !== initialDraft.nonce) {
@@ -246,14 +295,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         setOverview(ov);
         syncPatrolDraftFromOverview(ov);
 
-        const pendingApprovalsCount = (ov.sessions || []).reduce(
-          (acc, s) => acc + (s.pending_approval_count || 0),
-          0
-        );
-        const pendingExtApprovals = ov.pending_external_approvals || 0;
-        onBadgeChange?.(
-          (ov.patrol_status?.unread_alerts || 0) + pendingApprovalsCount + pendingExtApprovals
-        );
+        onBadgeChange?.(ov.patrol_status?.unread_alerts || 0);
 
         if (preferBlankDraftRef.current && !preferSessionId) {
           preferBlankDraftRef.current = false;
@@ -263,10 +305,14 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         } else {
           const firstAvailableId =
             ov.sessions && ov.sessions.length > 0 ? ov.sessions[0].id : '';
+          const pinnedSessionId = pendingInitialSessionIdRef.current;
+          if (pinnedSessionId) {
+            pendingInitialSessionIdRef.current = '';
+          }
           const targetId =
             preferSessionId === null
               ? firstAvailableId
-              : preferSessionId || activeSessionId || firstAvailableId;
+              : preferSessionId || pinnedSessionId || activeSessionId || firstAvailableId;
           if (targetId) {
             setActiveSessionId(targetId);
             const { session } = await api.getAISession(targetId);
@@ -333,21 +379,10 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
               }
             : prev
         );
-        const pendingCnt = (overview?.sessions || []).reduce(
-          (acc, s) => acc + (s.pending_approval_count || 0),
-          0
-        );
-        const pendingExtApprovals = overview?.pending_external_approvals || 0;
-        onBadgeChange?.(pendingCnt + pendingExtApprovals);
+        onBadgeChange?.(0);
       });
     }
-  }, [
-    subTab,
-    overview?.patrol_status?.unread_alerts,
-    overview?.sessions,
-    overview?.pending_external_approvals,
-    onBadgeChange,
-  ]);
+  }, [subTab, overview?.patrol_status?.unread_alerts, onBadgeChange]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -490,6 +525,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         setActiveSession(null);
       }
       await loadOverview(deletingActive ? null : activeSessionId);
+      onApprovalsMutated?.();
       onNotify('已删除排障会话记录');
     } catch (err: any) {
       onNotify(err?.message || '删除会话失败');
@@ -651,6 +687,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         ac.signal
       );
       await loadOverview(sess.id);
+      onApprovalsMutated?.();
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         onNotify('已停止本次 AI 生成');
@@ -658,6 +695,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         onNotify(err?.message || 'AI 诊断对话中断');
       }
       await loadOverview(sess.id);
+      onApprovalsMutated?.();
     } finally {
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
@@ -688,6 +726,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         ac.signal
       );
       await loadOverview(sessId);
+      onApprovalsMutated?.();
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         onNotify('已停止本次 AI 生成');
@@ -695,6 +734,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         onNotify(err?.message || '处理变更审批失败');
       }
       await loadOverview(sessId);
+      onApprovalsMutated?.();
     } finally {
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
@@ -972,11 +1012,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             onClick={() => setSubTab('mcp')}
           >
             <PlugZap size={14} /> 外部 AI 接管 (MCP)
-            {((overview?.pending_external_approvals || 0) +
-              (overview?.patrol_status?.pending_external_count || 0)) > 0 && (
+            {(overview?.patrol_status?.pending_external_count || 0) > 0 && (
               <span className="nav-badge live">
-                {(overview?.pending_external_approvals || 0) +
-                  (overview?.patrol_status?.pending_external_count || 0)}
+                {overview?.patrol_status?.pending_external_count}
               </span>
             )}
           </button>
@@ -1849,13 +1887,16 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
         </div>
       )}
 
-      {/* TAB 2.5: External AI Takeover (MCP Gateway, Persistent Scoped Tokens & External HITL Queue) */}
+      {/* TAB 2.5: External AI Takeover (MCP Gateway, Persistent Scoped Tokens & Client Config) */}
       {subTab === 'mcp' && (
         <ExternalAIMCPTab
           overview={overview}
           servers={servers}
+          pendingApprovalsCount={pendingApprovalsCount}
+          runningApprovalsCount={runningApprovalsCount}
           onReloadOverview={() => loadOverview(activeSessionId)}
           onJumpPatrol={() => setSubTab('patrol')}
+          onJumpApprovals={() => onOpenApprovals?.()}
           onNotify={onNotify}
         />
       )}
