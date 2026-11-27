@@ -3,6 +3,90 @@
 All notable changes to **ServerNeedSafe** are documented in this file.
 本文件记录 **ServerNeedSafe** 每个正式版本的中英文更新日志。
 
+## v2.8.0 (2026-11-27)
+
+## 中文更新说明
+
+> 本版本全面升级 AI 运维与多模型接入能力，新增批量审批执行、敏感信息一键屏蔽和最新模型参数适配，同时强化安全、可观测性与交互稳定性。
+
+### ✨ 新功能与核心增强
+- 新增统一的 `propose_change_plan` MCP 工具，可在一个有序计划中混合编排 SSH 命令与 SFTP 写入，最多支持 20 步，并为每一步设置独立主机、超时和遇错继续策略。外部大模型可通过 `wait_for_approval` 等待终态并立即获取完整进度与步骤结果。 (#23)
+- 外部变更审批升级为完整批量工作流：界面按序展示全部步骤，支持局部勾选跳过、默认全选、安全拦截红框提示、实时执行回显和一键中止；批准后立即进入后台异步顺序执行，遇错时可停止后续步骤或按计划继续。 (#23)
+- 支持前后步骤修改同一文件时自动生成链式 Unified Diff，并在计划合并为一条 Webhook 通知和一条自动变更记忆。守护进程重启时会恢复遗留运行任务的终态状态，同时兼容读取历史单步审批记录。 (#23)
+- 新增「一键屏蔽关键信息」开关，默认关闭，可在展示层统一屏蔽 IP、域名、端口、服务器路径、凭据、密钥、邮件、手机号及常见敏感运维词汇，而不修改底层加密资产。 (#25)
+- 屏蔽功能已覆盖全局 AGENTS.md、长期记忆、主机画像 2.0 和 Runbook 技能库，并与当前服务器清单、主机画像部署路径和自定义 SSH 参数联动；开启后会阻止编辑与保存以防止 `***` 被误写入存储。 (#25)
+- AGENTS.md 屏蔽后可导出为 `AGENTS.masked.md`，Markdown 加粗、代码块与格式化渲染通过哨兵机制保持完整，恢复显示只会恢复原始明文且不会修改数据。 (#25)
+- 大模型接入全面支持 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 Google Gemini 原生协议，并兼容第三方中转的智能补全、完整地址直连及 Bearer、`x-api-key`、`x-goog-api-key`、URL Query、免密等认证方式。 (#26)
+- 排障对话、终端副驾驶、流式连通测试、后台巡检和上下文压缩均强制使用 SSE 流式请求，流式传输升级为建连、响应头和空闲超时；首字延迟与真实 Token Usage 可直接用于连通性诊断。 (#26)
+- 新增最新模型目录快照，并支持从 `models.dev/api.json` 联网同步、在 OpenRouter 中回退，以及从当前接口的 `/models` 拉取可用模型；选定模型可自动回填上下文窗口、最大输入与最大输出参数。 (#26)
+- 完全开放上下文窗口、输入输出 Token、温度、Top P 和推理强度等自定义配置，支持留空或设为 `0` 使用模型默认值，并可通过加密 `custom_headers` 与无字段白名单限制的 `extra_body_json` 深度合并任意参数。 (#26)
+
+### 🔒 安全与权限加固
+- MCP Token 越权主机、参数错误等请求继续在网关层直接拒绝；命中危险命令或敏感写入路径的步骤会以 `blocked` 状态安全入队、审计并禁止执行。 (#23)
+- 批量计划支持审批时逐步跳过、实时取消及严格按原始顺序执行，并对续错策略和后台中止行为进行边界保护。 (#23)
+- 敏感信息屏蔽引擎覆盖网络端点、SSH 配置、数据库连接串、PEM/SSH 密钥、JWT、Bearer、云厂商凭据、环境变量、身份证和手机号等高风险信息，同时保留时间、版本号、百分比等非敏感运维信息。 (#25)
+- 模型配置继续采用加密存储和零知识防泄漏规则：敏感请求头自动脱敏，克隆端点可复用同端点加密 API Key；更换地址或协议时必须重新填写敏感头，防止凭据被带入错误接口。 (#26)
+- 模型参数适配覆盖 GPT-5/6、Claude 4.6/5.5 Adaptive Thinking、Gemini 3/4、DeepSeek V4 和 Qwen4 等推理模型，包括模型族温度冲突规避、`reasoning` 与工具调用签名透传及最新 `thinkingLevel` / `thinkingBudget` 参数。 (#26)
+
+### 🐛 问题修复与稳定性提升
+- 修复外部 AI MCP 逐条审批无法表达多步运维序列、缺少执行进度、无法中途停止及旧任务状态恢复不完整的问题。 (#23)
+- 修正批量审批列表对完整 Diff 和敏感正文的脱敏与精简展示，避免新内容或预览中意外暴露敏感信息。 (#23)
+- 修复多类屏蔽规则中的误伤和泄漏边界，并用哨兵机制确保脱敏后的 Markdown、代码块和粗体渲染不会被破坏。 (#25)
+- 修正模型连通性测试不再强制截断为 `max_tokens=64`，避免短输出掩盖真实接入问题，并正确拒绝非 SSE 反代响应及处理流式空闲超时。 (#26)
+- 补强多轮工具调用中的思考签名、`reasoning_content`、Anthropic `redacted_thinking` 和 Responses API `reasoning` 项透传，避免多轮推理和工具执行后续轮次丢失上下文。 (#26)
+
+### ⚙️ 工程构建与运维体验
+- 新增敏感屏蔽引引擎的 11 组规则与边界测试、Markdown 记忆中心渲染测试，并将前端单元测试接入构建发布工作流。 (#25)
+- AI 运维界面新增可折叠的实时思考过程卡片、流式首字延迟和用量结果展示，便于区分连接问题、推理延迟与实际模型输出。 (#26)
+- 配置界面支持一键同步公开模型目录、一键拉取接口模型列表、复制同端点为新模型，以及在编辑或克隆时复用加密密钥并进行安全校验。 (#26)
+
+---
+
+## English Release Notes
+
+> This release substantially upgrades AI operations and multi-provider integration with ordered batch approvals, one-click sensitive-data masking, and modern model parameter support, while improving security and runtime reliability.
+
+### ✨ New Features & Highlights
+- Added the unified `propose_change_plan` MCP tool, allowing one ordered plan to mix SSH commands and SFTP writes in up to 20 steps, with per-step host, timeout, and `continue_on_error` settings. External models can use `wait_for_approval` to wait for the terminal state and receive complete step progress and results. (#23)
+- Upgraded external-change approvals into a full batch workflow: the console now displays every step in order, supports individual skips before approval, highlights blocked steps, streams live execution output, and provides one-click cancellation. Approved plans run asynchronously in the AI-defined sequence, stopping on errors or continuing only where configured. (#23)
+- Added chained Unified Diffs when consecutive steps modify the same file on the same host, plus one aggregated Webhook notification and one consolidated automatic change-memory entry per plan. Restarting the daemon restores interrupted legacy tasks to terminal states and remains compatible with historical single-step approvals. (#23)
+- Added a default-off “Mask Sensitive Information” switch that replaces IPs, domains, ports, server paths, credentials, keys, email addresses, phone numbers, and common sensitive operations terms in the display layer without changing encrypted stored data. (#25)
+- Applied masking across global AGENTS.md, the long-term memory library, Host Memory 2.0, and the Runbook library, with dynamic awareness of server inventory, deployment paths, custom SSH ports, and host usernames. Editing and saving are blocked while masking is enabled to prevent placeholders from being written back to storage. (#25)
+- Masked AGENTS.md content can be exported as `AGENTS.masked.md`. Sentinel handling preserves bold text, code blocks, and Markdown formatting, while restoring the view reveals the original plaintext without any data modification. (#25)
+- Expanded native AI provider support to OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Google Gemini, including third-party relay compatibility for smart URL completion, direct full-URL connections, and multiple authentication modes such as Bearer, `x-api-key`, `x-goog-api-key`, URL query keys, and no-auth. (#26)
+- Made SSE streaming mandatory across troubleshooting chat, Terminal Copilot, connectivity tests, patrol analysis, and context compaction. The transport now separates connection, response-header, and idle timeouts, reports first-token latency, and exposes real usage statistics. (#26)
+- Added an offline model-catalog snapshot plus online synchronization from `models.dev/api.json`, with OpenRouter fallback and provider `/models` discovery for OpenAI, Anthropic, and Gemini. Selecting a model automatically fills context-window, input, and output defaults. (#26)
+- Removed frontend and backend numeric limits for context-window, input/output token, temperature, top-p, and reasoning-effort settings. Zero or blank values can defer to model defaults, while encrypted custom headers and RFC 7396 deep-merging `extra_body_json` allow unrestricted compatible parameters. (#26)
+
+### 🔒 Security & Hardening
+- Keeps MCP authorization and parameter validation at the gateway boundary; steps that trigger blocked commands or sensitive write-path rules are queued as `blocked`, audited, red-highlighted, and prohibited from execution. (#23)
+- Added approval-time step skipping, cancellation, strict original-order execution, and guarded handling for error continuation and interrupted background tasks. (#23)
+- Masked sensitive network endpoints, SSH configuration, database connection strings, PEM and SSH keys, JWT/Bearer credentials, cloud tokens, environment assignments, identities, and phone numbers while preserving timestamps, versions, and percentages. (#25)
+- Retained zero-knowledge and encrypted credential protections for provider configuration: sensitive headers are masked, same-endpoint cloning reuses the encrypted API key, and changing a base URL or protocol requires re-entering sensitive custom headers. (#26)
+- Added model-family adaptations for GPT-5/6, Claude 4.6/5.5 Adaptive Thinking, Gemini 3/4, DeepSeek V4, and Qwen4, covering reasoning parameter conflicts, thought signatures, and the latest `thinkingLevel` / `thinkingBudget` formats. (#26)
+
+### 🐛 Bug Fixes & Reliability
+- Fixed the inability of external MCP workflows to represent ordered multi-step operations, track progress, stop mid-run, or recover legacy-running approvals reliably. (#23)
+- Improved batch approval previews and lists so full Diff content and sensitive proposal text are safely summarized or masked. (#23)
+- Hardened masking boundaries against false positives and accidental leaks, while ensuring placeholders do not break Markdown, code, or bold formatting. (#25)
+- Removed the forced `max_tokens=64` truncation from connectivity tests, preventing misleading connection checks, and now rejects non-SSE proxy responses and reports streaming idle timeouts explicitly. (#26)
+- Strengthened multi-turn reasoning and tool-call state transfer for `reasoning_content`, Anthropic `redacted_thinking`, interleaved signatures, and Responses API `reasoning` items. (#26)
+
+### ⚙️ Build, CI/CD & Developer Experience
+- Added 11 rule and boundary tests for the masking engine plus Markdown memory-center rendering tests, with frontend test coverage integrated into the build workflow. (#25)
+- Added collapsible live reasoning cards, first-token latency, and usage reporting to AI conversation and Terminal Copilot interfaces. (#26)
+- Improved provider configuration with one-click catalog synchronization, `/models` discovery, same-endpoint cloning, automatic model-default backfill, and encrypted API-key reuse safeguards. (#26)
+
+---
+
+### Included Changes / 包含的变更
+
+- #23 feat(mcp): 外部 AI 变更审批升级为有序批量执行计划与一键按序批准 (@icaruszezen)
+- #25 feat(ai-memory): Agent 与记忆中心新增一键屏蔽关键信息功能 (@icaruszezen)
+- #26 feat(aiops): 优化大模型 API 接入（四协议纯流式、最新模型参数适配、模型目录拉取与无限制自定义配置） (@icaruszezen)
+
+**Full Changelog**: https://github.com/icaruszezen/ServerNeedSafe/compare/v2.7.1...v2.8.0
+
 ## v2.7.1 (2026-11-27)
 
 ## 中文更新说明
