@@ -97,9 +97,13 @@ type SessionContextInspection struct {
 	EstimatedHistoryTokens    int                  `json:"estimated_history_tokens"`
 	EstimatedTotalTokens      int                  `json:"estimated_total_tokens"`
 	ContextWindowTokens       int                  `json:"context_window_tokens"`
+	MaxInputTokens            int                  `json:"max_input_tokens"`
+	MaxOutputTokens           int                  `json:"max_output_tokens"`
 	CompactionThresholdTokens int                  `json:"compaction_threshold_tokens"`
 	UsagePercent              float64              `json:"usage_percent"`
 	NeedsCompaction           bool                 `json:"needs_compaction"`
+	LastUsage                 *vault.AITokenUsage  `json:"last_usage,omitempty"`
+	SessionTotalUsage         *vault.AITokenUsage  `json:"session_total_usage,omitempty"`
 }
 
 type assembledPromptResult struct {
@@ -136,29 +140,46 @@ func EstimateMessagesTokens(msgs []vault.AIChatMessage) int {
 	return total
 }
 
-// EffectiveContextWindow determines the context token budget for an LLM provider.
+// EffectiveContextWindow determines the context token budget for an LLM provider using built-in defaults.
 func EffectiveContextWindow(prov vault.AIProviderConfig) int {
-	if prov.ContextWindow >= 4096 {
-		return prov.ContextWindow
+	ctxWin, _, _ := EffectiveTokenBudgets(prov, nil)
+	return ctxWin
+}
+
+// EffectiveTokenBudgets resolves (contextWindow, maxInputTokens, maxOutputTokens) for a provider,
+// honoring unrestricted user overrides first and falling back to the synced+builtin model catalog.
+func EffectiveTokenBudgets(prov vault.AIProviderConfig, cached *vault.AIModelCatalogCache) (contextWindow int, maxInputTokens int, maxOutputTokens int) {
+	spec := LookupModelSpec(prov.Model, vault.NormalizeAIProtocol(prov.Protocol), cached)
+
+	contextWindow = prov.ContextWindow
+	if contextWindow <= 0 {
+		contextWindow = spec.ContextWindow
 	}
-	m := strings.ToLower(strings.TrimSpace(prov.Model))
-	switch {
-	case strings.Contains(m, "claude"):
-		return 200000
-	case strings.Contains(m, "gemini"):
-		return 128000
-	case strings.Contains(m, "gpt-4.1"), strings.Contains(m, "gpt-4o"), strings.Contains(m, "gpt-5"),
-		strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"):
-		return 128000
-	case strings.Contains(m, "qwen3"), strings.Contains(m, "qwen-max"), strings.Contains(m, "qwen-plus"), strings.Contains(m, "qwen-long"):
-		return 128000
-	case strings.Contains(m, "deepseek"):
-		return 65536
-	case strings.Contains(m, "llama"), strings.Contains(m, "mistral"), strings.Contains(m, "gemma"), strings.Contains(m, "phi"), strings.Contains(m, ":"):
-		return 32768
-	default:
-		return 65536
+	if contextWindow <= 0 {
+		contextWindow = 128000
 	}
+
+	maxOutputTokens = prov.EffectiveMaxOutputTokens()
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = spec.MaxOutputTokens
+	}
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = 16384
+	}
+
+	if prov.MaxInputTokens > 0 {
+		maxInputTokens = prov.MaxInputTokens
+	} else if prov.ContextWindow > 0 {
+		// User explicitly configured ContextWindow without MaxInputTokens: reserve output budget conservatively.
+		reserve := min(maxOutputTokens, contextWindow/4)
+		maxInputTokens = max(4096, contextWindow-reserve)
+	} else if spec.MaxInputTokens > 0 {
+		maxInputTokens = spec.MaxInputTokens
+	} else {
+		reserve := min(maxOutputTokens, contextWindow/4)
+		maxInputTokens = max(4096, contextWindow-reserve)
+	}
+	return contextWindow, maxInputTokens, maxOutputTokens
 }
 
 func truncateRunes(s string, maxRunes int) (string, bool) {
@@ -525,18 +546,41 @@ func (s *Service) assembleSessionPrompt(sess *vault.AIChatSession) assembledProm
 	inspection.EstimatedHistoryTokens = EstimateMessagesTokens(uncompacted)
 	inspection.EstimatedTotalTokens = inspection.EstimatedSystemTokens + inspection.EstimatedSummaryTokens + inspection.EstimatedHistoryTokens
 
-	ctxWindow := EffectiveContextWindow(prov)
+	ctxWindow, maxInputTok, maxOutputTok := EffectiveTokenBudgets(prov, s.store.GetModelCatalogCache())
 	inspection.ContextWindowTokens = ctxWindow
-	threshold := int(float64(ctxWindow) * memCfg.CompactionTriggerRatio)
+	inspection.MaxInputTokens = maxInputTok
+	inspection.MaxOutputTokens = maxOutputTok
+	budgetBase := maxInputTok
+	if budgetBase <= 0 {
+		budgetBase = ctxWindow
+	}
+	threshold := int(float64(budgetBase) * memCfg.CompactionTriggerRatio)
 	if threshold < 4096 {
 		threshold = 4096
 	}
 	inspection.CompactionThresholdTokens = threshold
-	if ctxWindow > 0 {
-		pct := float64(inspection.EstimatedTotalTokens) * 100.0 / float64(ctxWindow)
+	if budgetBase > 0 {
+		pct := float64(inspection.EstimatedTotalTokens) * 100.0 / float64(budgetBase)
 		inspection.UsagePercent = math.Round(pct*10) / 10
 	}
 	inspection.NeedsCompaction = inspection.EstimatedTotalTokens >= threshold && canSplitForCompaction(sess, memCfg.CompactionKeepRecent)
+
+	// Aggregate real streaming usage stats reported by upstream providers across this session
+	var totalUsage vault.AITokenUsage
+	var lastUsage *vault.AITokenUsage
+	for _, m := range sess.Messages {
+		if m.Usage != nil {
+			uCopy := *m.Usage
+			lastUsage = &uCopy
+			totalUsage.InputTokens += m.Usage.InputTokens
+			totalUsage.OutputTokens += m.Usage.OutputTokens
+			totalUsage.ReasoningTokens += m.Usage.ReasoningTokens
+			totalUsage.CachedInputTokens += m.Usage.CachedInputTokens
+			totalUsage.TotalTokens += m.Usage.TotalTokens
+		}
+	}
+	inspection.LastUsage = lastUsage
+	inspection.SessionTotalUsage = finalizeUsage(&totalUsage)
 
 	return assembledPromptResult{
 		SystemPrompt:      sysPrompt,
@@ -784,12 +828,14 @@ func (s *Service) runCompactionOnSession(
 	var newSummary string
 
 	if prov != nil && prov.BaseURL != "" && prov.Model != "" {
-		compCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		compCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 
-		compactProv := *prov
-		if compactProv.MaxTokens <= 0 || compactProv.MaxTokens > 1600 {
-			compactProv.MaxTokens = 1400
+		compactProv := vault.CloneAIProviderConfig(*prov)
+		// Keep generous output room so thinking/reasoning models do not truncate summaries
+		if compactProv.EffectiveMaxOutputTokens() > 0 && compactProv.EffectiveMaxOutputTokens() < 4096 {
+			compactProv.MaxOutputTokens = 4096
+			compactProv.MaxTokens = 4096
 		}
 
 		sysPrompt := `你是 ServerNeedSafe 的运维上下文压缩引擎。请将历史排查对话与原有摘要合并提炼为一份精简、高信息密度的结构化中文 Markdown 摘要（控制在 800 字以内），严格保留：
@@ -810,7 +856,7 @@ func (s *Service) runCompactionOnSession(
 
 		turn, err := s.llm.StreamChat(compCtx, compactProv, sysPrompt, []vault.AIChatMessage{
 			{Role: "user", Content: userPrompt.String()},
-		}, nil, nil)
+		}, nil, StreamCallbacks{})
 		if err == nil && turn != nil && strings.TrimSpace(turn.Content) != "" {
 			newSummary = vault.RedactSensitiveText(strings.TrimSpace(turn.Content))
 			mode = "llm"

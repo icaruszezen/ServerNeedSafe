@@ -1,7 +1,10 @@
 package vault
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -14,17 +17,117 @@ const (
 	maxAISessions    = 100
 )
 
-// AIProviderMutationInput represents create/update request fields for an LLM provider.
+// AIProviderMutationInput represents create/update/clone request fields for an LLM provider.
 type AIProviderMutationInput struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	Protocol      AIProtocol `json:"protocol"`
-	BaseURL       string     `json:"base_url"`
-	APIKey        *string    `json:"api_key,omitempty"` // nil = preserve existing key on update
-	Model         string     `json:"model"`
-	MaxTokens     int        `json:"max_tokens"`
-	ContextWindow int        `json:"context_window"` // 0 = auto-infer from model
-	SetActive     bool       `json:"set_active"`
+	ID              string            `json:"id"`
+	CloneFromID     string            `json:"clone_from_id,omitempty"` // Optional: inherit encrypted APIKey & sensitive headers when endpoint/protocol matches
+	Name            string            `json:"name"`
+	Protocol        AIProtocol        `json:"protocol"`
+	BaseURL         string            `json:"base_url"`
+	EndpointMode    AIEndpointMode    `json:"endpoint_mode,omitempty"`
+	AuthMode        AIAuthMode        `json:"auth_mode,omitempty"`
+	APIKey          *string           `json:"api_key,omitempty"` // nil/empty = preserve existing key on update/clone
+	Model           string            `json:"model"`
+	MaxTokens       int               `json:"max_tokens,omitempty"`        // Legacy alias of MaxOutputTokens
+	MaxOutputTokens *int              `json:"max_output_tokens,omitempty"` // nil = fall back to MaxTokens; 0 = unset/model default; unrestricted positive integer
+	MaxInputTokens  int               `json:"max_input_tokens,omitempty"`  // 0 = auto from catalog/ContextWindow; unrestricted positive integer
+	ContextWindow   int               `json:"context_window,omitempty"`    // 0 = auto from catalog; unrestricted positive integer
+	Temperature     *float64          `json:"temperature,omitempty"`
+	TopP            *float64          `json:"top_p,omitempty"`
+	ReasoningEffort AIReasoningEffort `json:"reasoning_effort,omitempty"`
+	CustomHeaders   *[]AICustomHeader `json:"custom_headers,omitempty"`
+	ExtraBodyJSON   string            `json:"extra_body_json,omitempty"`
+	SetActive       bool              `json:"set_active"`
+}
+
+func validateExtraBodyJSON(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil || parsed == nil {
+		return "", fmt.Errorf("%w: 自定义扩展请求体 (Extra Body) 必须是合法的 JSON 对象（例如 {\"enable_thinking\": true}）", ErrInvalidInput)
+	}
+	return trimmed, nil
+}
+
+func validateOptionalFloat(p *float64, name string) (*float64, error) {
+	if p == nil {
+		return nil, nil
+	}
+	if math.IsNaN(*p) || math.IsInf(*p, 0) {
+		return nil, fmt.Errorf("%w: 参数 %s 必须是有效数值", ErrInvalidInput, name)
+	}
+	v := *p
+	return &v, nil
+}
+
+func sameProviderTarget(a AIProviderConfig, baseURL string, protocol AIProtocol, epMode AIEndpointMode) bool {
+	return SameEndpointURL(a.BaseURL, baseURL) &&
+		NormalizeAIProtocol(a.Protocol) == NormalizeAIProtocol(protocol) &&
+		NormalizeAIEndpointMode(a.EndpointMode) == NormalizeAIEndpointMode(epMode)
+}
+
+func mergeProviderCustomHeaders(
+	incoming *[]AICustomHeader,
+	existing []AICustomHeader,
+	endpointChanged bool,
+) ([]AICustomHeader, error) {
+	existingByLower := make(map[string]AICustomHeader, len(existing))
+	hasSensitiveExisting := false
+	for _, h := range existing {
+		k := strings.TrimSpace(h.Key)
+		if k == "" {
+			continue
+		}
+		existingByLower[strings.ToLower(k)] = h
+		if IsSensitiveHeaderKey(k) && strings.TrimSpace(h.Value) != "" {
+			hasSensitiveExisting = true
+		}
+	}
+
+	if incoming == nil {
+		if len(existing) == 0 {
+			return nil, nil
+		}
+		if endpointChanged && hasSensitiveExisting {
+			return nil, fmt.Errorf("%w: 更换接口地址或协议时必须重新填写或清空包含敏感值的自定义请求头", ErrInvalidInput)
+		}
+		return slices.Clone(existing), nil
+	}
+
+	out := make([]AICustomHeader, 0, len(*incoming))
+	seen := make(map[string]int, len(*incoming))
+	for _, h := range *incoming {
+		k := strings.TrimSpace(h.Key)
+		v := strings.TrimSpace(h.Value)
+		if k == "" {
+			continue
+		}
+		if strings.ContainsAny(k, "\r\n:") || strings.ContainsAny(v, "\r\n") {
+			return nil, fmt.Errorf("%w: 自定义请求头 %q 包含非法换行或冒号字符", ErrInvalidInput, k)
+		}
+		lower := strings.ToLower(k)
+		if v == "" && IsSensitiveHeaderKey(k) {
+			if prev, ok := existingByLower[lower]; ok && prev.Value != "" {
+				if endpointChanged {
+					return nil, fmt.Errorf("%w: 更换接口地址或协议时必须重新填写敏感自定义请求头 %s", ErrInvalidInput, k)
+				}
+				v = prev.Value
+			}
+		}
+		if idx, exists := seen[lower]; exists {
+			out[idx] = AICustomHeader{Key: k, Value: v}
+		} else {
+			seen[lower] = len(out)
+			out = append(out, AICustomHeader{Key: k, Value: v})
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // GetAISettingsView returns redacted AI settings, provider list, and patrol config.
@@ -49,7 +152,7 @@ func (s *Store) GetAISettingsView() (activeProviderID string, defaultMode AIExec
 	return s.secrets.AISettings.ActiveProviderID, defaultMode, providers, patrolCfg.ToView(), nil
 }
 
-// GetActiveAIProviderSecret returns a copy of the currently active AIProviderConfig including APIKey.
+// GetActiveAIProviderSecret returns a deep copy of the currently active AIProviderConfig including secrets.
 func (s *Store) GetActiveAIProviderSecret() (*AIProviderConfig, error) {
 	s.secMu.RLock()
 	defer s.secMu.RUnlock()
@@ -59,18 +162,18 @@ func (s *Store) GetActiveAIProviderSecret() (*AIProviderConfig, error) {
 	activeID := s.secrets.AISettings.ActiveProviderID
 	for _, p := range s.secrets.AISettings.Providers {
 		if p.ID == activeID {
-			cp := p
+			cp := CloneAIProviderConfig(p)
 			return &cp, nil
 		}
 	}
 	if len(s.secrets.AISettings.Providers) > 0 {
-		cp := s.secrets.AISettings.Providers[0]
+		cp := CloneAIProviderConfig(s.secrets.AISettings.Providers[0])
 		return &cp, nil
 	}
 	return nil, ErrNotFound
 }
 
-// GetAIProviderSecret returns a copy of a specific AIProviderConfig by ID including APIKey.
+// GetAIProviderSecret returns a deep copy of a specific AIProviderConfig by ID including secrets.
 func (s *Store) GetAIProviderSecret(id string) (*AIProviderConfig, error) {
 	s.secMu.RLock()
 	defer s.secMu.RUnlock()
@@ -79,59 +182,100 @@ func (s *Store) GetAIProviderSecret(id string) (*AIProviderConfig, error) {
 	}
 	for _, p := range s.secrets.AISettings.Providers {
 		if p.ID == id {
-			cp := p
+			cp := CloneAIProviderConfig(p)
 			return &cp, nil
 		}
 	}
 	return nil, ErrNotFound
 }
 
-// UpsertAIProvider creates or updates an encrypted LLM provider configuration inside secrets.enc.
+// UpsertAIProvider creates, updates, or clones an encrypted LLM provider configuration inside secrets.enc.
 func (s *Store) UpsertAIProvider(in AIProviderMutationInput, clientIP string) (*AIProviderView, string, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	in.BaseURL = strings.TrimSpace(in.BaseURL)
 	in.Model = strings.TrimSpace(in.Model)
 	if in.Protocol == "" {
 		in.Protocol = AIProtocolOpenAI
+	} else {
+		in.Protocol = AIProtocol(strings.ToLower(strings.TrimSpace(string(in.Protocol))))
 	}
-	if in.Protocol != AIProtocolOpenAI && in.Protocol != AIProtocolAnthropic {
+	if !IsValidAIProtocol(in.Protocol) {
 		return nil, "", fmt.Errorf("%w: 不支持的模型协议 %s", ErrInvalidInput, in.Protocol)
 	}
 	if in.Name == "" || in.BaseURL == "" || in.Model == "" {
 		return nil, "", fmt.Errorf("%w: 供应商名称、接口地址与模型名称不能为空", ErrInvalidInput)
 	}
-	if in.MaxTokens <= 0 || in.MaxTokens > 65536 {
-		in.MaxTokens = 4096
+
+	epMode := NormalizeAIEndpointMode(in.EndpointMode)
+	authMode := NormalizeAIAuthMode(in.AuthMode)
+	reasoningEffort := NormalizeAIReasoningEffort(in.ReasoningEffort)
+
+	extraBody, err := validateExtraBodyJSON(in.ExtraBodyJSON)
+	if err != nil {
+		return nil, "", err
 	}
-	if in.ContextWindow < 0 || in.ContextWindow > 2000000 {
-		in.ContextWindow = 0
+	tempPtr, err := validateOptionalFloat(in.Temperature, "temperature")
+	if err != nil {
+		return nil, "", err
 	}
+	topPPtr, err := validateOptionalFloat(in.TopP, "top_p")
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Unrestricted positive integers (0 = unset / follow model default).
+	maxOut := 0
+	if in.MaxOutputTokens != nil {
+		if *in.MaxOutputTokens > 0 {
+			maxOut = *in.MaxOutputTokens
+		}
+	} else if in.MaxTokens > 0 {
+		maxOut = in.MaxTokens
+	}
+	maxIn := max(0, in.MaxInputTokens)
+	ctxWin := max(0, in.ContextWindow)
 
 	var outView AIProviderView
 	var outActive string
 	auditAction := "ai.provider_create"
 	auditDetail := ""
 
-	err := s.mutateSecrets(func(sec *SecretsState) error {
+	err = s.mutateSecrets(func(sec *SecretsState) error {
 		now := time.Now().UTC()
+		newKey := ""
+		if in.APIKey != nil {
+			newKey = strings.TrimSpace(*in.APIKey)
+		}
+
 		if in.ID != "" {
 			for i := range sec.AISettings.Providers {
 				if sec.AISettings.Providers[i].ID == in.ID {
 					existing := sec.AISettings.Providers[i]
-					newKey := ""
-					if in.APIKey != nil {
-						newKey = strings.TrimSpace(*in.APIKey)
-					}
+					endpointChanged := !sameProviderTarget(existing, in.BaseURL, in.Protocol, epMode)
 					// Guard against silently re-pointing a stored masked API key to another endpoint.
-					if newKey == "" && existing.APIKey != "" && (!SameEndpointURL(existing.BaseURL, in.BaseURL) || normalizeAIProtocol(existing.Protocol) != in.Protocol) {
-						return fmt.Errorf("%w: 更换接口地址或协议时必须重新填写 API Key", ErrInvalidInput)
+					if newKey == "" && existing.APIKey != "" && endpointChanged {
+						return fmt.Errorf("%w: 更换接口地址、端点模式或协议时必须重新填写 API Key", ErrInvalidInput)
 					}
+					mergedHeaders, hErr := mergeProviderCustomHeaders(in.CustomHeaders, existing.CustomHeaders, endpointChanged)
+					if hErr != nil {
+						return hErr
+					}
+
 					existing.Name = in.Name
 					existing.Protocol = in.Protocol
 					existing.BaseURL = in.BaseURL
+					existing.EndpointMode = epMode
+					existing.AuthMode = authMode
 					existing.Model = in.Model
-					existing.MaxTokens = in.MaxTokens
-					existing.ContextWindow = in.ContextWindow
+					existing.MaxTokens = maxOut
+					existing.MaxOutputTokens = maxOut
+					existing.MaxInputTokens = maxIn
+					existing.ContextWindow = ctxWin
+					existing.Temperature = tempPtr
+					existing.TopP = topPPtr
+					existing.ReasoningEffort = reasoningEffort
+					existing.CustomHeaders = mergedHeaders
+					existing.ExtraBodyJSON = extraBody
 					existing.UpdatedAt = now
 					if newKey != "" {
 						existing.APIKey = newKey
@@ -149,19 +293,59 @@ func (s *Store) UpsertAIProvider(in AIProviderMutationInput, clientIP string) (*
 			}
 		}
 
-		newProv := AIProviderConfig{
-			ID:            uuid.NewString(),
-			Name:          in.Name,
-			Protocol:      in.Protocol,
-			BaseURL:       in.BaseURL,
-			Model:         in.Model,
-			MaxTokens:     in.MaxTokens,
-			ContextWindow: in.ContextWindow,
-			CreatedAt:     now,
-			UpdatedAt:     now,
+		// Optional clone from existing provider (safely reuses encrypted key & sensitive headers only for identical endpoint/protocol)
+		var cloneSource *AIProviderConfig
+		if strings.TrimSpace(in.CloneFromID) != "" {
+			for i := range sec.AISettings.Providers {
+				if sec.AISettings.Providers[i].ID == strings.TrimSpace(in.CloneFromID) {
+					cp := CloneAIProviderConfig(sec.AISettings.Providers[i])
+					cloneSource = &cp
+					break
+				}
+			}
+			if cloneSource == nil {
+				return fmt.Errorf("%w: 源模型配置不存在，无法复制", ErrNotFound)
+			}
 		}
-		if in.APIKey != nil {
-			newProv.APIKey = strings.TrimSpace(*in.APIKey)
+
+		resolvedKey := newKey
+		var existingHeaders []AICustomHeader
+		endpointChanged := false
+		if cloneSource != nil {
+			endpointChanged = !sameProviderTarget(*cloneSource, in.BaseURL, in.Protocol, epMode)
+			existingHeaders = cloneSource.CustomHeaders
+			if resolvedKey == "" && cloneSource.APIKey != "" {
+				if endpointChanged {
+					return fmt.Errorf("%w: 复制配置并更换接口地址、端点模式或协议时必须重新填写 API Key", ErrInvalidInput)
+				}
+				resolvedKey = cloneSource.APIKey
+			}
+		}
+		mergedHeaders, hErr := mergeProviderCustomHeaders(in.CustomHeaders, existingHeaders, endpointChanged)
+		if hErr != nil {
+			return hErr
+		}
+
+		newProv := AIProviderConfig{
+			ID:              uuid.NewString(),
+			Name:            in.Name,
+			Protocol:        in.Protocol,
+			BaseURL:         in.BaseURL,
+			EndpointMode:    epMode,
+			AuthMode:        authMode,
+			APIKey:          resolvedKey,
+			Model:           in.Model,
+			MaxTokens:       maxOut,
+			MaxOutputTokens: maxOut,
+			MaxInputTokens:  maxIn,
+			ContextWindow:   ctxWin,
+			Temperature:     tempPtr,
+			TopP:            topPPtr,
+			ReasoningEffort: reasoningEffort,
+			CustomHeaders:   mergedHeaders,
+			ExtraBodyJSON:   extraBody,
+			CreatedAt:       now,
+			UpdatedAt:       now,
 		}
 		sec.AISettings.Providers = append(sec.AISettings.Providers, newProv)
 		if in.SetActive || sec.AISettings.ActiveProviderID == "" || len(sec.AISettings.Providers) == 1 {
@@ -536,6 +720,22 @@ func cloneSession(cs AIChatSession) AIChatSession {
 	for i, m := range cs.Messages {
 		mc := m
 		mc.ToolCalls = slices.Clone(m.ToolCalls)
+		if m.Usage != nil {
+			u := *m.Usage
+			mc.Usage = &u
+		}
+		if m.ProviderState != nil {
+			ps := *m.ProviderState
+			ps.AnthropicThinking = slices.Clone(m.ProviderState.AnthropicThinking)
+			if m.ProviderState.GeminiToolSignatures != nil {
+				ps.GeminiToolSignatures = maps.Clone(m.ProviderState.GeminiToolSignatures)
+			}
+			if m.ProviderState.GeminiToolIDs != nil {
+				ps.GeminiToolIDs = maps.Clone(m.ProviderState.GeminiToolIDs)
+			}
+			ps.ResponsesReasoningRaw = slices.Clone(m.ProviderState.ResponsesReasoningRaw)
+			mc.ProviderState = &ps
+		}
 		cp.Messages[i] = mc
 	}
 	cp.PendingApprovals = make([]AIPendingApproval, len(cs.PendingApprovals))
@@ -1146,4 +1346,186 @@ func (s *Store) ListPatrolRecords(limit int, markRead bool) ([]PatrolRecord, int
 		s.triggerFlush()
 	}
 	return out, unread, nil
+}
+
+// ResolveAIProviderForTransientCall merges caller-supplied overrides with an optional stored provider ID
+// (or CloneFromID) while strictly enforcing that stored API keys and sensitive custom headers are NEVER
+// forwarded to a different BaseURL, Protocol, or EndpointMode.
+func (s *Store) ResolveAIProviderForTransientCall(in AIProviderMutationInput) (*AIProviderConfig, error) {
+	var cfg AIProviderConfig
+	var hasStored bool
+	sourceID := strings.TrimSpace(in.ID)
+	if sourceID == "" {
+		sourceID = strings.TrimSpace(in.CloneFromID)
+	}
+	if sourceID != "" {
+		if stored, err := s.GetAIProviderSecret(sourceID); err == nil && stored != nil {
+			cfg = *stored
+			hasStored = true
+		}
+	}
+
+	storedBaseURL := cfg.BaseURL
+	storedProto := NormalizeAIProtocol(cfg.Protocol)
+	storedEpMode := NormalizeAIEndpointMode(cfg.EndpointMode)
+	storedHeaders := slices.Clone(cfg.CustomHeaders)
+	storedKey := cfg.APIKey
+
+	if in.Protocol != "" {
+		proto := AIProtocol(strings.ToLower(strings.TrimSpace(string(in.Protocol))))
+		if !IsValidAIProtocol(proto) {
+			return nil, fmt.Errorf("%w: 不支持的模型协议 %s", ErrInvalidInput, in.Protocol)
+		}
+		cfg.Protocol = proto
+	} else if !hasStored {
+		cfg.Protocol = AIProtocolOpenAI
+	} else {
+		cfg.Protocol = storedProto
+	}
+
+	if strings.TrimSpace(in.BaseURL) != "" {
+		cfg.BaseURL = strings.TrimSpace(in.BaseURL)
+	}
+	if in.EndpointMode != "" {
+		cfg.EndpointMode = NormalizeAIEndpointMode(in.EndpointMode)
+	} else if !hasStored {
+		cfg.EndpointMode = AIEndpointModeAuto
+	} else {
+		cfg.EndpointMode = storedEpMode
+	}
+	if in.AuthMode != "" {
+		cfg.AuthMode = NormalizeAIAuthMode(in.AuthMode)
+	} else if !hasStored {
+		cfg.AuthMode = AIAuthModeAuto
+	}
+	if strings.TrimSpace(in.Model) != "" {
+		cfg.Model = strings.TrimSpace(in.Model)
+	}
+	if in.MaxOutputTokens != nil {
+		v := max(0, *in.MaxOutputTokens)
+		cfg.MaxOutputTokens = v
+		cfg.MaxTokens = v
+	} else if in.MaxTokens > 0 {
+		cfg.MaxOutputTokens = in.MaxTokens
+		cfg.MaxTokens = in.MaxTokens
+	}
+	if in.MaxInputTokens > 0 {
+		cfg.MaxInputTokens = in.MaxInputTokens
+	}
+	if in.ContextWindow > 0 {
+		cfg.ContextWindow = in.ContextWindow
+	}
+	if in.Temperature != nil {
+		v, err := validateOptionalFloat(in.Temperature, "temperature")
+		if err != nil {
+			return nil, err
+		}
+		cfg.Temperature = v
+	}
+	if in.TopP != nil {
+		v, err := validateOptionalFloat(in.TopP, "top_p")
+		if err != nil {
+			return nil, err
+		}
+		cfg.TopP = v
+	}
+	if in.ReasoningEffort != "" {
+		cfg.ReasoningEffort = NormalizeAIReasoningEffort(in.ReasoningEffort)
+	}
+	if strings.TrimSpace(in.ExtraBodyJSON) != "" {
+		extra, err := validateExtraBodyJSON(in.ExtraBodyJSON)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ExtraBodyJSON = extra
+	}
+
+	endpointChanged := hasStored && !(SameEndpointURL(storedBaseURL, cfg.BaseURL) &&
+		storedProto == NormalizeAIProtocol(cfg.Protocol) &&
+		storedEpMode == NormalizeAIEndpointMode(cfg.EndpointMode))
+
+	suppliedKey := ""
+	if in.APIKey != nil {
+		suppliedKey = strings.TrimSpace(*in.APIKey)
+	}
+	if suppliedKey != "" {
+		cfg.APIKey = suppliedKey
+	} else if hasStored && storedKey != "" && endpointChanged {
+		cfg.APIKey = ""
+		return nil, fmt.Errorf("%w: 更换接口地址、端点模式或协议时必须重新填写 API Key", ErrInvalidInput)
+	}
+
+	mergedHeaders, err := mergeProviderCustomHeaders(in.CustomHeaders, storedHeaders, endpointChanged)
+	if err != nil {
+		cfg.APIKey = ""
+		return nil, err
+	}
+	cfg.CustomHeaders = mergedHeaders
+	return &cfg, nil
+}
+
+// GetModelCatalogCache returns a deep copy of the cached online model metadata catalog from aiops_runtime.json.
+func (s *Store) GetModelCatalogCache() *AIModelCatalogCache {
+	if !s.IsReady() {
+		return nil
+	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.aiopsRT == nil || s.aiopsRT.ModelCatalog == nil {
+		return nil
+	}
+	src := s.aiopsRT.ModelCatalog
+	cp := &AIModelCatalogCache{
+		Source: src.Source,
+		Models: make([]AIModelCatalogEntry, len(src.Models)),
+	}
+	if src.SyncedAt != nil {
+		t := *src.SyncedAt
+		cp.SyncedAt = &t
+	}
+	for i, m := range src.Models {
+		mc := m
+		if m.SupportsTemperature != nil {
+			v := *m.SupportsTemperature
+			mc.SupportsTemperature = &v
+		}
+		cp.Models[i] = mc
+	}
+	return cp
+}
+
+// SaveModelCatalogCache persists synced public model metadata into aiops_runtime.json.
+func (s *Store) SaveModelCatalogCache(cache AIModelCatalogCache) error {
+	if !s.IsReady() {
+		return ErrVaultLocked
+	}
+	now := time.Now().UTC()
+	cp := AIModelCatalogCache{
+		Source: strings.TrimSpace(cache.Source),
+		Models: make([]AIModelCatalogEntry, len(cache.Models)),
+	}
+	if cache.SyncedAt != nil {
+		t := *cache.SyncedAt
+		cp.SyncedAt = &t
+	} else {
+		cp.SyncedAt = &now
+	}
+	for i, m := range cache.Models {
+		mc := m
+		if m.SupportsTemperature != nil {
+			v := *m.SupportsTemperature
+			mc.SupportsTemperature = &v
+		}
+		cp.Models[i] = mc
+	}
+
+	s.rtMu.Lock()
+	if s.aiopsRT == nil {
+		s.aiopsRT = DefaultAIOpsRuntimeState(now)
+	}
+	s.aiopsRT.ModelCatalog = &cp
+	s.dirtyAIOps = true
+	s.rtMu.Unlock()
+	s.triggerFlush()
+	return nil
 }

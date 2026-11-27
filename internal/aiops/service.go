@@ -19,8 +19,10 @@ const maxReActIterations = 8
 
 // StreamEvent is serialized as JSON over SSE (text/event-stream) to the browser.
 type StreamEvent struct {
-	Type             string                    `json:"type"` // "delta", "tool_start", "tool_result", "approval_required", "memory_updated", "memory_saved", "runbook_proposed", "agents_md_proposed", "context_compacted", "session_sync", "done", "error"
+	Type             string                    `json:"type"` // "delta", "reasoning_delta", "tool_start", "tool_result", "approval_required", "memory_updated", "memory_saved", "runbook_proposed", "agents_md_proposed", "context_compacted", "session_sync", "done", "error"
 	Delta            string                    `json:"delta,omitempty"`
+	ReasoningDelta   string                    `json:"reasoning_delta,omitempty"`
+	Usage            *vault.AITokenUsage       `json:"usage,omitempty"`
 	Tool             *vault.AIToolCallRecord   `json:"tool,omitempty"`
 	Approval         *vault.AIPendingApproval  `json:"approval,omitempty"`
 	Memory           *vault.HostMemory         `json:"memory,omitempty"`
@@ -30,6 +32,15 @@ type StreamEvent struct {
 	Compaction       *CompactionInfo           `json:"compaction,omitempty"`
 	Session          *vault.AIChatSession      `json:"session,omitempty"`
 	Error            string                    `json:"error,omitempty"`
+}
+
+// ModelCatalogOverview exposes merged built-in + synced public model metadata to the frontend.
+type ModelCatalogOverview struct {
+	Source       string                      `json:"source"`
+	SyncedAt     *time.Time                  `json:"synced_at,omitempty"`
+	BuiltinCount int                         `json:"builtin_count"`
+	SyncedCount  int                         `json:"synced_count"`
+	Models       []vault.AIModelCatalogEntry `json:"models"`
 }
 
 // ChatRequest encapsulates a user prompt sent from either AIOpsCenter or TerminalCopilot.
@@ -67,10 +78,12 @@ type Service struct {
 }
 
 func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
+	llmClient := NewLLMClient()
+	llmClient.SetCatalogProvider(store.GetModelCatalogCache)
 	svc := &Service{
 		store:            store,
 		ssh:              sshMgr,
-		llm:              NewLLMClient(),
+		llm:              llmClient,
 		patrolWakeCh:     make(chan struct{}, 1),
 		stopCh:           make(chan struct{}),
 		sessionLocks:     make(map[string]*sync.Mutex),
@@ -251,6 +264,43 @@ func (s *Service) notifyExternalApprovalChanged(approvalID string) {
 
 func (s *Service) LLM() *LLMClient {
 	return s.llm
+}
+
+// GetModelCatalogOverview returns the merged built-in + synced public model default catalog.
+func (s *Service) GetModelCatalogOverview() ModelCatalogOverview {
+	builtin := BuiltinModelCatalog()
+	cached := s.store.GetModelCatalogCache()
+	merged := MergedModelCatalog(cached)
+	ov := ModelCatalogOverview{
+		Source:       "builtin",
+		BuiltinCount: len(builtin),
+		Models:       merged,
+	}
+	if cached != nil && len(cached.Models) > 0 {
+		ov.Source = nonEmpty(cached.Source, "online")
+		ov.SyncedAt = cached.SyncedAt
+		ov.SyncedCount = len(cached.Models)
+	}
+	return ov
+}
+
+// SyncModelCatalog fetches the latest public model metadata from models.dev / OpenRouter (or customURL),
+// persists it into aiops_runtime.json, and returns the updated merged overview.
+func (s *Service) SyncModelCatalog(ctx context.Context, customURL string) (*ModelCatalogOverview, error) {
+	cache, err := SyncPublicModelCatalog(ctx, s.llm.Transport(), customURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.SaveModelCatalogCache(*cache); err != nil {
+		return nil, err
+	}
+	ov := s.GetModelCatalogOverview()
+	return &ov, nil
+}
+
+// FetchProviderModels queries the configured LLM provider's /models endpoint and enriches results with default specs.
+func (s *Service) FetchProviderModels(ctx context.Context, prov vault.AIProviderConfig) ([]vault.AIModelCatalogEntry, error) {
+	return FetchProviderModels(ctx, s.llm.Transport(), prov, s.store.GetModelCatalogCache())
 }
 
 // RunChatStream appends a user turn and runs the ReAct tool-calling loop, streaming SSE events via emit.
@@ -518,36 +568,40 @@ func (s *Service) continueAgentLoop(
 			s.store.TouchAIMemoryUsage(assembled.InjectedMemoryIDs)
 		}
 
-		ctxWin := EffectiveContextWindow(prov)
-		outReserve := prov.MaxTokens
-		if outReserve <= 0 {
-			outReserve = 4096
-		}
-		maxHistTokens := ctxWin - assembled.Inspection.EstimatedSystemTokens - assembled.Inspection.EstimatedSummaryTokens - outReserve - 1024
+		_, maxInputTok, _ := EffectiveTokenBudgets(prov, s.store.GetModelCatalogCache())
+		maxHistTokens := maxInputTok - assembled.Inspection.EstimatedSystemTokens - assembled.Inspection.EstimatedSummaryTokens - 1024
 		if maxHistTokens < 4096 {
 			maxHistTokens = 4096
 		}
 		effectiveHistory := buildEffectiveHistoryForLLM(sess, maxHistTokens)
 
-		turn, err := s.llm.StreamChat(ctx, prov, assembled.SystemPrompt, effectiveHistory, tools, func(chunk string) {
-			emit(StreamEvent{Type: "delta", Delta: chunk})
+		turn, err := s.llm.StreamChat(ctx, prov, assembled.SystemPrompt, effectiveHistory, tools, StreamCallbacks{
+			OnTextDelta: func(chunk string) {
+				emit(StreamEvent{Type: "delta", Delta: chunk})
+			},
+			OnReasoningDelta: func(chunk string) {
+				emit(StreamEvent{Type: "reasoning_delta", ReasoningDelta: chunk})
+			},
 		})
 		if err != nil {
 			return err
 		}
 
 		assistantMsg := vault.AIChatMessage{
-			ID:        uuid.NewString(),
-			Role:      "assistant",
-			Content:   turn.Content,
-			Timestamp: time.Now().UTC(),
+			ID:               uuid.NewString(),
+			Role:             "assistant",
+			Content:          turn.Content,
+			ReasoningContent: turn.ReasoningContent,
+			ProviderState:    turn.ProviderState,
+			Usage:            turn.Usage,
+			Timestamp:        time.Now().UTC(),
 		}
 
 		if len(turn.ToolCalls) == 0 {
 			sess.Messages = append(sess.Messages, assistantMsg)
 			_ = s.store.SaveAISession(*sess)
-			emit(StreamEvent{Type: "session_sync", Session: sess})
-			emit(StreamEvent{Type: "done", Session: sess})
+			emit(StreamEvent{Type: "session_sync", Session: sess, Usage: turn.Usage})
+			emit(StreamEvent{Type: "done", Session: sess, Usage: turn.Usage})
 			return nil
 		}
 

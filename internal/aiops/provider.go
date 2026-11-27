@@ -1,78 +1,151 @@
 package aiops
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
-// ProviderPreset provides one-click templates for popular LLM vendors.
+// ProviderPreset provides one-click templates for popular official, third-party relay, and local LLM services.
 type ProviderPreset struct {
-	ID           string           `json:"id"`
-	Name         string           `json:"name"`
-	Protocol     vault.AIProtocol `json:"protocol"`
-	BaseURL      string           `json:"base_url"`
-	DefaultModel string           `json:"default_model"`
-	Description  string           `json:"description"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	Protocol        vault.AIProtocol     `json:"protocol"`
+	BaseURL         string               `json:"base_url"`
+	EndpointMode    vault.AIEndpointMode `json:"endpoint_mode,omitempty"`
+	AuthMode        vault.AIAuthMode     `json:"auth_mode,omitempty"`
+	DefaultModel    string               `json:"default_model"`
+	ContextWindow   int                  `json:"context_window,omitempty"`
+	MaxInputTokens  int                  `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens int                  `json:"max_output_tokens,omitempty"`
+	Description     string               `json:"description"`
 }
 
-// BuiltinProviderPresets returns ready-to-use templates for mainstream cloud & local LLM services.
+// BuiltinProviderPresets returns ready-to-use templates for mainstream cloud, 3rd-party compatible relays & local LLMs.
 func BuiltinProviderPresets() []ProviderPreset {
 	return []ProviderPreset{
 		{
-			ID:           "deepseek",
-			Name:         "DeepSeek 官方接口",
-			Protocol:     vault.AIProtocolOpenAI,
-			BaseURL:      "https://api.deepseek.com/v1",
-			DefaultModel: "deepseek-chat",
-			Description:  "原生兼容 OpenAI Tool Calling，中文排障性价比极高",
+			ID:              "openai-responses",
+			Name:            "OpenAI 官方 (Responses API)",
+			Protocol:        vault.AIProtocolOpenAIResponses,
+			BaseURL:         "https://api.openai.com/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "gpt-6.2-sol",
+			ContextWindow:   1050000,
+			MaxInputTokens:  922000,
+			MaxOutputTokens: 128000,
+			Description:     "原生 Responses 流式接口，完整适配 GPT-6 / GPT-5 / Codex 推理与工具调用",
 		},
 		{
-			ID:           "aliyun-bailian",
-			Name:         "阿里云百炼 (通义千问)",
-			Protocol:     vault.AIProtocolOpenAI,
-			BaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
-			DefaultModel: "qwen-max",
-			Description:  "阿里云百炼兼容接口，支持 qwen-max / qwen-plus / deepseek 系列",
+			ID:              "anthropic-claude",
+			Name:            "Anthropic Claude 原生 / 中转",
+			Protocol:        vault.AIProtocolAnthropic,
+			BaseURL:         "https://api.anthropic.com",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "claude-sonnet-5-5",
+			ContextWindow:   1000000,
+			MaxInputTokens:  872000,
+			MaxOutputTokens: 128000,
+			Description:     "Anthropic Messages 协议，支持 Claude 5.5/4.6 自适应思考与 1M 上下文，兼容中转",
 		},
 		{
-			ID:           "anthropic-claude",
-			Name:         "Anthropic Claude 原生",
-			Protocol:     vault.AIProtocolAnthropic,
-			BaseURL:      "https://api.anthropic.com",
-			DefaultModel: "claude-sonnet-4-5",
-			Description:  "原生 Anthropic Messages 协议，擅长复杂 Shell 诊断与配置加固",
+			ID:              "google-gemini",
+			Name:            "Google Gemini 原生 / 中转",
+			Protocol:        vault.AIProtocolGemini,
+			BaseURL:         "https://generativelanguage.googleapis.com/v1beta",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "gemini-4-neon",
+			ContextWindow:   1048576,
+			MaxInputTokens:  983040,
+			MaxOutputTokens: 65536,
+			Description:     "Gemini 原生流式协议 (streamGenerateContent)，支持思考等级与多轮签名透传",
 		},
 		{
-			ID:           "openai",
-			Name:         "OpenAI 官方接口",
-			Protocol:     vault.AIProtocolOpenAI,
-			BaseURL:      "https://api.openai.com/v1",
-			DefaultModel: "gpt-4.1",
-			Description:  "标准 OpenAI Chat Completions 接口",
+			ID:              "deepseek",
+			Name:            "DeepSeek 官方接口",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "https://api.deepseek.com/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "deepseek-v4-pro",
+			ContextWindow:   1048576,
+			MaxInputTokens:  655360,
+			MaxOutputTokens: 393216,
+			Description:     "DeepSeek V4 / V3.2 原生思考链透传与工具调用，中文排障性价比极高",
 		},
 		{
-			ID:           "siliconflow",
-			Name:         "SiliconFlow 硅基流动",
-			Protocol:     vault.AIProtocolOpenAI,
-			BaseURL:      "https://api.siliconflow.cn/v1",
-			DefaultModel: "Qwen/Qwen3-235B-A22B",
-			Description:  "聚合多种开源旗舰推理与指令模型",
+			ID:              "aliyun-bailian",
+			Name:            "阿里云百炼 (通义千问)",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "qwen4-max",
+			ContextWindow:   1000000,
+			MaxInputTokens:  737856,
+			MaxOutputTokens: 262144,
+			Description:     "阿里云百炼兼容接口，支持 qwen4-max / qwen3.8 / deepseek-v4 系列",
 		},
 		{
-			ID:           "ollama-local",
-			Name:         "本地私有 Ollama",
-			Protocol:     vault.AIProtocolOpenAI,
-			BaseURL:      "http://127.0.0.1:11434/v1",
-			DefaultModel: "qwen3:14b",
-			Description:  "纯内网离线运行，数据零出境，无需填写 API Key",
+			ID:              "openrouter",
+			Name:            "OpenRouter 聚合网关",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "https://openrouter.ai/api/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "anthropic/claude-sonnet-5-5",
+			ContextWindow:   1000000,
+			MaxInputTokens:  872000,
+			MaxOutputTokens: 128000,
+			Description:     "一站式聚合 OpenAI / Claude / Gemini / DeepSeek 等数百款最新模型",
+		},
+		{
+			ID:              "openai-compatible-relay",
+			Name:            "通用第三方兼容中转 (OneAPI/NewAPI)",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "https://your-relay.example.com/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeBearer,
+			DefaultModel:    "gpt-5.4",
+			ContextWindow:   1050000,
+			MaxInputTokens:  922000,
+			MaxOutputTokens: 128000,
+			Description:     "适配各类 OpenAI / Claude / Gemini 兼容第三方中转站，支持自由切换协议与认证头",
+		},
+		{
+			ID:              "siliconflow",
+			Name:            "SiliconFlow 硅基流动",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "https://api.siliconflow.cn/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeAuto,
+			DefaultModel:    "deepseek-ai/DeepSeek-V3.2",
+			ContextWindow:   163840,
+			MaxInputTokens:  98304,
+			MaxOutputTokens: 65536,
+			Description:     "聚合开源旗舰推理与指令模型，国内直连低延迟",
+		},
+		{
+			ID:              "ollama-local",
+			Name:            "本地私有 Ollama / vLLM",
+			Protocol:        vault.AIProtocolOpenAI,
+			BaseURL:         "http://127.0.0.1:11434/v1",
+			EndpointMode:    vault.AIEndpointModeAuto,
+			AuthMode:        vault.AIAuthModeNone,
+			DefaultModel:    "qwen3:14b",
+			ContextWindow:   40960,
+			MaxInputTokens:  32768,
+			MaxOutputTokens: 8192,
+			Description:     "纯内网离线运行，数据零出境，无需填写 API Key",
 		},
 	}
 }
@@ -91,15 +164,37 @@ type LLMToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
-// AssistantTurn captures the completed text and/or tool calls of one LLM invocation.
+// AssistantTurn captures the completed text, reasoning, tool calls, protocol round-trip state, and real usage.
 type AssistantTurn struct {
-	Content   string
-	ToolCalls []LLMToolCall
+	Content          string
+	ReasoningContent string
+	ToolCalls        []LLMToolCall
+	ProviderState    *vault.AIMessageMeta
+	Usage            *vault.AITokenUsage
 }
 
-// LLMClient executes streaming/non-streaming requests against OpenAI-compatible and Anthropic endpoints.
+// StreamCallbacks receives incremental text and reasoning chunks during SSE streaming.
+type StreamCallbacks struct {
+	OnTextDelta      func(textChunk string)
+	OnReasoningDelta func(reasoningChunk string)
+}
+
+// TestConnectionResult carries detailed streaming latency and preview info from connectivity checks.
+type TestConnectionResult struct {
+	LatencyMs        int64               `json:"latency_ms"`
+	FirstTokenMs     int64               `json:"first_token_ms,omitempty"`
+	Reply            string              `json:"reply"`
+	ReasoningPreview string              `json:"reasoning_preview,omitempty"`
+	Protocol         vault.AIProtocol    `json:"protocol"`
+	Model            string              `json:"model"`
+	Usage            *vault.AITokenUsage `json:"usage,omitempty"`
+}
+
+// LLMClient executes strictly streaming requests against OpenAI Chat Completions,
+// OpenAI Responses API, Anthropic Messages, and Google Gemini endpoints.
 type LLMClient struct {
-	transport HTTPTransport
+	transport       HTTPTransport
+	catalogProvider func() *vault.AIModelCatalogCache
 }
 
 func NewLLMClient() *LLMClient {
@@ -108,7 +203,14 @@ func NewLLMClient() *LLMClient {
 	}
 }
 
-// Transport exposes the underlying HTTPTransport for shared webhook delivery.
+// SetCatalogProvider attaches an optional cache reader so LLMClient uses synced online model specs.
+func (c *LLMClient) SetCatalogProvider(fn func() *vault.AIModelCatalogCache) {
+	if c != nil {
+		c.catalogProvider = fn
+	}
+}
+
+// Transport exposes the underlying HTTPTransport for shared webhook delivery and catalog sync.
 func (c *LLMClient) Transport() HTTPTransport {
 	if c == nil || c.transport == nil {
 		return newDefaultHTTPTransport()
@@ -116,666 +218,452 @@ func (c *LLMClient) Transport() HTTPTransport {
 	return c.transport
 }
 
-// TestConnection sends a minimal ping message to verify endpoint reachability, credentials, and latency.
+func (c *LLMClient) lookupSpec(prov vault.AIProviderConfig) ModelSpec {
+	var cached *vault.AIModelCatalogCache
+	if c != nil && c.catalogProvider != nil {
+		cached = c.catalogProvider()
+	}
+	return LookupModelSpec(prov.Model, vault.NormalizeAIProtocol(prov.Protocol), cached)
+}
+
+// TestConnection sends a minimal streaming ping message to verify endpoint reachability, credentials, and latency.
 func (c *LLMClient) TestConnection(ctx context.Context, prov vault.AIProviderConfig) (int64, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	res, err := c.TestConnectionDetailed(ctx, prov)
+	if err != nil {
+		return 0, "", err
+	}
+	return res.LatencyMs, res.Reply, nil
+}
+
+// TestConnectionDetailed runs a real streaming connectivity check using the provider's configured protocol
+// and parameters WITHOUT artificially shrinking max_output_tokens (which would starve thinking/reasoning models).
+func (c *LLMClient) TestConnectionDetailed(ctx context.Context, prov vault.AIProviderConfig) (*TestConnectionResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
 	start := time.Now()
+	var firstTokenMs int64
+	markFirst := func() {
+		if firstTokenMs == 0 {
+			firstTokenMs = max(int64(1), time.Since(start).Milliseconds())
+		}
+	}
+
 	msgs := []vault.AIChatMessage{
 		{
 			Role:    "user",
 			Content: "请仅回复“连接正常”四个字用于连通性自检。",
 		},
 	}
-	prov.MaxTokens = 64
-	turn, err := c.StreamChat(ctx, prov, "你是 ServerNeedSafe 连通性测试助手。", msgs, nil, nil)
+
+	// Keep the user's configured max_output_tokens intact (or unset/model default);
+	// never clamp to tiny values like 64 which break reasoning/thinking models!
+	turn, err := c.StreamChat(ctx, prov, "你是 ServerNeedSafe 连通性测试助手。", msgs, nil, StreamCallbacks{
+		OnTextDelta: func(string) {
+			markFirst()
+		},
+		OnReasoningDelta: func(string) {
+			markFirst()
+		},
+	})
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	latency := time.Since(start).Milliseconds()
-	if latency <= 0 {
-		latency = 1
-	}
+
+	latency := max(int64(1), time.Since(start).Milliseconds())
 	preview := strings.TrimSpace(turn.Content)
-	if preview == "" {
-		preview = "连接成功"
+	reasoningPreview := strings.TrimSpace(turn.ReasoningContent)
+	if len([]rune(reasoningPreview)) > 160 {
+		reasoningPreview = string([]rune(reasoningPreview)[:160]) + "..."
 	}
-	return latency, preview, nil
+	if preview == "" {
+		if reasoningPreview != "" {
+			preview = "连接正常（模型返回了思考流，建议调大最大输出 Tokens 以输出正文）"
+		} else {
+			preview = "连接成功"
+		}
+	}
+	return &TestConnectionResult{
+		LatencyMs:        latency,
+		FirstTokenMs:     firstTokenMs,
+		Reply:            preview,
+		ReasoningPreview: reasoningPreview,
+		Protocol:         vault.NormalizeAIProtocol(prov.Protocol),
+		Model:            prov.Model,
+		Usage:            turn.Usage,
+	}, nil
 }
 
-// StreamChat invokes either OpenAI Chat Completions or Anthropic Messages with SSE streaming and tool calling.
+// StreamChat invokes the configured protocol strictly in streaming SSE mode with automatic model parameter adaptation.
 func (c *LLMClient) StreamChat(
 	ctx context.Context,
 	prov vault.AIProviderConfig,
 	systemPrompt string,
 	history []vault.AIChatMessage,
 	tools []ToolDefinition,
-	onDelta func(textChunk string),
+	cb StreamCallbacks,
 ) (*AssistantTurn, error) {
-	switch prov.Protocol {
+	proto := vault.NormalizeAIProtocol(prov.Protocol)
+	spec := c.lookupSpec(prov)
+	switch proto {
+	case vault.AIProtocolOpenAIResponses:
+		return c.streamOpenAIResponses(ctx, prov, spec, systemPrompt, history, tools, cb)
 	case vault.AIProtocolAnthropic:
-		return c.streamAnthropic(ctx, prov, systemPrompt, history, tools, onDelta)
+		return c.streamAnthropic(ctx, prov, spec, systemPrompt, history, tools, cb)
+	case vault.AIProtocolGemini:
+		return c.streamGemini(ctx, prov, spec, systemPrompt, history, tools, cb)
 	default:
-		return c.streamOpenAI(ctx, prov, systemPrompt, history, tools, onDelta)
+		return c.streamOpenAIChat(ctx, prov, spec, systemPrompt, history, tools, cb)
 	}
 }
 
-// --- OpenAI Chat Completions Compatible Protocol ---
+// --- Shared Endpoint Resolution, Auth, Custom Headers, Extra Body Merge & Error Handling ---
+
+var versionPathSuffixRe = regexp.MustCompile(`(?i)/(v[0-9]+(alpha|beta)?|openai|compatible-mode/v[0-9]+)$`)
+
+func resolveChatEndpoint(prov vault.AIProviderConfig, proto vault.AIProtocol) string {
+	raw := strings.TrimSpace(prov.BaseURL)
+	if vault.NormalizeAIEndpointMode(prov.EndpointMode) == vault.AIEndpointModeExact {
+		if proto == vault.AIProtocolGemini {
+			return ensureQueryParam(raw, "alt", "sse")
+		}
+		return raw
+	}
+
+	u := strings.TrimRight(raw, "/")
+	switch proto {
+	case vault.AIProtocolOpenAI:
+		if strings.HasSuffix(u, "/chat/completions") {
+			return u
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/chat/completions"
+		}
+		return u + "/v1/chat/completions"
+
+	case vault.AIProtocolOpenAIResponses:
+		if strings.HasSuffix(u, "/responses") {
+			return u
+		}
+		if strings.HasSuffix(u, "/chat/completions") {
+			return strings.TrimSuffix(u, "/chat/completions") + "/responses"
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/responses"
+		}
+		return u + "/v1/responses"
+
+	case vault.AIProtocolAnthropic:
+		if strings.HasSuffix(u, "/v1/messages") || strings.HasSuffix(u, "/messages") {
+			return u
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/messages"
+		}
+		return u + "/v1/messages"
+
+	case vault.AIProtocolGemini:
+		model := strings.TrimPrefix(strings.TrimSpace(prov.Model), "models/")
+		if strings.Contains(u, ":streamGenerateContent") {
+			return ensureQueryParam(u, "alt", "sse")
+		}
+		if strings.Contains(u, ":generateContent") {
+			rewritten := strings.Replace(u, ":generateContent", ":streamGenerateContent", 1)
+			return ensureQueryParam(rewritten, "alt", "sse")
+		}
+		if strings.HasSuffix(u, "/models") {
+			return ensureQueryParam(u+"/"+url.PathEscape(model)+":streamGenerateContent", "alt", "sse")
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return ensureQueryParam(u+"/models/"+url.PathEscape(model)+":streamGenerateContent", "alt", "sse")
+		}
+		return ensureQueryParam(u+"/v1beta/models/"+url.PathEscape(model)+":streamGenerateContent", "alt", "sse")
+
+	default:
+		return resolveOpenAIEndpoint(u)
+	}
+}
 
 func resolveOpenAIEndpoint(baseURL string) string {
 	u := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if strings.HasSuffix(u, "/chat/completions") {
 		return u
 	}
-	if strings.HasSuffix(u, "/v1") || strings.Contains(u, "/compatible-mode/v1") || strings.HasSuffix(u, "/openai") {
+	if versionPathSuffixRe.MatchString(u) {
 		return u + "/chat/completions"
 	}
 	return u + "/v1/chat/completions"
 }
-
-func (c *LLMClient) streamOpenAI(
-	ctx context.Context,
-	prov vault.AIProviderConfig,
-	systemPrompt string,
-	history []vault.AIChatMessage,
-	tools []ToolDefinition,
-	onDelta func(string),
-) (*AssistantTurn, error) {
-	messages := make([]map[string]any, 0, len(history)+1)
-	if strings.TrimSpace(systemPrompt) != "" {
-		messages = append(messages, map[string]any{
-			"role":    "system",
-			"content": systemPrompt,
-		})
-	}
-
-	for _, m := range history {
-		switch m.Role {
-		case "user":
-			messages = append(messages, map[string]any{
-				"role":    "user",
-				"content": m.Content,
-			})
-		case "assistant":
-			item := map[string]any{
-				"role": "assistant",
-			}
-			if m.Content != "" || len(m.ToolCalls) == 0 {
-				item["content"] = m.Content
-			}
-			if len(m.ToolCalls) > 0 {
-				tcs := make([]map[string]any, len(m.ToolCalls))
-				for i, tc := range m.ToolCalls {
-					args := tc.Arguments
-					if strings.TrimSpace(args) == "" {
-						args = "{}"
-					}
-					tcs[i] = map[string]any{
-						"id":   tc.ID,
-						"type": "function",
-						"function": map[string]any{
-							"name":      tc.Name,
-							"arguments": args,
-						},
-					}
-				}
-				item["tool_calls"] = tcs
-			}
-			messages = append(messages, item)
-		case "tool":
-			messages = append(messages, map[string]any{
-				"role":         "tool",
-				"tool_call_id": m.ToolCallID,
-				"content":      m.Content,
-			})
-		}
-	}
-
-	maxTok := prov.MaxTokens
-	if maxTok <= 0 {
-		maxTok = 4096
-	}
-
-	payload := map[string]any{
-		"model":      prov.Model,
-		"messages":   messages,
-		"max_tokens": maxTok,
-		"stream":     true,
-	}
-	if len(tools) > 0 {
-		oaTools := make([]map[string]any, len(tools))
-		for i, td := range tools {
-			oaTools[i] = map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        td.Name,
-					"description": td.Description,
-					"parameters":  td.Parameters,
-				},
-			}
-		}
-		payload["tools"] = oaTools
-	}
-
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	headers := map[string]string{
-		"Content-Type": "application/json",
-		"Accept":       "text/event-stream, application/json",
-	}
-	if strings.TrimSpace(prov.APIKey) != "" {
-		headers["Authorization"] = "Bearer " + strings.TrimSpace(prov.APIKey)
-	}
-
-	type partialCall struct {
-		id   string
-		name string
-		args strings.Builder
-	}
-	var contentBuf strings.Builder
-	callByIdx := make(map[int]*partialCall)
-	maxIdx := -1
-	var streamErrMsg string
-
-	endpoint := resolveOpenAIEndpoint(prov.BaseURL)
-	meta, err := c.Transport().PostStream(ctx, endpoint, headers, bodyBytes, func(rawLine string) bool {
-		line := strings.TrimSpace(rawLine)
-		if !strings.HasPrefix(line, "data:") {
-			return true
-		}
-		dataStr := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if dataStr == "" {
-			return true
-		}
-		if dataStr == "[DONE]" {
-			return false
-		}
-
-		var chunk struct {
-			Error   any `json:"error"`
-			Choices []struct {
-				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-			} `json:"choices"`
-		}
-		if json.Unmarshal([]byte(dataStr), &chunk) != nil {
-			return true
-		}
-		if chunk.Error != nil {
-			streamErrMsg = extractProviderErrMsg([]byte(dataStr))
-			return false
-		}
-		for _, ch := range chunk.Choices {
-			if ch.Delta.Content != "" {
-				contentBuf.WriteString(ch.Delta.Content)
-				if onDelta != nil {
-					onDelta(ch.Delta.Content)
-				}
-			}
-			for _, tc := range ch.Delta.ToolCalls {
-				pc, ok := callByIdx[tc.Index]
-				if !ok {
-					pc = &partialCall{}
-					callByIdx[tc.Index] = pc
-					if tc.Index > maxIdx {
-						maxIdx = tc.Index
-					}
-				}
-				if tc.ID != "" {
-					pc.id = tc.ID
-				}
-				if tc.Function.Name != "" {
-					pc.name += tc.Function.Name
-				}
-				if tc.Function.Arguments != "" {
-					pc.args.WriteString(tc.Function.Arguments)
-				}
-			}
-		}
-		return true
-	})
-	if err != nil {
-		return nil, fmt.Errorf("请求大模型接口失败: %w", err)
-	}
-	if meta.StatusCode >= 400 {
-		return nil, fmt.Errorf("模型接口返回 HTTP %d: %s", meta.StatusCode, extractProviderErrMsg(meta.RawBody))
-	}
-	if streamErrMsg != "" {
-		return nil, fmt.Errorf("模型流式接口返回错误: %s", streamErrMsg)
-	}
-	if !strings.Contains(strings.ToLower(meta.ContentType), "text/event-stream") {
-		return parseOpenAINonStream(bytes.NewReader(meta.RawBody), onDelta)
-	}
-
-	turn := &AssistantTurn{
-		Content: contentBuf.String(),
-	}
-	fallbackPrefix := uuid.NewString()[:8]
-	for i := 0; i <= maxIdx; i++ {
-		if pc, ok := callByIdx[i]; ok && pc.name != "" {
-			id := pc.id
-			if id == "" {
-				id = fmt.Sprintf("call_%s_%d", fallbackPrefix, i+1)
-			}
-			args := strings.TrimSpace(pc.args.String())
-			if args == "" {
-				args = "{}"
-			}
-			turn.ToolCalls = append(turn.ToolCalls, LLMToolCall{
-				ID:        id,
-				Name:      pc.name,
-				Arguments: args,
-			})
-		}
-	}
-	return turn, nil
-}
-
-func parseOpenAINonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, 4*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取大模型响应失败: %w", err)
-	}
-	var resp struct {
-		Error   any `json:"error"`
-		Choices []struct {
-			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
-					ID       string `json:"id"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("解析大模型响应失败: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("模型接口返回错误: %s", extractProviderErrMsg(raw))
-	}
-	if len(resp.Choices) == 0 {
-		return &AssistantTurn{}, nil
-	}
-	msg := resp.Choices[0].Message
-	if msg.Content != "" && onDelta != nil {
-		onDelta(msg.Content)
-	}
-	turn := &AssistantTurn{Content: msg.Content}
-	fallbackPrefix := uuid.NewString()[:8]
-	for i, tc := range msg.ToolCalls {
-		id := tc.ID
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d", fallbackPrefix, i+1)
-		}
-		args := strings.TrimSpace(tc.Function.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		turn.ToolCalls = append(turn.ToolCalls, LLMToolCall{
-			ID:        id,
-			Name:      tc.Function.Name,
-			Arguments: args,
-		})
-	}
-	return turn, nil
-}
-
-// --- Anthropic Messages Native Protocol ---
 
 func resolveAnthropicEndpoint(baseURL string) string {
 	u := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if strings.HasSuffix(u, "/v1/messages") || strings.HasSuffix(u, "/messages") {
 		return u
 	}
-	if strings.HasSuffix(u, "/v1") {
+	if versionPathSuffixRe.MatchString(u) {
 		return u + "/messages"
 	}
 	return u + "/v1/messages"
 }
 
-func buildAnthropicMessages(history []vault.AIChatMessage) []map[string]any {
-	var anthMessages []map[string]any
+func resolveModelsEndpoint(baseURL string, proto vault.AIProtocol) string {
+	u := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	// Strip query string if caller pasted a full streaming URL
+	if parsed, err := url.Parse(u); err == nil && parsed.RawQuery != "" {
+		parsed.RawQuery = ""
+		u = strings.TrimRight(parsed.String(), "/")
+	}
 
-	toBlocks := func(content any) []map[string]any {
-		switch v := content.(type) {
-		case []map[string]any:
-			return v
-		case string:
-			if strings.TrimSpace(v) == "" {
-				return nil
+	switch proto {
+	case vault.AIProtocolGemini:
+		if idx := strings.Index(u, "/models/"); idx > 0 {
+			return u[:idx] + "/models"
+		}
+		if strings.HasSuffix(u, "/models") {
+			return u
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/models"
+		}
+		return u + "/v1beta/models"
+
+	case vault.AIProtocolAnthropic:
+		u = strings.TrimSuffix(u, "/messages")
+		if strings.HasSuffix(u, "/models") {
+			return u
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/models"
+		}
+		return u + "/v1/models"
+
+	default: // openai / openai_responses
+		u = strings.TrimSuffix(u, "/chat/completions")
+		u = strings.TrimSuffix(u, "/responses")
+		if strings.HasSuffix(u, "/models") {
+			return u
+		}
+		if versionPathSuffixRe.MatchString(u) {
+			return u + "/models"
+		}
+		return u + "/v1/models"
+	}
+}
+
+func ensureQueryParam(rawURL, key, val string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		if strings.Contains(rawURL, "?") {
+			if strings.Contains(rawURL, key+"=") {
+				return rawURL
 			}
-			return []map[string]any{{"type": "text", "text": v}}
+			return rawURL + "&" + url.QueryEscape(key) + "=" + url.QueryEscape(val)
+		}
+		return rawURL + "?" + url.QueryEscape(key) + "=" + url.QueryEscape(val)
+	}
+	q := parsed.Query()
+	if q.Get(key) == "" {
+		q.Set(key, val)
+		parsed.RawQuery = q.Encode()
+	}
+	return parsed.String()
+}
+
+func applyAuthAndHeaders(prov vault.AIProviderConfig, proto vault.AIProtocol, endpoint string, headers map[string]string) string {
+	apiKey := strings.TrimSpace(prov.APIKey)
+	authMode := vault.NormalizeAIAuthMode(prov.AuthMode)
+	if authMode == vault.AIAuthModeAuto {
+		switch proto {
+		case vault.AIProtocolAnthropic:
+			authMode = vault.AIAuthModeXAPIKey
+		case vault.AIProtocolGemini:
+			authMode = vault.AIAuthModeXGoogAPIKey
 		default:
-			return nil
+			authMode = vault.AIAuthModeBearer
 		}
 	}
 
-	appendMsg := func(role string, content any) {
-		if len(anthMessages) > 0 && anthMessages[len(anthMessages)-1]["role"] == role {
-			prevBlocks := toBlocks(anthMessages[len(anthMessages)-1]["content"])
-			nextBlocks := toBlocks(content)
-			merged := append(prevBlocks, nextBlocks...)
-			if len(merged) > 0 {
-				anthMessages[len(anthMessages)-1]["content"] = merged
-			}
-			return
+	if apiKey != "" {
+		switch authMode {
+		case vault.AIAuthModeBearer:
+			headers["Authorization"] = "Bearer " + apiKey
+		case vault.AIAuthModeXAPIKey:
+			headers["x-api-key"] = apiKey
+		case vault.AIAuthModeXGoogAPIKey:
+			headers["x-goog-api-key"] = apiKey
+		case vault.AIAuthModeQueryKey:
+			endpoint = ensureQueryParam(endpoint, "key", apiKey)
+		case vault.AIAuthModeNone:
+			// Explicitly omit auth header/query
 		}
-		anthMessages = append(anthMessages, map[string]any{
-			"role":    role,
-			"content": content,
-		})
 	}
 
-	for i := 0; i < len(history); i++ {
-		m := history[i]
-		switch m.Role {
-		case "user":
-			if strings.TrimSpace(m.Content) == "" {
+	// Custom headers always apply last so users can override any header without restriction.
+	for _, h := range prov.CustomHeaders {
+		k := strings.TrimSpace(h.Key)
+		if k == "" {
+			continue
+		}
+		headers[k] = h.Value
+	}
+	return endpoint
+}
+
+func sanitizeURLError(err error, apiKey string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	key := strings.TrimSpace(apiKey)
+	if key != "" {
+		msg = strings.ReplaceAll(msg, key, "***")
+		msg = strings.ReplaceAll(msg, url.QueryEscape(key), "***")
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+// mergeExtraBodyJSON applies an RFC 7396 JSON Merge Patch from rawExtra into dst.
+// Nested objects merge recursively; explicit null values delete keys; scalars/arrays replace directly.
+func mergeExtraBodyJSON(dst map[string]any, rawExtra string) error {
+	trimmed := strings.TrimSpace(rawExtra)
+	if trimmed == "" {
+		return nil
+	}
+	var patch map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &patch); err != nil {
+		return fmt.Errorf("自定义扩展请求体 JSON 无效: %w", err)
+	}
+	if patch == nil {
+		return nil
+	}
+	deepMergeMap(dst, patch)
+	return nil
+}
+
+func deepMergeMap(dst, patch map[string]any) {
+	for k, v := range patch {
+		if v == nil {
+			delete(dst, k)
+			continue
+		}
+		if patchSub, ok := v.(map[string]any); ok {
+			if dstSub, ok2 := dst[k].(map[string]any); ok2 && dstSub != nil {
+				deepMergeMap(dstSub, patchSub)
 				continue
 			}
-			appendMsg("user", m.Content)
-		case "assistant":
-			var blocks []map[string]any
-			if strings.TrimSpace(m.Content) != "" {
-				blocks = append(blocks, map[string]any{
-					"type": "text",
-					"text": m.Content,
-				})
-			}
-			for _, tc := range m.ToolCalls {
-				var parsedInput any = map[string]any{}
-				if strings.TrimSpace(tc.Arguments) != "" {
-					_ = json.Unmarshal([]byte(tc.Arguments), &parsedInput)
-				}
-				blocks = append(blocks, map[string]any{
-					"type":  "tool_use",
-					"id":    tc.ID,
-					"name":  tc.Name,
-					"input": parsedInput,
-				})
-			}
-			if len(blocks) > 0 {
-				appendMsg("assistant", blocks)
-			}
-		case "tool":
-			var resultBlocks []map[string]any
-			for ; i < len(history) && history[i].Role == "tool"; i++ {
-				tm := history[i]
-				resultBlocks = append(resultBlocks, map[string]any{
-					"type":        "tool_result",
-					"tool_use_id": tm.ToolCallID,
-					"content":     tm.Content,
-					"is_error":    tm.IsError,
-				})
-			}
-			i--
-			if len(resultBlocks) > 0 {
-				appendMsg("user", resultBlocks)
-			}
+			// Clone patchSub into a fresh map so we don't alias caller structures
+			fresh := make(map[string]any, len(patchSub))
+			deepMergeMap(fresh, patchSub)
+			dst[k] = fresh
+			continue
 		}
+		dst[k] = v
 	}
-
-	// Anthropic Messages API requires the first message to have role "user".
-	for len(anthMessages) > 0 && anthMessages[0]["role"] != "user" {
-		anthMessages = anthMessages[1:]
-	}
-	return anthMessages
 }
 
-func (c *LLMClient) streamAnthropic(
-	ctx context.Context,
-	prov vault.AIProviderConfig,
-	systemPrompt string,
-	history []vault.AIChatMessage,
-	tools []ToolDefinition,
-	onDelta func(string),
-) (*AssistantTurn, error) {
-	anthMessages := buildAnthropicMessages(history)
-
-	maxTok := prov.MaxTokens
-	if maxTok <= 0 {
-		maxTok = 4096
-	}
-	payload := map[string]any{
-		"model":      prov.Model,
-		"max_tokens": maxTok,
-		"messages":   anthMessages,
-		"stream":     true,
-	}
-	if strings.TrimSpace(systemPrompt) != "" {
-		payload["system"] = systemPrompt
-	}
-	if len(tools) > 0 {
-		anthTools := make([]map[string]any, len(tools))
-		for i, td := range tools {
-			anthTools[i] = map[string]any{
-				"name":         td.Name,
-				"description":  td.Description,
-				"input_schema": td.Parameters,
-			}
-		}
-		payload["tools"] = anthTools
-	}
-
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	headers := map[string]string{
-		"Content-Type":                              "application/json",
-		"Accept":                                    "text/event-stream, application/json",
-		"anthropic-version":                         "2023-06-01",
-		"anthropic-dangerous-direct-browser-access": "true",
-	}
-	if strings.TrimSpace(prov.APIKey) != "" {
-		headers["x-api-key"] = strings.TrimSpace(prov.APIKey)
-	}
-
-	type anthBlock struct {
-		kind string
-		id   string
-		name string
-		json strings.Builder
-	}
-	var contentBuf strings.Builder
-	blocks := make(map[int]*anthBlock)
-	maxIdx := -1
-	var streamErrMsg string
-
-	endpoint := resolveAnthropicEndpoint(prov.BaseURL)
-	meta, err := c.Transport().PostStream(ctx, endpoint, headers, bodyBytes, func(rawLine string) bool {
-		line := strings.TrimSpace(rawLine)
-		if !strings.HasPrefix(line, "data:") {
-			return true
-		}
-		dataStr := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if dataStr == "" {
-			return true
-		}
-		var ev struct {
-			Type         string `json:"type"`
-			Index        int    `json:"index"`
-			Error        any    `json:"error"`
-			ContentBlock struct {
-				Type  string          `json:"type"`
-				ID    string          `json:"id"`
-				Name  string          `json:"name"`
-				Text  string          `json:"text"`
-				Input json.RawMessage `json:"input"`
-			} `json:"content_block"`
-			Delta struct {
-				Type        string `json:"type"`
-				Text        string `json:"text"`
-				PartialJSON string `json:"partial_json"`
-			} `json:"delta"`
-		}
-		if json.Unmarshal([]byte(dataStr), &ev) != nil {
-			return true
-		}
-		switch ev.Type {
-		case "error":
-			streamErrMsg = extractProviderErrMsg([]byte(dataStr))
-			return false
-		case "content_block_start":
-			b := &anthBlock{
-				kind: ev.ContentBlock.Type,
-				id:   ev.ContentBlock.ID,
-				name: ev.ContentBlock.Name,
-			}
-			if ev.ContentBlock.Type == "text" && ev.ContentBlock.Text != "" {
-				contentBuf.WriteString(ev.ContentBlock.Text)
-				if onDelta != nil {
-					onDelta(ev.ContentBlock.Text)
-				}
-			}
-			if ev.ContentBlock.Type == "tool_use" && len(ev.ContentBlock.Input) > 0 && string(ev.ContentBlock.Input) != "{}" {
-				b.json.Write(ev.ContentBlock.Input)
-			}
-			blocks[ev.Index] = b
-			if ev.Index > maxIdx {
-				maxIdx = ev.Index
-			}
-		case "content_block_delta":
-			if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
-				contentBuf.WriteString(ev.Delta.Text)
-				if onDelta != nil {
-					onDelta(ev.Delta.Text)
-				}
-			} else if ev.Delta.Type == "input_json_delta" && ev.Delta.PartialJSON != "" {
-				if b, ok := blocks[ev.Index]; ok {
-					b.json.WriteString(ev.Delta.PartialJSON)
-				}
-			}
-		case "message_stop":
-			return false
-		}
-		return true
-	})
-	if err != nil {
-		return nil, fmt.Errorf("请求 Anthropic 接口失败: %w", err)
+func validateStrictStreamMeta(meta *StreamResponseMeta, protocolLabel string) error {
+	if meta == nil {
+		return fmt.Errorf("%s 接口未返回有效响应", protocolLabel)
 	}
 	if meta.StatusCode >= 400 {
-		return nil, fmt.Errorf("Anthropic 接口返回 HTTP %d: %s", meta.StatusCode, extractProviderErrMsg(meta.RawBody))
+		return fmt.Errorf("%s 接口返回 HTTP %d: %s", protocolLabel, meta.StatusCode, extractProviderErrMsg(meta.RawBody))
 	}
-	if streamErrMsg != "" {
-		return nil, fmt.Errorf("Anthropic 流式接口返回错误: %s", streamErrMsg)
-	}
-	if !strings.Contains(strings.ToLower(meta.ContentType), "text/event-stream") {
-		return parseAnthropicNonStream(bytes.NewReader(meta.RawBody), onDelta)
-	}
-
-	turn := &AssistantTurn{Content: contentBuf.String()}
-	fallbackPrefix := uuid.NewString()[:8]
-	for i := 0; i <= maxIdx; i++ {
-		if b, ok := blocks[i]; ok && b.kind == "tool_use" && b.name != "" {
-			id := b.id
-			if id == "" {
-				id = fmt.Sprintf("toolu_%s_%d", fallbackPrefix, i+1)
-			}
-			args := strings.TrimSpace(b.json.String())
-			if args == "" {
-				args = "{}"
-			}
-			turn.ToolCalls = append(turn.ToolCalls, LLMToolCall{
-				ID:        id,
-				Name:      b.name,
-				Arguments: args,
-			})
+	if !meta.IsSSE {
+		if errMsg := extractExplicitErrorField(meta.RawBody); errMsg != "" {
+			return fmt.Errorf("%s 接口返回错误: %s", protocolLabel, errMsg)
 		}
+		return fmt.Errorf("%s 接口返回了非流式响应 (Content-Type: %s)，当前强制仅使用流式 SSE 请求，请检查接口地址或确认该网关支持流式响应", protocolLabel, nonEmpty(meta.ContentType, "未知"))
 	}
-	return turn, nil
+	return nil
 }
 
-func parseAnthropicNonStream(r io.Reader, onDelta func(string)) (*AssistantTurn, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, 4*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("读取 Anthropic 响应失败: %w", err)
+func extractExplicitErrorField(raw []byte) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return ""
 	}
-	var resp struct {
-		Type    string `json:"type"`
-		Error   any    `json:"error"`
-		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("解析 Anthropic 响应失败: %w", err)
-	}
-	if resp.Type == "error" || resp.Error != nil {
-		return nil, fmt.Errorf("Anthropic 接口返回错误: %s", extractProviderErrMsg(raw))
-	}
-	turn := &AssistantTurn{}
-	var sb strings.Builder
-	fallbackPrefix := uuid.NewString()[:8]
-	for i, blk := range resp.Content {
-		switch blk.Type {
-		case "text":
-			sb.WriteString(blk.Text)
-		case "tool_use":
-			id := blk.ID
-			if id == "" {
-				id = fmt.Sprintf("toolu_%s_%d", fallbackPrefix, i+1)
+	// Handle Gemini array error: [{"error": {"message": "..."}}]
+	if strings.HasPrefix(trimmed, "[") {
+		var arr []struct {
+			Error any `json:"error"`
+		}
+		if json.Unmarshal(raw, &arr) == nil {
+			for _, item := range arr {
+				if msg := parseErrorValue(item.Error); msg != "" {
+					return msg
+				}
 			}
-			args := strings.TrimSpace(string(blk.Input))
-			if args == "" {
-				args = "{}"
-			}
-			turn.ToolCalls = append(turn.ToolCalls, LLMToolCall{
-				ID:        id,
-				Name:      blk.Name,
-				Arguments: args,
-			})
 		}
 	}
-	turn.Content = sb.String()
-	if turn.Content != "" && onDelta != nil {
-		onDelta(turn.Content)
+	var parsed struct {
+		Error   any    `json:"error"`
+		Message string `json:"message"`
+		Detail  string `json:"detail"`
 	}
-	return turn, nil
+	if json.Unmarshal(raw, &parsed) == nil {
+		if msg := parseErrorValue(parsed.Error); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+func parseErrorValue(val any) string {
+	if val == nil {
+		return ""
+	}
+	switch v := val.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		if msg, ok := v["message"].(string); ok && strings.TrimSpace(msg) != "" {
+			return strings.TrimSpace(msg)
+		}
+		if msg, ok := v["detail"].(string); ok && strings.TrimSpace(msg) != "" {
+			return strings.TrimSpace(msg)
+		}
+		if typ, ok := v["type"].(string); ok && strings.TrimSpace(typ) != "" {
+			return strings.TrimSpace(typ)
+		}
+	}
+	return ""
 }
 
 func extractProviderErrMsg(raw []byte) string {
-	var parsed struct {
-		Error any `json:"error"`
+	if msg := extractExplicitErrorField(raw); msg != "" {
+		return msg
 	}
-	if json.Unmarshal(raw, &parsed) == nil && parsed.Error != nil {
-		switch v := parsed.Error.(type) {
-		case string:
-			return v
-		case map[string]any:
-			if msg, ok := v["message"].(string); ok && msg != "" {
-				return msg
-			}
+	var parsed struct {
+		Message string `json:"message"`
+		Detail  string `json:"detail"`
+	}
+	if json.Unmarshal(raw, &parsed) == nil {
+		if strings.TrimSpace(parsed.Message) != "" {
+			return strings.TrimSpace(parsed.Message)
+		}
+		if strings.TrimSpace(parsed.Detail) != "" {
+			return strings.TrimSpace(parsed.Detail)
 		}
 	}
 	s := strings.TrimSpace(string(raw))
-	if len(s) > 360 {
-		s = TruncateUTF8Bytes(s, 360) + "..."
+	if len(s) > 420 {
+		s = TruncateUTF8Bytes(s, 420) + "..."
 	}
 	if s == "" {
 		return "未知错误"
 	}
 	return s
+}
+
+func finalizeUsage(u *vault.AITokenUsage) *vault.AITokenUsage {
+	if u == nil {
+		return nil
+	}
+	if u.InputTokens == 0 && u.OutputTokens == 0 && u.ReasoningTokens == 0 && u.CachedInputTokens == 0 && u.TotalTokens == 0 {
+		return nil
+	}
+	if u.TotalTokens == 0 {
+		u.TotalTokens = u.InputTokens + u.OutputTokens
+	}
+	return u
 }

@@ -25,6 +25,7 @@ import type {
   AIAgentsMDProposal,
   AIPendingApproval,
   AIRunbookProposal,
+  AITokenUsage,
   AIToolCallRecord,
   SessionContextInspection,
 } from '../types';
@@ -80,6 +81,63 @@ export const UnifiedDiffViewer: React.FC<{ diff: string }> = ({ diff }) => {
           </div>
         );
       })}
+    </div>
+  );
+};
+
+export const ReasoningTraceBlock: React.FC<{
+  text: string;
+  streaming?: boolean;
+  defaultOpen?: boolean;
+}> = ({ text, streaming = false, defaultOpen = false }) => {
+  const [expanded, setExpanded] = useState(defaultOpen || streaming);
+
+  useEffect(() => {
+    if (streaming) {
+      setExpanded(true);
+    }
+  }, [streaming]);
+
+  if (!text) return null;
+
+  return (
+    <div className={`ai-reasoning-box ${streaming ? 'streaming' : ''}`}>
+      <button
+        type="button"
+        className="ai-reasoning-head"
+        onClick={() => setExpanded((prev) => !prev)}
+        aria-expanded={expanded}
+      >
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          <BrainCircuit size={13} style={{ color: 'var(--accent-teal)' }} />
+          <span>{streaming ? '深度思考中...' : '思考过程'}</span>
+        </span>
+        <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+          {text.length.toLocaleString()} 字
+        </span>
+      </button>
+      {expanded && <div className="ai-reasoning-body">{text}</div>}
+    </div>
+  );
+};
+
+export const MessageUsagePill: React.FC<{ usage?: AITokenUsage | null }> = ({ usage }) => {
+  if (!usage) return null;
+  const parts: string[] = [];
+  if (usage.input_tokens) parts.push(`输入 ${usage.input_tokens.toLocaleString()}`);
+  if (usage.output_tokens) parts.push(`输出 ${usage.output_tokens.toLocaleString()}`);
+  if (usage.reasoning_tokens) parts.push(`思考 ${usage.reasoning_tokens.toLocaleString()}`);
+  if (usage.cached_input_tokens) parts.push(`缓存命中 ${usage.cached_input_tokens.toLocaleString()}`);
+  if (parts.length === 0 && usage.total_tokens) {
+    parts.push(`总计 ${usage.total_tokens.toLocaleString()}`);
+  }
+  if (parts.length === 0) return null;
+
+  return (
+    <div className="ai-usage-pill mono" title="本次流式响应上游模型实际统计的 Token 用量">
+      <Activity size={10.5} />
+      <span>{parts.join(' · ')} tok</span>
     </div>
   );
 };
@@ -778,7 +836,7 @@ export const ContextInspectorModal: React.FC<ContextInspectorModalProps> = ({
                   </div>
                   <span className="mono" style={{ fontSize: 12, fontWeight: 620, color: barTone }}>
                     ~{inspection.estimated_total_tokens.toLocaleString()} /{' '}
-                    {inspection.context_window_tokens.toLocaleString()} tokens ({usagePct.toFixed(1)}%)
+                    {(inspection.max_input_tokens || inspection.context_window_tokens).toLocaleString()} tokens ({usagePct.toFixed(1)}%)
                   </span>
                 </div>
 
@@ -794,7 +852,40 @@ export const ContextInspectorModal: React.FC<ContextInspectorModalProps> = ({
                   <span>滚动摘要: ~{inspection.estimated_summary_tokens.toLocaleString()} tok</span>
                   <span>未压缩对话 ({inspection.uncompacted_messages}/{inspection.total_messages} 条): ~{inspection.estimated_history_tokens.toLocaleString()} tok</span>
                   <span>自动压缩阈值: ~{inspection.compaction_threshold_tokens.toLocaleString()} tok</span>
+                  <span>总上下文窗口: {inspection.context_window_tokens.toLocaleString()} tok</span>
+                  {inspection.max_input_tokens ? (
+                    <span>最大输入预算: {inspection.max_input_tokens.toLocaleString()} tok</span>
+                  ) : null}
+                  {inspection.max_output_tokens ? (
+                    <span>单轮最大输出: {inspection.max_output_tokens.toLocaleString()} tok</span>
+                  ) : null}
                 </div>
+
+                {(inspection.last_usage || inspection.session_total_usage) && (
+                  <div
+                    className="ai-ctx-token-breakdown"
+                    style={{
+                      marginTop: 8,
+                      paddingTop: 8,
+                      borderTop: '1px dashed var(--border-subtle)',
+                    }}
+                  >
+                    {inspection.last_usage && (
+                      <span>
+                        <strong>最近一轮真实用量:</strong> 输入 {(inspection.last_usage.input_tokens || 0).toLocaleString()} · 输出 {(inspection.last_usage.output_tokens || 0).toLocaleString()}
+                        {inspection.last_usage.reasoning_tokens ? ` · 思考 ${inspection.last_usage.reasoning_tokens.toLocaleString()}` : ''}
+                        {inspection.last_usage.cached_input_tokens ? ` · 缓存 ${inspection.last_usage.cached_input_tokens.toLocaleString()}` : ''} tok
+                      </span>
+                    )}
+                    {inspection.session_total_usage && (
+                      <span>
+                        <strong>会话累计真实用量:</strong> 输入 {(inspection.session_total_usage.input_tokens || 0).toLocaleString()} · 输出 {(inspection.session_total_usage.output_tokens || 0).toLocaleString()}
+                        {inspection.session_total_usage.reasoning_tokens ? ` · 思考 ${inspection.session_total_usage.reasoning_tokens.toLocaleString()}` : ''}
+                        {inspection.session_total_usage.cached_input_tokens ? ` · 缓存 ${inspection.session_total_usage.cached_input_tokens.toLocaleString()}` : ''} tok
+                      </span>
+                    )}
+                  </div>
+                )}
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
                   <button

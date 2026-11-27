@@ -1263,7 +1263,7 @@ func cloneServersWithoutRuntime(servers []ServerConfig) []ServerConfig {
 
 func cloneAISettings(src AISettings) AISettings {
 	dst := src
-	dst.Providers = slices.Clone(src.Providers)
+	dst.Providers = cloneAIProviders(src.Providers)
 	dst.Patrol.ServerIDs = slices.Clone(src.Patrol.ServerIDs)
 	dst.Patrol.Webhooks = slices.Clone(src.Patrol.Webhooks)
 	dst.MCP.Tokens = cloneMCPTokens(src.MCP.Tokens)

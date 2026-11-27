@@ -24,6 +24,8 @@ import {
   ContextInspectorModal,
   FormattedMarkdownText,
   HITLApprovalCard,
+  MessageUsagePill,
+  ReasoningTraceBlock,
   RunbookProposalCard,
   ShellSnippetActionBar,
   ToolTraceStep,
@@ -61,6 +63,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   const [streaming, setStreaming] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState('');
   const [streamDelta, setStreamDelta] = useState('');
+  const [streamReasoning, setStreamReasoning] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const [contextInspection, setContextInspection] = useState<SessionContextInspection | null>(null);
   const [showInspector, setShowInspector] = useState(false);
@@ -112,6 +115,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     setStreaming(false);
     setPendingUserMessage('');
     setStreamDelta('');
+    setStreamReasoning('');
     setStreamTools([]);
     void loadBoundSession();
     return () => {
@@ -130,7 +134,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session?.messages.length, streamDelta, streamTools.length]);
+  }, [session?.messages.length, streamDelta, streamReasoning, streamTools.length]);
 
   const startFreshSession = async () => {
     try {
@@ -175,6 +179,9 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         case 'delta':
           if (ev.delta) setStreamDelta((prev) => prev + ev.delta);
           break;
+        case 'reasoning_delta':
+          if (ev.reasoning_delta) setStreamReasoning((prev) => prev + ev.reasoning_delta);
+          break;
         case 'tool_start':
           if (ev.tool) {
             setStreamTools((prev) => {
@@ -217,6 +224,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
             setSession(ev.session);
             setPendingUserMessage('');
             setStreamDelta('');
+            setStreamReasoning('');
             setStreamTools([]);
           }
           break;
@@ -247,6 +255,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     setPendingUserMessage(text);
     setStreaming(true);
     setStreamDelta('');
+    setStreamReasoning('');
     setStreamTools([]);
 
     const ptyText = attachPtyContext || forceAttachPty ? getTerminalContext() : '';
@@ -279,6 +288,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
       setStreaming(false);
       setPendingUserMessage('');
       setStreamDelta('');
+      setStreamReasoning('');
       setStreamTools([]);
     }
   };
@@ -287,6 +297,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     if (!session || streaming) return;
     setStreaming(true);
     setStreamDelta('');
+    setStreamReasoning('');
     setStreamTools([]);
     const ac = new AbortController();
     streamAbortRef.current = ac;
@@ -305,6 +316,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
       }
       setStreaming(false);
       setStreamDelta('');
+      setStreamReasoning('');
       setStreamTools([]);
     }
   };
@@ -485,7 +497,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
           <div className="empty-state" style={{ padding: '36px 14px' }}>
             <Bot size={22} style={{ marginBottom: 8, color: 'var(--amber-text)' }} />
             <h3>尚未接入大模型</h3>
-            <p>配置 OpenAI 兼容、DeepSeek、通义千问、Anthropic Claude 或本地 Ollama 后即可启用终端副驾驶。</p>
+            <p>配置 OpenAI (Chat / Responses)、Anthropic Claude、Google Gemini、DeepSeek、通义千问或本地 Ollama 后即可启用终端副驾驶。</p>
             <button type="button" className="btn btn-primary btn-sm" onClick={onNavigateAIConfig}>
               前往配置大模型
             </button>
@@ -551,6 +563,9 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                       />
                     )}
                     <div className="ai-msg-row assistant">
+                      {msg.reasoning_content && (
+                        <ReasoningTraceBlock text={msg.reasoning_content} />
+                      )}
                       {msg.tool_calls && msg.tool_calls.length > 0 && (
                         <div className="ai-tool-trace-list">
                           {msg.tool_calls.map((tc) => (
@@ -563,6 +578,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                           <FormattedMarkdownText text={msg.content} />
                         </div>
                       )}
+                      {msg.usage && <MessageUsagePill usage={msg.usage} />}
                       {snippets.length > 0 && (
                         <ShellSnippetActionBar
                           commands={snippets}
@@ -638,6 +654,9 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
 
             {streaming && (
               <div className="ai-msg-row assistant">
+                {streamReasoning && (
+                  <ReasoningTraceBlock text={streamReasoning} streaming={!streamDelta} />
+                )}
                 {streamTools.length > 0 && (
                   <div className="ai-tool-trace-list">
                     {streamTools.map((tc) => (
@@ -648,6 +667,8 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
                 <div className="ai-msg-bubble" style={{ fontSize: 12.5, padding: '9px 12px' }}>
                   {streamDelta ? (
                     <FormattedMarkdownText text={streamDelta} />
+                  ) : streamReasoning ? (
+                    <span style={{ color: 'var(--text-muted)' }}>思考完成，正在生成回答...</span>
                   ) : (
                     <span style={{ color: 'var(--text-muted)' }}>正在分析终端上下文...</span>
                   )}

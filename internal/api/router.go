@@ -278,6 +278,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/ai/active-provider", s.requireAuth(s.handleSetActiveAIProvider))
 	s.mux.HandleFunc("DELETE /api/ai/providers/{id}", s.requireAuth(s.handleDeleteAIProvider))
 	s.mux.HandleFunc("POST /api/ai/test-provider", s.requireAuth(s.handleTestAIProvider))
+	s.mux.HandleFunc("POST /api/ai/provider-models", s.requireAuth(s.handleFetchAIProviderModels))
+	s.mux.HandleFunc("POST /api/ai/model-catalog/sync", s.requireAuth(s.handleSyncAIModelCatalog))
 	s.mux.HandleFunc("PUT /api/ai/agents-md", s.requireAuth(s.handleUpdateAgentsMD))
 	s.mux.HandleFunc("PUT /api/ai/memory-config", s.requireAuth(s.handleUpdateAIMemoryConfig))
 	s.mux.HandleFunc("POST /api/ai/agents-md-proposals/resolve", s.requireAuth(s.handleResolveAgentsMDProposal))

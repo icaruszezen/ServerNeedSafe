@@ -239,7 +239,7 @@ func TestAnthropicMessageCoalescingSSEErrorsAndUniqueToolIDs(t *testing.T) {
 		BaseURL:  mockServer.URL + "/openai-err",
 		APIKey:   "sk-test",
 		Model:    "test-model",
-	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
+	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "hi"}}, nil, StreamCallbacks{})
 	if err == nil || !strings.Contains(err.Error(), "rate limit") {
 		t.Fatalf("expected OpenAI SSE error to surface, got err=%v", err)
 	}
@@ -249,7 +249,7 @@ func TestAnthropicMessageCoalescingSSEErrorsAndUniqueToolIDs(t *testing.T) {
 		BaseURL:  mockServer.URL + "/anthropic-err",
 		APIKey:   "sk-ant-test",
 		Model:    "claude-test",
-	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "hi"}}, nil, nil)
+	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "hi"}}, nil, StreamCallbacks{})
 	if err == nil || !strings.Contains(err.Error(), "overloaded") {
 		t.Fatalf("expected Anthropic SSE error to surface, got err=%v", err)
 	}
@@ -259,7 +259,7 @@ func TestAnthropicMessageCoalescingSSEErrorsAndUniqueToolIDs(t *testing.T) {
 		BaseURL:  mockServer.URL + "/openai-noid",
 		APIKey:   "sk-test",
 		Model:    "test-model",
-	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "1"}}, nil, nil)
+	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "1"}}, nil, StreamCallbacks{})
 	if err != nil || len(turn1.ToolCalls) != 1 {
 		t.Fatalf("turn1 failed: turn=%+v err=%v", turn1, err)
 	}
@@ -268,7 +268,7 @@ func TestAnthropicMessageCoalescingSSEErrorsAndUniqueToolIDs(t *testing.T) {
 		BaseURL:  mockServer.URL + "/openai-noid",
 		APIKey:   "sk-test",
 		Model:    "test-model",
-	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "2"}}, nil, nil)
+	}, "sys", []vault.AIChatMessage{{Role: "user", Content: "2"}}, nil, StreamCallbacks{})
 	if err != nil || len(turn2.ToolCalls) != 1 {
 		t.Fatalf("turn2 failed: turn=%+v err=%v", turn2, err)
 	}
@@ -334,10 +334,10 @@ func TestPatrolBaselinePreservedOnNewPortsAndFallbackRace(t *testing.T) {
 		}
 	}
 
-	// 2. Empty LLM output must NOT set AIAnalyzed=true.
+	// 2. Empty LLM SSE output must NOT set AIAnalyzed=true.
 	emptyLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"   "}}]}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"   \"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer emptyLLM.Close()
 
@@ -389,8 +389,8 @@ func TestPatrolBaselinePreservedOnNewPortsAndFallbackRace(t *testing.T) {
 			ExternalClient: "Claude Code",
 			AISummary:      "外部 AI 已抢先完成深度研判",
 		}, "127.0.0.1")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"内置兜底迟到结果\"}"}}]}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"summary\\\":\\\"内置兜底迟到结果\\\"}\"}}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer racingLLM.Close()
 

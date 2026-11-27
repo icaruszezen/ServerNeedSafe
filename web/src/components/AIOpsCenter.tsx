@@ -15,10 +15,7 @@ import {
   Sparkles,
   Server as ServerIcon,
   Bell,
-  Edit3,
-  RefreshCw,
   ArrowUpRight,
-  KeyRound,
   MessageSquare,
   X,
   Layers,
@@ -33,13 +30,10 @@ import type {
   AIChatSessionSummary,
   AIExecutionMode,
   AIOverviewResponse,
-  AIProtocol,
-  AIProviderView,
   AIRunbook,
   AIToolCallRecord,
   PatrolAnalysisMode,
   PatrolRecord,
-  ProviderPreset,
   ServerView,
   SessionContextInspection,
 } from '../types';
@@ -49,6 +43,8 @@ import {
   ContextInspectorModal,
   FormattedMarkdownText,
   HITLApprovalCard,
+  MessageUsagePill,
+  ReasoningTraceBlock,
   RunbookProposalCard,
   ShellSnippetActionBar,
   ToolTraceStep,
@@ -56,6 +52,7 @@ import {
 } from './AIMessageWidgets';
 import { AIMemoryAgentsTab, type MemorySubSection } from './AIMemoryAgentsTab';
 import { ExternalAIMCPTab } from './ExternalAIMCPTab';
+import { AIProviderConfigTab } from './AIProviderConfigTab';
 
 export type CenterTab = 'diagnosis' | 'patrol' | 'mcp' | 'memory' | 'providers';
 
@@ -141,6 +138,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [streaming, setStreaming] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState('');
   const [streamDelta, setStreamDelta] = useState('');
+  const [streamReasoning, setStreamReasoning] = useState('');
   const [streamTools, setStreamTools] = useState<AIToolCallRecord[]>([]);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -202,34 +200,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   const [notifyPendingApprovals, setNotifyPendingApprovals] = useState(true);
   const [webhookDrafts, setWebhookDrafts] = useState<WebhookDraft[]>([]);
   const [testingWebhookIdx, setTestingWebhookIdx] = useState<number | null>(null);
-
-  // Provider Form State
-  const [provForm, setProvForm] = useState<{
-    id: string;
-    name: string;
-    protocol: AIProtocol;
-    base_url: string;
-    api_key: string;
-    model: string;
-    max_tokens: string;
-    context_window: string;
-    set_active: boolean;
-  }>({
-    id: '',
-    name: 'DeepSeek 官方接口',
-    protocol: 'openai',
-    base_url: 'https://api.deepseek.com/v1',
-    api_key: '',
-    model: 'deepseek-chat',
-    max_tokens: '4096',
-    context_window: '0',
-    set_active: true,
-  });
-  const [testingProvId, setTestingProvId] = useState<string>('');
-  const [testResultBanner, setTestResultBanner] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
+  const [switchingProvider, setSwitchingProvider] = useState(false);
 
   const syncPatrolDraftFromOverview = useCallback((ov: AIOverviewResponse) => {
     const pc = ov.patrol_config;
@@ -380,7 +351,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeSession?.messages.length, streamDelta, streamTools.length]);
+  }, [activeSession?.messages.length, streamDelta, streamReasoning, streamTools.length]);
 
   const activeProvider = useMemo(() => {
     if (!overview?.providers?.length) return null;
@@ -570,6 +541,11 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             setStreamDelta((prev) => prev + ev.delta);
           }
           break;
+        case 'reasoning_delta':
+          if (ev.reasoning_delta) {
+            setStreamReasoning((prev) => prev + ev.reasoning_delta);
+          }
+          break;
         case 'tool_start':
           if (ev.tool) {
             setStreamTools((prev) => {
@@ -622,6 +598,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
             setActiveSession(ev.session);
             setPendingUserMessage('');
             setStreamDelta('');
+            setStreamReasoning('');
             setStreamTools([]);
           }
           break;
@@ -656,6 +633,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     setPendingUserMessage(text);
     setStreaming(true);
     setStreamDelta('');
+    setStreamReasoning('');
     setStreamTools([]);
 
     const ac = new AbortController();
@@ -687,6 +665,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       setStreaming(false);
       setPendingUserMessage('');
       setStreamDelta('');
+      setStreamReasoning('');
       setStreamTools([]);
     }
   };
@@ -696,6 +675,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     const sessId = activeSession.id;
     setStreaming(true);
     setStreamDelta('');
+    setStreamReasoning('');
     setStreamTools([]);
     const ac = new AbortController();
     streamAbortRef.current = ac;
@@ -721,6 +701,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
       }
       setStreaming(false);
       setStreamDelta('');
+      setStreamReasoning('');
       setStreamTools([]);
     }
   };
@@ -820,88 +801,21 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
     }
   };
 
-  // --- Provider Actions ---
-  const applyPreset = (preset: ProviderPreset) => {
-    setProvForm({
-      id: '',
-      name: preset.name,
-      protocol: preset.protocol,
-      base_url: preset.base_url,
-      api_key: '',
-      model: preset.default_model,
-      max_tokens: '4096',
-      context_window: '0',
-      set_active: true,
-    });
-    setTestResultBanner(null);
-  };
-
-  const editExistingProvider = (p: AIProviderView) => {
-    setProvForm({
-      id: p.id,
-      name: p.name,
-      protocol: p.protocol,
-      base_url: p.base_url,
-      api_key: '',
-      model: p.model,
-      max_tokens: String(p.max_tokens || 4096),
-      context_window: String(p.context_window || 0),
-      set_active: overview?.active_provider_id === p.id,
-    });
-    setTestResultBanner(null);
-  };
-
-  const handleSaveProvider = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const parsedMaxTok = Number(provForm.max_tokens);
-    const parsedCtxWin = Number(provForm.context_window);
+  const handleQuickSwitchProvider = async (providerId: string) => {
+    if (!providerId || providerId === overview?.active_provider_id || switchingProvider) return;
+    setSwitchingProvider(true);
     try {
-      await api.upsertAIProvider({
-        id: provForm.id || undefined,
-        name: provForm.name,
-        protocol: provForm.protocol,
-        base_url: provForm.base_url,
-        api_key: provForm.api_key || undefined,
-        model: provForm.model,
-        max_tokens:
-          Number.isFinite(parsedMaxTok) && parsedMaxTok >= 256
-            ? Math.min(32768, Math.round(parsedMaxTok))
-            : 4096,
-        context_window:
-          Number.isFinite(parsedCtxWin) && parsedCtxWin > 0
-            ? Math.min(2000000, Math.round(parsedCtxWin))
-            : 0,
-        set_active: provForm.set_active,
-      });
-      setProvForm((prev) => ({ ...prev, id: '', api_key: '' }));
-      onNotify('大模型供应商配置已通过 XChaCha20-Poly1305 加密保存');
+      await api.setActiveAIProvider(providerId);
+      const target = overview?.providers?.find((p) => p.id === providerId);
+      onNotify(`已切换全局激活模型为 ${target ? `${target.name} · ${target.model}` : providerId}`);
       await loadOverview(activeSessionId);
+      if (activeSession?.id) {
+        void refreshSessionContext(activeSession.id);
+      }
     } catch (err: any) {
-      onNotify(err?.message || '保存模型配置失败');
-    }
-  };
-
-  const handleTestProvider = async (target?: AIProviderView) => {
-    const id = target ? target.id : provForm.id;
-    setTestingProvId(id || '__form__');
-    setTestResultBanner(null);
-    try {
-      const res = await api.testAIProvider({
-        id: id || undefined,
-        protocol: target ? target.protocol : provForm.protocol,
-        base_url: target ? target.base_url : provForm.base_url,
-        api_key: target ? undefined : provForm.api_key || undefined,
-        model: target ? target.model : provForm.model,
-      });
-      const msg = `连通成功 · 响应延迟 ${res.latency_ms}ms · 回复：「${res.reply}」`;
-      setTestResultBanner({ ok: true, text: msg });
-      onNotify(msg);
-    } catch (err: any) {
-      const msg = err?.message || '模型接口连通测试失败';
-      setTestResultBanner({ ok: false, text: msg });
-      onNotify(msg);
+      onNotify(err?.message || '切换激活模型失败');
     } finally {
-      setTestingProvId('');
+      setSwitchingProvider(false);
     }
   };
 
@@ -943,31 +857,60 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
           >
             <h2>AI 智能运维与安全诊断中心</h2>
             {activeProvider ? (
-              <button
-                type="button"
-                className="tag-chip teal"
-                style={{
-                  border: 'none',
-                  cursor: 'pointer',
-                  maxWidth: 'min(100%, 310px)',
-                  minWidth: 0,
-                  flexShrink: 1,
-                }}
-                onClick={() => setSubTab('providers')}
-                title={`${activeProvider.name} · ${activeProvider.model}（点击切换或管理全局激活大模型）`}
-              >
-                <Sparkles size={11.5} style={{ marginRight: 4, flexShrink: 0 }} />
-                <span
+              (overview?.providers?.length || 0) > 1 ? (
+                <div className="ai-provider-quick-switcher">
+                  <Sparkles size={11.5} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+                  <select
+                    aria-label="快捷切换全局激活大模型"
+                    className="ai-provider-quick-select"
+                    value={activeProvider.id}
+                    disabled={switchingProvider || streaming}
+                    onChange={(e) => void handleQuickSwitchProvider(e.target.value)}
+                    title="直接切换全局激活大模型"
+                  >
+                    {(overview?.providers || []).map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} · {p.model}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm btn-icon"
+                    style={{ width: 22, height: 22 }}
+                    onClick={() => setSubTab('providers')}
+                    title="管理模型与网关配置"
+                  >
+                    <Sliders size={11.5} />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="tag-chip teal"
                   style={{
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
+                    border: 'none',
+                    cursor: 'pointer',
+                    maxWidth: 'min(100%, 310px)',
                     minWidth: 0,
+                    flexShrink: 1,
                   }}
+                  onClick={() => setSubTab('providers')}
+                  title={`${activeProvider.name} · ${activeProvider.model}（点击切换或管理全局激活大模型）`}
                 >
-                  {activeProvider.name} · {activeProvider.model}
-                </span>
-              </button>
+                  <Sparkles size={11.5} style={{ marginRight: 4, flexShrink: 0 }} />
+                  <span
+                    style={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      minWidth: 0,
+                    }}
+                  >
+                    {activeProvider.name} · {activeProvider.model}
+                  </span>
+                </button>
+              )
             ) : (
               overview?.mcp_runtime?.deploy_mode === 'desktop'
                 ? Boolean(
@@ -1372,6 +1315,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                             />
                           )}
                           <div className="ai-msg-row assistant">
+                            {msg.reasoning_content && (
+                              <ReasoningTraceBlock text={msg.reasoning_content} />
+                            )}
                             {msg.tool_calls && msg.tool_calls.length > 0 && (
                               <div className="ai-tool-trace-list">
                                 {msg.tool_calls.map((tc) => (
@@ -1385,6 +1331,8 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                                 <FormattedMarkdownText text={msg.content} />
                               </div>
                             )}
+
+                            {msg.usage && <MessageUsagePill usage={msg.usage} />}
 
                             {snippets.length > 0 && (
                               <ShellSnippetActionBar commands={snippets} onNotify={onNotify} />
@@ -1436,6 +1384,9 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                   {/* Live Streaming Turn */}
                   {streaming && (
                     <div className="ai-msg-row assistant">
+                      {streamReasoning && (
+                        <ReasoningTraceBlock text={streamReasoning} streaming={!streamDelta} />
+                      )}
                       {streamTools.length > 0 && (
                         <div className="ai-tool-trace-list">
                           {streamTools.map((tc) => (
@@ -1446,6 +1397,10 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                       <div className="ai-msg-bubble">
                         {streamDelta ? (
                           <FormattedMarkdownText text={streamDelta} />
+                        ) : streamReasoning ? (
+                          <span style={{ color: 'var(--text-muted)' }}>
+                            深度思考进行中，即将输出诊断结果...
+                          </span>
                         ) : (
                           <span style={{ color: 'var(--text-muted)' }}>
                             正在连接远程探针并推理诊断方案...
@@ -1920,354 +1875,11 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
 
       {/* TAB 4: LLM Provider & Gateway Configuration */}
       {subTab === 'providers' && (
-        <div className="page-body">
-          <div style={{ marginBottom: 10, fontWeight: 620, fontSize: 13.5 }}>
-            一键填入主流云厂商 / 本地私有模型预设
-          </div>
-          <div className="preset-grid">
-            {(overview?.presets || []).map((preset) => (
-              <button
-                key={preset.id}
-                type="button"
-                className="preset-card"
-                onClick={() => applyPreset(preset)}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6, width: '100%' }}>
-                  <strong style={{ fontSize: 13.5, color: 'var(--text-primary)' }}>{preset.name}</strong>
-                  <span className="tag-chip mono" style={{ fontSize: 10.5 }}>
-                    {preset.protocol === 'anthropic' ? 'Anthropic 原生' : 'OpenAI 兼容'}
-                  </span>
-                </div>
-                <span className="mono" style={{ fontSize: 11.5, color: 'var(--accent-teal)', wordBreak: 'break-all' }}>
-                  默认模型: {preset.default_model}
-                </span>
-                <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>{preset.description}</span>
-              </button>
-            ))}
-          </div>
-
-          <div className="security-grid">
-            {/* Provider Form */}
-            <section className="sec-panel">
-              <h3>
-                <KeyRound size={16} style={{ color: 'var(--accent-teal)' }} />
-                {provForm.id ? '编辑已保存的大模型配置' : '接入新大模型供应商'}
-              </h3>
-              <p className="sec-panel-desc">
-                API Key 写入时直接进入加密保险库（XChaCha20-Poly1305），界面与日志永不回显明文。
-              </p>
-
-              {testResultBanner && (
-                <div
-                  className={`alert ${testResultBanner.ok ? '' : 'alert-error'}`}
-                  style={
-                    testResultBanner.ok
-                      ? {
-                          background: 'var(--accent-teal-soft)',
-                          border: '1px solid var(--accent-teal-border)',
-                          color: 'var(--accent-teal)',
-                          marginBottom: 12,
-                        }
-                      : { marginBottom: 12 }
-                  }
-                >
-                  <span>{testResultBanner.text}</span>
-                </div>
-              )}
-
-              <form onSubmit={handleSaveProvider}>
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">配置显示名称</label>
-                    <input
-                      className="input"
-                      value={provForm.name}
-                      onChange={(e) => setProvForm({ ...provForm, name: e.target.value })}
-                      placeholder="例如：生产 DeepSeek 专线"
-                      required
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">接口通信协议</label>
-                    <select
-                      className="select"
-                      value={provForm.protocol}
-                      onChange={(e) =>
-                        setProvForm({ ...provForm, protocol: e.target.value as AIProtocol })
-                      }
-                    >
-                      <option value="openai">OpenAI Chat Completions 兼容 (/v1/chat/completions)</option>
-                      <option value="anthropic">Anthropic Messages 原生 (/v1/messages)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="field">
-                  <label className="field-label">API Base URL</label>
-                  <input
-                    className="input mono"
-                    value={provForm.base_url}
-                    onChange={(e) => setProvForm({ ...provForm, base_url: e.target.value })}
-                    placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1"
-                    required
-                  />
-                </div>
-
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">模型标识 (Model ID)</label>
-                    <input
-                      className="input mono"
-                      value={provForm.model}
-                      onChange={(e) => setProvForm({ ...provForm, model: e.target.value })}
-                      placeholder="deepseek-chat / claude-sonnet-4-5 / qwen-max"
-                      required
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">单轮最大输出 Tokens</label>
-                    <input
-                      type="number"
-                      className="input mono"
-                      min={256}
-                      max={32768}
-                      value={provForm.max_tokens}
-                      onChange={(e) => setProvForm({ ...provForm, max_tokens: e.target.value })}
-                    />
-                  </div>
-                </div>
-
-                <div className="field-row">
-                  <div className="field">
-                    <label className="field-label">
-                      API Key 密钥 {provForm.id ? '（留空则保留原加密密钥不变）' : '（本地 Ollama 可留空）'}
-                    </label>
-                    <input
-                      type="password"
-                      className="input mono"
-                      value={provForm.api_key}
-                      onChange={(e) => setProvForm({ ...provForm, api_key: e.target.value })}
-                      placeholder={provForm.id ? '已加密存储，如需更换请输入新密钥' : 'sk-...'}
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label">上下文窗口大小 (Context Window，0=智能推算)</label>
-                    <input
-                      type="number"
-                      className="input mono"
-                      min={0}
-                      max={2000000}
-                      step={4096}
-                      value={provForm.context_window}
-                      onChange={(e) =>
-                        setProvForm({
-                          ...provForm,
-                          context_window: e.target.value,
-                        })
-                      }
-                      placeholder="0 (默认按模型推算/65536)"
-                    />
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                  <button type="submit" className="btn btn-primary">
-                    {provForm.id ? '更新模型配置' : '加密保存并设为激活'}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={testingProvId === '__form__'}
-                    onClick={() => void handleTestProvider()}
-                  >
-                    <RefreshCw size={13.5} />
-                    {testingProvId === '__form__' ? '正在握手自检...' : '测试连接延迟'}
-                  </button>
-                  {provForm.id && (
-                    <button
-                      type="button"
-                      className="btn btn-ghost"
-                      onClick={() =>
-                        setProvForm({
-                          id: '',
-                          name: '',
-                          protocol: 'openai',
-                          base_url: '',
-                          api_key: '',
-                          model: '',
-                          max_tokens: '4096',
-                          context_window: '0',
-                          set_active: true,
-                        })
-                      }
-                    >
-                      取消编辑
-                    </button>
-                  )}
-                </div>
-              </form>
-            </section>
-
-            {/* Saved Providers & Global Active Selector */}
-            <section className="sec-panel">
-              <h3>
-                <Cpu size={16} />
-                已加密保存的模型列表 ({overview?.providers?.length || 0})
-              </h3>
-              <p className="sec-panel-desc">
-                采用单全局激活模型路由：排障对话、终端副驾驶与后台异常研判统一调用当前激活模型。
-              </p>
-
-              {!overview?.providers?.length ? (
-                <div style={{ padding: '32px 12px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12.5 }}>
-                  暂未保存任何大模型供应商，可点击上方预设卡片快速配置
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
-                  {overview.providers.map((p) => {
-                    const isActive = overview.active_provider_id === p.id;
-                    return (
-                      <div
-                        key={p.id}
-                        style={{
-                          padding: '12px 14px',
-                          borderRadius: 8,
-                          border: `1px solid ${
-                            isActive ? 'var(--accent-teal-border)' : 'var(--border-default)'
-                          }`,
-                          background: isActive ? 'var(--accent-teal-soft)' : 'var(--bg-subtle)',
-                          minWidth: 0,
-                          maxWidth: '100%',
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            alignItems: 'center',
-                            gap: 8,
-                            flexWrap: 'wrap',
-                            minWidth: 0,
-                            maxWidth: '100%',
-                          }}
-                        >
-                          <div
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 7,
-                              flexWrap: 'wrap',
-                              minWidth: 0,
-                              maxWidth: '100%',
-                            }}
-                          >
-                            <strong
-                              style={{
-                                minWidth: 0,
-                                maxWidth: '100%',
-                                overflowWrap: 'anywhere',
-                                wordBreak: 'break-word',
-                              }}
-                            >
-                              {p.name}
-                            </strong>
-                            <span
-                              className="tag-chip mono"
-                              style={{
-                                display: 'inline-block',
-                                maxWidth: '100%',
-                                minWidth: 0,
-                                flexShrink: 1,
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap',
-                              }}
-                              title={p.model}
-                            >
-                              {p.model}
-                            </span>
-                            {isActive && <span className="tag-chip teal">当前全局激活</span>}
-                          </div>
-                          <div
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 4,
-                              flexWrap: 'wrap',
-                              minWidth: 0,
-                              maxWidth: '100%',
-                            }}
-                          >
-                            {!isActive && (
-                              <button
-                                type="button"
-                                className="btn btn-teal btn-sm"
-                                onClick={async () => {
-                                  try {
-                                    await api.setActiveAIProvider(p.id);
-                                    onNotify(`已切换全局激活模型为 ${p.name}`);
-                                    await loadOverview(activeSessionId);
-                                  } catch (err: any) {
-                                    onNotify(err?.message || '切换激活模型失败');
-                                  }
-                                }}
-                              >
-                                设为激活
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              disabled={testingProvId === p.id}
-                              onClick={() => void handleTestProvider(p)}
-                            >
-                              {testingProvId === p.id ? '测试中...' : '测速'}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-ghost btn-sm btn-icon"
-                              onClick={() => editExistingProvider(p)}
-                              title="编辑配置"
-                            >
-                              <Edit3 size={13.5} />
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-ghost btn-sm btn-icon"
-                              style={{ color: 'var(--danger-text)' }}
-                              onClick={async () => {
-                                try {
-                                  await api.deleteAIProvider(p.id);
-                                  onNotify('已删除模型供应商配置');
-                                  await loadOverview(activeSessionId);
-                                } catch (err: any) {
-                                  onNotify(err?.message || '删除模型供应商失败');
-                                }
-                              }}
-                              title="删除"
-                            >
-                              <Trash2 size={13.5} />
-                            </button>
-                          </div>
-                        </div>
-                        <div className="mono provider-meta-row">
-                          <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-                            [{p.protocol}] {p.base_url}
-                          </span>
-                          <span style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-                            密钥: {p.has_api_key ? p.api_key_preview : '未设置(免密本地)'}
-                            {p.context_window ? ` · 窗口: ${p.context_window.toLocaleString()} tok` : ''}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-          </div>
-        </div>
+        <AIProviderConfigTab
+          overview={overview}
+          onReloadOverview={() => loadOverview(activeSessionId)}
+          onNotify={onNotify}
+        />
       )}
 
       {/* Modal: Patrol & Multi-Channel Webhook Config */}
