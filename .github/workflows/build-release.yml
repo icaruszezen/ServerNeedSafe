@@ -7,9 +7,15 @@ on:
   pull_request:
     branches: ["main", "master"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional Git tag (e.g. v2.6.0) to build binaries, multi-arch Docker image, and publish GitHub Release"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -24,6 +30,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || '' }}
 
       - name: Setup Go Toolchain
         uses: actions/setup-go@v5
@@ -44,6 +52,9 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+      - name: Release Automation Script Unit Tests
+        run: node --test .github/scripts/release-bot.test.mjs
+
       - name: Static Vet & Race-Enabled Security Integration Suite
         run: |
           go vet ./...
@@ -61,6 +72,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || '' }}
 
       - name: Setup Node.js 24 LTS
         uses: actions/setup-node@v4
@@ -81,9 +94,10 @@ jobs:
 
       - name: Build Windows GUI EXEs & Linux Server Binaries
         env:
-          SNS_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-          SNS_COMMIT: ${{ github.sha }}
-        run: bash ./scripts/build-all.sh
+          SNS_VERSION: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev') }}
+        run: |
+          export SNS_COMMIT="$(git rev-parse HEAD)"
+          bash ./scripts/build-all.sh
 
       - name: Verify Windows Native GUI Subsystem Header
         run: |
@@ -160,12 +174,16 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || '' }}
 
-      - name: Normalize Image Reference to Lowercase
+      - name: Normalize Image Reference & Build Metadata
         id: img
         run: |
           IMAGE_GHCR=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          BUILD_COMMIT=$(git rev-parse HEAD)
           echo "ghcr=${IMAGE_GHCR}" >> "$GITHUB_OUTPUT"
+          echo "commit=${BUILD_COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU Multi-Arch Support
         uses: docker/setup-qemu-action@v3
@@ -181,8 +199,8 @@ jobs:
           load: true
           tags: serverneedsafe:ci-smoke
           build-args: |
-            SNS_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-            SNS_COMMIT=${{ github.sha }}
+            SNS_VERSION=${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev') }}
+            SNS_COMMIT=${{ steps.img.outputs.commit }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -220,10 +238,12 @@ jobs:
         with:
           images: ${{ steps.img.outputs.ghcr }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ (inputs.release_tag == '' && github.ref == 'refs/heads/main') || (inputs.release_tag != '' && !contains(inputs.release_tag, '-')) }}
+            type=ref,event=branch,enable=${{ inputs.release_tag == '' }}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') && inputs.release_tag == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') && inputs.release_tag == '' }}
+            type=semver,pattern={{version}},value=${{ inputs.release_tag || 'v0.0.0' }},enable=${{ inputs.release_tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag || 'v0.0.0' }},enable=${{ inputs.release_tag != '' }}
             type=sha,prefix=sha-
 
       - name: Build & Push Multi-Platform Image (linux/amd64, linux/arm64)
@@ -236,8 +256,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            SNS_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-            SNS_COMMIT=${{ github.sha }}
+            SNS_VERSION=${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev') }}
+            SNS_COMMIT=${{ steps.img.outputs.commit }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -249,7 +269,8 @@ jobs:
     needs: [build-docker]
     if: >-
       github.event_name != 'pull_request' &&
-      !startsWith(github.ref, 'refs/tags/')
+      !startsWith(github.ref, 'refs/tags/') &&
+      inputs.release_tag == ''
     runs-on: ubuntu-latest
     concurrency:
       group: production-deploy
@@ -454,11 +475,11 @@ jobs:
           EOF
 
   # ============================================================================
-  # 5. 推送 v* 版本标签时自动创建 GitHub Release 并附带 Windows/Linux 安装包
+  # 5. 推送 v* 版本标签或自动发布调度时，上传 Windows/Linux 安装包并正式公开 GitHub Release
   # ============================================================================
   publish-release:
     name: Publish GitHub Release Assets
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: [build-windows-app, build-docker]
     runs-on: ubuntu-latest
     permissions:
@@ -476,10 +497,11 @@ jobs:
           name: ServerNeedSafe-Linux-Server
           path: release-assets
 
-      - name: Generate Final Checksums & Create GitHub Release
+      - name: Generate Final Checksums & Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           (
             cd release-assets
@@ -491,11 +513,19 @@ jobs:
               sns-server-linux-amd64 \
               sns-server-linux-arm64 > SHA256SUMS.txt
           )
-          if gh release view "${{ github.ref_name }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" release-assets/* -R "${{ github.repository }}" --clobber
+          EXISTING_DRAFT=$(gh api "repos/${GH_REPO}/releases?per_page=100" | jq -r --arg tag "${RELEASE_TAG}" '.[] | select(.tag_name == $tag) | .draft' | head -n 1 || true)
+          if [ -n "${EXISTING_DRAFT}" ]; then
+            gh release upload "${RELEASE_TAG}" release-assets/* -R "${GH_REPO}" --clobber
+            if [ "${EXISTING_DRAFT}" = "true" ]; then
+              if [[ "${RELEASE_TAG}" == *-* ]]; then
+                gh release edit "${RELEASE_TAG}" -R "${GH_REPO}" --draft=false --prerelease
+              else
+                gh release edit "${RELEASE_TAG}" -R "${GH_REPO}" --draft=false --latest
+              fi
+            fi
           else
-            gh release create "${{ github.ref_name }}" release-assets/* \
-              -R "${{ github.repository }}" \
-              --title "ServerNeedSafe ${{ github.ref_name }}" \
+            gh release create "${RELEASE_TAG}" release-assets/* \
+              -R "${GH_REPO}" \
+              --title "ServerNeedSafe ${RELEASE_TAG}" \
               --generate-notes
           fi
