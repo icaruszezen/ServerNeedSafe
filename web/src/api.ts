@@ -1149,18 +1149,31 @@ export const api = {
     ),
 
   listExternalApprovals: (status = 'all', limit = 60) =>
-    requestJSON<{ approvals: ExternalApproval[]; pending_count: number }>(
+    requestJSON<{ approvals: ExternalApproval[]; pending_count: number; running_count?: number }>(
       'GET',
       `/api/ai/external-approvals?status=${encodeURIComponent(status)}&limit=${limit}`
     ),
 
-  resolveExternalApproval: (id: string, approve: boolean) =>
+  resolveExternalApproval: (id: string, approve: boolean, selectedStepIds?: string[]) =>
     requestJSON<{
       ok: boolean;
       approval: ExternalApproval;
       approvals: ExternalApproval[];
       pending_count: number;
-    }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/resolve`, { approve }),
+      running_count?: number;
+    }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/resolve`, {
+      approve,
+      ...(selectedStepIds !== undefined ? { selected_step_ids: selectedStepIds } : {}),
+    }),
+
+  cancelExternalApproval: (id: string) =>
+    requestJSON<{
+      ok: boolean;
+      approval: ExternalApproval;
+      approvals: ExternalApproval[];
+      pending_count: number;
+      running_count?: number;
+    }>('POST', `/api/ai/external-approvals/${encodeURIComponent(id)}/cancel`, {}),
 
   // GitHub Release Auto-Detection, China Mirror Probing & Self-Update
   getHealth: () =>

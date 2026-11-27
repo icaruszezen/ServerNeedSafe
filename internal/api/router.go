@@ -312,6 +312,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/ai/mcp/tokens/{id}", s.requireAuth(s.handleDeleteMCPToken))
 	s.mux.HandleFunc("GET /api/ai/external-approvals", s.requireAuth(s.handleListExternalApprovals))
 	s.mux.HandleFunc("POST /api/ai/external-approvals/{id}/resolve", s.requireAuth(s.handleResolveExternalApproval))
+	s.mux.HandleFunc("POST /api/ai/external-approvals/{id}/cancel", s.requireAuth(s.handleCancelExternalApproval))
 
 	// Built-in MCP Streamable HTTP endpoint (authenticates strictly via scoped MCP Bearer Token, never admin session)
 	if s.mcpServer != nil {

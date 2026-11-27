@@ -3,13 +3,19 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +24,8 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/internal/version"
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 )
 
 func postMCPJSONRPC(t *testing.T, url, bearerToken, sessionID string, payload any) (*http.Response, map[string]any) {
@@ -277,22 +285,54 @@ func TestExternalAIMCPGatewayPatrolTakeoverAndHITL(t *testing.T) {
 		t.Fatalf("CRITICAL: raw SSH password leaked into MCP list_servers response!")
 	}
 
-	// 5b. readonlyToken cannot call propose_ssh_command
+	// 5b. readonlyToken cannot call propose_change_plan; retired single-step tools return migration error
+	_, toolsListBody := postMCPJSONRPC(t, mcpURL, opsTokResp.RawToken, sessionID, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      30,
+		"method":  "tools/list",
+	})
+	toolsJSON, _ := json.Marshal(toolsListBody)
+	if !strings.Contains(string(toolsJSON), `"propose_change_plan"`) || !strings.Contains(string(toolsJSON), `"wait_for_approval"`) {
+		t.Fatalf("expected ops_propose tools/list to expose propose_change_plan and wait_for_approval, got: %s", string(toolsJSON))
+	}
+	if strings.Contains(string(toolsJSON), `"propose_ssh_command"`) || strings.Contains(string(toolsJSON), `"propose_sftp_write"`) {
+		t.Fatalf("expected legacy propose_ssh_command/propose_sftp_write to be retired from tools/list, got: %s", string(toolsJSON))
+	}
+
+	_, legacyCallBody := postMCPJSONRPC(t, mcpURL, opsTokResp.RawToken, sessionID, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      31,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "propose_ssh_command",
+			"arguments": map[string]any{"server_ids": []string{srvA.ID}, "command": "systemctl reload nginx", "reason": "legacy"},
+		},
+	})
+	if !extractMCPToolIsError(t, legacyCallBody) || !strings.Contains(extractMCPToolText(t, legacyCallBody), "propose_change_plan") {
+		t.Fatalf("expected legacy propose_ssh_command call to return migration guidance error, got: %v", legacyCallBody)
+	}
+
 	_, roDenyBody := postMCPJSONRPC(t, mcpURL, roTokResp.RawToken, "", map[string]any{
 		"jsonrpc": "2.0",
 		"id":      3,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name": "propose_ssh_command",
+			"name": "propose_change_plan",
 			"arguments": map[string]any{
-				"server_ids": []string{srvA.ID},
-				"command":    "systemctl reload nginx",
-				"reason":     "test readonly denial",
+				"title":  "readonly denial plan",
+				"reason": "test readonly denial",
+				"steps": []map[string]any{
+					{
+						"type":       "exec_ssh_command",
+						"server_ids": []string{srvA.ID},
+						"command":    "systemctl reload nginx",
+					},
+				},
 			},
 		},
 	})
 	if !extractMCPToolIsError(t, roDenyBody) {
-		t.Fatalf("expected patrol_readonly token to be rejected for propose_ssh_command")
+		t.Fatalf("expected patrol_readonly token to be rejected for propose_change_plan")
 	}
 
 	// 5c. exec_readonly_ssh MUST reject mutating and catastrophic commands
@@ -414,50 +454,88 @@ func TestExternalAIMCPGatewayPatrolTakeoverAndHITL(t *testing.T) {
 		t.Fatalf("unexpected updated patrol record: %+v", updatedRec)
 	}
 
-	// 7. External AI HITL Mutation Proposal Flow
-	// 7a. Catastrophic command MUST be hard-blocked immediately (no approval created)
+	// 7. External AI HITL Change Plan Flow
+	// 7a. Catastrophic command enters the queue marked blocked (red-locked, non-executable) so admin can audit what AI attempted
 	_, blockBody := postMCPJSONRPC(t, mcpURL, opsTokResp.RawToken, sessionID, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      9,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name": "propose_ssh_command",
+			"name": "propose_change_plan",
 			"arguments": map[string]any{
-				"server_ids": []string{srvA.ID},
-				"command":    "rm -rf /",
-				"reason":     "catastrophic test",
+				"title":  "高危指令拦截测试",
+				"reason": "catastrophic test",
+				"steps": []map[string]any{
+					{
+						"type":       "exec_ssh_command",
+						"server_ids": []string{srvA.ID},
+						"command":    "rm -rf /",
+					},
+				},
 			},
 		},
 	})
-	if !extractMCPToolIsError(t, blockBody) {
-		t.Fatalf("expected catastrophic rm -rf / to be hard-blocked")
+	if extractMCPToolIsError(t, blockBody) {
+		t.Fatalf("expected blocked step plan to enqueue as locked for admin visibility, got error: %s", extractMCPToolText(t, blockBody))
+	}
+	var blockRes struct {
+		ApprovalID      string `json:"approval_id"`
+		BlockedSteps    int    `json:"blocked_steps"`
+		ExecutableSteps int    `json:"executable_steps"`
+		HasBlockedSteps bool   `json:"has_blocked_steps"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, blockBody)), &blockRes)
+	if blockRes.ApprovalID == "" || !blockRes.HasBlockedSteps || blockRes.BlockedSteps != 1 || blockRes.ExecutableSteps != 0 {
+		t.Fatalf("expected 1 blocked step and 0 executable steps, got: %+v", blockRes)
+	}
+	// Attempting to approve an all-blocked plan MUST be hard-refused by backend
+	approveBlockedResp, _ := adminReq(http.MethodPost, "/api/ai/external-approvals/"+blockRes.ApprovalID+"/resolve", map[string]any{
+		"approve": true,
+	})
+	if approveBlockedResp.StatusCode == http.StatusOK {
+		t.Fatalf("SECURITY FAILURE: backend approved a plan containing only blocked steps!")
+	}
+	// Admin rejects the blocked plan cleanly
+	rejectBlockedResp, _ := adminReq(http.MethodPost, "/api/ai/external-approvals/"+blockRes.ApprovalID+"/resolve", map[string]any{
+		"approve": false,
+	})
+	if rejectBlockedResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected rejecting blocked plan to succeed, got %d", rejectBlockedResp.StatusCode)
 	}
 
-	// 7b. Valid repair command -> lands in pending approval queue & fires pending-approval webhook
+	// 7b. Valid repair change plan -> lands in pending approval queue & fires 1 aggregated pending-approval webhook
 	_, propBody := postMCPJSONRPC(t, mcpURL, opsTokResp.RawToken, sessionID, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      10,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name": "propose_ssh_command",
+			"name": "propose_change_plan",
 			"arguments": map[string]any{
-				"server_ids":       []string{srvA.ID},
-				"command":          "journalctl --vacuum-size=200M",
+				"title":            "清理系统日志释放根分区空间",
 				"reason":           "清理膨胀的 systemd journal 日志释放根分区空间",
 				"patrol_record_id": "patrol-seed-001",
+				"steps": []map[string]any{
+					{
+						"type":       "exec_ssh_command",
+						"title":      "收缩 journal 日志",
+						"server_ids": []string{srvA.ID},
+						"command":    "journalctl --vacuum-size=200M",
+					},
+				},
 			},
 		},
 	})
 	if extractMCPToolIsError(t, propBody) {
-		t.Fatalf("propose_ssh_command failed: %s", extractMCPToolText(t, propBody))
+		t.Fatalf("propose_change_plan failed: %s", extractMCPToolText(t, propBody))
 	}
 	var propResult struct {
 		ApprovalID      string `json:"approval_id"`
 		Status          string `json:"status"`
+		TotalSteps      int    `json:"total_steps"`
 		WebhookNotified bool   `json:"webhook_notified"`
 	}
 	_ = json.Unmarshal([]byte(extractMCPToolText(t, propBody)), &propResult)
-	if propResult.ApprovalID == "" || propResult.Status != "pending" || !propResult.WebhookNotified {
+	if propResult.ApprovalID == "" || propResult.Status != "pending" || propResult.TotalSteps != 1 || !propResult.WebhookNotified {
 		t.Fatalf("unexpected proposal result: %+v", propResult)
 	}
 
@@ -856,21 +934,27 @@ func TestMCPReviewSecurityAndIsolationFixes(t *testing.T) {
 	}
 	delResp.Body.Close()
 
-	// Verify fullSessionID still belongs to rawFull by proposing an approval under fullSessionID
+	// Verify fullSessionID still belongs to rawFull by proposing a change plan under fullSessionID
 	_, propBBody := postMCPJSONRPC(t, mcpURL, rawFull, fullSessionID, map[string]any{
 		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
 		"params": map[string]any{
-			"name": "propose_sftp_write",
+			"name": "propose_change_plan",
 			"arguments": map[string]any{
-				"server_id":   srvB.ID,
-				"path":        "/etc/nginx/conf.d/db-proxy.conf",
-				"new_content": "SUPER_SENSITIVE_FILE_PAYLOAD_999",
-				"reason":      "update db proxy",
+				"title":  "update db proxy",
+				"reason": "update db proxy",
+				"steps": []map[string]any{
+					{
+						"type":      "sftp_write_file",
+						"server_id": srvB.ID,
+						"path":      "/etc/nginx/conf.d/db-proxy.conf",
+						"content":   "SUPER_SENSITIVE_FILE_PAYLOAD_999",
+					},
+				},
 			},
 		},
 	})
 	if extractMCPToolIsError(t, propBBody) {
-		t.Fatalf("propose_sftp_write on srvB failed: %v", propBBody)
+		t.Fatalf("propose_change_plan on srvB failed: %v", propBBody)
 	}
 	// If fullSessionID had been deleted by rawScoped, client_name would have fallen back away from "Cursor".
 	apsAll, _, _ := store.ListExternalApprovals("pending", 20)
@@ -878,20 +962,45 @@ func TestMCPReviewSecurityAndIsolationFixes(t *testing.T) {
 		t.Fatalf("expected fullSessionID to remain intact with ClientName=Cursor, got %+v", apsAll)
 	}
 
-	// Also create a pending approval on srvA
+	// Out-of-scope server inside ANY step of propose_change_plan MUST be rejected at gateway boundary
+	_, crossScopeDeny := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
+		"jsonrpc": "2.0", "id": 301, "method": "tools/call",
+		"params": map[string]any{
+			"name": "propose_change_plan",
+			"arguments": map[string]any{
+				"title":  "cross scope attempt",
+				"reason": "should be rejected",
+				"steps": []map[string]any{
+					{"type": "exec_ssh_command", "server_ids": []string{srvA.ID}, "command": "systemctl reload nginx"},
+					{"type": "exec_ssh_command", "server_ids": []string{srvB.ID}, "command": "systemctl reload postgresql"},
+				},
+			},
+		},
+	})
+	if !extractMCPToolIsError(t, crossScopeDeny) {
+		t.Fatalf("SECURITY FAILURE: scoped token was allowed to submit plan targeting unauthorized srvB!")
+	}
+
+	// Also create a pending approval plan on srvA
 	_, propABody := postMCPJSONRPC(t, mcpURL, rawScoped, "", map[string]any{
 		"jsonrpc": "2.0", "id": 3, "method": "tools/call",
 		"params": map[string]any{
-			"name": "propose_ssh_command",
+			"name": "propose_change_plan",
 			"arguments": map[string]any{
-				"server_ids": []string{srvA.ID},
-				"command":    "systemctl reload nginx",
-				"reason":     "reload web-a",
+				"title":  "reload web-a",
+				"reason": "reload web-a",
+				"steps": []map[string]any{
+					{
+						"type":       "exec_ssh_command",
+						"server_ids": []string{srvA.ID},
+						"command":    "systemctl reload nginx",
+					},
+				},
 			},
 		},
 	})
 	if extractMCPToolIsError(t, propABody) {
-		t.Fatalf("propose_ssh_command on srvA failed: %v", propABody)
+		t.Fatalf("propose_change_plan on srvA failed: %v", propABody)
 	}
 
 	// 2. list_approvals and approvals/pending MUST strip new_content even for fullToken,
@@ -985,3 +1094,543 @@ func TestMCPReviewSecurityAndIsolationFixes(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func startMockMCPTestSSHServer(t *testing.T, expectedUser, expectedPass string) (string, int, func()) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen host key: %v", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			if c.User() == expectedUser && string(pass) == expectedPass {
+				return nil, nil
+			}
+			return nil, errors.New("bad credentials")
+		},
+	}
+	cfg.AddHostKey(hostSigner)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh mock: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(netConn net.Conn) {
+				_, chans, reqs, err := ssh.NewServerConn(netConn, cfg)
+				if err != nil {
+					_ = netConn.Close()
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+				for newChan := range chans {
+					if newChan.ChannelType() != "session" {
+						_ = newChan.Reject(ssh.UnknownChannelType, "unsupported")
+						continue
+					}
+					ch, chReqs, err := newChan.Accept()
+					if err != nil {
+						continue
+					}
+					go func(in <-chan *ssh.Request) {
+						for req := range in {
+							switch req.Type {
+							case "exec":
+								var payload struct{ Command string }
+								_ = ssh.Unmarshal(req.Payload, &payload)
+								if req.WantReply {
+									_ = req.Reply(true, nil)
+								}
+								cmdCtx, cmdCancel := context.WithCancel(context.Background())
+								cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", payload.Command)
+								cmd.Stdout = ch
+								cmd.Stderr = ch.Stderr()
+								if err := cmd.Start(); err != nil {
+									cmdCancel()
+									_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: 1}))
+									_ = ch.Close()
+									return
+								}
+								waitCh := make(chan error, 1)
+								go func() { waitCh <- cmd.Wait() }()
+								go func() {
+									for range in {
+									}
+									cmdCancel()
+								}()
+								runErr := <-waitCh
+								cmdCancel()
+								exitStatus := uint32(0)
+								if runErr != nil {
+									var exitErr *exec.ExitError
+									if errors.As(runErr, &exitErr) && exitErr.ExitCode() > 0 {
+										exitStatus = uint32(exitErr.ExitCode())
+									} else {
+										exitStatus = 1
+									}
+								}
+								_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: exitStatus}))
+								_ = ch.Close()
+								return
+							case "subsystem":
+								var sub struct{ Name string }
+								_ = ssh.Unmarshal(req.Payload, &sub)
+								if sub.Name == "sftp" {
+									if req.WantReply {
+										_ = req.Reply(true, nil)
+									}
+									sftpSrv, err := sftp.NewServer(ch)
+									if err == nil {
+										_ = sftpSrv.Serve()
+									}
+									_ = ch.Close()
+									return
+								}
+								if req.WantReply {
+									_ = req.Reply(false, nil)
+								}
+							default:
+								if req.WantReply {
+									_ = req.Reply(true, nil)
+								}
+							}
+						}
+					}(chReqs)
+				}
+			}(conn)
+		}
+	}()
+
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	return "127.0.0.1", tcpAddr.Port, func() { _ = ln.Close() }
+}
+
+func TestMCPBatchChangePlanSequentialExecutionAndWait(t *testing.T) {
+	sshHost, sshPort, stopSSH := startMockMCPTestSSHServer(t, "ops", "MockPass!123")
+	defer stopSSH()
+
+	tmpDir := t.TempDir()
+	workDir := t.TempDir()
+	targetFile := filepath.Join(workDir, "app.conf")
+
+	store, err := vault.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	srv := NewServer(Config{DeployMode: "server", Store: store})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Setup admin vault & get session token
+	setupBody, _ := json.Marshal(map[string]string{"password": "BatchPlanAdmin!2026"})
+	res, err := http.Post(ts.URL+"/api/auth/setup", "application/json", bytes.NewReader(setupBody))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("setup failed: %v %v", err, res)
+	}
+	var setupResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&setupResp)
+	res.Body.Close()
+	adminToken := setupResp.Token
+
+	adminReq := func(method, path string, body any) (*http.Response, []byte) {
+		var rdr io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, ts.URL+path, rdr)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, b
+	}
+
+	// Register mock SSH server
+	_, srvBytes := adminReq(http.MethodPost, "/api/servers", map[string]any{
+		"name":      "mock-linux-01",
+		"group":     "测试环境",
+		"host":      sshHost,
+		"port":      sshPort,
+		"username":  "ops",
+		"auth_type": "password",
+		"password":  "MockPass!123",
+	})
+	var srvResp struct {
+		Server vault.ServerView `json:"server"`
+	}
+	_ = json.Unmarshal(srvBytes, &srvResp)
+	mockSrv := srvResp.Server
+
+	// Create ops_propose MCP token
+	_, tokBytes := adminReq(http.MethodPost, "/api/ai/mcp/tokens", map[string]any{
+		"name":        "Batch Plan Tester",
+		"client_hint": "claude_code",
+		"scope":       "ops_propose",
+	})
+	var tokResp struct {
+		RawToken string `json:"raw_token"`
+	}
+	_ = json.Unmarshal(tokBytes, &tokResp)
+	mcpURL := ts.URL + "/api/mcp"
+
+	// -------------------------------------------------------------------------
+	// Scenario A: Mixed SFTP (chained diff) + Blocked Step + Admin-Skipped Step + SSH Verify + wait_for_approval
+	// -------------------------------------------------------------------------
+	_, planABody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "propose_change_plan",
+			"arguments": map[string]any{
+				"title":  "端到端有序变更测试计划",
+				"reason": "验证 SFTP 链式 Diff、拦截步骤锁定、勾选跳过与严格按序执行",
+				"steps": []map[string]any{
+					{
+						"type":      "sftp_write_file",
+						"title":     "首次写入配置",
+						"server_id": mockSrv.ID,
+						"path":      targetFile,
+						"content":   "worker_connections 1024;\n",
+					},
+					{
+						"type":      "sftp_write_file",
+						"title":     "增量追加配置（链式 Diff）",
+						"server_id": mockSrv.ID,
+						"path":      targetFile,
+						"content":   "worker_connections 1024;\nkeepalive_timeout 65;\n",
+					},
+					{
+						"type":       "exec_ssh_command",
+						"title":      "高危毁灭命令（应被标红锁定）",
+						"server_ids": []string{mockSrv.ID},
+						"command":    "rm -rf /",
+					},
+					{
+						"type":       "exec_ssh_command",
+						"title":      "管理员取消勾选的步骤",
+						"server_ids": []string{mockSrv.ID},
+						"command":    "echo SHOULD_NOT_EXECUTE_UNCHECKED",
+					},
+					{
+						"type":       "exec_ssh_command",
+						"title":      "顺序验证最终文件内容",
+						"server_ids": []string{mockSrv.ID},
+						"command":    fmt.Sprintf("cat %q && echo SEQ_VERIFIED", targetFile),
+					},
+				},
+			},
+		},
+	})
+	if extractMCPToolIsError(t, planABody) {
+		t.Fatalf("Scenario A propose_change_plan failed: %s", extractMCPToolText(t, planABody))
+	}
+	var planARes struct {
+		ApprovalID      string `json:"approval_id"`
+		TotalSteps      int    `json:"total_steps"`
+		ExecutableSteps int    `json:"executable_steps"`
+		BlockedSteps    int    `json:"blocked_steps"`
+		Steps           []struct {
+			ID          string `json:"id"`
+			Index       int    `json:"index"`
+			Blocked     bool   `json:"blocked"`
+			Status      string `json:"status"`
+			DiffPreview string `json:"diff_preview"`
+		} `json:"steps"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, planABody)), &planARes)
+	if planARes.TotalSteps != 5 || planARes.ExecutableSteps != 4 || planARes.BlockedSteps != 1 {
+		t.Fatalf("unexpected Scenario A step counts: %+v", planARes)
+	}
+	if !planARes.Steps[2].Blocked || planARes.Steps[2].Status != "blocked" {
+		t.Fatalf("expected step 3 to be blocked, got %+v", planARes.Steps[2])
+	}
+	// Verify chained diff on step 2 diffs against step 1 (so line1 is context, only keepalive_timeout is added)
+	if !strings.Contains(planARes.Steps[1].DiffPreview, " worker_connections 1024;") ||
+		!strings.Contains(planARes.Steps[1].DiffPreview, "+keepalive_timeout 65;") {
+		t.Fatalf("expected step 2 chained diff against step 1, got:\n%s", planARes.Steps[1].DiffPreview)
+	}
+
+	// Launch concurrent wait_for_approval BEFORE admin approves
+	waitDone := make(chan map[string]any, 1)
+	go func() {
+		_, body := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+			"jsonrpc": "2.0",
+			"id":      2,
+			"method":  "tools/call",
+			"params": map[string]any{
+				"name": "wait_for_approval",
+				"arguments": map[string]any{
+					"approval_id": planARes.ApprovalID,
+					"timeout_sec": 15,
+				},
+			},
+		})
+		waitDone <- body
+	}()
+	time.Sleep(80 * time.Millisecond)
+
+	// Admin approves Steps 1, 2, 5 (intentionally also passing blocked Step 3 to verify backend refuses it, omitting Step 4)
+	resolveResp, resolveBytes := adminReq(http.MethodPost, "/api/ai/external-approvals/"+planARes.ApprovalID+"/resolve", map[string]any{
+		"approve":           true,
+		"selected_step_ids": []string{planARes.Steps[0].ID, planARes.Steps[1].ID, planARes.Steps[2].ID, planARes.Steps[4].ID},
+	})
+	if resolveResp.StatusCode != http.StatusOK {
+		t.Fatalf("Scenario A resolve failed: %d %s", resolveResp.StatusCode, string(resolveBytes))
+	}
+
+	// Receive wait_for_approval completion
+	waitBody := <-waitDone
+	if extractMCPToolIsError(t, waitBody) {
+		t.Fatalf("wait_for_approval returned error: %s", extractMCPToolText(t, waitBody))
+	}
+	var waitOut struct {
+		OK       bool                   `json:"ok"`
+		TimedOut bool                   `json:"timed_out"`
+		Terminal bool                   `json:"terminal"`
+		Approval vault.ExternalApproval `json:"approval"`
+	}
+	if err := json.Unmarshal([]byte(extractMCPToolText(t, waitBody)), &waitOut); err != nil {
+		t.Fatalf("unmarshal wait_for_approval: %v", err)
+	}
+	if waitOut.TimedOut || !waitOut.Terminal || waitOut.Approval.Status != "completed" {
+		t.Fatalf("expected Scenario A completed via wait_for_approval, got: %+v", waitOut)
+	}
+	if waitOut.Approval.Steps[0].Status != "succeeded" ||
+		waitOut.Approval.Steps[1].Status != "succeeded" ||
+		waitOut.Approval.Steps[2].Status != "blocked" ||
+		waitOut.Approval.Steps[3].Status != "skipped" ||
+		waitOut.Approval.Steps[4].Status != "succeeded" {
+		t.Fatalf("unexpected Scenario A per-step statuses: %+v", waitOut.Approval.Steps)
+	}
+	if !strings.Contains(waitOut.Approval.Steps[4].ExecutionOut, "keepalive_timeout 65;") ||
+		!strings.Contains(waitOut.Approval.Steps[4].ExecutionOut, "SEQ_VERIFIED") {
+		t.Fatalf("expected step 5 to observe step 1 & 2 SFTP writes in order, got:\n%s", waitOut.Approval.Steps[4].ExecutionOut)
+	}
+	rawDisk, err := os.ReadFile(targetFile)
+	if err != nil || string(rawDisk) != "worker_connections 1024;\nkeepalive_timeout 65;\n" {
+		t.Fatalf("unexpected targetFile content on disk: err=%v content=%q", err, string(rawDisk))
+	}
+	// Verify consolidated change memory recorded once for the plan
+	memories, _ := store.ListAIMemories()
+	foundPlanMem := false
+	for _, m := range memories {
+		if m.Category == "change" && m.Source == "approval" && strings.Contains(m.Title, "端到端有序变更测试计划") {
+			foundPlanMem = true
+			break
+		}
+	}
+	if !foundPlanMem {
+		t.Fatalf("expected consolidated approved-change memory for plan, got: %+v", memories)
+	}
+
+	// -------------------------------------------------------------------------
+	// Scenario B: continue_on_error=true vs Default Fail-Fast
+	// -------------------------------------------------------------------------
+	_, planBBody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "propose_change_plan",
+			"arguments": map[string]any{
+				"title":  "遇错策略验证计划",
+				"reason": "测试 continue_on_error 与默认 fail-fast",
+				"steps": []map[string]any{
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "exit 2", "continue_on_error": true},
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "echo STEP2_RAN"},
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "exit 3"},
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "echo STEP4_MUST_SKIP"},
+				},
+			},
+		},
+	})
+	var planBRes struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, planBBody)), &planBRes)
+
+	rB, _ := adminReq(http.MethodPost, "/api/ai/external-approvals/"+planBRes.ApprovalID+"/resolve", map[string]any{"approve": true})
+	if rB.StatusCode != http.StatusOK {
+		t.Fatalf("Scenario B resolve failed: %d", rB.StatusCode)
+	}
+	_, waitBBody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+		"params": map[string]any{"name": "wait_for_approval", "arguments": map[string]any{"approval_id": planBRes.ApprovalID, "timeout_sec": 15}},
+	})
+	var waitBOut struct {
+		Approval vault.ExternalApproval `json:"approval"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, waitBBody)), &waitBOut)
+	if waitBOut.Approval.Status != "partial_failed" ||
+		waitBOut.Approval.Steps[0].Status != "failed" ||
+		waitBOut.Approval.Steps[1].Status != "succeeded" ||
+		waitBOut.Approval.Steps[2].Status != "failed" ||
+		waitBOut.Approval.Steps[3].Status != "skipped" {
+		t.Fatalf("unexpected Scenario B outcome: status=%s steps=%+v", waitBOut.Approval.Status, waitBOut.Approval.Steps)
+	}
+
+	// -------------------------------------------------------------------------
+	// Scenario C: Mid-execution Cancel
+	// -------------------------------------------------------------------------
+	_, planCBody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+		"params": map[string]any{
+			"name": "propose_change_plan",
+			"arguments": map[string]any{
+				"title":  "中途取消验证计划",
+				"reason": "测试执行中点击中止",
+				"steps": []map[string]any{
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "sleep 6"},
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "echo NEVER_RUN"},
+				},
+			},
+		},
+	})
+	var planCRes struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, planCBody)), &planCRes)
+
+	rC, _ := adminReq(http.MethodPost, "/api/ai/external-approvals/"+planCRes.ApprovalID+"/resolve", map[string]any{"approve": true})
+	if rC.StatusCode != http.StatusOK {
+		t.Fatalf("Scenario C resolve failed: %d", rC.StatusCode)
+	}
+	time.Sleep(150 * time.Millisecond)
+	cancelStart := time.Now()
+	cResp, cBytes := adminReq(http.MethodPost, "/api/ai/external-approvals/"+planCRes.ApprovalID+"/cancel", map[string]any{})
+	if cResp.StatusCode != http.StatusOK {
+		t.Fatalf("Scenario C cancel failed: %d %s", cResp.StatusCode, string(cBytes))
+	}
+	_, waitCBody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+		"params": map[string]any{"name": "wait_for_approval", "arguments": map[string]any{"approval_id": planCRes.ApprovalID, "timeout_sec": 5}},
+	})
+	var waitCOut struct {
+		Terminal bool                   `json:"terminal"`
+		Approval vault.ExternalApproval `json:"approval"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, waitCBody)), &waitCOut)
+	if !waitCOut.Terminal || waitCOut.Approval.Status != "cancelled" || time.Since(cancelStart) > 4*time.Second {
+		t.Fatalf("expected prompt cancellation, got terminal=%v status=%s elapsed=%v steps=%+v",
+			waitCOut.Terminal, waitCOut.Approval.Status, time.Since(cancelStart), waitCOut.Approval.Steps)
+	}
+	if waitCOut.Approval.Steps[1].Status != "cancelled" {
+		t.Fatalf("expected step 2 to be cancelled, got %+v", waitCOut.Approval.Steps[1])
+	}
+
+	// -------------------------------------------------------------------------
+	// Scenario D: wait_for_approval timeout + legacy single-step migration + restart recovery
+	// -------------------------------------------------------------------------
+	_, planDBody := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+		"params": map[string]any{
+			"name": "propose_change_plan",
+			"arguments": map[string]any{
+				"title":  "等待超时测试",
+				"reason": "测试 wait_for_approval 超时返回",
+				"steps": []map[string]any{
+					{"type": "exec_ssh_command", "server_id": mockSrv.ID, "command": "echo hello"},
+				},
+			},
+		},
+	})
+	var planDRes struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, planDBody)), &planDRes)
+
+	_, waitDTimeout := postMCPJSONRPC(t, mcpURL, tokResp.RawToken, "", map[string]any{
+		"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+		"params": map[string]any{"name": "wait_for_approval", "arguments": map[string]any{"approval_id": planDRes.ApprovalID, "timeout_sec": 1}},
+	})
+	if extractMCPToolIsError(t, waitDTimeout) {
+		t.Fatalf("expected wait_for_approval timeout to return non-error snapshot, got: %s", extractMCPToolText(t, waitDTimeout))
+	}
+	var waitDOut struct {
+		TimedOut bool                   `json:"timed_out"`
+		Terminal bool                   `json:"terminal"`
+		Approval vault.ExternalApproval `json:"approval"`
+	}
+	_ = json.Unmarshal([]byte(extractMCPToolText(t, waitDTimeout)), &waitDOut)
+	if !waitDOut.TimedOut || waitDOut.Terminal || waitDOut.Approval.Status != "pending" {
+		t.Fatalf("expected timed_out=true terminal=false status=pending, got %+v", waitDOut)
+	}
+
+	// Verify legacy flat ExternalApproval normalization
+	legacy := vault.ExternalApproval{
+		ID:          "legacy-ap-001",
+		ToolName:    "exec_ssh_command",
+		ServerIDs:   []string{mockSrv.ID},
+		ServerNames: []string{mockSrv.Name},
+		Command:     "systemctl reload nginx",
+		Reason:      "legacy reload",
+		Status:      "approved",
+		ExecutionOut: "ok",
+	}
+	vault.NormalizeExternalApproval(&legacy)
+	if legacy.Status != "completed" || len(legacy.Steps) != 1 || legacy.Steps[0].Status != "succeeded" || legacy.TotalSteps != 1 {
+		t.Fatalf("unexpected legacy normalization: %+v", legacy)
+	}
+
+	// Verify daemon restart recovery of orphaned running plan
+	orphaned, err := store.CreateExternalApproval(vault.ExternalApproval{
+		ID:         "orphan-run-001",
+		Title:      "重启恢复测试",
+		ClientName: "Claude Code",
+		Reason:     "simulate crash",
+		Steps: []vault.ExternalApprovalStep{
+			{ID: "s1", Index: 1, ToolName: "exec_ssh_command", ServerIDs: []string{mockSrv.ID}, ServerNames: []string{mockSrv.Name}, Command: "echo 1", Selected: true, Status: "succeeded"},
+			{ID: "s2", Index: 2, ToolName: "exec_ssh_command", ServerIDs: []string{mockSrv.ID}, ServerNames: []string{mockSrv.Name}, Command: "sleep 10", Selected: true, Status: "running"},
+			{ID: "s3", Index: 3, ToolName: "exec_ssh_command", ServerIDs: []string{mockSrv.ID}, ServerNames: []string{mockSrv.Name}, Command: "echo 3", Selected: true, Status: "pending"},
+		},
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("CreateExternalApproval orphan: %v", err)
+	}
+	orphaned.Status = "running"
+	orphaned.Steps[0].Status = "succeeded"
+	orphaned.Steps[1].Status = "running"
+	orphaned.Steps[2].Status = "pending"
+	if err := store.UpdateExternalApproval(*orphaned); err != nil {
+		t.Fatalf("UpdateExternalApproval orphan: %v", err)
+	}
+	if err := store.FlushNow(); err != nil {
+		t.Fatalf("FlushNow: %v", err)
+	}
+
+	reopened, err := vault.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("reopen vault.NewStore: %v", err)
+	}
+	defer reopened.Close()
+	recOrphan, err := reopened.GetExternalApproval("orphan-run-001")
+	if err != nil {
+		t.Fatalf("GetExternalApproval after reopen: %v", err)
+	}
+	if recOrphan.Status != "partial_failed" ||
+		recOrphan.Steps[0].Status != "succeeded" ||
+		recOrphan.Steps[1].Status != "failed" ||
+		recOrphan.Steps[2].Status != "cancelled" {
+		t.Fatalf("expected restart recovery partial_failed (succeeded/failed/cancelled), got status=%s steps=%+v", recOrphan.Status, recOrphan.Steps)
+	}
+}

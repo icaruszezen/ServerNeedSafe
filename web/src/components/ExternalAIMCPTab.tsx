@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   PlugZap,
   KeyRound,
@@ -23,12 +23,22 @@ import {
   ChevronRight,
   ExternalLink,
   X,
+  Loader2,
+  StopCircle,
+  Ban,
+  AlertTriangle,
+  ListOrdered,
+  Clock,
+  SkipForward,
 } from 'lucide-react';
 import { api } from '../api';
 import { copyTextToClipboard } from '../utils/clipboard';
 import type {
   AIOverviewResponse,
   ExternalApproval,
+  ExternalApprovalStatus,
+  ExternalApprovalStep,
+  ExternalApprovalStepStatus,
   MCPConfigView,
   MCPRuntimeStatus,
   MCPTokenScope,
@@ -79,6 +89,73 @@ const CLIENT_HINT_LABELS: Record<string, string> = {
   custom: '通用 MCP',
 };
 
+const PLAN_STATUS_META: Record<
+  ExternalApprovalStatus,
+  { label: string; chipClass: string; cardClass: string }
+> = {
+  pending: { label: '待审阅批准', chipClass: 'amber', cardClass: '' },
+  running: { label: '按序执行中', chipClass: 'teal', cardClass: 'resolved-running' },
+  completed: { label: '全部执行完成', chipClass: 'teal', cardClass: 'resolved-approved' },
+  approved: { label: '已批准执行', chipClass: 'teal', cardClass: 'resolved-approved' },
+  partial_failed: { label: '部分步骤失败', chipClass: 'danger', cardClass: 'resolved-failed' },
+  failed: { label: '执行失败', chipClass: 'danger', cardClass: 'resolved-failed' },
+  cancelled: { label: '已中止执行', chipClass: 'amber', cardClass: 'resolved-rejected' },
+  rejected: { label: '管理员已拒绝', chipClass: '', cardClass: 'resolved-rejected' },
+};
+
+const STEP_STATUS_META: Record<
+  ExternalApprovalStepStatus,
+  { label: string; chipClass: string }
+> = {
+  pending: { label: '待执行', chipClass: '' },
+  blocked: { label: '安全拦截锁定', chipClass: 'danger' },
+  running: { label: '执行中...', chipClass: 'teal' },
+  succeeded: { label: '执行成功', chipClass: 'teal' },
+  failed: { label: '执行失败', chipClass: 'danger' },
+  skipped: { label: '已跳过', chipClass: '' },
+  cancelled: { label: '已中止', chipClass: 'amber' },
+  rejected: { label: '已拒绝', chipClass: '' },
+};
+
+function getNormalizedSteps(ap: ExternalApproval): ExternalApprovalStep[] {
+  if (ap.steps && ap.steps.length > 0) {
+    return ap.steps;
+  }
+  const toolName =
+    ap.tool_name === 'sftp_write_file' || ap.file_path ? 'sftp_write_file' : 'exec_ssh_command';
+  const stepStatus: ExternalApprovalStepStatus =
+    ap.status === 'rejected'
+      ? 'rejected'
+      : ap.status === 'approved' || ap.status === 'completed'
+      ? ap.execution_error
+        ? 'failed'
+        : 'succeeded'
+      : ap.status === 'failed'
+      ? 'failed'
+      : 'pending';
+  return [
+    {
+      id: `${ap.id}-step-1`,
+      index: 1,
+      title: ap.title || (toolName === 'sftp_write_file' ? `修改配置 ${ap.file_path || ''}` : ap.command || '远程命令'),
+      tool_name: toolName,
+      server_ids: ap.server_ids || [],
+      server_names: ap.server_names || [],
+      risk_level: ap.risk_level || 'high',
+      reason: ap.reason,
+      command: ap.command,
+      file_path: ap.file_path,
+      diff_preview: ap.diff_preview,
+      selected: ap.status !== 'rejected',
+      status: stepStatus,
+      execution_out: ap.execution_out,
+      execution_error: ap.execution_error,
+      duration_ms: ap.duration_ms,
+      completed_at: ap.resolved_at,
+    },
+  ];
+}
+
 interface ExternalAIMCPTabProps {
   overview: AIOverviewResponse | null;
   servers: ServerView[];
@@ -127,8 +204,15 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
   } | null>(null);
 
   // Approval Queue UI state
-  const [approvalFilter, setApprovalFilter] = useState<'pending' | 'all'>('pending');
+  const [approvalFilter, setApprovalFilter] = useState<'active' | 'all'>('active');
   const [resolvingId, setResolvingId] = useState<string>('');
+  const [cancellingId, setCancellingId] = useState<string>('');
+  const [stepSelectionMap, setStepSelectionMap] = useState<Record<string, Record<string, boolean>>>(
+    {}
+  );
+  // Keep plans resolved/approved in this session visible under the "active" filter so live results don't vanish abruptly
+  const [pinnedPlanIds, setPinnedPlanIds] = useState<string[]>([]);
+  const lastPendingCountRef = useRef<number>(overview?.pending_external_approvals || 0);
 
   // Client Config Generator & Skill Preview state
   const [selectedClient, setSelectedClient] = useState<ClientPresetKey>('claude_code');
@@ -402,23 +486,85 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
     }
   };
 
+  const isStepChecked = (planId: string, step: ExternalApprovalStep): boolean => {
+    if (step.blocked) return false;
+    const planOverrides = stepSelectionMap[planId];
+    if (planOverrides && step.id in planOverrides) {
+      return Boolean(planOverrides[step.id]);
+    }
+    return step.selected !== false;
+  };
+
+  const toggleStepSelection = (planId: string, step: ExternalApprovalStep) => {
+    if (step.blocked) return;
+    setStepSelectionMap((prev) => {
+      const cur = prev[planId] || {};
+      const nextVal = !(step.id in cur ? cur[step.id] : step.selected !== false);
+      return {
+        ...prev,
+        [planId]: {
+          ...cur,
+          [step.id]: nextVal,
+        },
+      };
+    });
+  };
+
+  const setAllExecutableSteps = (ap: ExternalApproval, checked: boolean) => {
+    const steps = getNormalizedSteps(ap);
+    const nextPlanMap: Record<string, boolean> = {};
+    for (const st of steps) {
+      nextPlanMap[st.id] = st.blocked ? false : checked;
+    }
+    setStepSelectionMap((prev) => ({
+      ...prev,
+      [ap.id]: nextPlanMap,
+    }));
+  };
+
   const handleResolveApproval = async (ap: ExternalApproval, approve: boolean) => {
+    const steps = getNormalizedSteps(ap);
+    const selectedStepIds = approve
+      ? steps.filter((st) => !st.blocked && isStepChecked(ap.id, st)).map((st) => st.id)
+      : undefined;
+
+    if (approve && (!selectedStepIds || selectedStepIds.length === 0)) {
+      onNotify('请至少勾选 1 个可执行步骤，或点击拒绝整份计划');
+      return;
+    }
+
     setResolvingId(ap.id);
     try {
-      const res = await api.resolveExternalApproval(ap.id, approve);
+      const res = await api.resolveExternalApproval(ap.id, approve, selectedStepIds);
       setApprovals(res.approvals || []);
-      onNotify(
-        approve
-          ? res.approval.execution_error
-            ? `已批准执行但远端返回异常：${res.approval.execution_error}`
-            : `已批准并完成执行（耗时 ${res.approval.duration_ms || 0}ms），结果已回写供外部 AI 核验`
-          : `已拒绝外部 AI (${ap.client_name}) 的变更提案`
-      );
+      lastPendingCountRef.current = res.pending_count;
+      if (approve) {
+        setPinnedPlanIds((prev) => (prev.includes(ap.id) ? prev : [...prev, ap.id]));
+        onNotify(
+          `已批准变更计划「${ap.title || '外部 AI 计划'}」（共 ${selectedStepIds?.length || 0} 步），正在后台按序执行...`
+        );
+      } else {
+        onNotify(`已拒绝外部 AI (${ap.client_name}) 的变更计划`);
+      }
       await onReloadOverview();
     } catch (err: any) {
-      onNotify(err?.message || '处理外部 AI 审批请求失败');
+      onNotify(err?.message || '处理外部 AI 变更计划失败');
     } finally {
       setResolvingId('');
+    }
+  };
+
+  const handleCancelApproval = async (ap: ExternalApproval) => {
+    setCancellingId(ap.id);
+    try {
+      const res = await api.cancelExternalApproval(ap.id);
+      setApprovals(res.approvals || []);
+      onNotify(`已请求中止变更计划「${ap.title || '外部 AI 计划'}」的后续执行`);
+      await onReloadOverview();
+    } catch (err: any) {
+      onNotify(err?.message || '中止变更计划失败');
+    } finally {
+      setCancellingId('');
     }
   };
 
@@ -426,10 +572,44 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
     () => approvals.filter((a) => a.status === 'pending'),
     [approvals]
   );
-  const visibleApprovals = useMemo(
-    () => (approvalFilter === 'pending' ? pendingApprovals : approvals),
-    [approvalFilter, approvals, pendingApprovals]
+  const runningApprovals = useMemo(
+    () => approvals.filter((a) => a.status === 'running'),
+    [approvals]
   );
+  const activeApprovals = useMemo(
+    () =>
+      approvals.filter(
+        (a) => a.status === 'pending' || a.status === 'running' || pinnedPlanIds.includes(a.id)
+      ),
+    [approvals, pinnedPlanIds]
+  );
+  const visibleApprovals = useMemo(
+    () => (approvalFilter === 'active' ? activeApprovals : approvals),
+    [approvalFilter, activeApprovals, approvals]
+  );
+
+  // Auto-poll external approvals while this tab is open: fast 1.5s while any plan is running, gentle 5s when idle
+  useEffect(() => {
+    const intervalMs = runningApprovals.length > 0 ? 1500 : 5000;
+    let disposed = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api.listExternalApprovals('all', 60);
+        if (disposed) return;
+        setApprovals(res.approvals || []);
+        if (res.pending_count !== lastPendingCountRef.current) {
+          lastPendingCountRef.current = res.pending_count;
+          void onReloadOverview();
+        }
+      } catch {
+        // ignore transient polling failures
+      }
+    }, intervalMs);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [runningApprovals.length, onReloadOverview]);
 
   const pendingPatrolsCount = overview?.patrol_status?.pending_external_count || 0;
   const patrolAnalysisMode = overview?.patrol_config?.analysis_mode || 'builtin';
@@ -560,28 +740,41 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
         </div>
       </div>
 
-      {/* SECTION 1: External AI HITL Approval Queue */}
+      {/* SECTION 1: External AI HITL Change Plan Approval Queue */}
       <section className="mcp-section-card" id="mcp-approval-queue-section">
         <div className="mcp-section-head">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <ShieldAlert
+            <ListOrdered
               size={17}
-              style={{ color: pendingApprovals.length > 0 ? 'var(--amber-text)' : 'var(--accent-teal)' }}
+              style={{
+                color:
+                  runningApprovals.length > 0
+                    ? 'var(--accent-teal)'
+                    : pendingApprovals.length > 0
+                    ? 'var(--amber-text)'
+                    : 'var(--accent-teal)',
+              }}
             />
-            <h3 style={{ fontSize: 15, fontWeight: 640 }}>外部 AI 受控变更审批队列 (HITL)</h3>
-            {pendingApprovals.length > 0 ? (
-              <span className="tag-chip amber">{pendingApprovals.length} 项待审阅批准</span>
-            ) : (
-              <span className="tag-chip teal">当前无待审批变更</span>
+            <h3 style={{ fontSize: 15, fontWeight: 640 }}>外部 AI 变更计划审批队列 (HITL)</h3>
+            {runningApprovals.length > 0 && (
+              <span className="tag-chip teal">
+                <Loader2 size={11} className="spin-icon" style={{ marginRight: 4 }} />
+                {runningApprovals.length} 份计划按序执行中
+              </span>
             )}
+            {pendingApprovals.length > 0 ? (
+              <span className="tag-chip amber">{pendingApprovals.length} 份待审阅批准</span>
+            ) : runningApprovals.length === 0 ? (
+              <span className="tag-chip teal">当前无待审批变更</span>
+            ) : null}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <button
               type="button"
-              className={`btn btn-sm ${approvalFilter === 'pending' ? 'btn-primary' : ''}`}
-              onClick={() => setApprovalFilter('pending')}
+              className={`btn btn-sm ${approvalFilter === 'active' ? 'btn-primary' : ''}`}
+              onClick={() => setApprovalFilter('active')}
             >
-              仅看待审批 ({pendingApprovals.length})
+              待审批 / 执行中 ({pendingApprovals.length + runningApprovals.length})
             </button>
             <button
               type="button"
@@ -595,32 +788,72 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
 
         {visibleApprovals.length === 0 ? (
           <div className="mcp-empty-inline">
-            {approvalFilter === 'pending'
-              ? '暂无等待审批的外部 AI 修复命令或配置修改提案。当 Claude Code / Codex / Antigravity / Cursor 调用 propose_ssh_command 或 propose_sftp_write 时，变更与 Unified Diff 会立即出现在这里等待您审阅。'
-              : '尚无外部 AI 提交的变更审批记录。'}
+            {approvalFilter === 'active'
+              ? '暂无等待审批的外部 AI 变更计划。当 Claude Code / Codex / Antigravity / Cursor 调用 propose_change_plan 提交有序步骤列表时，全部步骤与 Unified Diff 会自动实时呈现在这里，支持一键批准按序执行。'
+              : '尚无外部 AI 提交的变更计划审批记录。'}
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {visibleApprovals.map((ap) => {
+              const steps = getNormalizedSteps(ap);
+              const totalSteps = ap.total_steps ?? steps.length;
+              const blockedCount = ap.blocked_steps ?? steps.filter((s) => s.blocked).length;
+              const executableSteps = steps.filter((s) => !s.blocked);
               const isPending = ap.status === 'pending';
-              const isApproved = ap.status === 'approved';
-              const cardCls = `ai-approval-card ${
-                isApproved ? 'resolved-approved' : ap.status === 'rejected' ? 'resolved-rejected' : ''
-              }`;
+              const isRunning = ap.status === 'running';
+              const statusMeta = PLAN_STATUS_META[ap.status] || PLAN_STATUS_META.pending;
+
+              const checkedExecutableSteps = executableSteps.filter((st) =>
+                isStepChecked(ap.id, st)
+              );
+              const selectedCount = checkedExecutableSteps.length;
+              const doneStepsCount = steps.filter(
+                (s) =>
+                  s.status === 'succeeded' ||
+                  s.status === 'failed' ||
+                  s.status === 'skipped' ||
+                  s.status === 'cancelled' ||
+                  s.status === 'blocked'
+              ).length;
+              const progressPct =
+                totalSteps > 0 ? Math.min(100, Math.round((doneStepsCount / totalSteps) * 100)) : 0;
+
               return (
-                <div key={ap.id} className={cardCls} data-external-approval-id={ap.id}>
+                <div
+                  key={ap.id}
+                  className={`ai-approval-card ${statusMeta.cardClass}`}
+                  data-external-approval-id={ap.id}
+                >
                   <div className="ai-approval-header">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                      {isPending ? (
-                        <ShieldAlert size={16} style={{ color: 'var(--amber-text)' }} />
-                      ) : isApproved ? (
-                        <CheckCircle2 size={16} style={{ color: 'var(--accent-teal)' }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+                      {isRunning ? (
+                        <Loader2 size={16} className="spin-icon" style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+                      ) : isPending ? (
+                        blockedCount > 0 ? (
+                          <AlertTriangle size={16} style={{ color: 'var(--danger-text)', flexShrink: 0 }} />
+                        ) : (
+                          <ShieldAlert size={16} style={{ color: 'var(--amber-text)', flexShrink: 0 }} />
+                        )
+                      ) : ap.status === 'completed' || ap.status === 'approved' ? (
+                        <CheckCircle2 size={16} style={{ color: 'var(--accent-teal)', flexShrink: 0 }} />
+                      ) : ap.status === 'partial_failed' || ap.status === 'failed' ? (
+                        <XCircle size={16} style={{ color: 'var(--danger-text)', flexShrink: 0 }} />
                       ) : (
-                        <XCircle size={16} style={{ color: 'var(--text-muted)' }} />
+                        <XCircle size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
                       )}
-                      <strong style={{ fontSize: 13.5 }}>
-                        {ap.tool_name === 'sftp_write_file' ? '远程配置文件修改提案' : '远程修复命令执行提案'}
+                      <strong style={{ fontSize: 14 }}>
+                        {ap.title || (totalSteps > 1 ? `${totalSteps} 步变更执行计划` : '外部 AI 变更提案')}
                       </strong>
+                      <span className={`tag-chip ${statusMeta.chipClass}`}>{statusMeta.label}</span>
+                      <span className="tag-chip mono" style={{ fontSize: 11 }}>
+                        共 {totalSteps} 步
+                      </span>
+                      {blockedCount > 0 && (
+                        <span className="tag-chip danger" style={{ fontSize: 11 }}>
+                          <Ban size={11} style={{ marginRight: 3 }} />
+                          含 {blockedCount} 步安全拦截锁定
+                        </span>
+                      )}
                       <span className="tag-chip teal">{ap.client_name || 'External MCP'}</span>
                       <span className="tag-chip mono" style={{ fontSize: 11 }}>
                         令牌: {ap.token_name}
@@ -642,50 +875,254 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
                   </div>
 
                   <div className="ai-approval-body">
-                    <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>
-                      <strong>变更说明：</strong>
+                    <div style={{ fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.55 }}>
+                      <strong>整体变更说明：</strong>
                       {ap.reason}
                     </div>
 
-                    {ap.command && (
-                      <div className="copilot-cmd-box">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0, flex: 1 }}>
-                          <Terminal size={13} style={{ color: '#2dd4bf', flexShrink: 0 }} />
-                          <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                            {ap.command}
-                          </code>
+                    {/* Execution progress bar for running or finished plans */}
+                    {(isRunning || (!isPending && ap.status !== 'rejected')) && (
+                      <div className="mcp-plan-progress-box">
+                        <div className="mcp-plan-progress-meta">
+                          <span>
+                            {isRunning
+                              ? ap.current_step_index
+                                ? `正在按序执行第 ${ap.current_step_index} / ${totalSteps} 步...`
+                                : '正在调度按序执行...'
+                              : `执行汇总：成功 ${ap.completed_steps || 0} 步 · 失败 ${ap.failed_steps || 0} 步 · 跳过/中止 ${ap.skipped_steps || 0} 步${
+                                  blockedCount > 0 ? ` · 拦截锁定 ${blockedCount} 步` : ''
+                                }`}
+                          </span>
+                          <span className="mono" style={{ color: 'var(--text-muted)' }}>
+                            {ap.duration_ms ? `总耗时 ${ap.duration_ms}ms` : `${progressPct}%`}
+                          </span>
+                        </div>
+                        <div className="mcp-plan-progress-track">
+                          <div
+                            className={`mcp-plan-progress-fill ${
+                              ap.status === 'failed' || ap.status === 'partial_failed'
+                                ? 'is-danger'
+                                : ap.status === 'cancelled'
+                                ? 'is-amber'
+                                : ''
+                            }`}
+                            style={{ width: `${isRunning ? Math.max(8, progressPct) : 100}%` }}
+                          />
                         </div>
                       </div>
                     )}
 
-                    {ap.file_path && (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        <div
-                          className="mono"
-                          style={{
-                            fontSize: 12,
-                            color: 'var(--text-secondary)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 6,
-                          }}
-                        >
-                          <FileCode2 size={13} /> 目标远程文件：{ap.file_path}
-                        </div>
-                        {ap.diff_preview && <UnifiedDiffViewer diff={ap.diff_preview} />}
+                    {/* Pending step selection toolbar */}
+                    {isPending && (
+                      <div className="mcp-plan-toolbar">
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                          按 AI 给出的顺序依次执行（默认遇错即停）· 已勾选{' '}
+                          <strong>
+                            {selectedCount} / {executableSteps.length}
+                          </strong>{' '}
+                          个可执行步骤
+                        </span>
+                        {executableSteps.length > 1 && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => setAllExecutableSteps(ap, true)}
+                            >
+                              全选可执行
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              onClick={() => setAllExecutableSteps(ap, false)}
+                            >
+                              清空勾选
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )}
 
+                    {/* Ordered Steps List (always expanded for full visibility) */}
+                    <div className="mcp-plan-steps">
+                      {steps.map((st, idx) => {
+                        const checked = isStepChecked(ap.id, st);
+                        const stepMeta = STEP_STATUS_META[st.status] || STEP_STATUS_META.pending;
+                        const stepCls = [
+                          'mcp-plan-step',
+                          st.blocked ? 'is-blocked' : '',
+                          st.status === 'running' ? 'is-running' : '',
+                          st.status === 'succeeded' ? 'is-succeeded' : '',
+                          st.status === 'failed' ? 'is-failed' : '',
+                          st.status === 'skipped' || st.status === 'cancelled' || st.status === 'rejected'
+                            ? 'is-muted'
+                            : '',
+                          isPending && !st.blocked && !checked ? 'is-unchecked' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ');
+
+                        return (
+                          <div key={st.id} className={stepCls} data-step-id={st.id} data-step-status={st.status}>
+                            <div className="mcp-plan-step-head">
+                              <div className="mcp-plan-step-left">
+                                {isPending && (
+                                  <label
+                                    className={`mcp-step-checkbox-wrap ${st.blocked ? 'is-disabled' : ''}`}
+                                    title={
+                                      st.blocked
+                                        ? '该步骤已触发安全熔断锁定，禁止勾选执行'
+                                        : checked
+                                        ? '取消勾选以跳过本步'
+                                        : '勾选以纳入本次按序执行'
+                                    }
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      disabled={Boolean(st.blocked)}
+                                      onChange={() => toggleStepSelection(ap.id, st)}
+                                    />
+                                  </label>
+                                )}
+                                <span className={`mcp-step-index ${st.blocked ? 'is-blocked' : ''}`}>
+                                  #{st.index || idx + 1}
+                                </span>
+                                <strong style={{ fontSize: 13 }}>
+                                  {st.title ||
+                                    (st.tool_name === 'sftp_write_file' ? `修改 ${st.file_path}` : '执行远程命令')}
+                                </strong>
+                                <span className="tag-chip" style={{ fontSize: 11 }}>
+                                  {st.tool_name === 'sftp_write_file' ? 'SFTP 配置' : 'SSH 命令'}
+                                </span>
+                                {st.continue_on_error && (
+                                  <span className="tag-chip amber" style={{ fontSize: 10.5 }} title="该步骤失败时仍会继续执行后续步骤">
+                                    <SkipForward size={10} style={{ marginRight: 3 }} />
+                                    遇错继续
+                                  </span>
+                                )}
+                                {st.timeout_sec && st.tool_name === 'exec_ssh_command' && st.timeout_sec !== 45 ? (
+                                  <span className="tag-chip mono" style={{ fontSize: 10.5 }}>
+                                    <Clock size={10} style={{ marginRight: 3 }} />
+                                    {st.timeout_sec}s
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              <div className="mcp-plan-step-right">
+                                <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                  {(st.server_names || []).join(', ')}
+                                </span>
+                                <span className={`tag-chip ${stepMeta.chipClass}`} style={{ fontSize: 11 }}>
+                                  {st.status === 'running' && (
+                                    <Loader2 size={10} className="spin-icon" style={{ marginRight: 4 }} />
+                                  )}
+                                  {st.blocked && <Lock size={10} style={{ marginRight: 3 }} />}
+                                  {stepMeta.label}
+                                  {st.duration_ms ? ` · ${st.duration_ms}ms` : ''}
+                                </span>
+                              </div>
+                            </div>
+
+                            {st.reason && st.reason !== ap.reason && (
+                              <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
+                                {st.reason}
+                              </div>
+                            )}
+
+                            {st.blocked && (
+                              <div className="mcp-step-blocked-banner">
+                                <Ban size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                                <div>
+                                  <strong>安全熔断锁定（强制不可勾选与执行）：</strong>
+                                  <span>{st.blocked_reason || '命中安全黑名单，已被系统硬拦截'}</span>
+                                </div>
+                              </div>
+                            )}
+
+                            {st.command && (
+                              <div className={`copilot-cmd-box ${st.blocked ? 'is-blocked-cmd' : ''}`}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0, flex: 1 }}>
+                                  <Terminal
+                                    size={13}
+                                    style={{ color: st.blocked ? '#f87171' : '#2dd4bf', flexShrink: 0 }}
+                                  />
+                                  <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                                    {st.command}
+                                  </code>
+                                </div>
+                              </div>
+                            )}
+
+                            {st.file_path && (
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                <div
+                                  className="mono"
+                                  style={{
+                                    fontSize: 12,
+                                    color: st.blocked ? 'var(--danger-text)' : 'var(--text-secondary)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: 6,
+                                  }}
+                                >
+                                  <FileCode2 size={13} /> 目标远程文件：{st.file_path}
+                                </div>
+                                {!st.blocked && st.diff_preview && (
+                                  <UnifiedDiffViewer diff={st.diff_preview} />
+                                )}
+                              </div>
+                            )}
+
+                            {(st.execution_error || st.execution_out) && (
+                              <div className="mcp-step-output-box">
+                                {st.execution_error && (
+                                  <div
+                                    style={{
+                                      color:
+                                        st.status === 'skipped' || st.status === 'cancelled'
+                                          ? 'var(--text-muted)'
+                                          : 'var(--danger-text)',
+                                      fontSize: 12,
+                                      marginBottom: st.execution_out ? 6 : 0,
+                                    }}
+                                  >
+                                    {st.status === 'skipped' || st.status === 'cancelled'
+                                      ? `说明：${st.execution_error}`
+                                      : `执行异常：${st.execution_error}`}
+                                  </div>
+                                )}
+                                {st.execution_out && (
+                                  <pre className="mcp-code-block compact">{st.execution_out}</pre>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Plan Footer Actions */}
                     {isPending ? (
                       <div className="ai-approval-actions">
                         <button
                           type="button"
                           className="btn btn-teal btn-sm"
-                          disabled={resolvingId === ap.id}
+                          disabled={
+                            resolvingId === ap.id ||
+                            executableSteps.length === 0 ||
+                            selectedCount === 0
+                          }
                           onClick={() => void handleResolveApproval(ap, true)}
                         >
                           <ShieldCheck size={13} />
-                          {resolvingId === ap.id ? '正在远程执行...' : '批准并立即远程执行'}
+                          {resolvingId === ap.id
+                            ? '正在启动按序执行...'
+                            : executableSteps.length === 0
+                            ? '全部步骤已安全拦截，无法批准'
+                            : selectedCount === executableSteps.length && blockedCount === 0
+                            ? `一键批准全部 ${selectedCount} 步并按序执行`
+                            : `批准已选 ${selectedCount} 步并按序执行`}
                         </button>
                         <button
                           type="button"
@@ -694,26 +1131,38 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
                           disabled={resolvingId === ap.id}
                           onClick={() => void handleResolveApproval(ap, false)}
                         >
-                          <XCircle size={13} /> 拒绝此变更
+                          <XCircle size={13} /> 拒绝整份计划
+                        </button>
+                        {blockedCount > 0 && executableSteps.length > 0 && (
+                          <span style={{ fontSize: 12, color: 'var(--danger-text)' }}>
+                            注：{blockedCount} 个红框锁定步骤将强制跳过，不会执行
+                          </span>
+                        )}
+                      </div>
+                    ) : isRunning ? (
+                      <div className="ai-approval-actions" style={{ justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: 12.5, color: 'var(--accent-teal)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <Loader2 size={13} className="spin-icon" />
+                          后台按序执行中，页面每 1.5 秒自动同步各步状态与实时回显...
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          style={{ color: 'var(--danger-text)', borderColor: 'var(--danger-border)' }}
+                          disabled={cancellingId === ap.id}
+                          onClick={() => void handleCancelApproval(ap)}
+                        >
+                          <StopCircle size={13} />
+                          {cancellingId === ap.id ? '正在中止...' : '中止剩余执行'}
                         </button>
                       </div>
                     ) : (
-                      <div
-                        style={{
-                          padding: '9px 12px',
-                          borderRadius: 7,
-                          background: 'var(--bg-subtle)',
-                          border: '1px solid var(--border-subtle)',
-                          fontSize: 12,
-                        }}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: ap.execution_out || ap.execution_error ? 6 : 0 }}>
-                          <strong>
-                            {isApproved ? '已批准执行' : '管理员已拒绝'}
-                          </strong>
+                      <div className="mcp-plan-terminal-footer">
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <strong>{statusMeta.label}</strong>
                           {ap.duration_ms ? (
                             <span className="mono" style={{ color: 'var(--text-muted)' }}>
-                              耗时 {ap.duration_ms}ms
+                              总耗时 {ap.duration_ms}ms
                             </span>
                           ) : null}
                           {ap.resolved_at && (
@@ -722,16 +1171,13 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
                             </span>
                           )}
                           <span style={{ color: 'var(--text-muted)' }}>
-                            · 外部 AI 可通过 get_approval_status(&quot;{ap.id}&quot;) 读取此结果
+                            · 外部 AI 可通过 get_approval_status(&quot;{ap.id}&quot;) 或 wait_for_approval 读取每步结果
                           </span>
                         </div>
                         {ap.execution_error && (
-                          <div style={{ color: 'var(--danger-text)', marginBottom: 4 }}>
-                            执行异常：{ap.execution_error}
+                          <div style={{ color: 'var(--danger-text)', marginTop: 4 }}>
+                            {ap.execution_error}
                           </div>
-                        )}
-                        {ap.execution_out && (
-                          <pre className="mcp-code-block compact">{ap.execution_out}</pre>
                         )}
                       </div>
                     )}

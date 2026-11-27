@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/icaruszezen/ServerNeedSafe/internal/aiops"
 	"github.com/icaruszezen/ServerNeedSafe/internal/mcp"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -171,6 +172,16 @@ func (s *Server) handleDeleteMCPToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func countRunningExternalApprovals(approvals []vault.ExternalApproval) int {
+	n := 0
+	for _, ap := range approvals {
+		if ap.Status == "running" {
+			n++
+		}
+	}
+	return n
+}
+
 func (s *Server) handleListExternalApprovals(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
@@ -186,19 +197,24 @@ func (s *Server) handleListExternalApprovals(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{
 		"approvals":     approvals,
 		"pending_count": pending,
+		"running_count": countRunningExternalApprovals(approvals),
 	})
 }
 
 func (s *Server) handleResolveExternalApproval(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		Approve bool `json:"approve"`
+		Approve         bool      `json:"approve"`
+		SelectedStepIDs *[]string `json:"selected_step_ids,omitempty"`
 	}
-	if err := decodeJSON(r, &req, 16*1024); err != nil {
+	if err := decodeJSON(r, &req, 64*1024); err != nil {
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "外部 AI 审批参数格式错误")
 		return
 	}
-	ap, err := s.cfg.AI.ResolveExternalApproval(r.Context(), id, req.Approve, extractClientIP(r))
+	ap, err := s.cfg.AI.ResolveExternalApproval(r.Context(), id, aiops.ResolveExternalApprovalInput{
+		Approve:         req.Approve,
+		SelectedStepIDs: req.SelectedStepIDs,
+	}, extractClientIP(r))
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -209,5 +225,23 @@ func (s *Server) handleResolveExternalApproval(w http.ResponseWriter, r *http.Re
 		"approval":      ap,
 		"approvals":     approvals,
 		"pending_count": pending,
+		"running_count": countRunningExternalApprovals(approvals),
+	})
+}
+
+func (s *Server) handleCancelExternalApproval(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ap, err := s.cfg.AI.CancelExternalApproval(id, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	approvals, pending, _ := s.cfg.Store.ListExternalApprovals("all", 60)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"approval":      ap,
+		"approvals":     approvals,
+		"pending_count": pending,
+		"running_count": countRunningExternalApprovals(approvals),
 	})
 }

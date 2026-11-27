@@ -59,6 +59,11 @@ type Service struct {
 	sessionLocks     map[string]*sync.Mutex
 	extApprovalMu    sync.Mutex
 	extApprovalLocks map[string]*sync.Mutex
+	extExecMu        sync.Mutex
+	extExecCancel    map[string]context.CancelFunc
+	extExecWG        sync.WaitGroup
+	extSubMu         sync.Mutex
+	extSubs          map[string]map[chan struct{}]struct{}
 }
 
 func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
@@ -70,6 +75,8 @@ func NewService(store *vault.Store, sshMgr *sshmanager.Manager) *Service {
 		stopCh:           make(chan struct{}),
 		sessionLocks:     make(map[string]*sync.Mutex),
 		extApprovalLocks: make(map[string]*sync.Mutex),
+		extExecCancel:    make(map[string]context.CancelFunc),
+		extSubs:          make(map[string]map[chan struct{}]struct{}),
 	}
 
 	// When store becomes ready at startup/setup, wake up patrol scheduler immediately
@@ -157,6 +164,89 @@ func (s *Service) Close() {
 	default:
 		close(s.stopCh)
 	}
+	s.extExecMu.Lock()
+	for id, cancel := range s.extExecCancel {
+		if cancel != nil {
+			cancel()
+		}
+		delete(s.extExecCancel, id)
+	}
+	s.extExecMu.Unlock()
+	s.extExecWG.Wait()
+
+	s.extSubMu.Lock()
+	for _, subs := range s.extSubs {
+		for ch := range subs {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
+	s.extSubMu.Unlock()
+}
+
+func (s *Service) registerExternalExecCancel(approvalID string, cancel context.CancelFunc) {
+	s.extExecMu.Lock()
+	if s.extExecCancel == nil {
+		s.extExecCancel = make(map[string]context.CancelFunc)
+	}
+	s.extExecCancel[approvalID] = cancel
+	s.extExecMu.Unlock()
+}
+
+func (s *Service) unregisterExternalExecCancel(approvalID string) {
+	s.extExecMu.Lock()
+	delete(s.extExecCancel, approvalID)
+	s.extExecMu.Unlock()
+}
+
+func (s *Service) invokeExternalExecCancel(approvalID string) bool {
+	s.extExecMu.Lock()
+	cancel := s.extExecCancel[approvalID]
+	s.extExecMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (s *Service) subscribeExternalApproval(approvalID string) (chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	s.extSubMu.Lock()
+	if s.extSubs == nil {
+		s.extSubs = make(map[string]map[chan struct{}]struct{})
+	}
+	if s.extSubs[approvalID] == nil {
+		s.extSubs[approvalID] = make(map[chan struct{}]struct{})
+	}
+	s.extSubs[approvalID][ch] = struct{}{}
+	s.extSubMu.Unlock()
+
+	unsub := func() {
+		s.extSubMu.Lock()
+		if subs := s.extSubs[approvalID]; subs != nil {
+			delete(subs, ch)
+			if len(subs) == 0 {
+				delete(s.extSubs, approvalID)
+			}
+		}
+		s.extSubMu.Unlock()
+	}
+	return ch, unsub
+}
+
+func (s *Service) notifyExternalApprovalChanged(approvalID string) {
+	s.extSubMu.Lock()
+	subs := s.extSubs[approvalID]
+	for ch := range subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	s.extSubMu.Unlock()
 }
 
 func (s *Service) LLM() *LLMClient {
