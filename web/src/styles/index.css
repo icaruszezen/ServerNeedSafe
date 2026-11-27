@@ -6201,6 +6201,1498 @@ pre,
   }
 }
 
+/* ==========================================================================
+   7x24 Vulnerability Monitor Center (.vuln-*)
+   ========================================================================== */
+
+:root {
+  --vuln-crit-text: #b91c1c;
+  --vuln-crit-bg: rgba(220, 38, 38, 0.10);
+  --vuln-crit-border: rgba(220, 38, 38, 0.30);
+  --vuln-crit-stripe: #dc2626;
+
+  --vuln-high-text: #c2410c;
+  --vuln-high-bg: rgba(234, 88, 12, 0.10);
+  --vuln-high-border: rgba(234, 88, 12, 0.28);
+  --vuln-high-stripe: #ea580c;
+
+  --vuln-med-text: #a16207;
+  --vuln-med-bg: rgba(217, 119, 6, 0.11);
+  --vuln-med-border: rgba(217, 119, 6, 0.28);
+  --vuln-med-stripe: #d97706;
+
+  --vuln-low-text: #0369a1;
+  --vuln-low-bg: rgba(2, 132, 199, 0.10);
+  --vuln-low-border: rgba(2, 132, 199, 0.25);
+  --vuln-low-stripe: #0284c7;
+
+  --vuln-unk-text: #475569;
+  --vuln-unk-bg: rgba(100, 116, 139, 0.10);
+  --vuln-unk-border: rgba(100, 116, 139, 0.24);
+  --vuln-unk-stripe: #64748b;
+}
+
+[data-theme="dark"] {
+  --vuln-crit-text: #fca5a5;
+  --vuln-crit-bg: rgba(239, 68, 68, 0.16);
+  --vuln-crit-border: rgba(239, 68, 68, 0.38);
+  --vuln-crit-stripe: #ef4444;
+
+  --vuln-high-text: #fdba74;
+  --vuln-high-bg: rgba(249, 115, 22, 0.16);
+  --vuln-high-border: rgba(249, 115, 22, 0.36);
+  --vuln-high-stripe: #f97316;
+
+  --vuln-med-text: #fcd34d;
+  --vuln-med-bg: rgba(245, 158, 11, 0.15);
+  --vuln-med-border: rgba(245, 158, 11, 0.34);
+  --vuln-med-stripe: #f59e0b;
+
+  --vuln-low-text: #7dd3fc;
+  --vuln-low-bg: rgba(56, 189, 248, 0.14);
+  --vuln-low-border: rgba(56, 189, 248, 0.32);
+  --vuln-low-stripe: #38bdf8;
+
+  --vuln-unk-text: #cbd5e1;
+  --vuln-unk-bg: rgba(148, 163, 184, 0.14);
+  --vuln-unk-border: rgba(148, 163, 184, 0.28);
+  --vuln-unk-stripe: #94a3b8;
+}
+
+.vuln-page-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.vuln-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Live Rolling Ticker Banner */
+.vuln-ticker-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+  max-width: 100%;
+  min-width: 0;
+  contain: layout paint;
+}
+
+.vuln-ticker-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
+  color: var(--danger-text);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.vuln-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger-text);
+  animation: vuln-pulse 1.8s infinite;
+}
+
+@keyframes vuln-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.82); }
+}
+
+.vuln-ticker-viewport {
+  flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  contain: layout paint;
+  position: relative;
+  mask-image: linear-gradient(90deg, transparent 0%, #000 3%, #000 97%, transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 3%, #000 97%, transparent 100%);
+}
+
+.vuln-ticker-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+  will-change: transform;
+  animation: vuln-marquee 38s linear infinite;
+}
+
+.vuln-ticker-viewport:hover .vuln-ticker-track,
+.vuln-ticker-viewport:focus-within .vuln-ticker-track,
+.vuln-ticker-viewport.is-paused .vuln-ticker-track {
+  animation-play-state: paused;
+}
+
+@keyframes vuln-marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vuln-ticker-track {
+    animation: none;
+  }
+  .vuln-ticker-viewport {
+    overflow-x: auto;
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+}
+
+.vuln-ticker-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.vuln-ticker-item:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.vuln-ticker-app {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.vuln-ticker-id {
+  font-size: 11.5px;
+  color: var(--accent-teal);
+  font-weight: 600;
+}
+
+.vuln-ticker-title {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+}
+
+.vuln-ticker-fix {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--accent-teal-soft);
+  color: var(--accent-teal);
+  font-weight: 600;
+}
+
+.vuln-ticker-empty {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vuln-ticker-toggle {
+  flex-shrink: 0;
+}
+
+/* KPI Posture Grid */
+.vuln-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.vuln-kpi-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+  min-width: 0;
+}
+
+.vuln-kpi-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+.vuln-kpi-card.active {
+  border-color: var(--accent-teal);
+  box-shadow: 0 0 0 2px var(--ring-focus);
+}
+
+.vuln-kpi-top {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.vuln-kpi-val {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+
+.vuln-kpi-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.vuln-kpi-card.kpi-critical .vuln-kpi-top,
+.vuln-kpi-card.kpi-critical .vuln-kpi-val {
+  color: var(--vuln-crit-text);
+}
+.vuln-kpi-card.kpi-high .vuln-kpi-top,
+.vuln-kpi-card.kpi-high .vuln-kpi-val {
+  color: var(--vuln-high-text);
+}
+.vuln-kpi-card.kpi-kev .vuln-kpi-top,
+.vuln-kpi-card.kpi-kev .vuln-kpi-val {
+  color: var(--danger-text);
+}
+.vuln-kpi-card.kpi-fix .vuln-kpi-top,
+.vuln-kpi-card.kpi-fix .vuln-kpi-val {
+  color: var(--accent-teal);
+}
+
+/* New arrivals & error banners */
+.vuln-new-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 14px;
+  border-radius: var(--radius-md);
+  background: var(--accent-teal-soft);
+  border: 1px solid var(--accent-teal-border);
+  color: var(--accent-teal);
+  font-size: 13px;
+}
+
+.vuln-new-banner-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vuln-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
+  color: var(--danger-text);
+  font-size: 12.5px;
+}
+
+/* Filter Card */
+.vuln-filter-card {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.vuln-filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.vuln-triage-tabs {
+  display: inline-flex;
+  align-items: center;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 3px;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.vuln-triage-tab {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.vuln-triage-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.vuln-triage-tab.active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: var(--shadow-xs);
+}
+
+.vuln-filter-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.vuln-search-box {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 170px;
+  max-width: 340px;
+}
+
+.vuln-search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.vuln-search-input {
+  width: 100%;
+  padding-left: 31px !important;
+}
+
+.vuln-days-select {
+  width: auto;
+  min-width: 116px;
+}
+
+.vuln-toggle-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.14s ease;
+}
+
+.vuln-toggle-pill:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.vuln-toggle-pill.active-danger {
+  background: var(--danger-soft);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+  font-weight: 600;
+}
+
+.vuln-toggle-pill.active-teal {
+  background: var(--accent-teal-soft);
+  border-color: var(--accent-teal-border);
+  color: var(--accent-teal);
+  font-weight: 600;
+}
+
+.vuln-chip-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.vuln-chip-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+  padding-top: 5px;
+  min-width: 56px;
+}
+
+.vuln-chip-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.vuln-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.vuln-filter-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.vuln-filter-chip.active {
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-text);
+  border-color: var(--btn-primary-bg);
+  font-weight: 600;
+}
+
+.vuln-filter-chip.active-teal {
+  background: var(--accent-teal-soft);
+  border-color: var(--accent-teal-border);
+  color: var(--accent-teal);
+  font-weight: 600;
+}
+
+.vuln-filter-chip.sev-chip-filter.sev-critical.active {
+  background: var(--vuln-crit-bg);
+  border-color: var(--vuln-crit-border);
+  color: var(--vuln-crit-text);
+}
+.vuln-filter-chip.sev-chip-filter.sev-high.active {
+  background: var(--vuln-high-bg);
+  border-color: var(--vuln-high-border);
+  color: var(--vuln-high-text);
+}
+.vuln-filter-chip.sev-chip-filter.sev-medium.active {
+  background: var(--vuln-med-bg);
+  border-color: var(--vuln-med-border);
+  color: var(--vuln-med-text);
+}
+.vuln-filter-chip.sev-chip-filter.sev-low.active {
+  background: var(--vuln-low-bg);
+  border-color: var(--vuln-low-border);
+  color: var(--vuln-low-text);
+}
+.vuln-filter-chip.sev-chip-filter.sev-unknown.active {
+  background: var(--vuln-unk-bg);
+  border-color: var(--vuln-unk-border);
+  color: var(--vuln-unk-text);
+}
+
+.vuln-chip-count {
+  font-size: 11px;
+  opacity: 0.78;
+}
+
+.vuln-add-more-chip {
+  border-style: dashed;
+  color: var(--accent-teal);
+  border-color: var(--accent-teal-border);
+  background: transparent;
+}
+
+.vuln-custom-tag {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+}
+
+/* Severity Dots, Chips & Badges */
+.vuln-sev-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.vuln-sev-dot.sev-critical { background: var(--vuln-crit-stripe); }
+.vuln-sev-dot.sev-high { background: var(--vuln-high-stripe); }
+.vuln-sev-dot.sev-medium { background: var(--vuln-med-stripe); }
+.vuln-sev-dot.sev-low { background: var(--vuln-low-stripe); }
+.vuln-sev-dot.sev-unknown { background: var(--vuln-unk-stripe); }
+
+.vuln-sev-chip,
+.vuln-sev-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+  font-weight: 700;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.vuln-sev-chip {
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.vuln-sev-badge {
+  font-size: 11.5px;
+  padding: 2px 8px;
+}
+
+.vuln-sev-chip.sev-critical,
+.vuln-sev-badge.sev-critical {
+  color: var(--vuln-crit-text);
+  background: var(--vuln-crit-bg);
+  border-color: var(--vuln-crit-border);
+}
+.vuln-sev-chip.sev-high,
+.vuln-sev-badge.sev-high {
+  color: var(--vuln-high-text);
+  background: var(--vuln-high-bg);
+  border-color: var(--vuln-high-border);
+}
+.vuln-sev-chip.sev-medium,
+.vuln-sev-badge.sev-medium {
+  color: var(--vuln-med-text);
+  background: var(--vuln-med-bg);
+  border-color: var(--vuln-med-border);
+}
+.vuln-sev-chip.sev-low,
+.vuln-sev-badge.sev-low {
+  color: var(--vuln-low-text);
+  background: var(--vuln-low-bg);
+  border-color: var(--vuln-low-border);
+}
+.vuln-sev-chip.sev-unknown,
+.vuln-sev-badge.sev-unknown {
+  color: var(--vuln-unk-text);
+  background: var(--vuln-unk-bg);
+  border-color: var(--vuln-unk-border);
+}
+
+.vuln-cvss-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+}
+.vuln-cvss-pill.sev-critical { color: var(--vuln-crit-text); border-color: var(--vuln-crit-border); }
+.vuln-cvss-pill.sev-high { color: var(--vuln-high-text); border-color: var(--vuln-high-border); }
+
+.vuln-kev-badge,
+.vuln-kev-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-weight: 700;
+  border-radius: 6px;
+  background: #dc2626;
+  color: #ffffff;
+  white-space: nowrap;
+}
+.vuln-kev-badge {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+.vuln-kev-mini {
+  font-size: 10px;
+  padding: 1px 5px;
+}
+
+.vuln-new-badge {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--accent-teal);
+  color: #ffffff;
+}
+
+/* Advisory Feed Stream */
+.vuln-feed-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vuln-feed-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  padding: 0 2px;
+}
+
+.vuln-feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vuln-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px 13px 18px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-left: 4px solid var(--vuln-unk-stripe);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.15s ease;
+  min-width: 0;
+}
+
+.vuln-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.vuln-card.sev-critical { border-left-color: var(--vuln-crit-stripe); }
+.vuln-card.sev-high { border-left-color: var(--vuln-high-stripe); }
+.vuln-card.sev-medium { border-left-color: var(--vuln-med-stripe); }
+.vuln-card.sev-low { border-left-color: var(--vuln-low-stripe); }
+.vuln-card.sev-unknown { border-left-color: var(--vuln-unk-stripe); }
+
+.vuln-card.is-fresh {
+  box-shadow: 0 0 0 2px var(--accent-teal-border), var(--shadow-sm);
+}
+
+.vuln-card.is-ignored {
+  opacity: 0.65;
+}
+
+.vuln-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.vuln-card-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.vuln-id-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.vuln-id-copy:hover {
+  border-color: var(--accent-teal-border);
+  color: var(--accent-teal);
+}
+
+.vuln-app-pill {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--bg-muted);
+  color: var(--text-primary);
+}
+
+.vuln-card-meta-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.vuln-time-text {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.vuln-quick-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.vuln-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.vuln-icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.vuln-icon-btn.starred {
+  color: #f59e0b;
+}
+
+.vuln-card-title {
+  font-size: 14.5px;
+  font-weight: 650;
+  color: var(--text-primary);
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.vuln-card-summary {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.vuln-ai-preview {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--accent-teal);
+  background: var(--accent-teal-soft);
+  padding: 6px 10px;
+  border-radius: 8px;
+  -webkit-line-clamp: unset;
+}
+
+.vuln-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.vuln-patch-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.vuln-affected-pill {
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vuln-fixed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--accent-teal-soft);
+  border: 1px solid var(--accent-teal-border);
+  color: var(--accent-teal);
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vuln-unfixed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--amber-soft);
+  border: 1px solid var(--amber-border);
+  color: var(--amber-text);
+}
+
+.vuln-source-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+}
+
+.vuln-ai-cached-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-teal);
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--accent-teal-soft);
+}
+
+.vuln-card-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.vuln-empty-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 10px;
+  padding: 42px 20px;
+}
+
+.vuln-load-more-row {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 12px;
+}
+
+/* Detail Slide-Over Drawer */
+.vuln-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-backdrop);
+  z-index: 90;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.vuln-drawer {
+  width: min(680px, 100vw);
+  height: 100%;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-default);
+  box-shadow: var(--shadow-modal);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.vuln-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.vuln-drawer-title {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.4;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.vuln-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.vuln-drawer-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.vuln-kev-callout {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-border);
+  color: var(--danger-text);
+  font-size: 13px;
+}
+
+.vuln-kev-callout-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.vuln-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+}
+
+.vuln-meta-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.vuln-meta-span2 {
+  grid-column: span 2;
+}
+
+.vuln-meta-k {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.vuln-meta-v {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.vuln-section-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vuln-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.vuln-ranges-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vuln-range-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+}
+
+.vuln-range-vals {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vuln-ai-box {
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--accent-teal-border);
+}
+
+.vuln-ai-box-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vuln-ai-error {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--danger-soft);
+  color: var(--danger-text);
+  font-size: 12.5px;
+}
+
+.vuln-ai-content {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.vuln-ai-summary {
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.vuln-ai-sub {
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+.vuln-ai-steps {
+  margin: 4px 0 0 18px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vuln-ai-cmd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  font-size: 12px;
+}
+
+.vuln-ai-foot {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.vuln-aiops-jump {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vuln-aiops-jump-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.vuln-detail-pre {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.vuln-ref-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vuln-ref-list a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  text-decoration: none;
+  font-size: 12.5px;
+}
+
+.vuln-ref-list a:hover {
+  border-color: var(--accent-teal-border);
+  color: var(--accent-teal);
+}
+
+.vuln-ref-type {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.vuln-ref-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Self-Select Apps Modal & Settings Modal */
+.vuln-picker-modal {
+  width: min(860px, 96vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.vuln-settings-modal {
+  width: min(680px, 96vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.vuln-modal-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.vuln-modal-tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.vuln-modal-tab.active {
+  color: var(--accent-teal);
+  border-bottom-color: var(--accent-teal);
+}
+
+.vuln-picker-body {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.vuln-preset-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+}
+
+.vuln-cat-block {
+  margin-bottom: 16px;
+}
+
+.vuln-cat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.vuln-cat-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.vuln-cat-count {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.vuln-app-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.vuln-app-option {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.14s ease;
+  min-width: 0;
+}
+
+.vuln-app-option:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-subtle);
+}
+
+.vuln-app-option.selected {
+  border-color: var(--accent-teal);
+  background: var(--accent-teal-soft);
+}
+
+.vuln-app-opt-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.vuln-app-opt-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.vuln-core-pill {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--amber-soft);
+  color: var(--amber-text);
+  white-space: nowrap;
+}
+
+.vuln-check-box {
+  width: 17px;
+  height: 17px;
+  border-radius: 5px;
+  border: 1.5px solid var(--border-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  color: #ffffff;
+}
+
+.vuln-check-box.checked {
+  background: var(--accent-teal);
+  border-color: var(--accent-teal);
+}
+
+.vuln-app-opt-desc {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.vuln-app-opt-sources {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+
+.vuln-app-opt-sources span {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+}
+
+.vuln-custom-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.vuln-custom-form {
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+}
+
+.vuln-custom-form-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: var(--text-primary);
+}
+
+.vuln-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.vuln-span2 {
+  grid-column: span 2;
+}
+
+.vuln-custom-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vuln-custom-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+}
+
+.vuln-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vuln-source-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+}
+
+.vuln-webhook-box {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+}
+
+@media (max-width: 1120px) {
+  .vuln-kpi-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .vuln-app-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+
 
 
 

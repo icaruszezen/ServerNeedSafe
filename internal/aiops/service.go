@@ -171,6 +171,27 @@ func (s *Service) notifyPersist() {
 	}
 }
 
+// CompleteTextPrompt executes a single-turn text completion using the currently active AI provider.
+// Used by on-demand features such as Vulnerability Monitor Chinese advisory explanation.
+func (s *Service) CompleteTextPrompt(ctx context.Context, systemPrompt, userPrompt string) (string, string, error) {
+	if s == nil || s.store == nil {
+		return "", "", fmt.Errorf("AI 服务尚未就绪")
+	}
+	prov, err := s.store.GetActiveAIProviderSecret()
+	if err != nil || prov == nil {
+		return "", "", fmt.Errorf("尚未配置可用的 AI 模型服务商，请先前往「AI 智能运维 -> 模型配置」添加一个服务商")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	turn, err := s.llm.StreamChat(callCtx, *prov, systemPrompt, []vault.AIChatMessage{
+		{Role: "user", Content: userPrompt},
+	}, nil, StreamCallbacks{})
+	if err != nil {
+		return "", prov.Model, err
+	}
+	return strings.TrimSpace(turn.Content), prov.Model, nil
+}
+
 func (s *Service) Close() {
 	select {
 	case <-s.stopCh:

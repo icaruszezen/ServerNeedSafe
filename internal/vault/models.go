@@ -354,6 +354,7 @@ type SecretsState struct {
 	MonitorSettings   MonitorSettings         `json:"monitor_settings"`
 	MonitorRules      []MonitorAlertRule      `json:"monitor_rules"`
 	AISettings        AISettings              `json:"ai_settings"`
+	VulnSettings      VulnSettings            `json:"vuln_settings"`
 }
 
 // ServerRuntimeMeta tracks volatile per-server telemetry/connection metadata outside secrets.enc.
@@ -406,6 +407,7 @@ type CoreConfigSnapshot struct {
 	MonitorSettings MonitorSettings    `json:"monitor_settings"`
 	MonitorRules    []MonitorAlertRule `json:"monitor_rules"`
 	AISettings      AISettings         `json:"ai_settings"`
+	VulnSettings    VulnSettings       `json:"vuln_settings,omitempty"`
 }
 
 // AIKnowledgeSnapshot carries reusable SRE knowledge (host profiles, long-term memories, runbooks).
@@ -415,7 +417,7 @@ type AIKnowledgeSnapshot struct {
 	Runbooks     []AIRunbook     `json:"runbooks"`
 }
 
-// RuntimeDataSnapshot carries optional operational history (monitoring, AI chats, patrol, audit).
+// RuntimeDataSnapshot carries optional operational history (monitoring, AI chats, patrol, audit, vuln).
 type RuntimeDataSnapshot struct {
 	Monitor           *MonitorRuntimeState     `json:"monitor,omitempty"`
 	AISessions        []AIChatSession          `json:"ai_sessions,omitempty"`
@@ -423,6 +425,7 @@ type RuntimeDataSnapshot struct {
 	PatrolRecords     []PatrolRecord           `json:"patrol_records,omitempty"`
 	ExternalApprovals []ExternalApproval       `json:"external_approvals,omitempty"`
 	AuditLogs         []AuditEntry             `json:"audit_logs,omitempty"`
+	Vuln              *VulnRuntimeState        `json:"vuln,omitempty"`
 }
 
 // BackupBundle is the structured payload inside v3 password-encrypted .sns backups and cross-instance sync.
@@ -448,6 +451,7 @@ type StorageFilesInfo struct {
 	MonitorSizeBytes  int64  `json:"monitor_size_bytes"`
 	AIOpsSizeBytes    int64  `json:"aiops_size_bytes"`
 	AuditSizeBytes    int64  `json:"audit_size_bytes"`
+	VulnSizeBytes     int64  `json:"vuln_size_bytes"`
 	RuntimeTotalBytes int64  `json:"runtime_total_bytes"`
 }
 
@@ -606,5 +610,6 @@ func DefaultSecretsState(vaultID string) *SecretsState {
 		MonitorSettings: def.Monitor.Settings,
 		MonitorRules:    def.Monitor.Rules,
 		AISettings:      def.AISettings,
+		VulnSettings:    DefaultVulnSettings(),
 	}
 }

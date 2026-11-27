@@ -20,6 +20,7 @@ export interface StorageFilesInfo {
   monitor_size_bytes: number;
   aiops_size_bytes: number;
   audit_size_bytes: number;
+  vuln_size_bytes?: number;
   runtime_total_bytes: number;
 }
 
@@ -289,6 +290,7 @@ export interface WorkspaceBootstrapResponse {
   running_external_approvals?: number;
   pending_session_approvals?: number;
   pending_approvals_total?: number;
+  vuln_unread_high?: number;
 }
 
 export interface TerminalReadyInfo {
@@ -1566,6 +1568,221 @@ export interface UpdateOverviewResponse {
   docker_commands?: DockerUpgradeCommands;
   active_ssh_tabs?: number;
 }
+
+// ============================================================================
+// 7x24 Vulnerability Monitor (Official Security Advisory Rolling Feed)
+// ============================================================================
+
+export type VulnSeverity = 'critical' | 'high' | 'medium' | 'low' | 'unknown';
+
+export interface VulnCustomApp {
+  id: string;
+  name: string;
+  category: string;
+  kind: 'github_repo' | 'osv_package';
+  repo?: string;
+  ecosystem?: string;
+  package_name?: string;
+  enabled: boolean;
+  created_at?: string;
+}
+
+export interface VulnSettingsView {
+  enabled: boolean;
+  sync_interval_minutes: number;
+  retention_days: number;
+  max_records: number;
+  watched_app_ids: string[];
+  custom_apps: VulnCustomApp[];
+  has_http_proxy: boolean;
+  http_proxy_display?: string;
+  has_github_token: boolean;
+  notify_webhook: boolean;
+  notify_min_severity: VulnSeverity;
+  notify_kev_only: boolean;
+  reuse_ai_patrol_webhook: boolean;
+  has_custom_webhook: boolean;
+  custom_webhook_display?: string;
+}
+
+export interface VulnSettingsUpdatePayload {
+  enabled?: boolean;
+  sync_interval_minutes?: number;
+  retention_days?: number;
+  max_records?: number;
+  watched_app_ids?: string[];
+  custom_apps?: VulnCustomApp[];
+  http_proxy_url?: string;
+  clear_http_proxy?: boolean;
+  github_token?: string;
+  clear_github_token?: boolean;
+  notify_webhook?: boolean;
+  notify_min_severity?: VulnSeverity;
+  notify_kev_only?: boolean;
+  reuse_ai_patrol_webhook?: boolean;
+  custom_webhook_url?: string;
+  clear_custom_webhook?: boolean;
+}
+
+export interface VulnAffectedRange {
+  ecosystem?: string;
+  package_name?: string;
+  introduced?: string;
+  fixed?: string;
+  last_affected?: string;
+  range_text?: string;
+  fixed_versions?: string[];
+}
+
+export interface VulnReference {
+  type?: string;
+  url: string;
+  label?: string;
+}
+
+export interface VulnAIAnalysis {
+  summary_zh: string;
+  impact_zh?: string;
+  fix_steps_zh?: string[];
+  verification_cmd?: string;
+  raw_markdown?: string;
+  model?: string;
+  generated_at: string;
+}
+
+export interface VulnAdvisory {
+  id: string;
+  cve_id?: string;
+  ghsa_id?: string;
+  aliases?: string[];
+  app_ids: string[];
+  app_names: string[];
+  categories: string[];
+  title: string;
+  summary: string;
+  details?: string;
+  severity: VulnSeverity;
+  cvss_score?: number;
+  cvss_vector?: string;
+  cwe_ids?: string[];
+  ecosystem?: string;
+  package_name?: string;
+  cpe_hints?: string[];
+  affected_text?: string;
+  fixed_version?: string;
+  fixed_versions?: string[];
+  has_fix: boolean;
+  affected_ranges?: VulnAffectedRange[];
+  is_kev: boolean;
+  kev_date_added?: string;
+  kev_due_date?: string;
+  kev_action?: string;
+  sources: string[];
+  primary_source: string;
+  official_url?: string;
+  references?: VulnReference[];
+  published_at: string;
+  modified_at: string;
+  first_seen_at: string;
+  last_synced_at: string;
+  is_read: boolean;
+  is_starred: boolean;
+  is_ignored: boolean;
+  is_new: boolean;
+  ai_analysis?: VulnAIAnalysis;
+}
+
+export interface VulnSourceStatus {
+  id: string;
+  name: string;
+  kind: string;
+  url?: string;
+  ok: boolean;
+  item_count: number;
+  duration_ms: number;
+  last_sync_at?: string;
+  last_error?: string;
+}
+
+export interface VulnAppCategoryInfo {
+  id: string;
+  label: string;
+  order: number;
+}
+
+export interface VulnAppPreset {
+  id: string;
+  name: string;
+  description: string;
+  app_ids: string[];
+}
+
+export interface VulnAppDefinition {
+  id: string;
+  name: string;
+  category: string;
+  category_label: string;
+  vendor: string;
+  description: string;
+  homepage?: string;
+  default_watched: boolean;
+  is_custom?: boolean;
+  watched: boolean;
+  osv_packages?: { ecosystem: string; name: string }[];
+  github_repos?: string[];
+  vendor_feed_id?: string;
+}
+
+export interface VulnKPIStats {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  unknown: number;
+  kev: number;
+  has_fix: number;
+  recent_7d: number;
+  unread_total: number;
+  unread_critical_high: number;
+  starred_total: number;
+  sources_ok: number;
+  sources_total: number;
+}
+
+export interface VulnRuntimeStatus {
+  syncing: boolean;
+  last_sync_at?: string;
+  next_sync_at?: string;
+  last_error?: string;
+  last_new_count: number;
+  source_status: VulnSourceStatus[];
+  watched_count: number;
+  catalog_total: number;
+}
+
+export interface VulnOverviewResponse {
+  advisories: VulnAdvisory[];
+  total_matched: number;
+  has_more: boolean;
+  new_since_count: number;
+  ticker: VulnAdvisory[];
+  kpi: VulnKPIStats;
+  settings: VulnSettingsView;
+  catalog: VulnAppDefinition[];
+  categories: VulnAppCategoryInfo[];
+  presets: VulnAppPreset[];
+  runtime: VulnRuntimeStatus;
+}
+
+export interface VulnSyncResult {
+  ok: boolean;
+  fetched_count: number;
+  new_count: number;
+  error?: string;
+  runtime: VulnRuntimeStatus;
+}
+
 
 
 

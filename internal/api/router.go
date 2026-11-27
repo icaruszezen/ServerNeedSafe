@@ -17,6 +17,7 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/updater"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 	"github.com/icaruszezen/ServerNeedSafe/internal/version"
+	"github.com/icaruszezen/ServerNeedSafe/internal/vuln"
 )
 
 const (
@@ -33,11 +34,13 @@ type Config struct {
 	SSH                    *sshmanager.Manager
 	Monitor                *monitor.Engine
 	AI                     *aiops.Service
+	Vuln                   *vuln.Service
 	Updater                *updater.Service
 	Auth                   *auth.Manager
 	StaticFS               fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
 	OnRestart              func(exePath, backupPath string) error
 	DisableAutoUpdateCheck bool
+	DisableAutoVulnSync    bool
 }
 
 type Server struct {
@@ -64,6 +67,14 @@ func NewServer(cfg Config) *Server {
 		if cfg.AI == nil {
 			cfg.AI = aiops.NewService(cfg.Store, cfg.SSH)
 		}
+		if cfg.Vuln == nil {
+			aiSvc := cfg.AI
+			cfg.Vuln = vuln.NewService(vuln.Config{
+				Store:           cfg.Store,
+				AICompleter:     aiSvc.CompleteTextPrompt,
+				DisableAutoLoop: cfg.DisableAutoVulnSync || cfg.DisableAutoUpdateCheck,
+			})
+		}
 	}
 	if cfg.Updater == nil {
 		cfg.Updater = updater.NewService(updater.Config{
@@ -89,6 +100,9 @@ func NewServer(cfg Config) *Server {
 	if s.cfg.Monitor != nil {
 		s.cfg.Monitor.Start()
 	}
+	if s.cfg.Vuln != nil {
+		s.cfg.Vuln.Start()
+	}
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.Start()
 	}
@@ -107,6 +121,9 @@ func NewServer(cfg Config) *Server {
 func (s *Server) Close() {
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.Close()
+	}
+	if s.cfg.Vuln != nil {
+		s.cfg.Vuln.Close()
 	}
 	if s.mcpLoopback != nil {
 		s.mcpLoopback.Close()
@@ -321,6 +338,17 @@ func (s *Server) registerRoutes() {
 	if s.mcpServer != nil {
 		s.mux.Handle("/api/mcp", s.mcpServer.HTTPHandler(false))
 	}
+
+	// 7x24 Vulnerability Monitor (Multi-Source Official Advisory Rolling Feed)
+	s.mux.HandleFunc("GET /api/vulns/overview", s.requireAuth(s.handleGetVulnOverview))
+	s.mux.HandleFunc("POST /api/vulns/sync", s.requireAuth(s.handleSyncVulnsNow))
+	s.mux.HandleFunc("PUT /api/vulns/config", s.requireAuth(s.handleUpdateVulnConfig))
+	s.mux.HandleFunc("POST /api/vulns/custom-apps", s.requireAuth(s.handleUpsertCustomVulnApp))
+	s.mux.HandleFunc("DELETE /api/vulns/custom-apps/{id}", s.requireAuth(s.handleDeleteCustomVulnApp))
+	s.mux.HandleFunc("POST /api/vulns/state", s.requireAuth(s.handleUpdateVulnState))
+	s.mux.HandleFunc("POST /api/vulns/mark-all-read", s.requireAuth(s.handleMarkAllVulnsRead))
+	s.mux.HandleFunc("POST /api/vulns/{id}/explain", s.requireAuth(s.handleExplainVuln))
+	s.mux.HandleFunc("POST /api/vulns/test-webhook", s.requireAuth(s.handleTestVulnWebhook))
 
 	// GitHub Release Auto-Detection, China Mirror Probing & Self-Update
 	s.mux.HandleFunc("GET /api/system/update/status", s.requireAuth(s.handleGetUpdateStatus))

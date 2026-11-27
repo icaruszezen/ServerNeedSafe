@@ -1547,6 +1547,7 @@ async function runSuite() {
       ['servers', '#nav-servers-btn'],
       ['monitor', '#nav-monitor-btn'],
       ['alerts', '#nav-alerts-btn'],
+      ['vulns', '#nav-vulns-btn'],
       ['terminals', '#nav-terminals-btn'],
       ['ai', '#nav-ai-btn'],
       ['approvals', '#nav-approvals-btn'],
