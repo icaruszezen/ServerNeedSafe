@@ -22,6 +22,7 @@ const (
 	monitorRuntimeFileName = "monitor_runtime.json"
 	aiopsRuntimeFileName   = "aiops_runtime.json"
 	auditRuntimeFileName   = "audit_logs.json"
+	vulnRuntimeFileName    = "vuln_runtime.json"
 	legacyVaultFileName    = "vault.sns"
 )
 
@@ -42,6 +43,7 @@ type Store struct {
 	monitorPath string
 	aiopsPath   string
 	auditPath   string
+	vulnPath    string
 	legacyPath  string
 
 	masterKey     []byte
@@ -58,12 +60,15 @@ type Store struct {
 	monitorRT       *MonitorRuntimeState
 	aiopsRT         *AIOpsRuntimeState
 	auditRT         *AuditRuntimeState
+	vulnRT          *VulnRuntimeState
 	dirtyMonitor    bool
 	dirtyAIOps      bool
 	dirtyAudit      bool
+	dirtyVuln       bool
 	monitorFileSize int64
 	aiopsFileSize   int64
 	auditFileSize   int64
+	vulnFileSize    int64
 
 	flushMu       sync.Mutex
 	flushDebounce time.Duration
@@ -101,6 +106,7 @@ func NewStore(dataDirOrFile string) (*Store, error) {
 		monitorPath:   filepath.Join(dataDir, monitorRuntimeFileName),
 		aiopsPath:     filepath.Join(dataDir, aiopsRuntimeFileName),
 		auditPath:     filepath.Join(dataDir, auditRuntimeFileName),
+		vulnPath:      filepath.Join(dataDir, vulnRuntimeFileName),
 		legacyPath:    filepath.Join(dataDir, legacyVaultFileName),
 		masterKey:     masterKey,
 		masterKeyMode: keyMode,
@@ -108,6 +114,7 @@ func NewStore(dataDirOrFile string) (*Store, error) {
 		monitorRT:     DefaultMonitorRuntimeState(),
 		aiopsRT:       DefaultAIOpsRuntimeState(now),
 		auditRT:       DefaultAuditRuntimeState(),
+		vulnRT:        DefaultVulnRuntimeState(),
 		flushDebounce: defaultFlushDebounce,
 		flushWakeCh:   make(chan struct{}, 1),
 		stopCh:        make(chan struct{}),
@@ -211,6 +218,16 @@ func (s *Store) loadRuntimeFilesBestEffort() {
 			}
 			s.auditRT = &au
 			s.auditFileSize = int64(len(raw))
+		}
+	}
+	if raw, err := os.ReadFile(s.vulnPath); err == nil && len(raw) > 0 {
+		var vr VulnRuntimeState
+		if json.Unmarshal(raw, &vr) == nil {
+			ensureVulnRuntimeDefaults(&vr)
+			s.vulnRT = &vr
+			s.vulnFileSize = int64(len(raw))
+		} else {
+			log.Printf("[ServerNeedSafe] 警告: vuln_runtime.json 解析失败，已重置为空运行态")
 		}
 	}
 }
@@ -383,13 +400,14 @@ func (s *Store) FlushNow() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
-	var monBytes, aiBytes, auditBytes []byte
+	var monBytes, aiBytes, auditBytes, vulnBytes []byte
 	var err error
 
 	s.rtMu.Lock()
 	doMon := s.dirtyMonitor
 	doAI := s.dirtyAIOps
 	doAudit := s.dirtyAudit
+	doVuln := s.dirtyVuln
 	if doMon {
 		monBytes, err = json.Marshal(s.monitorRT)
 		if err != nil {
@@ -422,6 +440,26 @@ func (s *Store) FlushNow() error {
 			return err
 		}
 		s.dirtyAudit = false
+	}
+	if doVuln {
+		if s.vulnRT == nil {
+			s.vulnRT = DefaultVulnRuntimeState()
+		}
+		vulnBytes, err = json.Marshal(s.vulnRT)
+		if err != nil {
+			if doMon {
+				s.dirtyMonitor = true
+			}
+			if doAI {
+				s.dirtyAIOps = true
+			}
+			if doAudit {
+				s.dirtyAudit = true
+			}
+			s.rtMu.Unlock()
+			return err
+		}
+		s.dirtyVuln = false
 	}
 	s.rtMu.Unlock()
 
@@ -463,6 +501,20 @@ func (s *Store) FlushNow() error {
 		} else {
 			s.rtMu.Lock()
 			s.auditFileSize = int64(len(auditBytes))
+			s.rtMu.Unlock()
+		}
+	}
+	if doVuln {
+		if wErr := atomicWriteFile(s.vulnPath, vulnBytes, 0o600, false); wErr != nil {
+			s.rtMu.Lock()
+			s.dirtyVuln = true
+			s.rtMu.Unlock()
+			if firstErr == nil {
+				firstErr = wErr
+			}
+		} else {
+			s.rtMu.Lock()
+			s.vulnFileSize = int64(len(vulnBytes))
 			s.rtMu.Unlock()
 		}
 	}
@@ -773,6 +825,7 @@ func (s *Store) StorageInfo() StorageFilesInfo {
 	monSize := s.monitorFileSize
 	aiSize := s.aiopsFileSize
 	audSize := s.auditFileSize
+	vulnSize := s.vulnFileSize
 	s.rtMu.RUnlock()
 
 	return StorageFilesInfo{
@@ -784,7 +837,8 @@ func (s *Store) StorageInfo() StorageFilesInfo {
 		MonitorSizeBytes:  monSize,
 		AIOpsSizeBytes:    aiSize,
 		AuditSizeBytes:    audSize,
-		RuntimeTotalBytes: monSize + aiSize + audSize,
+		VulnSizeBytes:     vulnSize,
+		RuntimeTotalBytes: monSize + aiSize + audSize + vulnSize,
 	}
 }
 
@@ -818,6 +872,7 @@ func (s *Store) BuildBackupBundle(includeRuntime bool) (*BackupBundle, error) {
 			PatrolRecords:     clonePatrolRecords(s.aiopsRT.PatrolRecords),
 			ExternalApprovals: cloneExternalApprovals(s.aiopsRT.ExternalApprovals),
 			AuditLogs:         slices.Clone(s.auditRT.AuditLogs),
+			Vuln:              cloneVulnRuntimeState(s.vulnRT),
 		}
 	}
 	s.rtMu.RUnlock()
@@ -838,6 +893,7 @@ func (s *Store) BuildBackupBundle(includeRuntime bool) (*BackupBundle, error) {
 			MonitorSettings: sec.MonitorSettings,
 			MonitorRules:    sec.MonitorRules,
 			AISettings:      sec.AISettings,
+			VulnSettings:    sec.VulnSettings,
 		},
 		AIKnowledge: aiKnow,
 		Runtime:     rtSnap,
@@ -907,6 +963,7 @@ func (s *Store) ApplySyncSnapshot(bundle *BackupBundle, includeRuntime bool, ini
 	nextSec.MonitorSettings = cloneMonitorSettings(bundle.Config.MonitorSettings)
 	nextSec.MonitorRules = slices.Clone(bundle.Config.MonitorRules)
 	nextSec.AISettings = cloneAISettings(bundle.Config.AISettings)
+	nextSec.VulnSettings = cloneVulnSettings(bundle.Config.VulnSettings)
 	ensureSecretsDefaults(nextSec)
 
 	sealed, err := SealSecretsBytes(s.masterKey, nextSec)
@@ -967,6 +1024,11 @@ func (s *Store) ApplySyncSnapshot(bundle *BackupBundle, includeRuntime bool, ini
 			if len(s.auditRT.AuditLogs) > maxAuditEntries {
 				s.auditRT.AuditLogs = s.auditRT.AuditLogs[:maxAuditEntries]
 			}
+		}
+		if bundle.Runtime.Vuln != nil {
+			s.vulnRT = cloneVulnRuntimeState(bundle.Runtime.Vuln)
+			ensureVulnRuntimeDefaults(s.vulnRT)
+			s.dirtyVuln = true
 		}
 	}
 	ensureAIOpsRuntimeDefaults(s.aiopsRT)
@@ -1150,6 +1212,7 @@ func ensureSecretsDefaults(sec *SecretsState) {
 	} else {
 		sec.AISettings.MemoryConfig = SanitizeAIMemoryConfig(sec.AISettings.MemoryConfig)
 	}
+	sec.VulnSettings = NormalizeVulnSettings(sec.VulnSettings)
 }
 
 func ensureMonitorRuntimeDefaults(m *MonitorRuntimeState) {
@@ -1289,6 +1352,7 @@ func cloneSecretsState(src *SecretsState) *SecretsState {
 	cp.MonitorSettings = cloneMonitorSettings(src.MonitorSettings)
 	cp.MonitorRules = slices.Clone(src.MonitorRules)
 	cp.AISettings = cloneAISettings(src.AISettings)
+	cp.VulnSettings = cloneVulnSettings(src.VulnSettings)
 	return &cp
 }
 

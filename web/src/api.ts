@@ -59,6 +59,13 @@ import type {
   UpdateOverviewResponse,
   UpdateSettings,
   VaultSecurityOverview,
+  VulnAIAnalysis,
+  VulnCustomApp,
+  VulnOverviewResponse,
+  VulnRuntimeStatus,
+  VulnSettingsUpdatePayload,
+  VulnSettingsView,
+  VulnSyncResult,
   WorkspaceBootstrapResponse,
 } from './types';
 
@@ -1276,4 +1283,102 @@ export const api = {
       '/api/system/update/apply',
       { confirm_disconnect_ssh }
     ),
+
+  // 7x24 Vulnerability Monitor (Multi-Source Official Security Advisories)
+  getVulnOverview: (params?: {
+    apps?: string[];
+    categories?: string[];
+    severities?: string[];
+    state?: string;
+    kev_only?: boolean;
+    fixed_only?: boolean;
+    days?: number;
+    search?: string;
+    since?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (params?.apps && params.apps.length > 0) q.set('apps', params.apps.join(','));
+    if (params?.categories && params.categories.length > 0)
+      q.set('categories', params.categories.join(','));
+    if (params?.severities && params.severities.length > 0)
+      q.set('severities', params.severities.join(','));
+    if (params?.state) q.set('state', params.state);
+    if (params?.kev_only) q.set('kev_only', 'true');
+    if (params?.fixed_only) q.set('fixed_only', 'true');
+    if (params?.days && params.days > 0) q.set('days', String(params.days));
+    if (params?.search?.trim()) q.set('search', params.search.trim());
+    if (params?.since) q.set('since', params.since);
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.offset) q.set('offset', String(params.offset));
+    const qs = q.toString();
+    return requestJSON<VulnOverviewResponse>('GET', `/api/vulns/overview${qs ? `?${qs}` : ''}`);
+  },
+
+  syncVulnsNow: (app_ids?: string[], asyncMode = false) =>
+    requestJSON<VulnSyncResult>('POST', '/api/vulns/sync', {
+      ...(app_ids && app_ids.length > 0 ? { app_ids } : {}),
+      async: asyncMode,
+    }),
+
+  updateVulnConfig: (payload: VulnSettingsUpdatePayload) =>
+    requestJSON<{
+      ok: boolean;
+      settings: VulnSettingsView;
+      newly_enabled: string[];
+      runtime: VulnRuntimeStatus;
+    }>('PUT', '/api/vulns/config', payload),
+
+  upsertCustomVulnApp: (payload: {
+    id?: string;
+    name: string;
+    kind: 'github_repo' | 'osv_package';
+    repo?: string;
+    ecosystem?: string;
+    package_name?: string;
+    enabled?: boolean;
+  }) =>
+    requestJSON<{
+      ok: boolean;
+      app: VulnCustomApp;
+      settings: VulnSettingsView;
+      runtime: VulnRuntimeStatus;
+    }>('POST', '/api/vulns/custom-apps', payload),
+
+  deleteCustomVulnApp: (id: string) =>
+    requestJSON<{ ok: boolean; settings: VulnSettingsView; runtime: VulnRuntimeStatus }>(
+      'DELETE',
+      `/api/vulns/custom-apps/${encodeURIComponent(id)}`
+    ),
+
+  updateVulnState: (payload: {
+    id?: string;
+    ids?: string[];
+    read?: boolean;
+    starred?: boolean;
+    ignored?: boolean;
+  }) =>
+    requestJSON<{ ok: boolean; updated: number; vuln_unread_high: number }>(
+      'POST',
+      '/api/vulns/state',
+      payload
+    ),
+
+  markAllVulnsRead: () =>
+    requestJSON<{ ok: boolean; read_all_before: string; vuln_unread_high: number }>(
+      'POST',
+      '/api/vulns/mark-all-read',
+      {}
+    ),
+
+  explainVuln: (id: string, force = false) =>
+    requestJSON<{ ok: boolean; analysis: VulnAIAnalysis }>(
+      'POST',
+      `/api/vulns/${encodeURIComponent(id)}/explain`,
+      { force }
+    ),
+
+  testVulnWebhook: (payload?: { custom_webhook_url?: string; reuse_ai_patrol_webhook?: boolean }) =>
+    requestJSON<{ ok: boolean }>('POST', '/api/vulns/test-webhook', payload || {}),
 };

@@ -37,6 +37,7 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 	_, patrolUnread, _ := s.cfg.Store.ListPatrolRecords(1, false)
 	pendingExtPatrols, _ := s.cfg.Store.CountExternalPending()
 	pendingExtApprovals, runningExtApprovals, pendingSessionApprovals := s.cfg.Store.CountApprovalSummary()
+	vulnUnreadHigh := s.cfg.Store.CountUnreadHighVulns()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"servers":                    servers,
@@ -52,6 +53,7 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 		"running_external_approvals": runningExtApprovals,
 		"pending_session_approvals":  pendingSessionApprovals,
 		"pending_approvals_total":    pendingExtApprovals + pendingSessionApprovals,
+		"vuln_unread_high":           vulnUnreadHigh,
 	})
 }
 

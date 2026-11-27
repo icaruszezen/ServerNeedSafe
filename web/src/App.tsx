@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ShieldCheck,
+  ShieldAlert,
   Server,
   Activity,
   Bell,
@@ -31,6 +32,7 @@ import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
 import { MonitorCenter, type MonitorSubTab } from './components/MonitorCenter';
 import { AlertCenter, type AlertTargetNavigation } from './components/AlertCenter';
+import { VulnCenter } from './components/VulnCenter';
 import {
   TerminalWorkspace,
   type PendingCopilotTarget,
@@ -48,6 +50,7 @@ type NavKey =
   | 'servers'
   | 'monitor'
   | 'alerts'
+  | 'vulns'
   | 'terminals'
   | 'ai'
   | 'approvals'
@@ -59,6 +62,7 @@ const NAV_KEY_LABELS: Record<NavKey, string> = {
   servers: '主机资产',
   monitor: '状态监控',
   alerts: '告警信息',
+  vulns: '漏洞监测',
   terminals: '终端工作台',
   ai: 'AI 智能运维',
   approvals: '执行审批',
@@ -89,6 +93,7 @@ export const App: React.FC = () => {
   const [aiInitialDraft, setAiInitialDraft] = useState<AIDiagnosisDraft | null>(null);
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
   const [activeAlertsByServer, setActiveAlertsByServer] = useState<Record<string, number>>({});
+  const [vulnUnreadHighCount, setVulnUnreadHighCount] = useState<number>(0);
   const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
   const [pendingExternalApprovals, setPendingExternalApprovals] = useState<number>(0);
   const [runningExternalApprovals, setRunningExternalApprovals] = useState<number>(0);
@@ -169,6 +174,7 @@ export const App: React.FC = () => {
     setAiInitialDraft(null);
     setFiringAlertsCount(0);
     setActiveAlertsByServer({});
+    setVulnUnreadHighCount(0);
     setPatrolUnreadCount(0);
     setPendingExternalApprovals(0);
     setRunningExternalApprovals(0);
@@ -205,6 +211,7 @@ export const App: React.FC = () => {
       setSnippets(boot.snippets || []);
       setFiringAlertsCount(boot.firing_alerts || 0);
       setActiveAlertsByServer(boot.active_alerts_by_server || {});
+      setVulnUnreadHighCount(boot.vuln_unread_high || 0);
       setPatrolUnreadCount(boot.patrol_unread || 0);
       const nextExt = boot.pending_external_approvals || 0;
       const nextRunning = boot.running_external_approvals || 0;
@@ -730,6 +737,23 @@ export const App: React.FC = () => {
 
           <button
             type="button"
+            id="nav-vulns-btn"
+            className={`nav-item ${activeNav === 'vulns' ? 'active' : ''}`}
+            onClick={() => {
+              setActiveNav('vulns');
+              setMobileNavOpen(false);
+            }}
+          >
+            <span className="nav-item-left">
+              <ShieldAlert size={16} /> 漏洞监测
+            </span>
+            {vulnUnreadHighCount > 0 && (
+              <span className="nav-badge danger">{vulnUnreadHighCount}</span>
+            )}
+          </button>
+
+          <button
+            type="button"
             id="nav-terminals-btn"
             className={`nav-item ${activeNav === 'terminals' ? 'active' : ''}`}
             onClick={() => {
@@ -965,6 +989,15 @@ export const App: React.FC = () => {
               setAiInitialMemorySection('runbooks');
               setActiveNav('ai');
             }}
+            onNotify={notify}
+          />
+        )}
+
+        {activeNav === 'vulns' && (
+          <VulnCenter
+            servers={servers}
+            onUnreadHighChange={setVulnUnreadHighCount}
+            onDiagnoseWithAI={handleDiagnoseAlertWithAI}
             onNotify={notify}
           />
         )}

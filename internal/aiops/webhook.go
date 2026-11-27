@@ -215,6 +215,28 @@ func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, c
 	return sendFormattedWebhook(ctx, transport, ch, titleText, color, markdownText, customPayload)
 }
 
+// SendCustomMarkdownWebhook dispatches a formatted Markdown alert to a configured WebhookChannel
+// (Feishu interactive card, DingTalk Markdown, WeCom Markdown, or HMAC-signed Custom JSON).
+func SendCustomMarkdownWebhook(
+	ctx context.Context,
+	transport HTTPTransport,
+	ch vault.WebhookChannel,
+	titleText string,
+	feishuColor string,
+	markdownText string,
+	customPayload map[string]any,
+) error {
+	if strings.TrimSpace(ch.URL) == "" {
+		return fmt.Errorf("Webhook URL 不能为空")
+	}
+	if transport == nil {
+		transport = newDefaultHTTPTransport()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	return sendFormattedWebhook(ctx, transport, ch, titleText, feishuColor, markdownText, customPayload)
+}
+
 func sendFormattedWebhook(
 	ctx context.Context,
 	transport HTTPTransport,

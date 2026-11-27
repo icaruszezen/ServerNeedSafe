@@ -467,7 +467,7 @@ export const VaultSecurity: React.FC<VaultSecurityProps> = ({
                   <div className="kv-row">
                     <span className="kv-key">独立运行态分文件体积</span>
                     <span className="kv-val mono" style={{ fontSize: 12 }}>
-                      监控 {formatBytes(data?.storage?.monitor_size_bytes)} · AI {formatBytes(data?.storage?.aiops_size_bytes)} · 审计 {formatBytes(data?.storage?.audit_size_bytes)}
+                      监控 {formatBytes(data?.storage?.monitor_size_bytes)} · AI {formatBytes(data?.storage?.aiops_size_bytes)} · 漏洞 {formatBytes(data?.storage?.vuln_size_bytes)} · 审计 {formatBytes(data?.storage?.audit_size_bytes)}
                     </span>
                   </div>
                   <div className="kv-row">
