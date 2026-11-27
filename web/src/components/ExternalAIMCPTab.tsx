@@ -25,6 +25,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api';
+import { copyTextToClipboard } from '../utils/clipboard';
 import type {
   AIOverviewResponse,
   ExternalApproval,
@@ -245,7 +246,7 @@ export const ExternalAIMCPTab: React.FC<ExternalAIMCPTabProps> = ({
 
   const copyText = async (key: string, text: string, label: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedKey(key);
       onNotify(`已复制${label}`);
       setTimeout(() => setCopiedKey((cur) => (cur === key ? '' : cur)), 1800);

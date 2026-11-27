@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { ApiError, api } from '../api';
+import { copyTextToClipboard } from '../utils/clipboard';
 import type { UpdateJobStage, UpdateOverviewResponse } from '../types';
 
 interface UpdateModalProps {
@@ -240,7 +241,7 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
 
   const handleCopy = async (key: string, text: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedKey(key);
       onNotify('升级命令已复制到剪贴板');
       window.setTimeout(() => setCopiedKey((prev) => (prev === key ? '' : prev)), 1800);
