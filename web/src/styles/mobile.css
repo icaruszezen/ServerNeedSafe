@@ -1506,14 +1506,44 @@
     gap: 8px;
   }
 
+  .al-card-stack {
+    gap: 14px;
+  }
+
   .al-card {
     min-width: 0;
     max-width: 100%;
+    border-left-width: 4px;
   }
 
   .al-card-main {
-    padding: 12px;
+    padding: 0;
     min-width: 0;
+  }
+
+  .al-card-top {
+    padding: 9px 12px;
+    gap: 6px 10px;
+  }
+
+  .al-card-top-right {
+    width: 100%;
+    justify-content: space-between;
+    padding-top: 6px;
+    border-top: 1px dashed var(--al-divider);
+  }
+
+  .al-cat-label::before {
+    display: none;
+  }
+
+  .al-card-content {
+    padding: 12px;
+    gap: 10px;
+  }
+
+  .al-card-title {
+    font-size: 14.5px;
   }
 
   .al-card-body {
@@ -1525,6 +1555,24 @@
   .al-metric-box {
     width: 100%;
     max-width: 100%;
+    min-width: 0;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    padding: 9px 11px;
+  }
+
+  .al-metric-val {
+    font-size: 16.5px;
+  }
+
+  .al-metric-foot {
+    padding-top: 0;
+    border-top: none;
+    align-items: flex-end;
+    text-align: right;
     min-width: 0;
   }
 
@@ -1550,6 +1598,7 @@
   .al-card-actions {
     flex-direction: column;
     align-items: stretch;
+    padding: 9px 12px;
   }
 
   .al-card-actions-left,
@@ -1561,18 +1610,41 @@
     flex: 1 1 auto;
   }
 
+  .al-remediation-panel {
+    padding: 12px;
+  }
+
+  .al-server-group {
+    padding: 10px;
+  }
+
   .al-server-pill {
-    border-radius: 10px;
+    border-radius: 7px;
   }
 
   .al-advice-preview {
     min-width: 0;
+    padding: 8px 10px;
   }
 
   .al-advice-preview-text {
     flex: 1 1 100%;
     overflow-wrap: anywhere;
     word-break: break-word;
+  }
+}
+
+@media (max-width: 420px) {
+  .al-metric-box {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .al-metric-foot {
+    align-items: flex-start;
+    text-align: left;
+    padding-top: 6px;
+    border-top: 1px dashed var(--al-divider);
   }
 }
 
