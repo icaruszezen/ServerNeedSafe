@@ -3,6 +3,7 @@
    ========================================================================== */
 
 :root {
+  color-scheme: light;
   /* Surface Hierarchy — Warm Alabaster & Pure White */
   --bg-shell: hsl(220, 18%, 96.5%);
   --bg-surface: #ffffff;
@@ -80,6 +81,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg-shell: #0b0d11;
   --bg-surface: #12151c;
   --bg-subtle: #161a23;
@@ -768,6 +770,203 @@ pre,
   position: absolute;
   right: 6px;
   display: flex;
+}
+
+/* Searchable Custom Group Combobox */
+.group-combobox {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.group-combobox-input {
+  padding-right: 34px;
+  text-overflow: ellipsis;
+}
+
+.group-combobox-input.has-clear {
+  padding-right: 60px;
+}
+
+.group-combobox.open .group-combobox-input {
+  border-color: var(--accent-teal);
+  box-shadow: 0 0 0 3px var(--ring-focus);
+}
+
+.group-combobox-actions {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.group-combobox-clear,
+.group-combobox-toggle {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.group-combobox-clear:hover,
+.group-combobox-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.group-combobox-chevron {
+  transition: transform 150ms ease, color 150ms ease;
+}
+
+.group-combobox.open .group-combobox-chevron {
+  transform: rotate(180deg);
+  color: var(--accent-teal);
+}
+
+.group-combobox-menu {
+  z-index: 140;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  -webkit-overflow-scrolling: touch;
+  animation: fadeIn 100ms ease;
+}
+
+[data-theme="dark"] .group-combobox-menu {
+  background: #1d222e;
+  border-color: var(--border-strong);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.58), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.group-combobox-option {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
+.group-combobox-option:hover,
+.group-combobox-option.active {
+  background: var(--bg-hover);
+}
+
+.group-combobox-option.selected {
+  background: var(--accent-teal-soft);
+  color: var(--accent-teal);
+  font-weight: 560;
+}
+
+.group-combobox-option.selected.active {
+  box-shadow: inset 0 0 0 1px var(--accent-teal-border);
+}
+
+.group-combobox-option.create {
+  color: var(--accent-teal);
+  font-weight: 550;
+}
+
+.group-combobox-option.create.with-divider {
+  margin-top: 4px;
+  position: relative;
+}
+
+.group-combobox-option.create.with-divider::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: 6px;
+  right: 6px;
+  height: 1px;
+  background: var(--border-subtle);
+  pointer-events: none;
+}
+
+.group-combobox-option-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.group-combobox-option-icon {
+  flex-shrink: 0;
+  opacity: 0.78;
+}
+
+.group-combobox-option-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-combobox-option-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.group-combobox-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.group-combobox-option.selected .group-combobox-count {
+  color: var(--accent-teal);
+  opacity: 0.85;
+}
+
+.group-combobox-check {
+  color: var(--accent-teal);
+  flex-shrink: 0;
+}
+
+.group-combobox-create-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-teal-soft);
+  border: 1px solid var(--accent-teal-border);
+  color: var(--accent-teal);
+}
+
+.group-combobox-empty {
+  padding: 10px 12px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 /* SSH Key File Upload Dropzone & Inline .pub Upload */

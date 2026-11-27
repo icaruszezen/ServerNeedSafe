@@ -538,6 +538,26 @@
     padding: 0 14px;
   }
 
+  .group-combobox-input {
+    padding-right: 40px;
+  }
+
+  .group-combobox-input.has-clear {
+    padding-right: 72px;
+  }
+
+  .group-combobox-clear,
+  .group-combobox-toggle {
+    width: 30px;
+    height: 30px;
+  }
+
+  .group-combobox-option {
+    min-height: 40px;
+    padding: 9px 12px;
+    font-size: 14px;
+  }
+
   .field-row,
   .security-grid,
   .mon-charts-grid,
