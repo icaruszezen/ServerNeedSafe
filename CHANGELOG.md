@@ -3,6 +3,34 @@
 All notable changes to **ServerNeedSafe** are documented in this file.
 本文件记录 **ServerNeedSafe** 每个正式版本的中英文更新日志。
 
+## v2.7.1 (2026-11-27)
+
+## 中文更新说明
+
+> 统一复制操作并增加兼容降级方案，让 HTTP 局域网访问及受限浏览器环境中的常用复制功能更加可靠。
+
+### 🐛 问题修复与稳定性提升
+- 新增统一的剪贴板复制工具：安全上下文优先使用浏览器剪贴板 API；在 HTTP 等非安全上下文或原生写入失败时，自动尝试兼容性降级方案，避免复制操作直接报错。（#21）
+- 将该方案应用于 MCP 地址、令牌及客户端配置，告警处置命令、升级命令、AI 建议命令和 SSH 公钥复制；降级操作完成后会清理临时元素并恢复原选区与焦点。（#21）
+
+---
+
+## English Release Notes
+
+> Unified clipboard handling with a compatibility fallback makes common copy actions more reliable over HTTP and in restricted browser environments.
+
+### 🐛 Bug Fixes & Reliability
+- Added a shared clipboard utility that prefers the browser Clipboard API in secure contexts and falls back to a compatibility method when accessed over HTTP or when native writes fail, preventing copy actions from failing outright. (#21)
+- Applied the fallback to MCP endpoints, tokens and client configuration, alert remediation and upgrade commands, AI suggestions, and SSH public keys. Temporary elements are cleaned up, and the previous selection and focus are restored afterward. (#21)
+
+---
+
+### Included Changes / 包含的变更
+
+- #21 fix(web): add clipboard copy fallback for HTTP/non-secure contexts (@icaruszezen)
+
+**Full Changelog**: https://github.com/icaruszezen/ServerNeedSafe/compare/v2.7.0...v2.7.1
+
 ## v2.7.0 (2026-11-27)
 
 ## 中文更新说明
