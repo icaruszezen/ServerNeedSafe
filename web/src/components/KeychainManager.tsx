@@ -20,6 +20,7 @@ import {
   type ParsedPrivateKeyFile,
   type ParsedPublicKeyFile,
 } from '../utils/sshKeyFile';
+import { copyTextToClipboard } from '../utils/clipboard';
 
 interface KeychainManagerProps {
   credentials: CredentialView[];
@@ -166,10 +167,14 @@ export const KeychainManager: React.FC<KeychainManagerProps> = ({
 
   const handleCopyPub = async (cred: CredentialView) => {
     if (!cred.public_key) return;
-    await navigator.clipboard.writeText(cred.public_key);
-    setCopiedId(cred.id);
-    onNotify('公钥已复制到剪贴板');
-    setTimeout(() => setCopiedId(''), 1800);
+    try {
+      await copyTextToClipboard(cred.public_key);
+      setCopiedId(cred.id);
+      onNotify('公钥已复制到剪贴板');
+      setTimeout(() => setCopiedId(''), 1800);
+    } catch {
+      onNotify('浏览器剪贴板写入失败，请手动选中复制');
+    }
   };
 
   const handleDeploy = async (e: React.FormEvent) => {

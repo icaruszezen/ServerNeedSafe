@@ -29,6 +29,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api';
+import { copyTextToClipboard } from '../utils/clipboard';
 import type {
   AlertQuickAction,
   AlertSummaryStats,
@@ -323,7 +324,7 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
 
   const handleCopyCommand = async (key: string, cmd: string) => {
     try {
-      await navigator.clipboard.writeText(cmd);
+      await copyTextToClipboard(cmd);
       setCopiedCmdKey(key);
       onNotify('指令已复制到剪贴板');
       window.setTimeout(() => {

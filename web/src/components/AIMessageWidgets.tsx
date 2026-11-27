@@ -28,6 +28,7 @@ import type {
   AIToolCallRecord,
   SessionContextInspection,
 } from '../types';
+import { copyTextToClipboard } from '../utils/clipboard';
 
 const TOOL_LABELS: Record<string, string> = {
   probe_server: '主机连通与负载探针',
@@ -414,8 +415,7 @@ export const ShellSnippetActionBar: React.FC<{
               className="btn btn-sm copilot-cmd-btn"
               onClick={async () => {
                 try {
-                  if (!navigator.clipboard) throw new Error('unavailable');
-                  await navigator.clipboard.writeText(cmd);
+                  await copyTextToClipboard(cmd);
                   onNotify?.('命令已复制到剪贴板');
                 } catch {
                   onNotify?.('浏览器剪贴板写入失败，请手动选中复制');
