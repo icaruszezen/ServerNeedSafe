@@ -3412,12 +3412,22 @@ pre,
    Global AGENTS.md, Long-Term Memory Center, Context Inspector & Compaction
    ========================================================================== */
 
+.ai-memory-subtabs-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  min-width: 0;
+}
+
 .ai-memory-subtabs {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 16px;
+  min-width: 0;
 }
 
 .ai-memory-subtab-btn {
@@ -3447,6 +3457,88 @@ pre,
   color: var(--accent-teal);
   font-weight: 630;
   box-shadow: var(--shadow-xs);
+}
+
+.ai-mask-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 36px;
+  padding: 0 13px;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 580;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 120ms ease;
+}
+
+.ai-mask-toggle-btn:hover {
+  border-color: var(--amber-border);
+  color: var(--text-primary);
+  background: var(--bg-subtle);
+}
+
+.ai-mask-toggle-btn.active {
+  background: var(--amber-soft);
+  border-color: var(--amber-border);
+  color: var(--amber-text);
+  font-weight: 640;
+  box-shadow: var(--shadow-xs);
+}
+
+.ai-mask-pill-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--amber-text);
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+[data-theme="dark"] .ai-mask-pill-badge {
+  color: #0b0d11;
+}
+
+.ai-mask-active-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 13px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+  border: 1px solid var(--amber-border);
+  color: var(--amber-text);
+  font-size: 12.2px;
+  line-height: 1.5;
+}
+
+.ai-mask-active-banner-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.ai-agents-textarea.masked-readonly {
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  cursor: default;
 }
 
 .ai-agents-header-row {

@@ -22,6 +22,7 @@ import {
   ChevronRight,
   Sparkles,
   Eye,
+  EyeOff,
   Code2,
   Columns2,
 } from 'lucide-react';
@@ -40,6 +41,7 @@ import {
   MEMORY_CATEGORY_LABELS,
   MEMORY_SOURCE_LABELS,
 } from './AIMessageWidgets';
+import { createSensitiveMasker } from '../utils/sensitiveMask';
 
 export type MemorySubSection = 'agents_md' | 'memories' | 'hosts' | 'runbooks';
 
@@ -47,6 +49,7 @@ interface AIMemoryAgentsTabProps {
   overview: AIOverviewResponse | null;
   servers: ServerView[];
   initialSection?: MemorySubSection;
+  initialMaskSensitive?: boolean;
   onReloadOverview: () => Promise<void>;
   onRefreshWorkspace: () => Promise<void>;
   onLaunchRunbook: (rb: AIRunbook) => Promise<void>;
@@ -66,20 +69,23 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   overview,
   servers,
   initialSection = 'agents_md',
+  initialMaskSensitive = false,
   onReloadOverview,
   onRefreshWorkspace,
   onLaunchRunbook,
   onNotify,
 }) => {
   const [section, setSection] = useState<MemorySubSection>(initialSection);
+  // One-click sensitive server info masking (OFF by default)
+  const [maskSensitive, setMaskSensitive] = useState(initialMaskSensitive);
 
   useEffect(() => {
     setSection(initialSection);
   }, [initialSection]);
 
   // --- Global AGENTS.md Editor State ---
-  const [agentsEnabled, setAgentsEnabled] = useState(true);
-  const [agentsContent, setAgentsContent] = useState('');
+  const [agentsEnabled, setAgentsEnabled] = useState(overview?.agents_md?.enabled ?? true);
+  const [agentsContent, setAgentsContent] = useState(overview?.agents_md?.content || '');
   const [agentsDirty, setAgentsDirty] = useState(false);
   const [savingAgents, setSavingAgents] = useState(false);
   const [editorMode, setEditorMode] = useState<'split' | 'edit' | 'preview'>('split');
@@ -212,6 +218,60 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
     return map;
   }, [servers]);
 
+  const sensitiveMasker = useMemo(
+    () =>
+      createSensitiveMasker({
+        servers,
+        hostMemories: overview?.host_memories,
+      }),
+    [servers, overview?.host_memories]
+  );
+
+  const displayText = (raw: string | undefined | null): string => {
+    const str = raw || '';
+    return maskSensitive ? sensitiveMasker.maskText(str) : str;
+  };
+
+  const displayPortsNote = (raw: string | undefined | null): string => {
+    const str = raw || '';
+    return maskSensitive ? sensitiveMasker.maskPortsNote(str) : str;
+  };
+
+  const displayDeployPath = (raw: string): string =>
+    maskSensitive ? sensitiveMasker.maskDeployPath(raw) : raw;
+
+  const displayServiceName = (raw: string): string =>
+    maskSensitive ? sensitiveMasker.maskServiceName(raw) : raw;
+
+  const displayServerName = (raw: string): string =>
+    maskSensitive ? sensitiveMasker.maskServerName(raw) : raw;
+
+  const maskedAgentsSource = useMemo(
+    () => (maskSensitive ? sensitiveMasker.maskText(agentsContent) : agentsContent),
+    [maskSensitive, sensitiveMasker, agentsContent]
+  );
+
+  const maskedAgentsMarkdown = useMemo(
+    () => (maskSensitive ? sensitiveMasker.maskMarkdownWithSentinel(agentsContent) : null),
+    [maskSensitive, sensitiveMasker, agentsContent]
+  );
+
+  const handleToggleMaskSensitive = () => {
+    setMaskSensitive((prev) => {
+      const next = !prev;
+      if (next) {
+        setEditingEntry(null);
+        setEditingHostMemory(null);
+        setEditingRunbook(null);
+      }
+      return next;
+    });
+  };
+
+  const notifyEditBlockedByMask = (actionLabel = '编辑') => {
+    onNotify(`已开启关键信息屏蔽模式，请先关闭屏蔽后再${actionLabel}，以防明文暴露或误覆盖`);
+  };
+
   const filteredMemories = useMemo(() => {
     const list = overview?.memories || [];
     const q = memSearch.trim().toLowerCase();
@@ -222,17 +282,34 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
         if (m.scope !== 'server' || !(m.server_ids || []).includes(memServerFilter)) return false;
       }
       if (q) {
-        const hay = `${m.title} ${m.content} ${(m.tags || []).join(' ')} ${
+        const title = maskSensitive ? sensitiveMasker.maskText(m.title) : m.title;
+        const content = maskSensitive ? sensitiveMasker.maskText(m.content) : m.content;
+        const tags = (m.tags || [])
+          .map((t) => (maskSensitive ? sensitiveMasker.maskText(t) : t))
+          .join(' ');
+        const hay = `${title} ${content} ${tags} ${
           MEMORY_CATEGORY_LABELS[m.category] || m.category
         }`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [overview?.memories, memSearch, memScopeFilter, memCatFilter, memServerFilter]);
+  }, [
+    overview?.memories,
+    memSearch,
+    memScopeFilter,
+    memCatFilter,
+    memServerFilter,
+    maskSensitive,
+    sensitiveMasker,
+  ]);
 
   // --- AGENTS.md Handlers ---
   const handleSaveAgentsMD = async () => {
+    if (maskSensitive) {
+      notifyEditBlockedByMask('保存 AGENTS.md');
+      return;
+    }
     setSavingAgents(true);
     try {
       await api.updateAgentsMD({
@@ -250,6 +327,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   };
 
   const handleResetAgentsMD = async () => {
+    if (maskSensitive) {
+      notifyEditBlockedByMask('重置 AGENTS.md');
+      return;
+    }
     setSavingAgents(true);
     try {
       const res = await api.updateAgentsMD({
@@ -270,21 +351,30 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
   };
 
   const handleExportAgentsMD = () => {
-    const blob = new Blob([agentsContent], { type: 'text/markdown;charset=utf-8' });
+    const exportContent = maskSensitive ? maskedAgentsSource : agentsContent;
+    const blob = new Blob([exportContent], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'AGENTS.md';
+    a.download = maskSensitive ? 'AGENTS.masked.md' : 'AGENTS.md';
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    onNotify('已导出 AGENTS.md 文件');
+    onNotify(
+      maskSensitive
+        ? '已导出脱敏版 AGENTS.masked.md（服务器关键信息已替换为 ***）'
+        : '已导出 AGENTS.md 文件'
+    );
   };
 
   const handleImportAgentsMD = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
+    if (maskSensitive) {
+      notifyEditBlockedByMask('导入 AGENTS.md');
+      return;
+    }
     if (!file) return;
     if (file.size > 64 * 1024) {
       onNotify('导入的 Markdown 文件超过 64 KB 上限');
@@ -369,7 +459,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
         ...m,
         pinned: !m.pinned,
       });
-      onNotify(!m.pinned ? `已置顶记忆《${m.title}》，每次对话优先注入` : `已取消置顶《${m.title}》`);
+      const shownTitle = displayText(m.title);
+      onNotify(
+        !m.pinned ? `已置顶记忆《${shownTitle}》，每次对话优先注入` : `已取消置顶《${shownTitle}》`
+      );
       await onReloadOverview();
     } catch (err: any) {
       onNotify(err?.message || '更新置顶状态失败');
@@ -458,54 +551,94 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
 
   return (
     <div className="page-body" id="ai-memory-agents-center">
-      {/* Unified 4-Section Switcher */}
-      <div className="ai-memory-subtabs" role="tablist" aria-label="AGENTS.md 与记忆中心分区">
-        <button
-          type="button"
-          id="ai-mem-subtab-agents"
-          className={`ai-memory-subtab-btn ${section === 'agents_md' ? 'active' : ''}`}
-          onClick={() => setSection('agents_md')}
-        >
-          <FileText size={14} />
-          <span>全局 AGENTS.md</span>
-          <span className={`tag-chip ${agentsEnabled ? 'teal' : ''}`} style={{ fontSize: 10.5 }}>
-            {agentsEnabled ? `v${overview?.agents_md?.revision || 1}` : '已关闭'}
-          </span>
-        </button>
+      {/* Unified 4-Section Switcher + One-Click Sensitive Info Mask Toggle */}
+      <div className="ai-memory-subtabs-bar">
+        <div className="ai-memory-subtabs" role="tablist" aria-label="AGENTS.md 与记忆中心分区">
+          <button
+            type="button"
+            id="ai-mem-subtab-agents"
+            className={`ai-memory-subtab-btn ${section === 'agents_md' ? 'active' : ''}`}
+            onClick={() => setSection('agents_md')}
+          >
+            <FileText size={14} />
+            <span>全局 AGENTS.md</span>
+            <span className={`tag-chip ${agentsEnabled ? 'teal' : ''}`} style={{ fontSize: 10.5 }}>
+              {agentsEnabled ? `v${overview?.agents_md?.revision || 1}` : '已关闭'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            id="ai-mem-subtab-memories"
+            className={`ai-memory-subtab-btn ${section === 'memories' ? 'active' : ''}`}
+            onClick={() => setSection('memories')}
+          >
+            <BrainCircuit size={14} />
+            <span>长期记忆库</span>
+            <span className="nav-badge">{overview?.memories?.length || 0}</span>
+          </button>
+
+          <button
+            type="button"
+            id="ai-mem-subtab-hosts"
+            className={`ai-memory-subtab-btn ${section === 'hosts' ? 'active' : ''}`}
+            onClick={() => setSection('hosts')}
+          >
+            <ServerIcon size={14} />
+            <span>主机画像 2.0</span>
+            <span className="nav-badge">{overview?.host_memories?.length || 0}</span>
+          </button>
+
+          <button
+            type="button"
+            id="ai-mem-subtab-runbooks"
+            className={`ai-memory-subtab-btn ${section === 'runbooks' ? 'active' : ''}`}
+            onClick={() => setSection('runbooks')}
+          >
+            <BookOpen size={14} />
+            <span>Runbook 技能库</span>
+            <span className="nav-badge">{overview?.runbooks?.length || 0}</span>
+          </button>
+        </div>
 
         <button
           type="button"
-          id="ai-mem-subtab-memories"
-          className={`ai-memory-subtab-btn ${section === 'memories' ? 'active' : ''}`}
-          onClick={() => setSection('memories')}
+          id="ai-memory-mask-sensitive-btn"
+          className={`ai-mask-toggle-btn ${maskSensitive ? 'active' : ''}`}
+          aria-pressed={maskSensitive}
+          onClick={handleToggleMaskSensitive}
+          title={
+            maskSensitive
+              ? '当前已屏蔽服务器路径、端口、IP 与敏感词汇/信息，点击恢复明文显示'
+              : '开启后，Agent 与记忆中心内涉及服务器的路径、端口、IP、主机地址及敏感信息将只显示 ***（仅影响展示，不修改原始数据）'
+          }
         >
-          <BrainCircuit size={14} />
-          <span>长期记忆库</span>
-          <span className="nav-badge">{overview?.memories?.length || 0}</span>
-        </button>
-
-        <button
-          type="button"
-          id="ai-mem-subtab-hosts"
-          className={`ai-memory-subtab-btn ${section === 'hosts' ? 'active' : ''}`}
-          onClick={() => setSection('hosts')}
-        >
-          <ServerIcon size={14} />
-          <span>主机画像 2.0</span>
-          <span className="nav-badge">{overview?.host_memories?.length || 0}</span>
-        </button>
-
-        <button
-          type="button"
-          id="ai-mem-subtab-runbooks"
-          className={`ai-memory-subtab-btn ${section === 'runbooks' ? 'active' : ''}`}
-          onClick={() => setSection('runbooks')}
-        >
-          <BookOpen size={14} />
-          <span>Runbook 技能库</span>
-          <span className="nav-badge">{overview?.runbooks?.length || 0}</span>
+          <EyeOff size={14} />
+          <span>{maskSensitive ? '已屏蔽关键信息' : '一键屏蔽关键信息'}</span>
+          {maskSensitive && <span className="ai-mask-pill-badge">***</span>}
         </button>
       </div>
+
+      {maskSensitive && (
+        <div className="ai-mask-active-banner" id="ai-memory-mask-banner" role="status">
+          <div className="ai-mask-active-banner-text">
+            <EyeOff size={14} style={{ flexShrink: 0 }} />
+            <span>
+              <strong>关键信息屏蔽已开启：</strong>
+              涉及服务器的路径、端口、IP、主机地址、敏感词汇及凭据信息均仅显示为{' '}
+              <code className="mono">***</code>（仅影响当前页面展示与导出，底层加密资产不受改动）。
+            </span>
+          </div>
+          <button
+            type="button"
+            id="ai-memory-unmask-btn"
+            className="btn btn-sm"
+            onClick={() => setMaskSensitive(false)}
+          >
+            <Eye size={12.5} /> 恢复显示
+          </button>
+        </div>
+      )}
 
       {/* SECTION 1: Global AGENTS.md Editor + Advanced Context Budget */}
       {section === 'agents_md' && (
@@ -531,7 +664,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   <input
                     type="checkbox"
                     checked={agentsEnabled}
+                    disabled={maskSensitive}
                     onChange={(e) => {
+                      if (maskSensitive) return;
                       setAgentsEnabled(e.target.checked);
                       setAgentsDirty(true);
                     }}
@@ -584,7 +719,8 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   type="button"
                   id="ai-agents-save-btn"
                   className="btn btn-primary btn-sm"
-                  disabled={savingAgents}
+                  disabled={savingAgents || maskSensitive}
+                  title={maskSensitive ? '已开启关键信息屏蔽，请先关闭后再保存' : undefined}
                   onClick={() => void handleSaveAgentsMD()}
                 >
                   <Save size={13.5} />
@@ -593,7 +729,8 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 <button
                   type="button"
                   className="btn btn-sm"
-                  disabled={savingAgents}
+                  disabled={savingAgents || maskSensitive}
+                  title={maskSensitive ? '已开启关键信息屏蔽，请先关闭后再重置' : undefined}
                   onClick={() => void handleResetAgentsMD()}
                 >
                   <RotateCcw size={13} /> 重置 SRE 默认模板
@@ -608,12 +745,14 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 <button
                   type="button"
                   className="btn btn-sm"
+                  disabled={maskSensitive}
+                  title={maskSensitive ? '已开启关键信息屏蔽，请先关闭后再导入' : undefined}
                   onClick={() => mdImportInputRef.current?.click()}
                 >
                   <Upload size={13} /> 导入 .md
                 </button>
                 <button type="button" className="btn btn-sm" onClick={handleExportAgentsMD}>
-                  <Download size={13} /> 导出 AGENTS.md
+                  <Download size={13} /> {maskSensitive ? '导出脱敏 AGENTS.md' : '导出 AGENTS.md'}
                 </button>
               </div>
 
@@ -629,13 +768,21 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 <div className="ai-agents-pane">
                   <div className="ai-agents-pane-head">
                     <span>Markdown 源码 (AGENTS.md)</span>
-                    <span className="mono">单机差异请维护于「主机画像 2.0」</span>
+                    {maskSensitive ? (
+                      <span className="tag-chip amber" style={{ fontSize: 10.5 }}>
+                        关键信息已屏蔽 · 只读保护
+                      </span>
+                    ) : (
+                      <span className="mono">单机差异请维护于「主机画像 2.0」</span>
+                    )}
                   </div>
                   <textarea
                     id="ai-agents-md-textarea"
-                    className="ai-agents-textarea mono"
-                    value={agentsContent}
+                    className={`ai-agents-textarea mono ${maskSensitive ? 'masked-readonly' : ''}`}
+                    value={maskSensitive ? maskedAgentsSource : agentsContent}
+                    readOnly={maskSensitive}
                     onChange={(e) => {
+                      if (maskSensitive) return;
                       setAgentsContent(e.target.value);
                       setAgentsDirty(true);
                     }}
@@ -648,7 +795,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
               {editorMode !== 'edit' && (
                 <div className="ai-agents-pane">
                   <div className="ai-agents-pane-head">
-                    <span>实时渲染预览</span>
+                    <span>实时渲染预览{maskSensitive ? '（已屏蔽关键信息）' : ''}</span>
                     <span>
                       {overview?.agents_md?.updated_at
                         ? `上次保存：${new Date(overview.agents_md.updated_at).toLocaleString('zh-CN')}`
@@ -657,7 +804,14 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   </div>
                   <div className="ai-agents-preview-body">
                     {agentsContent.trim() ? (
-                      <FormattedMarkdownText text={agentsContent} />
+                      maskSensitive && maskedAgentsMarkdown ? (
+                        <FormattedMarkdownText
+                          text={maskedAgentsMarkdown.masked}
+                          maskSentinel={maskedAgentsMarkdown.sentinel}
+                        />
+                      ) : (
+                        <FormattedMarkdownText text={agentsContent} />
+                      )
                     ) : (
                       <div style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>
                         当前 AGENTS.md 为空，点击「重置 SRE 默认模板」可快速填入推荐规范。
@@ -819,7 +973,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
               type="button"
               id="ai-add-memory-btn"
               className="btn btn-primary btn-sm"
-              onClick={() =>
+              onClick={() => {
+                if (maskSensitive) {
+                  notifyEditBlockedByMask('新增长期记忆');
+                  return;
+                }
                 setEditingEntry({
                   scope: 'global',
                   server_ids: servers.length > 0 ? [servers[0].id] : [],
@@ -829,8 +987,8 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   tags_csv: '',
                   importance: 4,
                   pinned: false,
-                })
-              }
+                });
+              }}
             >
               <Plus size={13.5} /> 新增长期记忆
             </button>
@@ -897,7 +1055,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 <option value="all">全部关联主机</option>
                 {servers.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.name}
+                    {displayServerName(s.name)}
                   </option>
                 ))}
               </select>
@@ -926,7 +1084,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                           <Pin size={10.5} style={{ marginRight: 3 }} /> 置顶
                         </span>
                       )}
-                      <strong style={{ fontSize: 13.5, wordBreak: 'break-word' }}>{m.title}</strong>
+                      <strong style={{ fontSize: 13.5, wordBreak: 'break-word' }}>
+                        {displayText(m.title)}
+                      </strong>
                     </div>
 
                     <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
@@ -942,7 +1102,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm btn-icon"
-                        onClick={() =>
+                        onClick={() => {
+                          if (maskSensitive) {
+                            notifyEditBlockedByMask('编辑长期记忆');
+                            return;
+                          }
                           setEditingEntry({
                             id: m.id,
                             scope: m.scope === 'server' ? 'server' : 'global',
@@ -953,9 +1117,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                             tags_csv: (m.tags || []).join(', '),
                             importance: m.importance || 3,
                             pinned: m.pinned,
-                          })
-                        }
-                        title="编辑长期记忆"
+                          });
+                        }}
+                        title={maskSensitive ? '屏蔽模式下已暂停编辑' : '编辑长期记忆'}
                       >
                         <Edit3 size={13.5} />
                       </button>
@@ -966,7 +1130,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                         onClick={async () => {
                           try {
                             await api.deleteAIMemory(m.id);
-                            onNotify(`已删除长期记忆《${m.title}》`);
+                            onNotify(`已删除长期记忆《${displayText(m.title)}》`);
                             await onReloadOverview();
                           } catch (err: any) {
                             onNotify(err?.message || '删除长期记忆失败');
@@ -987,7 +1151,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       {m.scope === 'global'
                         ? '全局生效'
                         : `主机：${(m.server_ids || [])
-                            .map((id) => serverNameById.get(id) || id)
+                            .map((id) => displayServerName(serverNameById.get(id) || id))
                             .join(', ')}`}
                     </span>
                     <span className="tag-chip">重要度 {m.importance}/5</span>
@@ -996,13 +1160,13 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                     </span>
                   </div>
 
-                  <div className="ai-mem-entry-content">{m.content}</div>
+                  <div className="ai-mem-entry-content">{displayText(m.content)}</div>
 
                   <div className="ai-mem-entry-foot">
                     <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                       {(m.tags || []).map((t) => (
                         <span key={t} className="tag-chip mono" style={{ fontSize: 10.5 }}>
-                          #{t}
+                          #{displayText(t)}
                         </span>
                       ))}
                     </div>
@@ -1048,6 +1212,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                     id="ai-add-host-mem-btn"
                     className="btn btn-sm"
                     onClick={() => {
+                      if (maskSensitive) {
+                        notifyEditBlockedByMask('录入主机画像');
+                        return;
+                      }
                       const unprofiled = servers.find((s) => !hostMemoryByServerId.has(s.id));
                       const targetId = unprofiled ? unprofiled.id : servers[0].id;
                       setEditingHostMemory(buildHostMemoryFormState(targetId, true));
@@ -1074,8 +1242,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 <article key={m.server_id} className="ai-mem-entry-card">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 }}>
-                      <strong style={{ fontSize: 14, wordBreak: 'break-word' }}>{m.server_name}</strong>
-                      {m.os_arch && <span className="tag-chip">{m.os_arch}</span>}
+                      <strong style={{ fontSize: 14, wordBreak: 'break-word' }}>
+                        {displayServerName(m.server_name)}
+                      </strong>
+                      {m.os_arch && <span className="tag-chip">{displayText(m.os_arch)}</span>}
                       {m.auto_updated_count > 0 && (
                         <span className="tag-chip teal">AI 自学习 {m.auto_updated_count} 次</span>
                       )}
@@ -1098,7 +1268,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm btn-icon"
-                        onClick={() =>
+                        onClick={() => {
+                          if (maskSensitive) {
+                            notifyEditBlockedByMask('编辑主机画像');
+                            return;
+                          }
                           setEditingHostMemory({
                             is_new: false,
                             server_id: m.server_id,
@@ -1109,9 +1283,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                             ports_note: m.ports_note || '',
                             constraints: m.constraints || '',
                             notes: m.notes || '',
-                          })
-                        }
-                        title="编辑主机画像与红线"
+                          });
+                        }}
+                        title={maskSensitive ? '屏蔽模式下已暂停编辑' : '编辑主机画像与红线'}
                       >
                         <Edit3 size={13.5} />
                       </button>
@@ -1137,7 +1311,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
 
                   {m.summary && (
                     <div style={{ fontSize: 12.5, marginTop: 6, color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
-                      {m.summary}
+                      {displayText(m.summary)}
                     </div>
                   )}
 
@@ -1146,7 +1320,7 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                       <AlertTriangle size={13} style={{ flexShrink: 0 }} />
                       <span>
                         <strong>运维红线 / 避坑禁忌：</strong>
-                        {m.constraints}
+                        {displayText(m.constraints)}
                       </span>
                     </div>
                   )}
@@ -1154,14 +1328,14 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   {m.ports_note && (
                     <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 7, wordBreak: 'break-word' }}>
                       <strong>端口用途：</strong>
-                      <span className="mono">{m.ports_note}</span>
+                      <span className="mono">{displayPortsNote(m.ports_note)}</span>
                     </div>
                   )}
 
                   {m.notes && (
                     <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 5, wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>
                       <strong>补充备注：</strong>
-                      {m.notes}
+                      {displayText(m.notes)}
                     </div>
                   )}
 
@@ -1169,12 +1343,12 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 9 }}>
                       {(m.key_services || []).map((svc) => (
                         <span key={svc} className="tag-chip teal">
-                          {svc}
+                          {displayServiceName(svc)}
                         </span>
                       ))}
                       {(m.deploy_paths || []).map((dp) => (
                         <span key={dp} className="tag-chip mono">
-                          {dp}
+                          {displayDeployPath(dp)}
                         </span>
                       ))}
                     </div>
@@ -1203,7 +1377,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
             <button
               type="button"
               className="btn btn-primary btn-sm"
-              onClick={() =>
+              onClick={() => {
+                if (maskSensitive) {
+                  notifyEditBlockedByMask('新建 Runbook');
+                  return;
+                }
                 setEditingRunbook({
                   title: '',
                   category: '安全加固',
@@ -1213,8 +1391,8 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                   fix_commands_text: '',
                   verification: '',
                   sync_snippet: true,
-                })
-              }
+                });
+              }}
             >
               <Plus size={13} /> 新建 Runbook
             </button>
@@ -1225,8 +1403,10 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
               <article key={rb.id} className="ai-mem-entry-card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', minWidth: 0 }}>
-                    <strong style={{ fontSize: 13.5, wordBreak: 'break-word' }}>{rb.title}</strong>
-                    <span className="tag-chip teal">{rb.category}</span>
+                    <strong style={{ fontSize: 13.5, wordBreak: 'break-word' }}>
+                      {displayText(rb.title)}
+                    </strong>
+                    <span className="tag-chip teal">{displayText(rb.category)}</span>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
                     <button
@@ -1240,7 +1420,11 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                     <button
                       type="button"
                       className="btn btn-ghost btn-sm btn-icon"
-                      onClick={() =>
+                      onClick={() => {
+                        if (maskSensitive) {
+                          notifyEditBlockedByMask('编辑 Runbook');
+                          return;
+                        }
                         setEditingRunbook({
                           id: rb.id,
                           title: rb.title,
@@ -1251,8 +1435,9 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                           fix_commands_text: (rb.fix_commands || []).join('\n'),
                           verification: rb.verification || '',
                           sync_snippet: Boolean(rb.linked_snippet_id),
-                        })
-                      }
+                        });
+                      }}
+                      title={maskSensitive ? '屏蔽模式下已暂停编辑' : '编辑 Runbook'}
                     >
                       <Edit3 size={13.5} />
                     </button>
@@ -1276,18 +1461,18 @@ export const AIMemoryAgentsTab: React.FC<AIMemoryAgentsTabProps> = ({
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6, wordBreak: 'break-word' }}>
                   <strong>适用症状：</strong>
-                  {rb.symptom}
+                  {displayText(rb.symptom)}
                 </div>
                 {rb.root_cause && (
                   <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4, wordBreak: 'break-word' }}>
                     <strong>典型根因：</strong>
-                    {rb.root_cause}
+                    {displayText(rb.root_cause)}
                   </div>
                 )}
                 {rb.fix_commands?.length > 0 && (
                   <div className="copilot-cmd-box" style={{ marginTop: 8 }}>
                     <code style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                      {rb.fix_commands.join(' && ')}
+                      {displayText(rb.fix_commands.join(' && '))}
                     </code>
                   </div>
                 )}

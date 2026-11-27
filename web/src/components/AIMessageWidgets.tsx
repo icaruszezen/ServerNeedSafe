@@ -440,11 +440,19 @@ export const ShellSnippetActionBar: React.FC<{
   );
 };
 
-function renderInlineFormatting(text: string): React.ReactNode[] {
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`\n]+`)/g);
+function restoreMaskSentinel(str: string, maskSentinel?: string): string {
+  if (!maskSentinel) return str;
+  return str.split(maskSentinel).join('***');
+}
+
+function renderInlineFormatting(text: string, maskSentinel?: string): React.ReactNode[] {
+  const parts = text.split(/(`[^`\n]+`|\*\*\*|\*\*(?!\*)[^*\n]+?(?<!\*)\*\*)/g);
   return parts.map((part, idx) => {
+    if (part === '***') {
+      return <React.Fragment key={idx}>***</React.Fragment>;
+    }
     if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
-      return <strong key={idx}>{part.slice(2, -2)}</strong>;
+      return <strong key={idx}>{restoreMaskSentinel(part.slice(2, -2), maskSentinel)}</strong>;
     }
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
       return (
@@ -459,15 +467,18 @@ function renderInlineFormatting(text: string): React.ReactNode[] {
             fontSize: '0.91em',
           }}
         >
-          {part.slice(1, -1)}
+          {restoreMaskSentinel(part.slice(1, -1), maskSentinel)}
         </code>
       );
     }
-    return <React.Fragment key={idx}>{part}</React.Fragment>;
+    return <React.Fragment key={idx}>{restoreMaskSentinel(part, maskSentinel)}</React.Fragment>;
   });
 }
 
-export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
+export const FormattedMarkdownText: React.FC<{ text: string; maskSentinel?: string }> = ({
+  text,
+  maskSentinel,
+}) => {
   // Support an in-progress (unclosed) fenced code block cleanly during SSE streaming
   const normalized = text.replace(/\r\n/g, '\n');
   const fenceMatches = normalized.match(/```/g);
@@ -496,7 +507,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                 wordBreak: 'break-all',
               }}
             >
-              <code>{inner}</code>
+              <code>{restoreMaskSentinel(inner, maskSentinel)}</code>
             </pre>
           );
         }
@@ -520,7 +531,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                       borderBottom: '1px solid var(--border-subtle)',
                     }}
                   >
-                    {renderInlineFormatting(h1[1])}
+                    {renderInlineFormatting(h1[1], maskSentinel)}
                   </div>
                 );
               }
@@ -536,7 +547,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                       marginTop: li > 0 ? 8 : 2,
                     }}
                   >
-                    {renderInlineFormatting(h2[1])}
+                    {renderInlineFormatting(h2[1], maskSentinel)}
                   </div>
                 );
               }
@@ -552,7 +563,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                       marginTop: li > 0 ? 6 : 2,
                     }}
                   >
-                    {renderInlineFormatting(h3[1])}
+                    {renderInlineFormatting(h3[1], maskSentinel)}
                   </div>
                 );
               }
@@ -568,7 +579,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
                       whiteSpace: 'pre-wrap',
                     }}
                   >
-                    {renderInlineFormatting(quote[1])}
+                    {renderInlineFormatting(quote[1], maskSentinel)}
                   </div>
                 );
               }
@@ -577,7 +588,7 @@ export const FormattedMarkdownText: React.FC<{ text: string }> = ({ text }) => {
               }
               return (
                 <div key={li} style={{ whiteSpace: 'pre-wrap' }}>
-                  {renderInlineFormatting(line)}
+                  {renderInlineFormatting(line, maskSentinel)}
                 </div>
               );
             })}
