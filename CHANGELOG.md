@@ -3,6 +3,81 @@
 All notable changes to **ServerNeedSafe** are documented in this file.
 本文件记录 **ServerNeedSafe** 每个正式版本的中英文更新日志。
 
+## v2.7.0 (2026-11-27)
+
+## 中文更新说明
+
+> 本版本显著降低动态端口与 VPN 网络中的告警误报，并提升告警中心可读性、兼容性与运维排障体验。
+
+### ✨ 新功能与核心增强
+- 告警中心新增卡片式三段布局、语义状态条、实测指标焦点卡、处置建议预览与结果汇总栏，并支持一键展开或收起全部修复建议，便于快速分辨告警级别和处置状态 (#18)。
+- 端口漂移检测升级为策略版本 3，并可从既有 v2 配置平滑迁移；新增全局及单机级进程豁免、端口豁免、临时 UDP 端口豁免和端口区间规则，支持通配符及 `tcp:`、`udp:` 协议限定 (#19)。
+- 新增按端口独立计数的防抖机制，可避免动态端口短时间频繁轮换触发重复告警；告警面板支持一键忽略动态端口进程或端口，并在策略、基线和忽略配置变更时同步更新活跃告警 (#19)。
+- 补充全局端口漂移策略接口及告警中心忽略操作入口，使运维人员可以直接管理持续误报源，无需手工修改配置 (#19)。
+- README 已全面更新并补充顶部徽章、目录、分层加密与 7×24 架构图、部署模式、环境变量、目录结构及构建测试说明，并提供 Docker、Windows 桌面端和 Linux 二进制部署指引 (#17)。
+
+### 🔒 安全与权限加固
+- 端口暴露分类补充 RFC 6598 `100.64.0.0/10` 和 Tailscale IPv6 ULA `fd7a:115c:a1e0::/48`，避免 CGNAT、Tailscale 等私有或覆盖网络地址被误标记为公网监听 (#19)。
+- 内置常见动态端口进程与应用豁免，包括 RustDesk、ToDesk、Tailscale、P2P/远程桌面、代理软件及 macOS 动态端口进程，降低误报同时保留真实公网监听告警 (#19)。
+- 深色与浅色主题共 44组前景/背景配色均已校验达到 WCAG AA（≥ 4.5:1），包括徽标、辅助文字和状态指示元素 (#18)。
+
+### 🐛 问题修复与稳定性提升
+- 修复 RustDesk、ToDesk、syslogd、replicatord 等应用在 UDP `>= 32768` 临时端口间频繁轮换时持续产生端口漂移误报的问题 (#19)。
+- 修复 `tailscaled` PeerAPI 动态端口因私网/覆盖网络地址分类错误而触发的漂移告警，并覆盖部分代理与系统瞬态端口场景 (#19)。
+- 修复 macOS 15/26 `netstat -anv` 解析偏移：不再将 `rhiwat`、`shiwat` 等窗口尺寸误当作 PID，并提升完整进程名解析准确性 (#19)。
+- 修复端口漂移智能建议仅展示前 5 个基线端口、未展示实际漂移端口的问题；建议现在会提供与实际漂移证据相符的排障信息，并按 macOS/Linux 平台返回合适命令 (#19)。
+- 修复采集脚本超时路径读取并发缓冲区导致的数据竞争，并限制 Linux 磁盘采集对 `virtiofs`、`9p`、FUSE 等宿主机挂载可能造成的阻塞风险 (#19)。
+- 告警界面同步优化深浅主题视觉层级、移动端紧凑指标卡和窄屏堆叠布局；在 768px 及以下保持可用，在 420px 以下避免横向溢出，输入控件尺寸保持不低于 16px (#18)。
+- 修复单机忽略进程、忽略端口、策略变更、基线提取及漂移计算各环节的状态同步，并为配置变更实时执行活跃告警和快照一致性处理 (#19)。
+
+### ⚙️ 工程构建与文档体验
+- 新增 9 张高清 Retina 运行截图，覆盖监控概览、告警中心、资产路由、终端与 SFTP、AI 智能运维、MCP 网关及安全存储界面，并支持浅色/深色主题适配 (#17)。
+- 优化 `.dockerignore` 构建上下文，已忽略文档目录以避免截图资源放大 Docker 镜像构建体积 (#17)。
+- 补充端口漂移及 macOS/Linux 采集相关回归测试、告警中心 API 测试和策略迁移测试，前端构建、Go 静态检查、发布脚本测试均已纳入验证范围 (#19)。
+
+---
+
+## English Release Notes
+
+> This release substantially reduces false alarms for dynamic ports and VPN networks while improving alert readability, compatibility, and troubleshooting workflows.
+
+### ✨ New Features & Highlights
+- Redesigned Alert Center cards with a clear header, content, and footer structure, semantic status markers, prominent measured values, remediation previews, and result summaries (#18).
+- Added one-click controls to expand or collapse all remediation suggestions and to ignore recurring processes or ports directly from the alert workflow (#19).
+- Upgraded port-drift policy handling to policy version 3 with seamless migration from v2; global and per-server rules now support ignored processes, ignored ports, ephemeral UDP suppression, wildcard matching, protocol prefixes, and port ranges (#19).
+- Added independent debounce counters per drifted port, preventing short-lived dynamic-port rotation from creating duplicate or repeatedly resetting alerts (#19).
+- Added global port-drift policy APIs and per-server ignore controls, allowing operators to manage false-positive sources without manual configuration edits (#19).
+- Reworked the README with a badge header, table of contents, Mermaid security and 7×24 storage architecture diagrams, deployment modes, environment variables, directory structure, and build/test instructions (#17).
+
+### 🔒 Security & Hardening
+- Extended bind exposure classification to recognize RFC 6598 `100.64.0.0/10` and Tailscale IPv6 ULA `fd7a:115c:a1e0::/48`, preventing CGNAT and VPN overlay addresses from being labeled as public IP exposure (#19).
+- Added built-in ignore rules for common dynamic-port applications and processes, including RustDesk, ToDesk, Tailscale, P2P and remote-desktop tools, proxy software, and macOS transient services (#19).
+- Verified 44 light/dark-theme foreground and background combinations against WCAG AA contrast requirements; every checked pairing meets or exceeds the 4.5:1 ratio (#18).
+
+### 🐛 Bug Fixes & Reliability
+- Reduced false port-drift alerts for RustDesk, ToDesk, syslogd, replicatord, and other applications that rapidly rotate UDP ports at or above `32768` (#19).
+- Fixed false drift detection for `tailscaled` PeerAPI ports and comparable proxy or system transient ports caused by incorrect private-network exposure classification (#19).
+- Fixed macOS 15/26 `netstat -anv` parsing offsets that could interpret window-size fields such as `rhiwat` or `shiwat` as PIDs, improving full process-name resolution (#19).
+- Fixed port-drift remediation evidence to report the actual drifted ports instead of only the first five baseline ports, with platform-appropriate diagnostic commands for macOS and Linux (#19).
+- Removed a data race in collection timeout paths by avoiding concurrent reads of stdout and stderr buffers, and reduced the risk of hangs on host `virtiofs`, `9p`, and FUSE mounts during disk collection (#19).
+- Improved alert contrast and information hierarchy across light and dark themes, with compact metric cards on screens up to 768px and stacked layouts below 420px without horizontal overflow (#18).
+- Fixed reconciliation of active alerts and snapshots when server ignore lists, global policies, baseline extraction, or drift calculations change (#19).
+
+### ⚙️ Build, CI/CD & Developer Experience
+- Added nine high-resolution Retina screenshots covering monitoring, alerts, assets and routing, terminal/SFTP, AI operations, MCP gateway, and vault security, with light/dark theme support (#17).
+- Reduced Docker build-context size by excluding the `docs` directory through `.dockerignore` (#17).
+- Expanded regression coverage for port drift, macOS and Linux collection paths, alert-center APIs, and policy migration; frontend builds, Go vet checks, and release-bot tests are included in the validation workflow (#19).
+
+---
+
+### Included Changes / 包含的变更
+
+- #17 docs(readme): 根据最新代码更新 README、优化排版并附带高清运行截图 (@icaruszezen)
+- #18 feat(alerts): optimize alert card readability, separation, and contrast (@icaruszezen)
+- #19 feat(monitor): optimize port drift detection for dynamic-port apps and VPN overlays (@icaruszezen)
+
+**Full Changelog**: https://github.com/icaruszezen/ServerNeedSafe/compare/v2.6.0...v2.7.0
+
 ## v2.6.0 (2026-11-27)
 
 ## 中文更新说明
