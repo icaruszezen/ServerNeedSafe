@@ -15,6 +15,23 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // RuntimeStatus reports the live scheduler, SSH pool, and webhook health state of the monitoring engine.
 type RuntimeStatus struct {
 	Running           bool       `json:"running"`
@@ -799,7 +816,7 @@ func (e *Engine) probeSingleServer(
 	defer sess.Close()
 
 	script := buildTelemetryScript(settings, srv.WatchedServices, tier, hasPrevCPU)
-	var stdoutBuf, stderrBuf bytes.Buffer
+	var stdoutBuf, stderrBuf lockedBuffer
 	sess.Stdout = &stdoutBuf
 	sess.Stderr = &stderrBuf
 

@@ -242,7 +242,7 @@ func (s *Store) migrateFromLegacyState(hdr *LegacyEnvelopeHeader, st *VaultState
 		Snippets:        slices.Clone(st.Snippets),
 		KnownHosts:      slices.Clone(st.KnownHosts),
 		Settings:        st.Settings,
-		MonitorSettings: st.Monitor.Settings,
+		MonitorSettings: cloneMonitorSettings(st.Monitor.Settings),
 		MonitorRules:    slices.Clone(st.Monitor.Rules),
 		AISettings:      cloneAISettings(st.AISettings),
 	}
@@ -904,7 +904,7 @@ func (s *Store) ApplySyncSnapshot(bundle *BackupBundle, includeRuntime bool, ini
 	nextSec.Snippets = slices.Clone(bundle.Config.Snippets)
 	nextSec.KnownHosts = slices.Clone(bundle.Config.KnownHosts)
 	nextSec.Settings = bundle.Config.Settings
-	nextSec.MonitorSettings = bundle.Config.MonitorSettings
+	nextSec.MonitorSettings = cloneMonitorSettings(bundle.Config.MonitorSettings)
 	nextSec.MonitorRules = slices.Clone(bundle.Config.MonitorRules)
 	nextSec.AISettings = cloneAISettings(bundle.Config.AISettings)
 	ensureSecretsDefaults(nextSec)
@@ -1065,6 +1065,8 @@ func ensureSecretsDefaults(sec *SecretsState) {
 	} else {
 		for i := range sec.Servers {
 			normalizeServerJumpConfig(&sec.Servers[i])
+			sec.Servers[i].IgnoredPortDriftProcesses = SanitizePortDriftProcessPatterns(sec.Servers[i].IgnoredPortDriftProcesses)
+			sec.Servers[i].IgnoredPortDriftPorts = SanitizePortDriftPortSpecs(sec.Servers[i].IgnoredPortDriftPorts)
 		}
 	}
 	if sec.Credentials == nil {
@@ -1088,13 +1090,19 @@ func ensureSecretsDefaults(sec *SecretsState) {
 	if sec.MonitorSettings.IntervalSec == 0 && sec.MonitorSettings.RetentionPoints == 0 {
 		sec.MonitorSettings = DefaultMonitorSettings()
 	} else {
-		if sec.MonitorSettings.PolicyVersion < CurrentMonitorPolicyVersion {
+		if sec.MonitorSettings.PolicyVersion < 2 {
 			if sec.MonitorSettings.SlowIntervalSec <= 0 {
 				sec.MonitorSettings.SlowIntervalSec = 300
 			}
 			sec.MonitorSettings.UseSSHConnectionPool = true
-			sec.MonitorSettings.PolicyVersion = CurrentMonitorPolicyVersion
 		}
+		if sec.MonitorSettings.PolicyVersion < 3 {
+			sec.MonitorSettings.PortDriftIgnoreEphemeralUDP = true
+			if len(sec.MonitorSettings.PortDriftIgnoreProcesses) == 0 {
+				sec.MonitorSettings.PortDriftIgnoreProcesses = DefaultPortDriftIgnoreProcesses()
+			}
+		}
+		sec.MonitorSettings.PolicyVersion = CurrentMonitorPolicyVersion
 		sec.MonitorSettings = sanitizeMonitorSettings(sec.MonitorSettings)
 	}
 	sec.MonitorRules = mergeMonitorAlertRules(sec.MonitorRules)
@@ -1212,6 +1220,8 @@ func cloneServersWithoutRuntime(servers []ServerConfig) []ServerConfig {
 		cp.JumpServerIDs = slices.Clone(srv.JumpServerIDs)
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
+		cp.IgnoredPortDriftProcesses = slices.Clone(srv.IgnoredPortDriftProcesses)
+		cp.IgnoredPortDriftPorts = slices.Clone(srv.IgnoredPortDriftPorts)
 		cp.LastConnectedAt = nil
 		cp.LastLatencyMs = 0
 		cp.LastOSInfo = ""
@@ -1245,6 +1255,7 @@ func cloneSecretsState(src *SecretsState) *SecretsState {
 	cp.Credentials = slices.Clone(src.Credentials)
 	cp.Snippets = slices.Clone(src.Snippets)
 	cp.KnownHosts = slices.Clone(src.KnownHosts)
+	cp.MonitorSettings = cloneMonitorSettings(src.MonitorSettings)
 	cp.MonitorRules = slices.Clone(src.MonitorRules)
 	cp.AISettings = cloneAISettings(src.AISettings)
 	return &cp
@@ -1475,6 +1486,8 @@ func (s *Store) GetServerSecret(id string) (*ServerConfig, error) {
 			}
 			cp.WatchedServices = slices.Clone(srv.WatchedServices)
 			cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
+			cp.IgnoredPortDriftProcesses = slices.Clone(srv.IgnoredPortDriftProcesses)
+			cp.IgnoredPortDriftPorts = slices.Clone(srv.IgnoredPortDriftPorts)
 			return &cp, nil
 		}
 	}
@@ -1483,28 +1496,30 @@ func (s *Store) GetServerSecret(id string) (*ServerConfig, error) {
 
 // ServerMutationInput represents create/update request fields for an SSH server.
 type ServerMutationInput struct {
-	Name              string   `json:"name"`
-	Group             string   `json:"group"`
-	Tags              []string `json:"tags"`
-	Host              string   `json:"host"`
-	Port              int      `json:"port"`
-	Username          string   `json:"username"`
-	AuthType          AuthType `json:"auth_type"`
-	Password          *string  `json:"password,omitempty"`
-	PrivateKey        *string  `json:"private_key,omitempty"`
-	Passphrase        *string  `json:"passphrase,omitempty"`
-	CredentialID       string   `json:"credential_id"`
-	JumpServerID       string   `json:"jump_server_id"`
-	JumpServerIDs      []string `json:"jump_server_ids,omitempty"`
-	JumpFallbackDirect *bool    `json:"jump_fallback_direct,omitempty"`
-	DefaultPath        string   `json:"default_path"`
-	Notes             string   `json:"notes"`
-	Pinned            bool     `json:"pinned"`
-	KeepAliveSec      int      `json:"keep_alive_sec"`
-	MonitorEnabled    *bool    `json:"monitor_enabled,omitempty"`
-	CustomIntervalSec *int     `json:"custom_interval_sec,omitempty"`
-	WatchedServices   []string `json:"watched_services,omitempty"`
-	WatchedPorts      []int    `json:"watched_ports,omitempty"`
+	Name                      string   `json:"name"`
+	Group                     string   `json:"group"`
+	Tags                      []string `json:"tags"`
+	Host                      string   `json:"host"`
+	Port                      int      `json:"port"`
+	Username                  string   `json:"username"`
+	AuthType                  AuthType `json:"auth_type"`
+	Password                  *string  `json:"password,omitempty"`
+	PrivateKey                *string  `json:"private_key,omitempty"`
+	Passphrase                *string  `json:"passphrase,omitempty"`
+	CredentialID              string   `json:"credential_id"`
+	JumpServerID              string   `json:"jump_server_id"`
+	JumpServerIDs             []string `json:"jump_server_ids,omitempty"`
+	JumpFallbackDirect        *bool    `json:"jump_fallback_direct,omitempty"`
+	DefaultPath               string   `json:"default_path"`
+	Notes                     string   `json:"notes"`
+	Pinned                    bool     `json:"pinned"`
+	KeepAliveSec              int      `json:"keep_alive_sec"`
+	MonitorEnabled            *bool    `json:"monitor_enabled,omitempty"`
+	CustomIntervalSec         *int     `json:"custom_interval_sec,omitempty"`
+	WatchedServices           []string `json:"watched_services,omitempty"`
+	WatchedPorts              []int    `json:"watched_ports,omitempty"`
+	IgnoredPortDriftProcesses []string `json:"ignored_port_drift_processes,omitempty"`
+	IgnoredPortDriftPorts     []string `json:"ignored_port_drift_ports,omitempty"`
 }
 
 func sanitizeServiceNames(raw []string) []string {
@@ -1584,6 +1599,20 @@ func sanitizeServerInput(in *ServerMutationInput) error {
 	}
 	if in.WatchedPorts != nil {
 		in.WatchedPorts = sanitizePortList(in.WatchedPorts)
+	}
+	if in.IgnoredPortDriftProcesses != nil {
+		cleaned, err := ValidatePortDriftProcessPatternsStrict(in.IgnoredPortDriftProcesses)
+		if err != nil {
+			return err
+		}
+		in.IgnoredPortDriftProcesses = cleaned
+	}
+	if in.IgnoredPortDriftPorts != nil {
+		cleaned, err := ValidatePortDriftPortSpecsStrict(in.IgnoredPortDriftPorts)
+		if err != nil {
+			return err
+		}
+		in.IgnoredPortDriftPorts = cleaned
 	}
 	return nil
 }
@@ -1681,25 +1710,27 @@ func (s *Store) CreateServer(in ServerMutationInput, clientIP string) (*ServerVi
 		}
 		now := time.Now().UTC()
 		srv := ServerConfig{
-			ID:                 newID,
-			Name:               in.Name,
-			Group:              in.Group,
-			Tags:               slices.Clone(in.Tags),
-			Host:               in.Host,
-			Port:               in.Port,
-			Username:           in.Username,
-			AuthType:           in.AuthType,
-			CredentialID:       in.CredentialID,
-			JumpServerIDs:      slices.Clone(jumpIDs),
-			JumpFallbackDirect: fallbackDirect,
-			DefaultPath:        strings.TrimSpace(in.DefaultPath),
-			Notes:              strings.TrimSpace(in.Notes),
-			Pinned:             in.Pinned,
-			KeepAliveSec:       in.KeepAliveSec,
-			WatchedServices:    slices.Clone(in.WatchedServices),
-			WatchedPorts:       slices.Clone(in.WatchedPorts),
-			CreatedAt:          now,
-			UpdatedAt:          now,
+			ID:                        newID,
+			Name:                      in.Name,
+			Group:                     in.Group,
+			Tags:                      slices.Clone(in.Tags),
+			Host:                      in.Host,
+			Port:                      in.Port,
+			Username:                  in.Username,
+			AuthType:                  in.AuthType,
+			CredentialID:              in.CredentialID,
+			JumpServerIDs:             slices.Clone(jumpIDs),
+			JumpFallbackDirect:        fallbackDirect,
+			DefaultPath:               strings.TrimSpace(in.DefaultPath),
+			Notes:                     strings.TrimSpace(in.Notes),
+			Pinned:                    in.Pinned,
+			KeepAliveSec:              in.KeepAliveSec,
+			WatchedServices:           slices.Clone(in.WatchedServices),
+			WatchedPorts:              slices.Clone(in.WatchedPorts),
+			IgnoredPortDriftProcesses: slices.Clone(in.IgnoredPortDriftProcesses),
+			IgnoredPortDriftPorts:     slices.Clone(in.IgnoredPortDriftPorts),
+			CreatedAt:                 now,
+			UpdatedAt:                 now,
 		}
 		normalizeServerJumpConfig(&srv)
 		if in.MonitorEnabled != nil {
@@ -1787,6 +1818,12 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 		if in.WatchedPorts != nil {
 			srv.WatchedPorts = slices.Clone(in.WatchedPorts)
 		}
+		if in.IgnoredPortDriftProcesses != nil {
+			srv.IgnoredPortDriftProcesses = slices.Clone(in.IgnoredPortDriftProcesses)
+		}
+		if in.IgnoredPortDriftPorts != nil {
+			srv.IgnoredPortDriftPorts = slices.Clone(in.IgnoredPortDriftPorts)
+		}
 		srv.UpdatedAt = time.Now().UTC()
 
 		if in.Password != nil {
@@ -1819,6 +1856,8 @@ func (s *Store) UpdateServer(id string, in ServerMutationInput, clientIP string)
 
 	if !view.MonitorEnabled {
 		s.SilenceServerMonitorAlerts(id)
+	} else if in.IgnoredPortDriftProcesses != nil || in.IgnoredPortDriftPorts != nil {
+		s.ReconcilePortDriftForServer(id)
 	}
 
 	s.RecordAudit("server.update", fmt.Sprintf("%s (%s:%d)", view.Name, view.Host, view.Port), "更新服务器连接配置", clientIP, true)

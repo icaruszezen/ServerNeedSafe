@@ -34,7 +34,9 @@ type rawBlockDev struct {
 }
 
 var (
-	ssUsersRegex = regexp.MustCompile(`\(\("([^"]+)",pid=(\d+)`)
+	ssUsersRegex       = regexp.MustCompile(`\(\("([^"]+)",pid=(\d+)`)
+	cgnatPrefix        = netip.MustParsePrefix("100.64.0.0/10")       // RFC 6598 CGNAT / Tailscale / Headscale / NetBird mesh overlay
+	tailscaleULAPrefix = netip.MustParsePrefix("fd7a:115c:a1e0::/48") // Tailscale private WireGuard IPv6 ULA
 )
 
 func roundOne(v float64) float64 {
@@ -196,6 +198,10 @@ func classifyBindExposure(cleanAddr string) (exposed bool, scope string) {
 	}
 	if ip.IsUnspecified() {
 		return true, "wildcard"
+	}
+	if cgnatPrefix.Contains(ip) || tailscaleULAPrefix.Contains(ip) {
+		// RFC 6598 CGNAT (100.64/10) and Tailscale ULA overlay are private mesh/intranet addresses, never direct public internet exposures.
+		return false, "vpn_overlay"
 	}
 	if ip.IsPrivate() {
 		// In VPC/cloud servers, NIC-bound private IPv4 (10.x/172.16.x/192.168.x) is network-reachable (and often EIP-mapped)

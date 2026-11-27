@@ -70,6 +70,8 @@ const emptyForm: ServerMutationPayload = {
   custom_interval_sec: 0,
   watched_services: [],
   watched_ports: [],
+  ignored_port_drift_processes: [],
+  ignored_port_drift_ports: [],
 };
 
 function getEffectiveJumpIds(srv: ServerView): string[] {
@@ -100,6 +102,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
   const [tagsText, setTagsText] = useState('');
   const [watchedServicesText, setWatchedServicesText] = useState('');
   const [watchedPortsText, setWatchedPortsText] = useState('');
+  const [ignoredDriftProcsText, setIgnoredDriftProcsText] = useState('');
+  const [ignoredDriftPortsText, setIgnoredDriftPortsText] = useState('');
   const [uploadedServerKey, setUploadedServerKey] = useState<ParsedPrivateKeyFile | null>(null);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
@@ -173,6 +177,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     setTagsText('');
     setWatchedServicesText('');
     setWatchedPortsText('');
+    setIgnoredDriftProcsText('');
+    setIgnoredDriftPortsText('');
     setUploadedServerKey(null);
     setFormError('');
     setModalOpen(true);
@@ -204,10 +210,14 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       custom_interval_sec: srv.custom_interval_sec || 0,
       watched_services: srv.watched_services || [],
       watched_ports: srv.watched_ports || [],
+      ignored_port_drift_processes: srv.ignored_port_drift_processes || [],
+      ignored_port_drift_ports: srv.ignored_port_drift_ports || [],
     });
     setTagsText((srv.tags || []).join(', '));
     setWatchedServicesText((srv.watched_services || []).join(', '));
     setWatchedPortsText((srv.watched_ports || []).join(', '));
+    setIgnoredDriftProcsText((srv.ignored_port_drift_processes || []).join(', '));
+    setIgnoredDriftPortsText((srv.ignored_port_drift_ports || []).join(', '));
     setUploadedServerKey(null);
     setFormError('');
     setModalOpen(true);
@@ -226,6 +236,14 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
         .split(/[,，\s]+/)
         .map((s) => s.trim())
         .filter(Boolean);
+      const parsedIgnoredProcs = ignoredDriftProcsText
+        .split(/[,，\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsedIgnoredPorts = ignoredDriftPortsText
+        .split(/[,，\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
 
       const cleanJumpIds = form.jump_server_ids.filter(Boolean);
       const payload: ServerMutationPayload = {
@@ -239,6 +257,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
           .filter(Boolean),
         watched_services: parsedSvcs,
         watched_ports: parsedPorts,
+        ignored_port_drift_processes: parsedIgnoredProcs,
+        ignored_port_drift_ports: parsedIgnoredPorts,
       };
 
       // On update, omit blank secret fields so existing encrypted secrets remain untouched
@@ -1117,6 +1137,33 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                     value={watchedPortsText}
                     onChange={(e) => setWatchedPortsText(e.target.value)}
                   />
+                </div>
+
+                <div className="field-row" style={{ marginTop: 10, marginBottom: 0 }}>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">
+                      <span>忽略端口漂移进程 (本机白名单)</span>
+                      <span className="field-hint">支持 * 与 tcp:/udp:</span>
+                    </label>
+                    <input
+                      className="input mono"
+                      placeholder="例如 rustdesk*, todesk*, udp:xray*"
+                      value={ignoredDriftProcsText}
+                      onChange={(e) => setIgnoredDriftProcsText(e.target.value)}
+                    />
+                  </div>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">
+                      <span>忽略端口漂移端口 / 范围 (本机)</span>
+                      <span className="field-hint">如 udp/10000-20000</span>
+                    </label>
+                    <input
+                      className="input mono"
+                      placeholder="例如 udp/10000-20000, tcp/49152-65535"
+                      value={ignoredDriftPortsText}
+                      onChange={(e) => setIgnoredDriftPortsText(e.target.value)}
+                    />
+                  </div>
                 </div>
               </div>
 

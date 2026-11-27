@@ -71,7 +71,7 @@ if [ "$SNS_OS" = "Darwin" ]; then
   fi
   printf "METRIC_UID0=%s\n" "$UID0"
 
-  PORTS=$( (netstat -an -p tcp 2>/dev/null | awk '$1 ~ /^tcp/ && $6 == "LISTEN" {print $4}'; netstat -an -p udp 2>/dev/null | awk '$1 ~ /^udp/ && $5 == "*.*" {print $4}') | awk '{n=split($0, a, "."); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) print p}' | sort -u | tr '\n' ',' | sed 's/,$//' )
+  PORTS=$( (netstat -an -p tcp 2>/dev/null | awk '$1 ~ /^tcp/ && $6 == "LISTEN" {print $4}'; netstat -an -p udp 2>/dev/null | awk '$1 ~ /^udp/ && $5 == "*.*" {n=split($4, a, "."); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0 && p+0 < 32768) print $4}') | awk '{n=split($0, a, "."); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) print p}' | sort -u | tr '\n' ',' | sed 's/,$//' )
   printf "METRIC_PORTS=%s\n" "$PORTS"
 
   FAILED_UNITS=$(launchctl list 2>/dev/null | awk '$1 == "-" && $2 ~ /^[1-9][0-9]*$/ && $3 ~ /^homebrew\.mxcl\./ {n=$3; sub(/^homebrew\.mxcl\./, "", n); print n}' | head -n 5 | tr '\n' ',' | sed 's/,$//')
@@ -96,7 +96,7 @@ else
   UID0=$(awk -F: '($3 == 0) {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
   printf "METRIC_UID0=%s\n" "$UID0"
 
-  PORTS=$( (if command -v ss >/dev/null 2>&1; then ss -tulnH 2>/dev/null | awk '{print $5}'; else netstat -tuln 2>/dev/null | awk 'NR>2 {print $4}'; fi) | awk '{n=split($0, a, ":"); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) print p}' | sort -u | tr '\n' ',' | sed 's/,$//' )
+  PORTS=$( (if command -v ss >/dev/null 2>&1; then ss -tulnH 2>/dev/null | awk '{pr=tolower($1); n=split($5, a, ":"); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) { if (pr ~ /^udp/ && p+0 >= 32768) next; print p }}'; else netstat -tuln 2>/dev/null | awk 'NR>2 {pr=tolower($1); n=split($4, a, ":"); p=a[n]; if (p ~ /^[0-9]+$/ && p+0 > 0) { if (pr ~ /^udp/ && p+0 >= 32768) next; print p }}'; fi) | sort -u | tr '\n' ',' | sed 's/,$//' )
   printf "METRIC_PORTS=%s\n" "$PORTS"
 
   FAILED_UNITS=""
@@ -471,13 +471,13 @@ func (s *Service) evaluateServerPatrol(
 	errMsg string,
 ) vault.PatrolFinding {
 	finding := vault.PatrolFinding{
-		ServerID:  srv.ID,
+		ServerID:   srv.ID,
 		ServerName: srv.Name,
-		Host:      fmt.Sprintf("%s:%d", srv.Host, srv.Port),
-		Reachable: reachable,
-		LatencyMs: latencyMs,
-		Severity:  "healthy",
-		Anomalies: []string{},
+		Host:       fmt.Sprintf("%s:%d", srv.Host, srv.Port),
+		Reachable:  reachable,
+		LatencyMs:  latencyMs,
+		Severity:   "healthy",
+		Anomalies:  []string{},
 	}
 
 	if !reachable {

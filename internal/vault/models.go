@@ -35,67 +35,71 @@ const (
 // ServerConfig stores complete connection and metadata for a managed SSH server.
 // Every field resides strictly inside the encrypted VaultState payload.
 type ServerConfig struct {
-	ID                 string    `json:"id"`
-	Name               string    `json:"name"`
-	Group              string    `json:"group"`
-	Tags               []string  `json:"tags"`
-	Host               string    `json:"host"`
-	Port               int       `json:"port"`
-	Username           string    `json:"username"`
-	AuthType           AuthType  `json:"auth_type"`
-	Password           string    `json:"password,omitempty"`
-	PrivateKey         string    `json:"private_key,omitempty"`
-	Passphrase         string    `json:"passphrase,omitempty"`
-	CredentialID       string     `json:"credential_id,omitempty"`
-	JumpServerID       string     `json:"jump_server_id,omitempty"`       // Legacy/primary SSH Bastion / ProxyJump server ID (synced with JumpServerIDs[0])
-	JumpServerIDs      []string   `json:"jump_server_ids,omitempty"`      // Ordered candidate SSH jump host IDs for automatic failover
-	JumpFallbackDirect bool       `json:"jump_fallback_direct,omitempty"` // Allow fallback to direct connection when all jump hosts fail
-	DefaultPath        string     `json:"default_path,omitempty"`         // Default initial SFTP / shell directory
-	Notes              string    `json:"notes,omitempty"`
-	Pinned             bool       `json:"pinned"`
-	KeepAliveSec       int        `json:"keep_alive_sec"`
-	MonitorDisabled    bool       `json:"monitor_disabled,omitempty"`
-	CustomIntervalSec  int        `json:"custom_interval_sec,omitempty"`
-	WatchedServices    []string   `json:"watched_services,omitempty"`
-	WatchedPorts       []int      `json:"watched_ports,omitempty"`
-	LastConnectedAt    *time.Time `json:"last_connected_at,omitempty"`
-	LastLatencyMs      int64      `json:"last_latency_ms,omitempty"`
-	LastOSInfo         string     `json:"last_os_info,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                        string     `json:"id"`
+	Name                      string     `json:"name"`
+	Group                     string     `json:"group"`
+	Tags                      []string   `json:"tags"`
+	Host                      string     `json:"host"`
+	Port                      int        `json:"port"`
+	Username                  string     `json:"username"`
+	AuthType                  AuthType   `json:"auth_type"`
+	Password                  string     `json:"password,omitempty"`
+	PrivateKey                string     `json:"private_key,omitempty"`
+	Passphrase                string     `json:"passphrase,omitempty"`
+	CredentialID              string     `json:"credential_id,omitempty"`
+	JumpServerID              string     `json:"jump_server_id,omitempty"`       // Legacy/primary SSH Bastion / ProxyJump server ID (synced with JumpServerIDs[0])
+	JumpServerIDs             []string   `json:"jump_server_ids,omitempty"`      // Ordered candidate SSH jump host IDs for automatic failover
+	JumpFallbackDirect        bool       `json:"jump_fallback_direct,omitempty"` // Allow fallback to direct connection when all jump hosts fail
+	DefaultPath               string     `json:"default_path,omitempty"`         // Default initial SFTP / shell directory
+	Notes                     string     `json:"notes,omitempty"`
+	Pinned                    bool       `json:"pinned"`
+	KeepAliveSec              int        `json:"keep_alive_sec"`
+	MonitorDisabled           bool       `json:"monitor_disabled,omitempty"`
+	CustomIntervalSec         int        `json:"custom_interval_sec,omitempty"`
+	WatchedServices           []string   `json:"watched_services,omitempty"`
+	WatchedPorts              []int      `json:"watched_ports,omitempty"`
+	IgnoredPortDriftProcesses []string   `json:"ignored_port_drift_processes,omitempty"`
+	IgnoredPortDriftPorts     []string   `json:"ignored_port_drift_ports,omitempty"`
+	LastConnectedAt           *time.Time `json:"last_connected_at,omitempty"`
+	LastLatencyMs             int64      `json:"last_latency_ms,omitempty"`
+	LastOSInfo                string     `json:"last_os_info,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 // ServerView is a redacted representation returned to list views so raw secrets
 // are never unnecessarily transmitted over HTTP JSON responses unless explicitly needed internally.
 type ServerView struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Group             string     `json:"group"`
-	Tags              []string   `json:"tags"`
-	Host              string     `json:"host"`
-	Port              int        `json:"port"`
-	Username          string     `json:"username"`
-	AuthType          AuthType   `json:"auth_type"`
-	HasPassword       bool       `json:"has_password"`
-	HasPrivateKey     bool       `json:"has_private_key"`
-	HasPassphrase     bool       `json:"has_passphrase"`
-	CredentialID       string     `json:"credential_id,omitempty"`
-	JumpServerID       string     `json:"jump_server_id,omitempty"`
-	JumpServerIDs      []string   `json:"jump_server_ids"`
-	JumpFallbackDirect bool       `json:"jump_fallback_direct"`
-	DefaultPath        string     `json:"default_path,omitempty"`
-	Notes             string     `json:"notes,omitempty"`
-	Pinned            bool       `json:"pinned"`
-	KeepAliveSec      int        `json:"keep_alive_sec"`
-	MonitorEnabled    bool       `json:"monitor_enabled"`
-	CustomIntervalSec int        `json:"custom_interval_sec,omitempty"`
-	WatchedServices   []string   `json:"watched_services"`
-	WatchedPorts      []int      `json:"watched_ports"`
-	LastConnectedAt   *time.Time `json:"last_connected_at,omitempty"`
-	LastLatencyMs     int64      `json:"last_latency_ms,omitempty"`
-	LastOSInfo        string     `json:"last_os_info,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID                        string     `json:"id"`
+	Name                      string     `json:"name"`
+	Group                     string     `json:"group"`
+	Tags                      []string   `json:"tags"`
+	Host                      string     `json:"host"`
+	Port                      int        `json:"port"`
+	Username                  string     `json:"username"`
+	AuthType                  AuthType   `json:"auth_type"`
+	HasPassword               bool       `json:"has_password"`
+	HasPrivateKey             bool       `json:"has_private_key"`
+	HasPassphrase             bool       `json:"has_passphrase"`
+	CredentialID              string     `json:"credential_id,omitempty"`
+	JumpServerID              string     `json:"jump_server_id,omitempty"`
+	JumpServerIDs             []string   `json:"jump_server_ids"`
+	JumpFallbackDirect        bool       `json:"jump_fallback_direct"`
+	DefaultPath               string     `json:"default_path,omitempty"`
+	Notes                     string     `json:"notes,omitempty"`
+	Pinned                    bool       `json:"pinned"`
+	KeepAliveSec              int        `json:"keep_alive_sec"`
+	MonitorEnabled            bool       `json:"monitor_enabled"`
+	CustomIntervalSec         int        `json:"custom_interval_sec,omitempty"`
+	WatchedServices           []string   `json:"watched_services"`
+	WatchedPorts              []int      `json:"watched_ports"`
+	IgnoredPortDriftProcesses []string   `json:"ignored_port_drift_processes"`
+	IgnoredPortDriftPorts     []string   `json:"ignored_port_drift_ports"`
+	LastConnectedAt           *time.Time `json:"last_connected_at,omitempty"`
+	LastLatencyMs             int64      `json:"last_latency_ms,omitempty"`
+	LastOSInfo                string     `json:"last_os_info,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 // EffectiveJumpServerIDs returns the deduplicated, ordered list of jump server IDs,
@@ -128,75 +132,85 @@ func (s ServerConfig) ToView() ServerView {
 	if watchedPorts == nil {
 		watchedPorts = []int{}
 	}
+	ignoredProcs := slices.Clone(s.IgnoredPortDriftProcesses)
+	if ignoredProcs == nil {
+		ignoredProcs = []string{}
+	}
+	ignoredPorts := slices.Clone(s.IgnoredPortDriftPorts)
+	if ignoredPorts == nil {
+		ignoredPorts = []string{}
+	}
 	jumpIDs := s.EffectiveJumpServerIDs()
 	primaryJump := ""
 	if len(jumpIDs) > 0 {
 		primaryJump = jumpIDs[0]
 	}
 	return ServerView{
-		ID:                 s.ID,
-		Name:               s.Name,
-		Group:              s.Group,
-		Tags:               tags,
-		Host:               s.Host,
-		Port:               s.Port,
-		Username:           s.Username,
-		AuthType:           s.AuthType,
-		HasPassword:        s.Password != "",
-		HasPrivateKey:      s.PrivateKey != "",
-		HasPassphrase:      s.Passphrase != "",
-		CredentialID:       s.CredentialID,
-		JumpServerID:       primaryJump,
-		JumpServerIDs:      jumpIDs,
-		JumpFallbackDirect: s.JumpFallbackDirect && len(jumpIDs) > 0,
-		DefaultPath:        s.DefaultPath,
-		Notes:              s.Notes,
-		Pinned:             s.Pinned,
-		KeepAliveSec:       s.KeepAliveSec,
-		MonitorEnabled:     !s.MonitorDisabled,
-		CustomIntervalSec:  s.CustomIntervalSec,
-		WatchedServices:    watchedSvcs,
-		WatchedPorts:       watchedPorts,
-		LastConnectedAt:    s.LastConnectedAt,
-		LastLatencyMs:      s.LastLatencyMs,
-		LastOSInfo:         s.LastOSInfo,
-		CreatedAt:          s.CreatedAt,
-		UpdatedAt:          s.UpdatedAt,
+		ID:                        s.ID,
+		Name:                      s.Name,
+		Group:                     s.Group,
+		Tags:                      tags,
+		Host:                      s.Host,
+		Port:                      s.Port,
+		Username:                  s.Username,
+		AuthType:                  s.AuthType,
+		HasPassword:               s.Password != "",
+		HasPrivateKey:             s.PrivateKey != "",
+		HasPassphrase:             s.Passphrase != "",
+		CredentialID:              s.CredentialID,
+		JumpServerID:              primaryJump,
+		JumpServerIDs:             jumpIDs,
+		JumpFallbackDirect:        s.JumpFallbackDirect && len(jumpIDs) > 0,
+		DefaultPath:               s.DefaultPath,
+		Notes:                     s.Notes,
+		Pinned:                    s.Pinned,
+		KeepAliveSec:              s.KeepAliveSec,
+		MonitorEnabled:            !s.MonitorDisabled,
+		CustomIntervalSec:         s.CustomIntervalSec,
+		WatchedServices:           watchedSvcs,
+		WatchedPorts:              watchedPorts,
+		IgnoredPortDriftProcesses: ignoredProcs,
+		IgnoredPortDriftPorts:     ignoredPorts,
+		LastConnectedAt:           s.LastConnectedAt,
+		LastLatencyMs:             s.LastLatencyMs,
+		LastOSInfo:                s.LastOSInfo,
+		CreatedAt:                 s.CreatedAt,
+		UpdatedAt:                 s.UpdatedAt,
 	}
 }
 
 // Credential stores a reusable SSH identity (password or SSH key pair) inside the encrypted keychain.
 type Credential struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Kind          AuthType  `json:"kind"` // "password" or "private_key"
-	UsernameHint  string    `json:"username_hint,omitempty"`
-	Password      string    `json:"password,omitempty"`
-	PrivateKey    string    `json:"private_key,omitempty"`
-	Passphrase    string    `json:"passphrase,omitempty"`
-	PublicKey     string    `json:"public_key,omitempty"`
-	Fingerprint   string    `json:"fingerprint,omitempty"`
-	KeyAlgorithm  string    `json:"key_algorithm,omitempty"`
-	Notes         string    `json:"notes,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-}
-
-// CredentialView omits raw secret material when listing keychain entries.
-type CredentialView struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
-	Kind         AuthType  `json:"kind"`
+	Kind         AuthType  `json:"kind"` // "password" or "private_key"
 	UsernameHint string    `json:"username_hint,omitempty"`
-	HasPassword  bool      `json:"has_password"`
-	HasPrivateKey bool     `json:"has_private_key"`
-	HasPassphrase bool     `json:"has_passphrase"`
+	Password     string    `json:"password,omitempty"`
+	PrivateKey   string    `json:"private_key,omitempty"`
+	Passphrase   string    `json:"passphrase,omitempty"`
 	PublicKey    string    `json:"public_key,omitempty"`
 	Fingerprint  string    `json:"fingerprint,omitempty"`
 	KeyAlgorithm string    `json:"key_algorithm,omitempty"`
 	Notes        string    `json:"notes,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// CredentialView omits raw secret material when listing keychain entries.
+type CredentialView struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Kind          AuthType  `json:"kind"`
+	UsernameHint  string    `json:"username_hint,omitempty"`
+	HasPassword   bool      `json:"has_password"`
+	HasPrivateKey bool      `json:"has_private_key"`
+	HasPassphrase bool      `json:"has_passphrase"`
+	PublicKey     string    `json:"public_key,omitempty"`
+	Fingerprint   string    `json:"fingerprint,omitempty"`
+	KeyAlgorithm  string    `json:"key_algorithm,omitempty"`
+	Notes         string    `json:"notes,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func (c Credential) ToView() CredentialView {
@@ -230,12 +244,12 @@ type Snippet struct {
 
 // KnownHost records a trusted SSH host public key fingerprint inside the encrypted vault.
 type KnownHost struct {
-	Address       string    `json:"address"`        // host:port
-	ServerName    string    `json:"server_name"`    // friendly hint
-	KeyType       string    `json:"key_type"`       // e.g. ssh-ed25519
-	Fingerprint   string    `json:"fingerprint"`    // SHA256:...
-	PublicKeyB64  string    `json:"public_key_b64"` // wire format base64
-	FirstSeenAt   time.Time `json:"first_seen_at"`
+	Address        string    `json:"address"`        // host:port
+	ServerName     string    `json:"server_name"`    // friendly hint
+	KeyType        string    `json:"key_type"`       // e.g. ssh-ed25519
+	Fingerprint    string    `json:"fingerprint"`    // SHA256:...
+	PublicKeyB64   string    `json:"public_key_b64"` // wire format base64
+	FirstSeenAt    time.Time `json:"first_seen_at"`
 	LastVerifiedAt time.Time `json:"last_verified_at"`
 }
 
@@ -593,4 +607,3 @@ func DefaultSecretsState(vaultID string) *SecretsState {
 		AISettings:      def.AISettings,
 	}
 }
-

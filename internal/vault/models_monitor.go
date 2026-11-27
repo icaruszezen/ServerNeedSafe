@@ -32,28 +32,31 @@ const (
 )
 
 // CurrentMonitorPolicyVersion tracks schema migrations for MonitorSettings defaults.
-const CurrentMonitorPolicyVersion = 2
+const CurrentMonitorPolicyVersion = 3
 
 // MonitorSettings controls periodic background telemetry collection and retention.
 // Stored 100% encrypted inside SecretsState.
 type MonitorSettings struct {
-	Enabled                 bool   `json:"enabled"`                    // Enable scheduled background polling
-	IntervalSec             int    `json:"interval_sec"`               // Default fast-tier polling interval in seconds (10..86400)
-	SlowIntervalSec         int    `json:"slow_interval_sec"`          // Slow-tier static/security/audit interval in seconds (60..3600)
-	TimeoutSec              int    `json:"timeout_sec"`                // Per-server SSH probe timeout in seconds (5..120)
-	Concurrency             int    `json:"concurrency"`                // Max concurrent SSH collectors (1..20)
-	RetentionPoints         int    `json:"retention_points"`           // Max time-series samples kept per server (30..5000)
-	MaxAlertRecords         int    `json:"max_alert_records"`          // Max alert incidents retained (50..2000)
-	CollectProcesses        bool   `json:"collect_processes"`          // Collect top CPU/Mem processes & zombie/blocked stats
-	CollectPortsAndServices bool   `json:"collect_ports_and_services"` // Collect listening ports, systemd & Docker
-	CollectSecurity         bool   `json:"collect_security"`           // Collect SSH brute-force, logged-in users, firewall, FIM & intrusion cues
-	DetectPortDrift         bool   `json:"detect_port_drift"`          // Alert on newly exposed listening ports outside baseline
-	UseSSHConnectionPool    bool   `json:"use_ssh_connection_pool"`    // Reuse pooled SSH & jump-host connections across sweeps
-	ReuseAIPatrolWebhooks   bool   `json:"reuse_ai_patrol_webhooks"`   // Also forward monitor alerts to enabled AI patrol webhook channels
-	IncludeRemoteMounts     bool   `json:"include_remote_mounts"`      // Advanced: include NFS/CIFS mounts in df (disabled by default to avoid D-state hangs)
-	UnattendedWhileUnlocked bool   `json:"unattended_while_unlocked"`  // Keep daemon polling when web sessions idle-expire
-	WebhookURL              string `json:"webhook_url,omitempty"`      // Optional encrypted webhook URL for alert notifications
-	PolicyVersion           int    `json:"policy_version,omitempty"`   // Internal schema version for one-time default upgrades
+	Enabled                     bool     `json:"enabled"`                               // Enable scheduled background polling
+	IntervalSec                 int      `json:"interval_sec"`                          // Default fast-tier polling interval in seconds (10..86400)
+	SlowIntervalSec             int      `json:"slow_interval_sec"`                     // Slow-tier static/security/audit interval in seconds (60..3600)
+	TimeoutSec                  int      `json:"timeout_sec"`                           // Per-server SSH probe timeout in seconds (5..120)
+	Concurrency                 int      `json:"concurrency"`                           // Max concurrent SSH collectors (1..20)
+	RetentionPoints             int      `json:"retention_points"`                      // Max time-series samples kept per server (30..5000)
+	MaxAlertRecords             int      `json:"max_alert_records"`                     // Max alert incidents retained (50..2000)
+	CollectProcesses            bool     `json:"collect_processes"`                     // Collect top CPU/Mem processes & zombie/blocked stats
+	CollectPortsAndServices     bool     `json:"collect_ports_and_services"`            // Collect listening ports, systemd & Docker
+	CollectSecurity             bool     `json:"collect_security"`                      // Collect SSH brute-force, logged-in users, firewall, FIM & intrusion cues
+	DetectPortDrift             bool     `json:"detect_port_drift"`                     // Alert on newly exposed listening ports outside baseline
+	PortDriftIgnoreEphemeralUDP bool     `json:"port_drift_ignore_ephemeral_udp"`       // Ignore ephemeral unconnected UDP sockets (>= 32768) in port drift detection
+	PortDriftIgnoreProcesses    []string `json:"port_drift_ignore_processes,omitempty"` // Global dynamic-port process patterns ignored by port_drift
+	PortDriftIgnorePorts        []string `json:"port_drift_ignore_ports,omitempty"`     // Global port/range specs ignored by port_drift (e.g. udp/10000-20000)
+	UseSSHConnectionPool        bool     `json:"use_ssh_connection_pool"`               // Reuse pooled SSH & jump-host connections across sweeps
+	ReuseAIPatrolWebhooks       bool     `json:"reuse_ai_patrol_webhooks"`              // Also forward monitor alerts to enabled AI patrol webhook channels
+	IncludeRemoteMounts         bool     `json:"include_remote_mounts"`                 // Advanced: include NFS/CIFS mounts in df (disabled by default to avoid D-state hangs)
+	UnattendedWhileUnlocked     bool     `json:"unattended_while_unlocked"`             // Keep daemon polling when web sessions idle-expire
+	WebhookURL                  string   `json:"webhook_url,omitempty"`                 // Optional encrypted webhook URL for alert notifications
+	PolicyVersion               int      `json:"policy_version,omitempty"`              // Internal schema version for one-time default upgrades
 }
 
 // MonitorAlertRule configures warning/critical thresholds and anti-flap consecutive breach counts.
@@ -117,11 +120,13 @@ type ListeningPortStat struct {
 	Proto         string `json:"proto"`                    // tcp, tcp6, udp, udp6
 	BindAddr      string `json:"bind_addr"`                // e.g. 0.0.0.0, 127.0.0.1, [::], 10.0.0.5
 	Port          int    `json:"port"`                     // e.g. 22, 80, 443
-	PublicExposed bool   `json:"public_exposed"`           // Non-loopback/non-link-local exposed listener
-	ExposureScope string `json:"exposure_scope,omitempty"` // wildcard, public_ip, private_ip, loopback, link_local
+	PublicExposed bool   `json:"public_exposed"`           // Non-loopback/non-link-local/non-overlay exposed listener
+	ExposureScope string `json:"exposure_scope,omitempty"` // wildcard, public_ip, private_ip, vpn_overlay, loopback, link_local
 	Watched       bool   `json:"watched"`                  // Explicitly watched by server config
 	PID           int    `json:"pid,omitempty"`
 	Process       string `json:"process,omitempty"`
+	DriftIgnored  bool   `json:"drift_ignored,omitempty"` // Exempted from port_drift by ephemeral UDP or ignore whitelist
+	IgnoreReason  string `json:"ignore_reason,omitempty"` // Human-readable reason for drift exemption
 }
 
 // ServiceStat captures the runtime state of a systemd unit or daemon service.
@@ -481,22 +486,25 @@ type MonitorVaultData struct {
 // DefaultMonitorSettings returns production-grade defaults for scheduled monitoring.
 func DefaultMonitorSettings() MonitorSettings {
 	return MonitorSettings{
-		Enabled:                 true,
-		IntervalSec:             60,
-		SlowIntervalSec:         300,
-		TimeoutSec:              15,
-		Concurrency:             6,
-		RetentionPoints:         720,
-		MaxAlertRecords:         500,
-		CollectProcesses:        true,
-		CollectPortsAndServices: true,
-		CollectSecurity:         true,
-		DetectPortDrift:         true,
-		UseSSHConnectionPool:    true,
-		ReuseAIPatrolWebhooks:   false,
-		IncludeRemoteMounts:     false,
-		UnattendedWhileUnlocked: true,
-		PolicyVersion:           CurrentMonitorPolicyVersion,
+		Enabled:                     true,
+		IntervalSec:                 60,
+		SlowIntervalSec:             300,
+		TimeoutSec:                  15,
+		Concurrency:                 6,
+		RetentionPoints:             720,
+		MaxAlertRecords:             500,
+		CollectProcesses:            true,
+		CollectPortsAndServices:     true,
+		CollectSecurity:             true,
+		DetectPortDrift:             true,
+		PortDriftIgnoreEphemeralUDP: true,
+		PortDriftIgnoreProcesses:    DefaultPortDriftIgnoreProcesses(),
+		PortDriftIgnorePorts:        []string{},
+		UseSSHConnectionPool:        true,
+		ReuseAIPatrolWebhooks:       false,
+		IncludeRemoteMounts:         false,
+		UnattendedWhileUnlocked:     true,
+		PolicyVersion:               CurrentMonitorPolicyVersion,
 	}
 }
 
@@ -787,7 +795,7 @@ func DefaultMonitorAlertRules() []MonitorAlertRule {
 			Kind:             "port_drift",
 			Category:         "network",
 			Name:             "新增对外暴露监听端口漂移",
-			Description:      "相较安全基线发现新开放的非 loopback 对外监听端口（覆盖绑定具体网卡 IP）",
+			Description:      "相较安全基线发现新开放的非本地/非组网对外监听端口（自动过滤临时高端口 UDP 与白名单动态进程，支持按端口防抖）",
 			Enabled:          true,
 			StateBased:       true,
 			ConsecutiveCount: 1,

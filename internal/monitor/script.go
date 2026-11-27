@@ -263,9 +263,17 @@ fi
 	// 4. Local Disk Mounts, Inodes & Zero-Blocking /proc/mounts (Read-Only + Remote Mount Inventory)
 	dfFlags := "-PTkl"
 	dfInodeFlags := "-Pil"
+	dfExcludeSetup := `  DF_EXCL=""
+  if df -PTkl -x virtiofs / >/dev/null 2>&1; then
+    DF_EXCL="-x virtiofs -x 9p -x fuse.osxfs -x fuse.sshfs -x fuse.s3fs"
+  fi
+`
+	dfExcludeArg := " $DF_EXCL"
 	if settings.IncludeRemoteMounts {
 		dfFlags = "-PTk"
 		dfInodeFlags = "-Pi"
+		dfExcludeSetup = ""
+		dfExcludeArg = ""
 	}
 	b.WriteString(`echo "===SNS_SEC:DISK==="
 if [ "$SNS_OS" = "Darwin" ]; then
@@ -315,7 +323,7 @@ if [ "$SNS_OS" = "Darwin" ]; then
       printf "FS=%s|%s|%.0f|%.0f|%.0f|%s|%s\n", dev, fst, tot, used, av, cap, mnt;
     }'
 else
-  sns_to 3 df ` + dfFlags + ` | awk 'NR>1 {
+` + dfExcludeSetup + `  sns_to 3 df ` + dfFlags + dfExcludeArg + ` | awk 'NR>1 {
     if (NF==6) { dev="none"; fst=$1; tot=$2; used=$3; av=$4; cap=$5; mnt=$6 }
     else if (NF>=7) { dev=$1; fst=$2; tot=$3; used=$4; av=$5; cap=$6; mnt=$7 }
     else next;
@@ -343,7 +351,7 @@ if [ "$SNS_OS" = "Darwin" ]; then
     }
   }'
 else
-  sns_to 3 df ` + dfInodeFlags + ` | awk 'NR>1 {
+  sns_to 3 df ` + dfInodeFlags + dfExcludeArg + ` | awk 'NR>1 {
     if (NF==5) printf "INODE=%s|%s\n", $5, $4;
     else if (NF>=6) printf "INODE=%s|%s\n", $6, $5;
   }'
@@ -517,18 +525,18 @@ if [ "$SNS_OS" = "Darwin" ]; then
     }
     function extract_pid_proc(f, nf, start_idx,   i, pid, proc, parts) {
       pid = 0; proc = "";
-      if (start_idx <= nf && f[start_idx] ~ /^[0-9]+$/ && f[start_idx]+0 > 0) {
-        pid = f[start_idx]+0;
-      }
       for (i = start_idx; i <= nf; i++) {
         if (f[i] ~ /^[A-Za-z0-9_.-]+:[0-9]+$/ && f[i] !~ /^0x/) {
           split(f[i], parts, ":");
           if (parts[2]+0 > 0) {
-            if (pid == 0) pid = parts[2]+0;
+            pid = parts[2]+0;
             proc = parts[1];
             break;
           }
         }
+      }
+      if (pid == 0 && start_idx <= nf && f[start_idx] ~ /^[0-9]+$/ && f[start_idx]+0 > 0) {
+        pid = f[start_idx]+0;
       }
       if (pid > 0 && pcomm[pid] != "") proc = pcomm[pid];
       return pid "|" proc;

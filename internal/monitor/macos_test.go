@@ -175,7 +175,7 @@ Active Internet connections (including servers)
 Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)     rhiwat shiwat pid   epid state options
 tcp4       0      0  *.22                   *.*                    LISTEN      131072 131072 812   0    0x0   0x0
 tcp6       0      0  *.22                   *.*                    LISTEN      131072 131072 812   0    0x0   0x0
-tcp4       0      0  127.0.0.1.18899        *.*                    LISTEN      131072 131072 2401  0    0x0   0x0
+tcp4       0      0  127.0.0.1.18899        *.*                    LISTEN      131072 131072 131072 0   0x0   0x0 Helper:2401
 tcp46      0      0  *.8443                 *.*                    LISTEN      131072 131072 0     0    0x0   0x0 caddy:3001
 EOF
 elif [ "$1" = "-anv" ] && [ "$3" = "udp" ]; then
@@ -366,7 +366,7 @@ func TestMacOSDeepTelemetryEndToEndScriptExecutionAndParse(t *testing.T) {
 	if len(snap.ListeningPorts) != 5 {
 		t.Fatalf("expected 5 listening ports (tcp/22, tcp6/22, udp6/5353, tcp/8443, tcp/18899), got %+v", snap.ListeningPorts)
 	}
-	foundSSH, foundCaddy, foundMDNS := false, false, false
+	foundSSH, foundCaddy, foundMDNS, foundOrb := false, false, false, false
 	for _, lp := range snap.ListeningPorts {
 		if lp.Port == 22 && lp.Proto == "tcp" && lp.PublicExposed && lp.Process == "sshd" && lp.PID == 812 {
 			foundSSH = true
@@ -377,9 +377,12 @@ func TestMacOSDeepTelemetryEndToEndScriptExecutionAndParse(t *testing.T) {
 		if lp.Port == 5353 && lp.Proto == "udp6" && lp.BindAddr == "[fe80::1]" && !lp.PublicExposed && lp.Process == "mDNSResponder" {
 			foundMDNS = true
 		}
+		if lp.Port == 18899 && lp.Proto == "tcp" && !lp.PublicExposed && lp.Process == "OrbStack Helper" && lp.PID == 2401 {
+			foundOrb = true
+		}
 	}
-	if !foundSSH || !foundCaddy || !foundMDNS {
-		t.Fatalf("missing expected macOS listening ports (ssh=%v caddy=%v mdns=%v): %+v", foundSSH, foundCaddy, foundMDNS, snap.ListeningPorts)
+	if !foundSSH || !foundCaddy || !foundMDNS || !foundOrb {
+		t.Fatalf("missing expected macOS listening ports (ssh=%v caddy=%v mdns=%v orb=%v): %+v", foundSSH, foundCaddy, foundMDNS, foundOrb, snap.ListeningPorts)
 	}
 
 	// 9. Launchd / Homebrew services (noisy com.apple.* ignored; crashed homebrew.mxcl.postgresql@16 caught!)

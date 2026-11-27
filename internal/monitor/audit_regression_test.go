@@ -224,15 +224,23 @@ tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=100))
 tcp LISTEN 0 128 [::]:443 [::]:* users:(("nginx",pid=101))
 tcp LISTEN 0 128 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=102))
 udp UNCONN 0 0 [fe80::1%eth0]:5353 [::]:* users:(("avahi",pid=103))
+tcp LISTEN 0 128 100.96.0.101:34789 0.0.0.0:* users:(("tailscaled",pid=104))
+tcp6 LISTEN 0 128 [fd7a:115c:a1e0:100::6]:64551 [::]:* users:(("tailscaled",pid=104))
 ===SNS_END===
 `, baseSnap, nil)
-	// Verify link-local & loopback NOT exposed, wildcard exposed
+	// Verify link-local, loopback & RFC 6598 CGNAT / Tailscale overlay NOT marked public_exposed
 	for _, lp := range baseSnap.ListeningPorts {
 		if lp.Port == 5432 && (lp.PublicExposed || lp.ExposureScope != "loopback") {
 			t.Fatalf("expected 127.0.0.1:5432 loopback/non-exposed, got %+v", lp)
 		}
 		if lp.Port == 5353 && (lp.PublicExposed || lp.ExposureScope != "link_local") {
 			t.Fatalf("expected fe80::1:5353 link_local/non-exposed, got %+v", lp)
+		}
+		if lp.Port == 34789 && (lp.PublicExposed || lp.ExposureScope != "vpn_overlay") {
+			t.Fatalf("expected 100.96.0.101:34789 vpn_overlay/non-exposed, got %+v", lp)
+		}
+		if lp.Port == 64551 && (lp.PublicExposed || lp.ExposureScope != "vpn_overlay") {
+			t.Fatalf("expected fd7a:115c:a1e0:100::6:64551 vpn_overlay/non-exposed, got %+v", lp)
 		}
 	}
 	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{baseSnap})
