@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ShieldCheck,
   Server,
@@ -6,6 +6,7 @@ import {
   Bell,
   Terminal,
   Bot,
+  ClipboardCheck,
   KeyRound,
   Zap,
   Shield,
@@ -30,8 +31,13 @@ import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
 import { MonitorCenter, type MonitorSubTab } from './components/MonitorCenter';
 import { AlertCenter, type AlertTargetNavigation } from './components/AlertCenter';
-import { TerminalWorkspace, type PendingTerminalCommand } from './components/TerminalWorkspace';
+import {
+  TerminalWorkspace,
+  type PendingCopilotTarget,
+  type PendingTerminalCommand,
+} from './components/TerminalWorkspace';
 import { AIOpsCenter, type AIDiagnosisDraft, type CenterTab } from './components/AIOpsCenter';
+import { ApprovalCenter, type ApprovalCountsSnapshot } from './components/ApprovalCenter';
 import type { MemorySubSection } from './components/AIMemoryAgentsTab';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
@@ -44,6 +50,7 @@ type NavKey =
   | 'alerts'
   | 'terminals'
   | 'ai'
+  | 'approvals'
   | 'keychain'
   | 'snippets'
   | 'vault';
@@ -54,6 +61,7 @@ const NAV_KEY_LABELS: Record<NavKey, string> = {
   alerts: '告警信息',
   terminals: '终端工作台',
   ai: 'AI 智能运维',
+  approvals: '执行审批',
   keychain: '凭据与密钥',
   snippets: '快捷指令',
   vault: '安全保险库',
@@ -77,10 +85,18 @@ export const App: React.FC = () => {
   const [alertsTarget, setAlertsTarget] = useState<AlertTargetNavigation | null>(null);
   const [aiInitialTab, setAiInitialTab] = useState<CenterTab | undefined>(undefined);
   const [aiInitialMemorySection, setAiInitialMemorySection] = useState<MemorySubSection | undefined>(undefined);
+  const [aiInitialSessionId, setAiInitialSessionId] = useState<string | undefined>(undefined);
   const [aiInitialDraft, setAiInitialDraft] = useState<AIDiagnosisDraft | null>(null);
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
   const [activeAlertsByServer, setActiveAlertsByServer] = useState<Record<string, number>>({});
   const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
+  const [pendingExternalApprovals, setPendingExternalApprovals] = useState<number>(0);
+  const [runningExternalApprovals, setRunningExternalApprovals] = useState<number>(0);
+  const [pendingSessionApprovals, setPendingSessionApprovals] = useState<number>(0);
+  const approvalBootHydratedRef = useRef<boolean>(false);
+  const lastKnownPendingApprovalsRef = useRef<number>(0);
+  const activeNavRef = useRef<NavKey>(activeNav);
+  activeNavRef.current = activeNav;
 
   // Workspace State (populated in 1 RTT once session is authenticated)
   const [servers, setServers] = useState<ServerView[]>([]);
@@ -93,6 +109,8 @@ export const App: React.FC = () => {
   const [terminalTabs, setTerminalTabs] = useState<OpenTerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('');
   const [openSftpOnNextTab, setOpenSftpOnNextTab] = useState(false);
+  const [terminalCopilotTarget, setTerminalCopilotTarget] =
+    useState<PendingCopilotTarget | null>(null);
   const [pendingTerminalCommand, setPendingTerminalCommand] =
     useState<PendingTerminalCommand | null>(null);
 
@@ -142,14 +160,21 @@ export const App: React.FC = () => {
     setSnippets([]);
     setTerminalTabs([]);
     setActiveTabId('');
+    setTerminalCopilotTarget(null);
     setPendingTerminalCommand(null);
     setMonitorTargetId('');
     setMonitorInitialSubTab(undefined);
     setAlertsTarget(null);
+    setAiInitialSessionId(undefined);
     setAiInitialDraft(null);
     setFiringAlertsCount(0);
     setActiveAlertsByServer({});
     setPatrolUnreadCount(0);
+    setPendingExternalApprovals(0);
+    setRunningExternalApprovals(0);
+    setPendingSessionApprovals(0);
+    approvalBootHydratedRef.current = false;
+    lastKnownPendingApprovalsRef.current = 0;
     setUpdateOverview(null);
     setUpdateModalOpen(false);
     setActiveNav('servers');
@@ -181,10 +206,71 @@ export const App: React.FC = () => {
       setFiringAlertsCount(boot.firing_alerts || 0);
       setActiveAlertsByServer(boot.active_alerts_by_server || {});
       setPatrolUnreadCount(boot.patrol_unread || 0);
+      const nextExt = boot.pending_external_approvals || 0;
+      const nextRunning = boot.running_external_approvals || 0;
+      const nextSess = boot.pending_session_approvals || 0;
+      setPendingExternalApprovals(nextExt);
+      setRunningExternalApprovals(nextRunning);
+      setPendingSessionApprovals(nextSess);
+      lastKnownPendingApprovalsRef.current = nextExt + nextSess;
+      approvalBootHydratedRef.current = true;
     } catch {
       // Handled by global 401 listener if session expired
     }
   }, []);
+
+  const handleApprovalCountsChange = useCallback(
+    (counts: ApprovalCountsSnapshot) => {
+      const nextTotal = counts.pendingExternal + counts.pendingSession;
+      const prevTotal = lastKnownPendingApprovalsRef.current;
+      if (approvalBootHydratedRef.current && nextTotal > prevTotal) {
+        const delta = nextTotal - prevTotal;
+        notify(
+          activeNavRef.current === 'approvals'
+            ? `收到 ${delta} 条新的待执行审批`
+            : `收到 ${delta} 条新的待执行审批，请前往左侧「执行审批」核验授权`
+        );
+      }
+      lastKnownPendingApprovalsRef.current = nextTotal;
+      approvalBootHydratedRef.current = true;
+      setPendingExternalApprovals(counts.pendingExternal);
+      setRunningExternalApprovals(counts.runningExternal);
+      setPendingSessionApprovals(counts.pendingSession);
+    },
+    [notify]
+  );
+
+  const refreshApprovalSummary = useCallback(
+    async (allowToast = true) => {
+      try {
+        const res = await api.getApprovalSummary();
+        const nextExt = res.pending_external_count || 0;
+        const nextRunning = res.running_external_count || 0;
+        const nextSess = res.pending_session_count || 0;
+        const nextTotal = nextExt + nextSess;
+        const prevTotal = lastKnownPendingApprovalsRef.current;
+        if (allowToast && approvalBootHydratedRef.current && nextTotal > prevTotal) {
+          const delta = nextTotal - prevTotal;
+          notify(
+            activeNavRef.current === 'approvals'
+              ? `收到 ${delta} 条新的待执行审批`
+              : `收到 ${delta} 条新的待执行审批，请前往左侧「执行审批」核验授权`
+          );
+        }
+        lastKnownPendingApprovalsRef.current = nextTotal;
+        approvalBootHydratedRef.current = true;
+        setPendingExternalApprovals(nextExt);
+        setRunningExternalApprovals(nextRunning);
+        setPendingSessionApprovals(nextSess);
+        if (typeof res.patrol_unread === 'number') {
+          setPatrolUnreadCount(res.patrol_unread);
+        }
+      } catch {
+        // Ignore transient network errors during background polling
+      }
+    },
+    [notify]
+  );
 
   useEffect(() => {
     registerOnUnauthorized(() => {
@@ -208,12 +294,27 @@ export const App: React.FC = () => {
       void loadWorkspaceData();
       void loadUpdateOverview();
       // Sync background release check results periodically while console stays open
-      const timer = window.setInterval(() => {
+      const updateTimer = window.setInterval(() => {
         void loadUpdateOverview();
       }, 5 * 60 * 1000);
-      return () => window.clearInterval(timer);
+      // Lightweight background approval count polling (12s, paused when tab hidden or while ApprovalCenter is polling itself)
+      const approvalTimer = window.setInterval(() => {
+        if (document.hidden || activeNavRef.current === 'approvals') return;
+        void refreshApprovalSummary(true);
+      }, 12 * 1000);
+      const onVisibilityChange = () => {
+        if (!document.hidden && activeNavRef.current !== 'approvals') {
+          void refreshApprovalSummary(true);
+        }
+      };
+      document.addEventListener('visibilitychange', onVisibilityChange);
+      return () => {
+        window.clearInterval(updateTimer);
+        window.clearInterval(approvalTimer);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+      };
     }
-  }, [authStatus?.authenticated, loadWorkspaceData, loadUpdateOverview]);
+  }, [authStatus?.authenticated, loadWorkspaceData, loadUpdateOverview, refreshApprovalSummary]);
 
   useEffect(() => {
     if (!mobileNavOpen) return;
@@ -316,6 +417,7 @@ export const App: React.FC = () => {
   const handleDiagnoseAlertWithAI = (serverId: string, prompt: string) => {
     setAiInitialTab('diagnosis');
     setAiInitialMemorySection(undefined);
+    setAiInitialSessionId(undefined);
     setAiInitialDraft({
       serverId,
       prompt,
@@ -325,6 +427,60 @@ export const App: React.FC = () => {
     setActiveNav('ai');
     notify('已选中目标主机并预填告警排障提示词，确认后点击发送即可启动 AI 诊断');
   };
+
+  const handleOpenApprovals = () => {
+    setMobileNavOpen(false);
+    setActiveNav('approvals');
+  };
+
+  const handleOpenMCPConfig = () => {
+    setAiInitialTab('mcp');
+    setAiInitialMemorySection(undefined);
+    setAiInitialSessionId(undefined);
+    setMobileNavOpen(false);
+    setActiveNav('ai');
+  };
+
+  const handleOpenPatrol = () => {
+    setAiInitialTab('patrol');
+    setAiInitialMemorySection(undefined);
+    setAiInitialSessionId(undefined);
+    setMobileNavOpen(false);
+    setActiveNav('ai');
+  };
+
+  const handleJumpCenterSession = (sessionId: string) => {
+    setAiInitialTab('diagnosis');
+    setAiInitialMemorySection(undefined);
+    setAiInitialDraft(null);
+    setAiInitialSessionId(sessionId);
+    setMobileNavOpen(false);
+    setActiveNav('ai');
+  };
+
+  const handleJumpTerminalCopilot = (serverId: string, sessionId: string) => {
+    const srv = servers.find((s) => s.id === serverId);
+    if (!srv) {
+      notify('未在主机资产中找到对应服务器，可能已被移除');
+      return;
+    }
+    const existing = terminalTabs.find((t) => t.server.id === srv.id);
+    let targetTabId = existing?.tabId || '';
+    if (!targetTabId) {
+      targetTabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setTerminalTabs((prev) => [...prev, { tabId: targetTabId, server: srv }]);
+    }
+    setActiveTabId(targetTabId);
+    setTerminalCopilotTarget({
+      serverId: srv.id,
+      sessionId,
+      nonce: Date.now() + Math.random(),
+    });
+    setMobileNavOpen(false);
+    setActiveNav('terminals');
+  };
+
+  const pendingApprovalsTotal = pendingExternalApprovals + pendingSessionApprovals;
 
   const handleCloseTab = (tabId: string) => {
     terminalClient.closeTerminal(tabId);
@@ -439,6 +595,18 @@ export const App: React.FC = () => {
               title={`发现新版本 ${latestTag}`}
             >
               ↑ {latestTag}
+            </button>
+          )}
+          {pendingApprovalsTotal > 0 && (
+            <button
+              type="button"
+              id="mobile-approvals-btn"
+              className="nav-badge amber"
+              style={{ cursor: 'pointer', padding: '2px 8px' }}
+              onClick={handleOpenApprovals}
+              title="查看待审阅的执行审批"
+            >
+              {pendingApprovalsTotal} 待审批
             </button>
           )}
           {firingAlertsCount > 0 && (
@@ -592,6 +760,22 @@ export const App: React.FC = () => {
             {patrolUnreadCount > 0 && (
               <span className="nav-badge danger">{patrolUnreadCount}</span>
             )}
+          </button>
+
+          <button
+            type="button"
+            id="nav-approvals-btn"
+            className={`nav-item ${activeNav === 'approvals' ? 'active' : ''}`}
+            onClick={handleOpenApprovals}
+          >
+            <span className="nav-item-left">
+              <ClipboardCheck size={16} /> 执行审批
+            </span>
+            {pendingApprovalsTotal > 0 ? (
+              <span className="nav-badge amber">{pendingApprovalsTotal}</span>
+            ) : runningExternalApprovals > 0 ? (
+              <span className="nav-badge live">{runningExternalApprovals}</span>
+            ) : null}
           </button>
 
           <button
@@ -803,6 +987,8 @@ export const App: React.FC = () => {
               settings={settings}
               defaultOpenSftp={openSftpOnNextTab}
               onConsumeDefaultSftp={() => setOpenSftpOnNextTab(false)}
+              copilotTarget={terminalCopilotTarget}
+              onConsumeCopilotTarget={() => setTerminalCopilotTarget(null)}
               pendingCommand={pendingTerminalCommand}
               onConsumePendingCommand={() => setPendingTerminalCommand(null)}
               onSelectTab={setActiveTabId}
@@ -815,6 +1001,7 @@ export const App: React.FC = () => {
                 setActiveNav('ai');
               }}
               onRefreshWorkspace={loadWorkspaceData}
+              onApprovalMutated={() => void refreshApprovalSummary(false)}
               onNotify={notify}
             />
           </div>
@@ -825,14 +1012,32 @@ export const App: React.FC = () => {
             servers={servers}
             initialTab={aiInitialTab}
             initialMemorySection={aiInitialMemorySection}
+            initialSessionId={aiInitialSessionId}
             initialDraft={aiInitialDraft}
+            pendingApprovalsCount={pendingApprovalsTotal}
+            runningApprovalsCount={runningExternalApprovals}
             onConsumeInitialTab={() => {
               setAiInitialTab(undefined);
               setAiInitialMemorySection(undefined);
             }}
+            onConsumeInitialSessionId={() => setAiInitialSessionId(undefined)}
             onConsumeInitialDraft={() => setAiInitialDraft(null)}
+            onOpenApprovals={handleOpenApprovals}
+            onApprovalsMutated={() => void refreshApprovalSummary(false)}
             onBadgeChange={setPatrolUnreadCount}
             onRefreshWorkspace={loadWorkspaceData}
+            onNotify={notify}
+          />
+        )}
+
+        {activeNav === 'approvals' && (
+          <ApprovalCenter
+            servers={servers}
+            onApprovalCountsChange={handleApprovalCountsChange}
+            onOpenMCPConfig={handleOpenMCPConfig}
+            onOpenPatrol={handleOpenPatrol}
+            onJumpCenterSession={handleJumpCenterSession}
+            onJumpTerminalCopilot={handleJumpTerminalCopilot}
             onNotify={notify}
           />
         )}

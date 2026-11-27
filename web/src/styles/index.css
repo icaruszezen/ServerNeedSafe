@@ -1892,6 +1892,12 @@ pre,
   border: 1px solid var(--danger-border);
 }
 
+.nav-badge.amber {
+  background: var(--amber-soft);
+  color: var(--amber-text);
+  border: 1px solid var(--amber-border);
+}
+
 .tag-chip.danger {
   background: var(--danger-soft);
   border-color: var(--danger-border);
@@ -4456,6 +4462,38 @@ pre,
   color: var(--amber-text);
   font-size: 12.5px;
   line-height: 1.5;
+}
+
+.ap-center-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ap-clickable-chip {
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+
+.ap-clickable-chip:hover {
+  filter: brightness(0.96);
+}
+
+.ap-builtin-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ap-builtin-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 @media (max-width: 960px) {

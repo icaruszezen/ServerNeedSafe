@@ -35,7 +35,8 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 		}
 	}
 	_, patrolUnread, _ := s.cfg.Store.ListPatrolRecords(1, false)
-	pendingExtPatrols, pendingExtApprovals := s.cfg.Store.CountExternalPending()
+	pendingExtPatrols, _ := s.cfg.Store.CountExternalPending()
+	pendingExtApprovals, runningExtApprovals, pendingSessionApprovals := s.cfg.Store.CountApprovalSummary()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"servers":                    servers,
@@ -45,9 +46,12 @@ func (s *Server) handleWorkspaceBootstrap(w http.ResponseWriter, r *http.Request
 		"active_sessions":            s.cfg.SSH.ListActiveSessions(),
 		"firing_alerts":              firingAlerts,
 		"active_alerts_by_server":    activeAlertsByServer,
-		"patrol_unread":              patrolUnread + pendingExtApprovals,
+		"patrol_unread":              patrolUnread,
 		"pending_external_patrols":   pendingExtPatrols,
 		"pending_external_approvals": pendingExtApprovals,
+		"running_external_approvals": runningExtApprovals,
+		"pending_session_approvals":  pendingSessionApprovals,
+		"pending_approvals_total":    pendingExtApprovals + pendingSessionApprovals,
 	})
 }
 

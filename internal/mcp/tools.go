@@ -1081,7 +1081,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 			}
 			stepSummary = append(stepSummary, item)
 		}
-		msg := fmt.Sprintf("已将包含 %d 个有序步骤的变更计划提交至 ServerNeedSafe Web 端「外部 AI 接管 (MCP) → 变更审批队列」，等待管理员一键批准后按序执行。可调用 wait_for_approval 或 get_approval_status 查询每步执行进度与输出。", ap.TotalSteps)
+		msg := fmt.Sprintf("已将包含 %d 个有序步骤的变更计划提交至 ServerNeedSafe Web 端左侧「执行审批」，等待管理员一键批准后按序执行。可调用 wait_for_approval 或 get_approval_status 查询每步执行进度与输出。", ap.TotalSteps)
 		if ap.BlockedSteps > 0 {
 			msg = fmt.Sprintf("变更计划已进入审批队列，但其中 %d/%d 步命中安全熔断已被标红锁定且无法执行（其余 %d 步待管理员审阅批准）。", ap.BlockedSteps, ap.TotalSteps, ap.ExecutableSteps)
 		}

@@ -183,7 +183,7 @@ func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, c
 			md.WriteString(fmt.Sprintf("... 其余 %d 步请在 Web 控制台查看完整清单。\n", len(ap.Steps)-10))
 		}
 	}
-	md.WriteString("\n> 该变更计划处于 **等待管理员审批** 状态，尚未在远端服务器执行。请登录 ServerNeedSafe 控制台「AI 智能运维 → 外部 AI 接管 (MCP)」审阅全部步骤与 Diff 后一键批准按序执行或拒绝。\n")
+	md.WriteString("\n> 该变更计划处于 **等待管理员审批** 状态，尚未在远端服务器执行。请登录 ServerNeedSafe 控制台左侧「执行审批」审阅全部步骤与 Diff 后一键批准按序执行或拒绝。\n")
 
 	markdownText := md.String()
 	titleText := fmt.Sprintf("ServerNeedSafe · 待审批外部 AI 变更计划 (%s · %d 步)", nonEmpty(ap.ClientName, "MCP"), ap.TotalSteps)

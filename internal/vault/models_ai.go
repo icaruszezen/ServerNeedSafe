@@ -943,6 +943,15 @@ type AIPendingApproval struct {
 	ResolvedAt    *time.Time `json:"resolved_at,omitempty"`
 }
 
+// SessionApprovalItem flattens a built-in AI chat session HITL approval with its parent session metadata
+// for the standalone Execution Approval Center.
+type SessionApprovalItem struct {
+	AIPendingApproval
+	SessionTitle     string   `json:"session_title"`
+	SessionScope     string   `json:"session_scope"` // "center" or "terminal"
+	SessionServerIDs []string `json:"session_server_ids,omitempty"`
+}
+
 // AIRunbookProposal represents an AI-distilled Runbook draft awaiting one-click admin confirmation.
 type AIRunbookProposal struct {
 	ID              string    `json:"id"`

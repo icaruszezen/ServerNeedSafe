@@ -35,11 +35,14 @@ import {
 interface TerminalCopilotPanelProps {
   serverId: string;
   serverName: string;
+  preferredSessionId?: string;
+  preferredSessionNonce?: number;
   getTerminalContext: () => string;
   onInjectCommand: (cmd: string) => void;
   onNavigateAIConfig: () => void;
   onOpenAgentsMD?: () => void;
   onRefreshWorkspace?: () => Promise<void>;
+  onApprovalMutated?: () => void;
   onNotify: (msg: string) => void;
   onClose: () => void;
 }
@@ -47,11 +50,14 @@ interface TerminalCopilotPanelProps {
 export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
   serverId,
   serverName,
+  preferredSessionId,
+  preferredSessionNonce,
   getTerminalContext,
   onInjectCommand,
   onNavigateAIConfig,
   onOpenAgentsMD,
   onRefreshWorkspace,
+  onApprovalMutated,
   onNotify,
   onClose,
 }) => {
@@ -93,6 +99,18 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     try {
       const ov = await api.getAIOverview('terminal');
       setHasProvider((ov.providers || []).length > 0);
+      if (preferredSessionId) {
+        try {
+          const detail = await api.getAISession(preferredSessionId);
+          if (detail.session) {
+            setSession(detail.session);
+            setMode(detail.session.mode || 'standard');
+            return;
+          }
+        } catch {
+          // Fall back to server-matched session below
+        }
+      }
       const matched = (ov.sessions || []).find((s) =>
         (s.server_ids || []).includes(serverId)
       );
@@ -107,7 +125,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     } catch {
       // ignore transient
     }
-  }, [serverId]);
+  }, [serverId, preferredSessionId, preferredSessionNonce]);
 
   useEffect(() => {
     streamAbortRef.current?.abort();
@@ -274,6 +292,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         handleStreamEvent,
         ac.signal
       );
+      onApprovalMutated?.();
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         onNotify('已停止终端副驾驶本次生成');
@@ -281,6 +300,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         onNotify(err?.message || '终端副驾驶响应中断');
       }
       await loadBoundSession();
+      onApprovalMutated?.();
     } finally {
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
@@ -303,6 +323,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
     streamAbortRef.current = ac;
     try {
       await api.streamAIApproval(session.id, approvalId, approve, handleStreamEvent, ac.signal);
+      onApprovalMutated?.();
     } catch (err: any) {
       if (err?.name === 'AbortError') {
         onNotify('已停止本次生成');
@@ -310,6 +331,7 @@ export const TerminalCopilotPanel: React.FC<TerminalCopilotPanelProps> = ({
         onNotify(err?.message || '审批执行失败');
       }
       await loadBoundSession();
+      onApprovalMutated?.();
     } finally {
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
