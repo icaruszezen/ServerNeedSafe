@@ -72,6 +72,18 @@ function categoryLabel(cat?: string): string {
   return found ? found.label : '其他告警';
 }
 
+function formatAlertHeadline(title: string, serverName: string): string {
+  const trimmed = (title || '').trim();
+  const srv = (serverName || '').trim();
+  if (!trimmed || !srv) return trimmed;
+  const exactPrefix = `[${srv}]`;
+  if (trimmed.startsWith(exactPrefix)) {
+    const rest = trimmed.slice(exactPrefix.length).trim();
+    if (rest.length >= 4) return rest;
+  }
+  return trimmed;
+}
+
 function formatDuration(startIso?: string, endIso?: string): string {
   if (!startIso) return '—';
   const startMs = new Date(startIso).getTime();
@@ -229,6 +241,40 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
     () => alerts.filter((a) => a.status === 'firing').map((a) => a.id),
     [alerts]
   );
+
+  const viewBreakdown = useMemo(() => {
+    let critical = 0;
+    let warning = 0;
+    let resolved = 0;
+    for (const al of alerts) {
+      if (al.status === 'resolved') resolved++;
+      else if (al.severity === 'critical') critical++;
+      else warning++;
+    }
+    return { critical, warning, resolved };
+  }, [alerts]);
+
+  const expandableAlertIds = useMemo(
+    () => alerts.filter((a) => Boolean(a.advice)).map((a) => a.id),
+    [alerts]
+  );
+
+  const allExpanded = useMemo(
+    () => expandableAlertIds.length > 0 && expandableAlertIds.every((id) => Boolean(expandedIds[id])),
+    [expandableAlertIds, expandedIds]
+  );
+
+  const toggleExpandAll = () => {
+    if (allExpanded) {
+      setExpandedIds({});
+    } else {
+      const next: Record<string, boolean> = {};
+      for (const id of expandableAlertIds) {
+        next[id] = true;
+      }
+      setExpandedIds(next);
+    }
+  };
 
   const groupedAlerts = useMemo(() => {
     const map = new Map<
@@ -420,14 +466,15 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
     const cmdCount = advice?.commands?.length || 0;
     const quickCount = advice?.quick_actions?.length || 0;
     const runbookCount = advice?.runbooks?.length || 0;
+    const headline = formatAlertHeadline(al.title, al.server_name);
 
     return (
       <article
         key={al.id}
         id={`alert-card-${al.id}`}
-        className={`al-card tone-${tone} ${isExpanded ? 'expanded' : ''}`}
+        className={`al-card tone-${tone} status-${al.status} ${isExpanded ? 'expanded' : ''}`}
       >
-        {/* Top Summary Clickable Header */}
+        {/* Top Summary Clickable Region */}
         <div
           className="al-card-main"
           onClick={() => toggleExpand(al.id)}
@@ -440,27 +487,47 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
             }
           }}
         >
+          {/* Zone 1: Semantic Header Strip — Distinct Card Top Anchor */}
           <div className="al-card-top">
             <div className="al-card-badges">
-              <span className={`tag-chip ${al.severity === 'critical' ? 'danger' : 'amber'}`}>
-                {al.severity === 'critical' ? '严重 CRITICAL' : '警告 WARNING'}
-              </span>
-              <span
-                className={`tag-chip ${
-                  al.status === 'resolved'
-                    ? 'teal'
-                    : al.status === 'acknowledged'
-                    ? ''
-                    : 'danger'
-                }`}
-              >
-                {al.status === 'firing'
-                  ? '触发中'
-                  : al.status === 'acknowledged'
-                  ? '已知晓'
-                  : '已恢复'}
-              </span>
-              <span className="tag-chip">{categoryLabel(al.category)}</span>
+              {isResolved ? (
+                <>
+                  <span className="al-sev-badge resolved">
+                    <CheckCircle2 size={12} /> 已恢复
+                  </span>
+                  <span
+                    className={`al-origin-sev ${al.severity === 'critical' ? 'critical' : 'warning'}`}
+                  >
+                    {al.severity === 'critical' ? '原严重' : '原警告'}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className={`al-sev-badge ${al.severity === 'critical' ? 'critical' : 'warning'}`}>
+                    {al.severity === 'critical' ? (
+                      <>
+                        <ShieldAlert size={12} /> 严重
+                      </>
+                    ) : (
+                      <>
+                        <AlertTriangle size={12} /> 警告
+                      </>
+                    )}
+                  </span>
+                  {al.status === 'firing' ? (
+                    <span className={`al-status-flag firing ${tone}`}>
+                      <span className="al-live-dot" aria-hidden="true" />
+                      触发中
+                    </span>
+                  ) : (
+                    <span className="al-status-flag acknowledged">
+                      <Check size={12} />
+                      已知晓
+                    </span>
+                  )}
+                </>
+              )}
+
               {groupMode === 'timeline' && (
                 <button
                   type="button"
@@ -471,90 +538,105 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
                   }}
                   title={`仅查看 ${al.server_name} (${al.host}) 的告警`}
                 >
-                  <Server size={11.5} />
-                  <span>{al.server_name}</span>
-                  <span className="mono al-server-pill-host">{al.host}</span>
+                  <Server size={12} />
+                  <span className="al-server-pill-name">{al.server_name}</span>
+                  {al.host && <span className="mono al-server-pill-host">{al.host}</span>}
                 </button>
               )}
+
+              <span className="al-cat-label">{categoryLabel(al.category)}</span>
             </div>
 
             <div className="al-card-top-right" onClick={(e) => e.stopPropagation()}>
-              <span className="al-duration-chip tabular" title={`首次触发：${formatDateTime(al.triggered_at)}`}>
-                <Clock size={11.5} />
-                {isResolved
-                  ? `耗时 ${formatDuration(al.triggered_at, al.resolved_at)}`
-                  : `已持续 ${formatDuration(al.triggered_at)}`}
-              </span>
-              <span className="tag-chip tabular" title="连续或累计触发次数">
-                {al.occurrences} 次
-              </span>
+              <div
+                className="al-time-meta tabular"
+                title={`首次触发：${formatDateTime(al.triggered_at)}`}
+              >
+                <Clock size={12} />
+                <span>
+                  {isResolved
+                    ? `耗时 ${formatDuration(al.triggered_at, al.resolved_at)}`
+                    : `持续 ${formatDuration(al.triggered_at)}`}
+                </span>
+                <span className="al-meta-sep" aria-hidden="true">
+                  ·
+                </span>
+                <span title="连续或累计触发次数">触发 {al.occurrences} 次</span>
+              </div>
               <button
                 type="button"
-                className="btn btn-sm btn-ghost al-expand-btn"
+                className={`btn btn-sm al-expand-btn ${isExpanded ? 'is-open' : ''}`}
                 onClick={() => toggleExpand(al.id)}
                 aria-expanded={isExpanded}
               >
                 {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                <span>{isExpanded ? '收起' : '修复建议'}</span>
+                <span>{isExpanded ? '收起建议' : '修复建议'}</span>
               </button>
             </div>
           </div>
 
-          {/* Core Title, Detail & Metric Strip */}
-          <div className="al-card-body">
-            <div className="al-card-text">
-              <div className="al-card-title">{al.title}</div>
-              <div className="al-card-detail">
-                <span className="al-rule-tag">[{al.rule_name}]</span> {al.detail}
+          {/* Zone 2: Core Content — Headline, Rule Detail, Metric Callout & Compact Advice */}
+          <div className="al-card-content">
+            <div className="al-card-body">
+              <div className="al-card-text">
+                <div className="al-card-title">{headline}</div>
+                <div className="al-card-detail">
+                  <span className="al-rule-tag">{al.rule_name}</span>
+                  <span className="al-detail-desc">{al.detail}</span>
+                </div>
+              </div>
+
+              <div className={`al-metric-box tone-${tone} mono`}>
+                <div className="al-metric-head">
+                  <span className="al-metric-label">{isResolved ? '恢复前指标' : '当前实测'}</span>
+                  <strong className={`al-metric-val ${tone}`}>{al.metric_text || '—'}</strong>
+                </div>
+                <div className="al-metric-foot">
+                  {al.threshold_text && (
+                    <div className="al-metric-row">
+                      <span className="al-metric-sub-label">阈值</span>
+                      <span className="al-metric-thresh">{al.threshold_text}</span>
+                    </div>
+                  )}
+                  <div className="al-metric-time">
+                    {isResolved
+                      ? `恢复 ${formatDateTime(al.resolved_at)}`
+                      : `最近 ${formatDateTime(al.last_seen_at)}`}
+                  </div>
+                </div>
               </div>
             </div>
 
-            <div className="al-metric-box mono">
-              <div className="al-metric-row">
-                <span className="al-metric-label">实测</span>
-                <strong className={`al-metric-val ${tone}`}>{al.metric_text || '—'}</strong>
-              </div>
-              {al.threshold_text && (
-                <div className="al-metric-row muted">
-                  <span className="al-metric-label">阈值</span>
-                  <span>{al.threshold_text}</span>
+            {/* Smart Remediation Preview Bar (calm left-accented insight strip) */}
+            {advice && (
+              <div className="al-advice-preview">
+                <div className="al-advice-preview-text">
+                  <Wrench size={13.5} className="al-advice-icon" />
+                  <span className="al-advice-summary">
+                    <strong className="al-advice-label">处置建议</strong>
+                    {advice.summary}
+                  </span>
                 </div>
-              )}
-              <div className="al-metric-time">
-                {isResolved
-                  ? `恢复 ${formatDateTime(al.resolved_at)}`
-                  : `最近 ${formatDateTime(al.last_seen_at)}`}
+                {(cmdCount > 0 || quickCount > 0 || runbookCount > 0) && (
+                  <div className="al-advice-preview-pills">
+                    {quickCount > 0 && <span className="al-advice-badge quick">含一键处置</span>}
+                    {cmdCount > 0 && <span className="al-advice-badge cmd">{cmdCount} 条指令</span>}
+                    {runbookCount > 0 && (
+                      <span className="al-advice-badge runbook">{runbookCount} 篇 Runbook</span>
+                    )}
+                  </div>
+                )}
               </div>
-            </div>
+            )}
           </div>
 
-          {/* Smart Remediation Preview Bar (visible even when collapsed) */}
-          {advice && (
-            <div className="al-advice-preview">
-              <div className="al-advice-preview-text">
-                <Wrench size={13.5} className="al-advice-icon" />
-                <span>
-                  <strong>智能建议：</strong>
-                  {advice.summary}
-                </span>
-              </div>
-              <div className="al-advice-preview-pills">
-                {cmdCount > 0 && (
-                  <span className="tag-chip teal">{cmdCount} 条排查/修复指令</span>
-                )}
-                {quickCount > 0 && <span className="tag-chip amber">含一键快捷处置</span>}
-                {runbookCount > 0 && <span className="tag-chip">{runbookCount} 篇关联 Runbook</span>}
-              </div>
-            </div>
-          )}
-
-          {/* Quick Inline Action Bar */}
+          {/* Zone 3: Grounded Action Footer — Distinct Card Bottom Anchor */}
           <div className="al-card-actions" onClick={(e) => e.stopPropagation()}>
             <div className="al-card-actions-left">
               {al.status === 'firing' && (
                 <button
                   type="button"
-                  className="btn btn-sm"
+                  className="btn btn-sm al-btn-primary-action"
                   disabled={isBusy}
                   onClick={() => void handleAckAlert(al.id)}
                 >
@@ -564,7 +646,9 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
               {!isResolved && (
                 <button
                   type="button"
-                  className="btn btn-sm"
+                  className={`btn btn-sm ${
+                    al.status === 'acknowledged' ? 'al-btn-primary-action' : 'btn-ghost al-btn-quiet'
+                  }`}
                   disabled={isBusy}
                   onClick={() => void handleResolveAlert(al.id)}
                   title="人工标记解决并关闭当前告警，若下次采集仍超限会重新触发"
@@ -574,7 +658,7 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
               )}
               <button
                 type="button"
-                className="btn btn-sm"
+                className="btn btn-sm btn-ghost al-btn-quiet"
                 disabled={isRechecking}
                 onClick={() => void handleRecheckServer(al.server_id)}
                 title="立即触发单机全维采集以验证修复是否生效"
@@ -587,7 +671,7 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
             <div className="al-card-actions-right">
               <button
                 type="button"
-                className="btn btn-sm"
+                className="btn btn-sm btn-ghost al-btn-quiet"
                 onClick={() => onOpenMonitorDetail(al.server_id)}
               >
                 <Eye size={13} /> 单机透视
@@ -1176,74 +1260,117 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
               )}
             </div>
           </div>
-        ) : groupMode === 'server' ? (
-          <div className="al-server-groups">
-            {groupedAlerts.map((grp) => {
-              const collapsed = Boolean(collapsedServers[grp.serverId]);
-              const firingIds = grp.items
-                .filter((i) => i.status === 'firing')
-                .map((i) => i.id);
-              return (
-                <section key={grp.serverId} className="al-server-group">
-                  <div
-                    className="al-server-group-head"
-                    onClick={() =>
-                      setCollapsedServers((prev) => ({
-                        ...prev,
-                        [grp.serverId]: !prev[grp.serverId],
-                      }))
-                    }
-                  >
-                    <div className="al-server-group-title">
-                      {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
-                      <Server size={15} style={{ color: 'var(--accent-teal)' }} />
-                      <strong>{grp.serverName}</strong>
-                      <span className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        {grp.host}
-                      </span>
-                      {grp.criticalCount > 0 && (
-                        <span className="tag-chip danger tabular">严重 {grp.criticalCount}</span>
-                      )}
-                      {grp.warningCount > 0 && (
-                        <span className="tag-chip amber tabular">警告 {grp.warningCount}</span>
-                      )}
-                      <span className="tag-chip tabular">共 {grp.items.length} 条</span>
-                    </div>
-
-                    <div
-                      className="al-server-group-actions"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      {firingIds.length > 0 && (
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          disabled={bulkAcking}
-                          onClick={() => void handleBulkAck(firingIds, grp.serverId)}
-                        >
-                          <CheckCheck size={13} /> 确认本机 ({firingIds.length})
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => onOpenMonitorDetail(grp.serverId)}
-                      >
-                        <Eye size={13} /> 单机透视
-                      </button>
-                    </div>
-                  </div>
-                  {!collapsed && (
-                    <div className="al-card-stack">
-                      {grp.items.map((al) => renderAlertCard(al))}
-                    </div>
-                  )}
-                </section>
-              );
-            })}
-          </div>
         ) : (
-          <div className="al-card-stack">{alerts.map((al) => renderAlertCard(al))}</div>
+          <>
+            {/* Compact Feed Context & Bulk Expand Strip */}
+            <div className="al-list-bar">
+              <div className="al-list-bar-summary tabular">
+                <span>
+                  共 <strong>{alerts.length}</strong> 条匹配告警
+                </span>
+                {viewBreakdown.critical > 0 && (
+                  <span className="al-list-dot-stat critical">
+                    <span className="al-stat-dot" aria-hidden="true" />
+                    严重 {viewBreakdown.critical}
+                  </span>
+                )}
+                {viewBreakdown.warning > 0 && (
+                  <span className="al-list-dot-stat warning">
+                    <span className="al-stat-dot" aria-hidden="true" />
+                    警告 {viewBreakdown.warning}
+                  </span>
+                )}
+                {viewBreakdown.resolved > 0 && (
+                  <span className="al-list-dot-stat resolved">
+                    <span className="al-stat-dot" aria-hidden="true" />
+                    已恢复 {viewBreakdown.resolved}
+                  </span>
+                )}
+              </div>
+              {expandableAlertIds.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-ghost al-list-toggle-all"
+                  onClick={toggleExpandAll}
+                >
+                  {allExpanded ? <ChevronDown size={13.5} /> : <ChevronRight size={13.5} />}
+                  <span>{allExpanded ? '收起全部建议' : '展开全部建议'}</span>
+                </button>
+              )}
+            </div>
+
+            {groupMode === 'server' ? (
+              <div className="al-server-groups">
+                {groupedAlerts.map((grp) => {
+                  const collapsed = Boolean(collapsedServers[grp.serverId]);
+                  const firingIds = grp.items
+                    .filter((i) => i.status === 'firing')
+                    .map((i) => i.id);
+                  return (
+                    <section key={grp.serverId} className="al-server-group">
+                      <div
+                        className="al-server-group-head"
+                        onClick={() =>
+                          setCollapsedServers((prev) => ({
+                            ...prev,
+                            [grp.serverId]: !prev[grp.serverId],
+                          }))
+                        }
+                      >
+                        <div className="al-server-group-title">
+                          {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                          <Server size={15} style={{ color: 'var(--accent-teal)' }} />
+                          <strong>{grp.serverName}</strong>
+                          <span className="mono al-group-host">{grp.host}</span>
+                          {grp.criticalCount > 0 && (
+                            <span className="al-sev-badge critical compact tabular">
+                              严重 {grp.criticalCount}
+                            </span>
+                          )}
+                          {grp.warningCount > 0 && (
+                            <span className="al-sev-badge warning compact tabular">
+                              警告 {grp.warningCount}
+                            </span>
+                          )}
+                          <span className="al-group-count tabular">共 {grp.items.length} 条</span>
+                        </div>
+
+                        <div
+                          className="al-server-group-actions"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {firingIds.length > 0 && (
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              disabled={bulkAcking}
+                              onClick={() => void handleBulkAck(firingIds, grp.serverId)}
+                            >
+                              <CheckCheck size={13} /> 确认本机 ({firingIds.length})
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-ghost al-btn-quiet"
+                            onClick={() => onOpenMonitorDetail(grp.serverId)}
+                          >
+                            <Eye size={13} /> 单机透视
+                          </button>
+                        </div>
+                      </div>
+                      {!collapsed && (
+                        <div className="al-card-stack">
+                          {grp.items.map((al) => renderAlertCard(al))}
+                        </div>
+                      )}
+                    </section>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="al-card-stack">{alerts.map((al) => renderAlertCard(al))}</div>
+            )}
+          </>
         )}
       </div>
     </div>
