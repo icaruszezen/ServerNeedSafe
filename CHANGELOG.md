@@ -3,6 +3,80 @@
 All notable changes to **ServerNeedSafe** are documented in this file.
 本文件记录 **ServerNeedSafe** 每个正式版本的中英文更新日志。
 
+## v2.9.0 (2026-11-27)
+
+## 中文更新说明
+
+> 新增官方漏洞监测与独立执行审批中心，并进一步打通告警、外部 AI 和服务器分组的日常运维体验。
+
+### ✨ 新功能与核心增强
+- 新增「漏洞监测」一级功能模块，支持滚动快讯、动态情报流、CVSS 等级与 CISA KEV 标识、官方修复版本、星标、已读、忽略及多维筛选，并提供详情侧滑抽屉与按需 AI 中文解读入口 (#30)。
+- 集成 6 大领域、35 款主流应用目录与快捷场景预设；默认监看 Linux Kernel、OpenSSH、OpenSSL 和 Nginx，并支持 GitHub 仓库、OSV 包或自定义应用订阅 (#30)。
+- 新增多源官方漏洞聚合引擎，整合 OSV.dev、GitHub Security Advisories、厂商安全公告和 CISA KEV；支持 CVE/GHSA 去重、代理、GitHub Token、AI 解读缓存以及可选高严重性或在野利用告警推送 (#30)。
+- 新增侧边栏「执行审批」中心，统一展示 MCP 与内置 AI 的待审批、执行中、历史审批和异常记录，提供按步确认、安全熔断、一键批准/拒绝/中止、Unified Diff、实时进度及关联巡检跳转 (#28)。
+- 执行审批中心支持按状态、来源、主机和关键词筛选，并可定位原排障会话或打开对应主机的终端 Copilot 面板；记录保持只读审计留痕 (#28)。
+- 告警卡片在「AI 深度诊断」旁新增「复制 MCP 文案」按钮，可一键复制包含主机现场、告警指标、只读排查命令、修复参考和 MCP 工具链的结构化外部 AI 排障提示 (#31)。
+- MCP 告警提示词由后端根据告警详情和实时快照生成，并兼容前端兜底构建；针对离线、主机密钥变更、告警恢复及 macOS/Darwin 主机提供差异化安全引导 (#31)。
+
+### 🔒 安全与权限加固
+- 新增统一 `GET /api/ai/approvals` 审批聚合接口及轻量摘要轮询，工作区启动数据拆分巡检未读数与待审批数；AI 运维徽标不再混入审批计数 (#28)。
+- 控制台登录后每 12 秒轻量轮询审批摘要，页面隐藏时暂停、恢复前台时立即同步，并在出现新审批时更新徽标与 Toast 提醒 (#28)。
+- 将漏洞监测设置和可选代理、GitHub Token 纳入加密存储，情报运行数据独立防抖落盘至 `vuln_runtime.json`，并接入备份、跨端同步快照及磁盘占用统计 (#30)。
+- 为漏洞监测提供鉴权 API、级别与来源筛选、只读审计相关状态管理，并支持通过风险场景预设和自定义订阅控制监看范围 (#30)。
+- 外部 AI MCP 配置页收起审批队列和轮询，仅保留轻量「前往执行审批」入口，飞书、钉钉、企微 Webhook、变更计划提示及巡检引导已同步指向新审批中心 (#28)。
+
+### 🐛 问题修复与稳定性提升
+- 替换服务器分组原生 `<datalist>`，新增可搜索、自定义定位的分组选择组件；展开时即使已有预填值也会完整展示候选分组，支持模糊筛选、键盘导航、IME 保护和一键清空 (#27)。
+- 修复分组数据同步问题，合并服务器列表和分组配置中的去重分组并统计主机数；保存与新建分组前统一清理首尾空格 (#27)。
+- 下拉菜单通过 `createPortal` 渲染并动态计算视口位置，窄屏自动约束宽度、空间不足时向上翻转、锚点移出视口时收起，同时适配弹窗裁剪、鼠标、触摸、浅色和暗黑主题 (#27)。
+
+### ⚙️ 工程构建与运维体验
+- 前端补充移动端分组下拉切换、独立审批中心、漏洞中心及告警 MCP 文案按钮的响应式与端到端测试覆盖 (#27, #28, #30, #31)。
+- 新增漏洞源、CVSS、审批聚合、徽标解耦、鉴权和提示词等后端测试，前端单位测试与生产构建均已通过；相关 Go 包通过静态检查和竞态测试 (#28, #30, #31)。
+
+---
+
+## English Release Notes
+
+> Adds an official vulnerability monitoring center and standalone execution approvals, while improving alert handling, external AI workflows, and server-group management.
+
+### ✨ New Features & Highlights
+- Adds a new “Vulnerability Monitoring” workspace for live security bulletins, an evolving intelligence feed, CVSS severity and CISA KEV indicators, official fixed versions, starring, read/ignored states, and advanced filtering (#30).
+- Includes six categories and 35 mainstream applications, plus preset scenarios and custom subscriptions for GitHub repositories or OSV packages; Linux Kernel, OpenSSH, OpenSSL, and Nginx are monitored by default (#30).
+- Introduces a multi-source intelligence engine aggregating OSV.dev, GitHub Security Advisories, vendor feeds, and CISA KEV, with CVE/GHSA deduplication, proxy support, GitHub token authentication, cached AI analysis, and optional push notifications for severe or actively exploited advisories (#30).
+- Adds a dedicated “Execution Approvals” sidebar entry that consolidates MCP and built-in AI pending, running, completed, rejected, and failed approval records into one auditable center (#28).
+- The approval center supports step-by-step confirmation, fail-safe locking, approve/reject/abort actions, Unified Diff previews, 1.5-second execution updates, inspection links, status/source/host/keyword filters, and direct navigation back to source sessions or terminal Copilot panels (#28).
+- Alert cards now provide a “Copy MCP Prompt” action beside “AI Deep Diagnosis,” generating a structured external-AI troubleshooting prompt with host context, metrics, thresholds, read-only commands, remediation guidance, Runbook matches, and MCP tool steps (#31).
+- MCP prompt generation is handled by the backend with a frontend fallback, and includes tailored safety guidance for offline hosts, host-key changes, resolved alerts, and macOS/Darwin systems (#31).
+
+### 🔒 Security & Hardening
+- Adds unified `GET /api/ai/approvals` aggregation and lightweight summary polling, while separating patrol unread counts from pending approvals in workspace bootstrap data (#28).
+- Keeps approval status synchronized through a 12-second global poll that pauses while the page is hidden and resumes immediately when the foreground becomes active, with badge updates and Toast notifications for new requests (#28).
+- Encrypts vulnerability settings, optional HTTP/SOCKS5 proxy configuration, and GitHub tokens in `secrets.enc`, while storing high-frequency intelligence independently in `vuln_runtime.json` and including it in backup, sync, and disk-usage views (#30).
+- Protects vulnerability APIs with authentication and provides severity, source, application, KEV, patch, and read-state controls for managing monitored risk (#30).
+- Removes the approval queue and polling from the external AI MCP configuration page, replacing it with a lightweight link to Execution Approvals; Feishu, DingTalk, WeCom webhooks and AI guidance now direct users to the new center (#28).
+
+### 🐛 Bug Fixes & Reliability
+- Replaces the browser-native `<datalist>` used for server groups with a searchable, custom-positioned selector that always exposes all existing groups even when a default value is prefilled (#27).
+- Fixes group data synchronization by merging and deduplicating groups from server records and group configuration, with host counts and consistent trimming before save or creation (#27).
+- Adds fuzzy filtering, IME composition protection, keyboard navigation, clear actions, mouse and touch support, and accurate mobile positioning for the new server-group selector (#27).
+- Renders the dropdown through `createPortal`, constrains it to narrow viewports, flips it upward when needed, and closes it when its anchor leaves the viewport to prevent modal overflow and clipping issues (#27).
+
+### ⚙️ Build, CI/CD & Developer Experience
+- Expands responsive and E2E coverage for server-group switching, the approvals center, vulnerability monitoring, and alert MCP prompt actions (#27, #28, #30, #31).
+- Adds backend coverage for intelligence sources, CVSS, approval aggregation, badge decoupling, authentication, and prompt generation; frontend unit tests and production builds pass, and Go vet/race tests complete successfully (#28, #30, #31).
+
+---
+
+### Included Changes / 包含的变更
+
+- #27 fix(servers): 修复新建/编辑服务器时所属分组下拉框交互问题 (@icaruszezen)
+- #28 feat(approvals): 将 MCP 执行审批独立为侧边栏「执行审批」中心 (@icaruszezen)
+- #30 feat(vuln): 新增 7×24 主流应用官方漏洞监测中心与自选监看应用管理 (@icaruszezen)
+- #31 feat(alerts): 告警卡片新增一键复制外部 MCP AI 诊断文案按钮 (@icaruszezen)
+
+**Full Changelog**: https://github.com/icaruszezen/ServerNeedSafe/compare/v2.8.0...v2.9.0
+
 ## v2.8.0 (2026-11-27)
 
 ## 中文更新说明
