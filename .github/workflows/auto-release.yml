@@ -1,0 +1,131 @@
+name: AI Auto Release PR & One-Click Publish
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["main", "master"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "SemVer bump override (auto = AI + Conventional Commits)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      model:
+        description: "Optional AI model override (e.g. claude-sonnet-4.5, gpt-4.1)"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Preview generated version & bilingual notes without creating/updating PR"
+        required: false
+        default: false
+        type: boolean
+
+# Queue rapid consecutive PR merges sequentially so no merged PR is ever dropped or races.
+concurrency:
+  group: auto-release-${{ github.event.pull_request.base.ref || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # 1. 业务 PR 合并后（或手动触发）：自动调用 GitHub AI 生成/增量更新双语版本发布 PR
+  # ============================================================================
+  prepare-release-pr:
+    name: Prepare / Update AI Bilingual Release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.ref != 'release/next' &&
+        !contains(github.event.pull_request.labels.*.name, 'autorelease: pending') &&
+        !contains(github.event.pull_request.labels.*.name, 'autorelease: tagged') &&
+        !contains(github.event.pull_request.labels.*.name, 'skip-release')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout Latest Default Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install GitHub Copilot CLI (when configured)
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'auto' }}
+        run: |
+          if [ -n "${COPILOT_GITHUB_TOKEN}" ] && [ "${AI_PROVIDER}" != "openai-compatible" ]; then
+            echo "Installing @github/copilot CLI..."
+            npm install -g @github/copilot
+          else
+            echo "COPILOT_GITHUB_TOKEN not set or AI_PROVIDER=openai-compatible; skipping Copilot CLI install."
+          fi
+
+      - name: Generate / Update Bilingual Release PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_BASE_URL: ${{ vars.AI_API_BASE_URL }}
+          AI_MODEL: ${{ inputs.model || vars.AI_MODEL }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'auto' }}
+          BUMP_OVERRIDE: ${{ inputs.bump || 'auto' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          TRIGGER_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          TRIGGER_PR_TITLE: ${{ github.event.pull_request.title || '' }}
+        run: node .github/scripts/release-bot.mjs prepare
+
+  # ============================================================================
+  # 2. 点击合并版本发布 PR 后：一键打 Tag、创建双语 Release 草稿并触发全平台产物构建与公开
+  # ============================================================================
+  publish-release:
+    name: Tag & Publish New Release (One-Click Merge)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      (
+        github.event.pull_request.head.ref == 'release/next' ||
+        contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - name: Checkout Release Merge Commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Tag Release, Create Draft Bilingual Notes & Dispatch Build Pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGER_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node .github/scripts/release-bot.mjs publish
