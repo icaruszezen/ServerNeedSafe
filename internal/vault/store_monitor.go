@@ -2100,11 +2100,100 @@ func (s *Store) AcknowledgeMonitorAlert(alertID, clientIP string) (*MonitorAlert
 	return nil, ErrNotFound
 }
 
-// ClearResolvedMonitorAlerts removes all resolved alert incidents (runtime-only).
-func (s *Store) ClearResolvedMonitorAlerts(clientIP string) (int, error) {
+// AcknowledgeMonitorAlertsBulk marks multiple firing alerts (by ID list, server ID, or all) as acknowledged.
+func (s *Store) AcknowledgeMonitorAlertsBulk(alertIDs []string, serverID, clientIP string) (int, error) {
 	if !s.IsReady() {
 		return 0, ErrVaultLocked
 	}
+	idSet := make(map[string]bool, len(alertIDs))
+	for _, id := range alertIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			idSet[trimmed] = true
+		}
+	}
+
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	acked := 0
+	for i := range s.monitorRT.Alerts {
+		al := &s.monitorRT.Alerts[i]
+		if al.Status != AlertStatusFiring {
+			continue
+		}
+		if len(idSet) > 0 && !idSet[al.ID] {
+			continue
+		}
+		if serverID != "" && al.ServerID != serverID {
+			continue
+		}
+		al.Status = AlertStatusAcknowledged
+		al.AcknowledgedAt = &now
+		acked++
+	}
+	if acked > 0 {
+		s.dirtyMonitor = true
+		target := "alerts"
+		if serverID != "" {
+			target = serverID
+		}
+		s.appendAuditRuntimeLocked("monitor.alert_ack_bulk", target, fmt.Sprintf("批量确认知晓监控告警 %d 条", acked), clientIP, true)
+	}
+	s.rtMu.Unlock()
+	if acked > 0 {
+		s.triggerFlush()
+	}
+	return acked, nil
+}
+
+// ResolveMonitorAlert manually marks an active alert as resolved and resets its breach streak.
+// If the underlying condition remains breached on the next collection sweep, the rule will re-trigger cleanly.
+func (s *Store) ResolveMonitorAlert(alertID, clientIP string) (*MonitorAlert, error) {
+	if !s.IsReady() {
+		return nil, ErrVaultLocked
+	}
+
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.rtMu.Unlock()
+		return nil, ErrNotFound
+	}
+	for i := range s.monitorRT.Alerts {
+		al := &s.monitorRT.Alerts[i]
+		if al.ID == alertID {
+			if al.Status != AlertStatusResolved {
+				now := time.Now().UTC()
+				al.Status = AlertStatusResolved
+				al.ResolvedAt = &now
+				al.LastSeenAt = now
+				delete(s.monitorRT.BreachStreaks, al.DedupKey)
+				s.dirtyMonitor = true
+				s.appendAuditRuntimeLocked("monitor.alert_resolve", al.ServerName, "人工标记已解决: "+al.Title, clientIP, true)
+			}
+			cp := *al
+			s.rtMu.Unlock()
+			s.triggerFlush()
+			return &cp, nil
+		}
+	}
+	s.rtMu.Unlock()
+	return nil, ErrNotFound
+}
+
+// ClearResolvedMonitorAlerts removes all resolved alert incidents (runtime-only).
+func (s *Store) ClearResolvedMonitorAlerts(clientIP string) (int, error) {
+	return s.ClearResolvedMonitorAlertsForServer("", clientIP)
+}
+
+// ClearResolvedMonitorAlertsForServer removes resolved alert incidents globally or scoped to one server.
+func (s *Store) ClearResolvedMonitorAlertsForServer(serverID, clientIP string) (int, error) {
+	if !s.IsReady() {
+		return 0, ErrVaultLocked
+	}
+	serverID = strings.TrimSpace(serverID)
 
 	s.rtMu.Lock()
 	if s.monitorRT == nil {
@@ -2114,21 +2203,43 @@ func (s *Store) ClearResolvedMonitorAlerts(clientIP string) (int, error) {
 	before := len(s.monitorRT.Alerts)
 	kept := make([]MonitorAlert, 0, before)
 	for _, al := range s.monitorRT.Alerts {
-		if al.Status != AlertStatusResolved {
-			kept = append(kept, al)
+		if al.Status == AlertStatusResolved && (serverID == "" || al.ServerID == serverID) {
+			continue
 		}
+		kept = append(kept, al)
 	}
 	removed := before - len(kept)
 	if removed > 0 {
 		s.monitorRT.Alerts = kept
 		s.dirtyMonitor = true
-		s.appendAuditRuntimeLocked("monitor.alerts_clear", "alerts", fmt.Sprintf("清理已恢复历史告警 %d 条", removed), clientIP, true)
+		target := "alerts"
+		if serverID != "" {
+			target = serverID
+		}
+		s.appendAuditRuntimeLocked("monitor.alerts_clear", target, fmt.Sprintf("清理已恢复历史告警 %d 条", removed), clientIP, true)
 	}
 	s.rtMu.Unlock()
 	if removed > 0 {
 		s.triggerFlush()
 	}
 	return removed, nil
+}
+
+// GetLatestMonitorSnapshotsMap returns cloned latest monitor snapshots keyed by server ID.
+func (s *Store) GetLatestMonitorSnapshotsMap() map[string]*ServerMonitorSnapshot {
+	if !s.IsReady() {
+		return map[string]*ServerMonitorSnapshot{}
+	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.monitorRT == nil || len(s.monitorRT.LatestSnapshots) == 0 {
+		return map[string]*ServerMonitorSnapshot{}
+	}
+	out := make(map[string]*ServerMonitorSnapshot, len(s.monitorRT.LatestSnapshots))
+	for k, v := range s.monitorRT.LatestSnapshots {
+		out[k] = cloneSnapshot(v)
+	}
+	return out
 }
 
 // AcceptServerPortBaseline pins the server's current exposed listening ports as its trusted port baseline.

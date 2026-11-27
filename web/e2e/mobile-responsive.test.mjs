@@ -702,30 +702,7 @@ async function runSuite() {
     await page.click('#mon-detail-subtab-security');
     await assertNoHorizontalOverflow(page, 'Monitor-Detail-Security-375');
 
-    await page.click('#mon-tab-alerts');
-    await page.waitForSelector('.mon-alerts-table tbody tr', { state: 'visible', timeout: 10000 });
-    await assertNoHorizontalOverflow(page, 'Monitor-Alerts-375');
-    await assertMobileInputsFontSizeAtLeast16(page, 'Monitor-Alerts-375');
-    const alertCardStyle = await page.$eval('.mon-alerts-table tbody tr', (tr) => {
-      const r = tr.getBoundingClientRect();
-      const firstTd = tr.querySelector('td');
-      return {
-        display: window.getComputedStyle(tr).display,
-        width: r.width,
-        hasLabel: Boolean(firstTd?.getAttribute('data-label')),
-      };
-    });
-    assert.equal(alertCardStyle.display, 'flex', 'Expected stacked flex card-row on .mon-alerts-table at 375px');
-    assert.ok(alertCardStyle.width <= 375.5 && alertCardStyle.hasLabel, 'Expected stacked alert card within 375px');
-
-    // Acknowledge a firing alert directly on the mobile stacked card!
-    const ackBtn = page.locator('.mon-alerts-table tbody tr button:has-text("确认知晓")').first();
-    if ((await ackBtn.count()) > 0) {
-      await ackBtn.click();
-      await page.waitForTimeout(300);
-      await assertNoHorizontalOverflow(page, 'Monitor-Alerts-AfterAck-375');
-    }
-
+    // Check Monitor Policy sub-tab on 375px
     await page.click('#mon-tab-policy');
     await page.waitForSelector('.mon-policy-table tbody tr', { state: 'visible' });
     await assertNoHorizontalOverflow(page, 'Monitor-Policy-375');
@@ -743,6 +720,33 @@ async function runSuite() {
     assert.equal(policyCardStyle.display, 'flex', 'Expected stacked flex card-row on .mon-policy-table at 375px');
     assert.ok(policyCardStyle.width <= 375.5, `Expected policy card width <= 375px, got ${policyCardStyle.width}`);
     assert.ok(policyCardStyle.inpHeight >= 38, `Expected .mon-rule-input height >= 38px, got ${policyCardStyle.inpHeight}`);
+
+    // Navigate to dedicated Alert Center (#nav-alerts-btn) and verify mobile cards, remediation expansion & ack on 375px
+    await navigateSection(page, '#nav-alerts-btn');
+    await page.waitForSelector('#alert-center-view .al-card', { state: 'visible', timeout: 10000 });
+    await assertNoHorizontalOverflow(page, 'AlertCenter-375');
+    await assertMobileInputsFontSizeAtLeast16(page, 'AlertCenter-375');
+    const alertCardStyle = await page.$eval('#alert-center-view .al-card', (card) => {
+      const r = card.getBoundingClientRect();
+      return {
+        width: r.width,
+        hasAdvicePreview: Boolean(card.querySelector('.al-advice-preview')),
+      };
+    });
+    assert.ok(alertCardStyle.width <= 375.5 && alertCardStyle.hasAdvicePreview, 'Expected AlertCenter card with smart advice within 375px');
+
+    // Expand first alert card to verify smart remediation commands fit within 375px
+    await page.locator('#alert-center-view .al-card .al-expand-btn').first().click();
+    await page.waitForSelector('#alert-center-view .al-remediation-panel', { state: 'visible', timeout: 5000 });
+    await assertNoHorizontalOverflow(page, 'AlertCenter-Expanded-375');
+
+    // Acknowledge a firing alert directly on the mobile card!
+    const ackBtn = page.locator('#alert-center-view .al-card button:has-text("确认知晓")').first();
+    if ((await ackBtn.count()) > 0) {
+      await ackBtn.click();
+      await page.waitForTimeout(300);
+      await assertNoHorizontalOverflow(page, 'AlertCenter-AfterAck-375');
+    }
 
     // Desktop 1440px Monitor grid check (6 KPI cols, 2 chart cols, table layout preserved)
     await page.setViewportSize({ width: 1440, height: 940 });
@@ -1187,32 +1191,33 @@ async function runSuite() {
       );
     }
 
-    // R2-1: Verify #mon-tab-alerts stacked mobile alert rows wrap unbroken IPv6 strings at 320x568
-    await page.click('#mon-tab-alerts');
+    // R2-1: Verify dedicated AlertCenter (#nav-alerts-btn) cards wrap unbroken IPv6 strings at 320x568
+    await navigateSection(page, '#nav-alerts-btn');
     await page.waitForFunction(
-      (host) => document.querySelector('.mon-alerts-table')?.textContent?.includes(host),
+      (host) => document.querySelector('#alert-center-view')?.textContent?.includes(host),
       ipv6Host,
       { timeout: 15000 }
     );
-    await assertNoHorizontalOverflow(page, 'R2-1-Monitor-Alerts-IPv6-320');
+    await assertNoHorizontalOverflow(page, 'R2-1-AlertCenter-IPv6-320');
     const r2AlertRowMetrics320 = await page.evaluate((host) => {
-      const rows = Array.from(document.querySelectorAll('.mon-alerts-table tbody tr'));
-      return rows.map((tr) => ({
-        hasIpv6: Boolean(tr.textContent?.includes(host)),
-        scrollWidth: tr.scrollWidth,
-        clientWidth: tr.clientWidth,
+      const cards = Array.from(document.querySelectorAll('#alert-center-view .al-card'));
+      return cards.map((card) => ({
+        hasIpv6: Boolean(card.textContent?.includes(host)),
+        scrollWidth: card.scrollWidth,
+        clientWidth: card.clientWidth,
       }));
     }, ipv6Host);
     assert.ok(
       r2AlertRowMetrics320.some((r) => r.hasIpv6),
-      `[R2-1] Expected IPv6 offline alert row in .mon-alerts-table at 320x568, got ${JSON.stringify(r2AlertRowMetrics320)}`
+      `[R2-1] Expected IPv6 offline alert card in #alert-center-view at 320x568, got ${JSON.stringify(r2AlertRowMetrics320)}`
     );
     for (const r of r2AlertRowMetrics320) {
       assert.ok(
         r.scrollWidth <= r.clientWidth + 2,
-        `[R2-1] Expected .mon-alerts-table tbody tr scrollWidth <= clientWidth + 2 at 320x568, got ${JSON.stringify(r)}`
+        `[R2-1] Expected #alert-center-view .al-card scrollWidth <= clientWidth + 2 at 320x568, got ${JSON.stringify(r)}`
       );
     }
+    await navigateSection(page, '#nav-monitor-btn');
     await page.click('#mon-tab-overview');
 
     await page.setViewportSize({ width: 1440, height: 940 });
@@ -1516,10 +1521,11 @@ async function runSuite() {
     await page.keyboard.press('Escape');
     await page.waitForSelector('.term-dropdown-newtab', { state: 'hidden' });
 
-    // Sweep all 7 sections across all 8 viewports (including tablet-820 & landscape-844x390!) in BOTH dark and light themes!
+    // Sweep all 8 sections across all 8 viewports (including tablet-820 & landscape-844x390!) in BOTH dark and light themes!
     const sectionBtns = [
       ['servers', '#nav-servers-btn'],
       ['monitor', '#nav-monitor-btn'],
+      ['alerts', '#nav-alerts-btn'],
       ['terminals', '#nav-terminals-btn'],
       ['ai', '#nav-ai-btn'],
       ['keychain', '#nav-keychain-btn'],

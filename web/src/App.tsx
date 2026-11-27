@@ -3,6 +3,7 @@ import {
   ShieldCheck,
   Server,
   Activity,
+  Bell,
   Terminal,
   Bot,
   KeyRound,
@@ -27,20 +28,30 @@ import type {
 } from './types';
 import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
-import { MonitorCenter } from './components/MonitorCenter';
-import { TerminalWorkspace } from './components/TerminalWorkspace';
-import { AIOpsCenter, type CenterTab } from './components/AIOpsCenter';
+import { MonitorCenter, type MonitorSubTab } from './components/MonitorCenter';
+import { AlertCenter, type AlertTargetNavigation } from './components/AlertCenter';
+import { TerminalWorkspace, type PendingTerminalCommand } from './components/TerminalWorkspace';
+import { AIOpsCenter, type AIDiagnosisDraft, type CenterTab } from './components/AIOpsCenter';
 import type { MemorySubSection } from './components/AIMemoryAgentsTab';
 import { KeychainManager } from './components/KeychainManager';
 import { SnippetManager } from './components/SnippetManager';
 import { VaultSecurity } from './components/VaultSecurity';
 import { UpdateModal } from './components/UpdateModal';
 
-type NavKey = 'servers' | 'monitor' | 'terminals' | 'ai' | 'keychain' | 'snippets' | 'vault';
+type NavKey =
+  | 'servers'
+  | 'monitor'
+  | 'alerts'
+  | 'terminals'
+  | 'ai'
+  | 'keychain'
+  | 'snippets'
+  | 'vault';
 
 const NAV_KEY_LABELS: Record<NavKey, string> = {
   servers: '主机资产',
   monitor: '状态监控',
+  alerts: '告警信息',
   terminals: '终端工作台',
   ai: 'AI 智能运维',
   keychain: '凭据与密钥',
@@ -60,9 +71,15 @@ export const App: React.FC = () => {
   const [activeNav, setActiveNav] = useState<NavKey>('servers');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [monitorTargetId, setMonitorTargetId] = useState<string>('');
+  const [monitorInitialSubTab, setMonitorInitialSubTab] = useState<MonitorSubTab | undefined>(
+    undefined
+  );
+  const [alertsTarget, setAlertsTarget] = useState<AlertTargetNavigation | null>(null);
   const [aiInitialTab, setAiInitialTab] = useState<CenterTab | undefined>(undefined);
   const [aiInitialMemorySection, setAiInitialMemorySection] = useState<MemorySubSection | undefined>(undefined);
+  const [aiInitialDraft, setAiInitialDraft] = useState<AIDiagnosisDraft | null>(null);
   const [firingAlertsCount, setFiringAlertsCount] = useState<number>(0);
+  const [activeAlertsByServer, setActiveAlertsByServer] = useState<Record<string, number>>({});
   const [patrolUnreadCount, setPatrolUnreadCount] = useState<number>(0);
 
   // Workspace State (populated in 1 RTT once session is authenticated)
@@ -76,6 +93,8 @@ export const App: React.FC = () => {
   const [terminalTabs, setTerminalTabs] = useState<OpenTerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('');
   const [openSftpOnNextTab, setOpenSftpOnNextTab] = useState(false);
+  const [pendingTerminalCommand, setPendingTerminalCommand] =
+    useState<PendingTerminalCommand | null>(null);
 
   // Toast notifications
   const [toasts, setToasts] = useState<{ id: number; msg: string }[]>([]);
@@ -123,8 +142,13 @@ export const App: React.FC = () => {
     setSnippets([]);
     setTerminalTabs([]);
     setActiveTabId('');
+    setPendingTerminalCommand(null);
     setMonitorTargetId('');
+    setMonitorInitialSubTab(undefined);
+    setAlertsTarget(null);
+    setAiInitialDraft(null);
     setFiringAlertsCount(0);
+    setActiveAlertsByServer({});
     setPatrolUnreadCount(0);
     setUpdateOverview(null);
     setUpdateModalOpen(false);
@@ -155,6 +179,7 @@ export const App: React.FC = () => {
       setCredentials(boot.credentials || []);
       setSnippets(boot.snippets || []);
       setFiringAlertsCount(boot.firing_alerts || 0);
+      setActiveAlertsByServer(boot.active_alerts_by_server || {});
       setPatrolUnreadCount(boot.patrol_unread || 0);
     } catch {
       // Handled by global 401 listener if session expired
@@ -246,9 +271,59 @@ export const App: React.FC = () => {
   };
 
   const handleOpenMonitor = (serverId: string) => {
+    setMonitorInitialSubTab(undefined);
     setMonitorTargetId(serverId);
     setMobileNavOpen(false);
     setActiveNav('monitor');
+  };
+
+  const handleOpenMonitorPolicy = () => {
+    setMonitorTargetId('');
+    setMonitorInitialSubTab('policy');
+    setMobileNavOpen(false);
+    setActiveNav('monitor');
+  };
+
+  const handleOpenAlerts = (serverId?: string) => {
+    setAlertsTarget({ serverId: serverId || '', nonce: Date.now() + Math.random() });
+    setMobileNavOpen(false);
+    setActiveNav('alerts');
+  };
+
+  const handleRunTerminalCommand = (
+    srv: ServerView,
+    command: string,
+    autoExecute: boolean
+  ) => {
+    const existing = terminalTabs.find((t) => t.server.id === srv.id);
+    let targetTabId = existing?.tabId || '';
+    if (!targetTabId) {
+      targetTabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      setTerminalTabs((prev) => [...prev, { tabId: targetTabId, server: srv }]);
+    }
+    setActiveTabId(targetTabId);
+    setPendingTerminalCommand({
+      tabId: targetTabId,
+      serverId: srv.id,
+      command,
+      autoExecute,
+      nonce: Date.now() + Math.random(),
+    });
+    setMobileNavOpen(false);
+    setActiveNav('terminals');
+  };
+
+  const handleDiagnoseAlertWithAI = (serverId: string, prompt: string) => {
+    setAiInitialTab('diagnosis');
+    setAiInitialMemorySection(undefined);
+    setAiInitialDraft({
+      serverId,
+      prompt,
+      nonce: Date.now() + Math.random(),
+    });
+    setMobileNavOpen(false);
+    setActiveNav('ai');
+    notify('已选中目标主机并预填告警排障提示词，确认后点击发送即可启动 AI 诊断');
   };
 
   const handleCloseTab = (tabId: string) => {
@@ -371,11 +446,8 @@ export const App: React.FC = () => {
               type="button"
               className="nav-badge danger"
               style={{ border: 'none', cursor: 'pointer', padding: '2px 8px' }}
-              onClick={() => {
-                setMobileNavOpen(false);
-                setActiveNav('monitor');
-              }}
-              title="查看未恢复监控告警"
+              onClick={() => handleOpenAlerts()}
+              title="查看未恢复告警信息"
             >
               {firingAlertsCount} 告警
             </button>
@@ -467,13 +539,25 @@ export const App: React.FC = () => {
             <span className="nav-item-left">
               <Activity size={16} /> 状态监控
             </span>
-            {firingAlertsCount > 0 ? (
-              <span className="nav-badge danger">{firingAlertsCount}</span>
-            ) : servers.length > 0 ? (
+            {servers.length > 0 && (
               <span className="nav-badge live">
                 {servers.filter((s) => s.monitor_enabled !== false).length}
               </span>
-            ) : null}
+            )}
+          </button>
+
+          <button
+            type="button"
+            id="nav-alerts-btn"
+            className={`nav-item ${activeNav === 'alerts' ? 'active' : ''}`}
+            onClick={() => handleOpenAlerts()}
+          >
+            <span className="nav-item-left">
+              <Bell size={16} /> 告警信息
+            </span>
+            {firingAlertsCount > 0 && (
+              <span className="nav-badge danger">{firingAlertsCount}</span>
+            )}
           </button>
 
           <button
@@ -654,10 +738,12 @@ export const App: React.FC = () => {
             groups={groups}
             credentials={credentials}
             activeServerIds={activeServerIds}
+            activeAlertsByServer={activeAlertsByServer}
             showHiddenFiles={settings?.show_hidden_files}
             onRefresh={loadWorkspaceData}
             onConnectTerminal={handleConnectTerminal}
             onOpenMonitor={handleOpenMonitor}
+            onOpenServerAlerts={handleOpenAlerts}
             onNotify={notify}
           />
         )}
@@ -666,10 +752,35 @@ export const App: React.FC = () => {
           <MonitorCenter
             servers={servers}
             initialServerId={monitorTargetId}
+            initialSubTab={monitorInitialSubTab}
             onClearInitialServer={() => setMonitorTargetId('')}
+            onClearInitialSubTab={() => setMonitorInitialSubTab(undefined)}
             onConnectTerminal={handleConnectTerminal}
             onNavigateServers={() => setActiveNav('servers')}
+            onOpenServerAlerts={handleOpenAlerts}
             onFiringCountChange={setFiringAlertsCount}
+            onActiveByServerChange={setActiveAlertsByServer}
+            onNotify={notify}
+          />
+        )}
+
+        {activeNav === 'alerts' && (
+          <AlertCenter
+            servers={servers}
+            initialTarget={alertsTarget}
+            onClearInitialTarget={() => setAlertsTarget(null)}
+            onFiringCountChange={setFiringAlertsCount}
+            onActiveByServerChange={setActiveAlertsByServer}
+            onOpenMonitorDetail={handleOpenMonitor}
+            onOpenMonitorPolicy={handleOpenMonitorPolicy}
+            onOpenVaultSecurity={() => setActiveNav('vault')}
+            onRunTerminalCommand={handleRunTerminalCommand}
+            onDiagnoseWithAI={handleDiagnoseAlertWithAI}
+            onOpenRunbook={() => {
+              setAiInitialTab('memory');
+              setAiInitialMemorySection('runbooks');
+              setActiveNav('ai');
+            }}
             onNotify={notify}
           />
         )}
@@ -692,6 +803,8 @@ export const App: React.FC = () => {
               settings={settings}
               defaultOpenSftp={openSftpOnNextTab}
               onConsumeDefaultSftp={() => setOpenSftpOnNextTab(false)}
+              pendingCommand={pendingTerminalCommand}
+              onConsumePendingCommand={() => setPendingTerminalCommand(null)}
               onSelectTab={setActiveTabId}
               onCloseTab={handleCloseTab}
               onOpenServerTab={(srv) => handleConnectTerminal(srv, false)}
@@ -712,10 +825,12 @@ export const App: React.FC = () => {
             servers={servers}
             initialTab={aiInitialTab}
             initialMemorySection={aiInitialMemorySection}
+            initialDraft={aiInitialDraft}
             onConsumeInitialTab={() => {
               setAiInitialTab(undefined);
               setAiInitialMemorySection(undefined);
             }}
+            onConsumeInitialDraft={() => setAiInitialDraft(null)}
             onBadgeChange={setPatrolUnreadCount}
             onRefreshWorkspace={loadWorkspaceData}
             onNotify={notify}

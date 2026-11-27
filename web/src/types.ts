@@ -278,6 +278,7 @@ export interface WorkspaceBootstrapResponse {
   snippets: Snippet[];
   active_sessions: { id: string; server_id: string; server_name: string; started_at: string }[];
   firing_alerts: number;
+  active_alerts_by_server?: Record<string, number>;
   patrol_unread: number;
 }
 
@@ -639,6 +640,38 @@ export interface ServerMonitorSnapshot {
   security: SecurityPostureStat;
 }
 
+export interface AlertCommandSuggestion {
+  label: string;
+  description?: string;
+  command: string;
+  risk: 'readonly' | 'mutating';
+}
+
+export interface AlertQuickAction {
+  kind: 'accept_port_baseline' | 'accept_security_baseline' | 'open_vault_known_hosts' | string;
+  label: string;
+  description?: string;
+}
+
+export interface AlertRunbookRef {
+  id: string;
+  title: string;
+  category?: string;
+  symptom?: string;
+}
+
+export interface AlertAdvice {
+  summary: string;
+  root_cause?: string;
+  evidence?: string[];
+  steps?: string[];
+  commands?: AlertCommandSuggestion[];
+  quick_actions?: AlertQuickAction[];
+  runbooks?: AlertRunbookRef[];
+  ai_prompt?: string;
+  context_aware?: boolean;
+}
+
 export interface MonitorAlert {
   id: string;
   dedup_key: string;
@@ -647,6 +680,7 @@ export interface MonitorAlert {
   host: string;
   rule_kind: string;
   rule_name: string;
+  category?: string;
   severity: AlertSeverity;
   status: AlertStatus;
   title: string;
@@ -658,6 +692,25 @@ export interface MonitorAlert {
   last_seen_at: string;
   acknowledged_at?: string;
   resolved_at?: string;
+  advice?: AlertAdvice;
+}
+
+export interface AlertSummaryStats {
+  total_active: number;
+  firing: number;
+  acknowledged: number;
+  resolved: number;
+  critical_active: number;
+  warning_active: number;
+  affected_servers: number;
+  active_by_server: Record<string, number>;
+  active_by_category: Record<string, number>;
+}
+
+export interface MonitorAlertsListResponse {
+  alerts: MonitorAlert[];
+  summary?: AlertSummaryStats;
+  scoped_summary?: AlertSummaryStats;
 }
 
 export interface ServerSLASummary {

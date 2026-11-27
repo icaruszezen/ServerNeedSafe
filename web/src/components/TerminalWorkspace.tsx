@@ -39,6 +39,14 @@ function stripAnsi(str: string): string {
   return str.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 }
 
+export interface PendingTerminalCommand {
+  tabId: string;
+  serverId: string;
+  command: string;
+  autoExecute: boolean;
+  nonce: number;
+}
+
 interface TerminalWorkspaceProps {
   tabs: OpenTerminalTab[];
   activeTabId: string;
@@ -48,6 +56,8 @@ interface TerminalWorkspaceProps {
   settings?: AppSettings;
   defaultOpenSftp?: boolean;
   onConsumeDefaultSftp?: () => void;
+  pendingCommand?: PendingTerminalCommand | null;
+  onConsumePendingCommand?: () => void;
   onSelectTab: (tabId: string) => void;
   onCloseTab: (tabId: string) => void;
   onOpenServerTab: (server: ServerView) => void;
@@ -436,6 +446,8 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   settings,
   defaultOpenSftp,
   onConsumeDefaultSftp,
+  pendingCommand,
+  onConsumePendingCommand,
   onSelectTab,
   onCloseTab,
   onOpenServerTab,
@@ -445,6 +457,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   onNotify,
 }) => {
   const handlesRef = useRef<Record<string, SinglePaneHandle | null>>({});
+  const consumedCommandNonceRef = useRef<number>(0);
   const [tabMeta, setTabMeta] = useState<
     Record<
       string,
@@ -476,6 +489,39 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     tabId: string;
     info: HostKeyUntrustedInfo;
   } | null>(null);
+
+  // Dispatch queued remediation command once target terminal tab is connected
+  useEffect(() => {
+    if (!pendingCommand || consumedCommandNonceRef.current === pendingCommand.nonce) {
+      return;
+    }
+    const meta = tabMeta[pendingCommand.tabId];
+    if (!meta) return;
+    if (meta.status === 'error' || meta.status === 'closed') {
+      consumedCommandNonceRef.current = pendingCommand.nonce;
+      onConsumePendingCommand?.();
+      return;
+    }
+    if (meta.status !== 'connected') return;
+
+    const handle = handlesRef.current[pendingCommand.tabId];
+    if (!handle) return;
+
+    consumedCommandNonceRef.current = pendingCommand.nonce;
+    const { command, autoExecute } = pendingCommand;
+    const timer = window.setTimeout(() => {
+      if (autoExecute) {
+        handle.sendCommand(command);
+        onNotify('已在 SSH 终端执行只读排查指令');
+      } else {
+        handle.sendRaw(command);
+        handle.focus();
+        onNotify('已将变更指令填入终端命令行，请核对无误后按回车执行');
+      }
+      onConsumePendingCommand?.();
+    }, 240);
+    return () => window.clearTimeout(timer);
+  }, [pendingCommand, tabMeta, onConsumePendingCommand, onNotify]);
 
   const clearModifierLatches = useCallback(() => {
     ctrlLatchRef.current = false;

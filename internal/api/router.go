@@ -263,6 +263,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/monitor/test-webhook", s.requireAuth(s.handleTestMonitorWebhook))
 	s.mux.HandleFunc("GET /api/monitor/alerts", s.requireAuth(s.handleListMonitorAlerts))
 	s.mux.HandleFunc("POST /api/monitor/alerts/ack", s.requireAuth(s.handleAckMonitorAlert))
+	s.mux.HandleFunc("POST /api/monitor/alerts/ack-bulk", s.requireAuth(s.handleAckMonitorAlertsBulk))
+	s.mux.HandleFunc("POST /api/monitor/alerts/resolve", s.requireAuth(s.handleResolveMonitorAlert))
 	s.mux.HandleFunc("POST /api/monitor/alerts/clear-resolved", s.requireAuth(s.handleClearResolvedMonitorAlerts))
 	s.mux.HandleFunc("GET /api/monitor/policy", s.requireAuth(s.handleGetMonitorPolicy))
 	s.mux.HandleFunc("PUT /api/monitor/policy", s.requireAuth(s.handleUpdateMonitorPolicy))

@@ -1500,3 +1500,80 @@
   }
 }
 
+@media (max-width: 768px) {
+  .al-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .al-card {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .al-card-main {
+    padding: 12px;
+    min-width: 0;
+  }
+
+  .al-card-body {
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .al-metric-box {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .al-filter-controls {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .al-filter-select,
+  .al-filter-select.server,
+  .al-search-box {
+    max-width: 100%;
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+
+  .al-filter-select,
+  .al-search-input {
+    font-size: 16px;
+    height: 40px;
+  }
+
+  .al-card-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .al-card-actions-left,
+  .al-card-actions-right {
+    width: 100%;
+  }
+
+  .al-card-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .al-server-pill {
+    border-radius: 10px;
+  }
+
+  .al-advice-preview {
+    min-width: 0;
+  }
+
+  .al-advice-preview-text {
+    flex: 1 1 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
+
