@@ -706,6 +706,7 @@ export interface AlertAdvice {
   quick_actions?: AlertQuickAction[];
   runbooks?: AlertRunbookRef[];
   ai_prompt?: string;
+  mcp_prompt?: string;
   context_aware?: boolean;
 }
 

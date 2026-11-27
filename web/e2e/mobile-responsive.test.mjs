@@ -756,6 +756,83 @@ async function runSuite() {
     });
     assert.ok(alertCardStyle.width <= 375.5 && alertCardStyle.hasAdvicePreview, 'Expected AlertCenter card with smart advice within 375px');
 
+    // Verify one-click Copy External MCP AI Prompt button sits right beside "AI 深度诊断" and copies rich MCP prompt
+    await page.evaluate(() => {
+      // Capture copied text cleanly in headless Chromium (supports both Clipboard API & execCommand fallback)
+      window.__capturedCopiedText = '';
+      const origExec = document.execCommand?.bind(document);
+      document.execCommand = (cmd, ...rest) => {
+        if (String(cmd).toLowerCase() === 'copy') {
+          const active = document.activeElement;
+          if (active && 'value' in active && typeof active.value === 'string') {
+            window.__capturedCopiedText = active.value;
+          }
+          return true;
+        }
+        return origExec ? origExec(cmd, ...rest) : false;
+      };
+      try {
+        Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: {
+            writeText: async (text) => {
+              window.__capturedCopiedText = String(text);
+            },
+          },
+        });
+      } catch {
+        // Fallback execCommand spy above still captures the copied payload.
+      }
+    });
+    const mcpCopyMetrics = await page.$eval('#alert-center-view .al-card', (card) => {
+      const actionsRight = card.querySelector('.al-card-actions-right');
+      const copyBtn = actionsRight?.querySelector('button[data-action="copy-mcp-prompt"]');
+      const aiBtn = Array.from(actionsRight?.querySelectorAll('button') || []).find((b) =>
+        (b.textContent || '').includes('AI 深度诊断')
+      );
+      const cardRect = card.getBoundingClientRect();
+      const copyRect = copyBtn?.getBoundingClientRect();
+      const aiRect = aiBtn?.getBoundingClientRect();
+      return {
+        hasCopyBtn: Boolean(copyBtn),
+        hasAiBtn: Boolean(aiBtn),
+        adjacent: Boolean(copyBtn && aiBtn && copyBtn.nextElementSibling === aiBtn),
+        copyInsideCard: Boolean(
+          copyRect && copyRect.left >= cardRect.left - 0.5 && copyRect.right <= cardRect.right + 0.5
+        ),
+        aiInsideCard: Boolean(
+          aiRect && aiRect.left >= cardRect.left - 0.5 && aiRect.right <= cardRect.right + 0.5
+        ),
+      };
+    });
+    assert.ok(
+      mcpCopyMetrics.hasCopyBtn &&
+        mcpCopyMetrics.hasAiBtn &&
+        mcpCopyMetrics.adjacent &&
+        mcpCopyMetrics.copyInsideCard &&
+        mcpCopyMetrics.aiInsideCard,
+      `Expected Copy MCP Prompt button adjacent to AI 深度诊断 inside card bounds at 375px, got ${JSON.stringify(mcpCopyMetrics)}`
+    );
+
+    const copyMcpBtn = page.locator('#alert-center-view .al-card button[data-action="copy-mcp-prompt"]').first();
+    await copyMcpBtn.click();
+    await page.waitForFunction(
+      () =>
+        document
+          .querySelector('#alert-center-view .al-card button[data-action="copy-mcp-prompt"]')
+          ?.textContent?.includes('已复制 MCP 文案'),
+      null,
+      { timeout: 3000 }
+    );
+    const copiedMcpPrompt = await page.evaluate(() => window.__capturedCopiedText || '');
+    for (const token of ['serverneedsafe', 'get_ops_context', 'get_server_detail', 'propose_change_plan']) {
+      assert.ok(
+        copiedMcpPrompt.includes(token),
+        `Expected copied MCP prompt to include ${token}, got: ${copiedMcpPrompt.slice(0, 300)}`
+      );
+    }
+    await assertNoHorizontalOverflow(page, 'AlertCenter-AfterCopyMCP-375');
+
     // Expand first alert card to verify smart remediation commands fit within 375px
     await page.locator('#alert-center-view .al-card .al-expand-btn').first().click();
     await page.waitForSelector('#alert-center-view .al-remediation-panel', { state: 'visible', timeout: 5000 });
