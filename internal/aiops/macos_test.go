@@ -133,7 +133,7 @@ EOF`)
 if [ "$3" = "tcp" ]; then
   printf "tcp4 0 0 *.22 *.* LISTEN\ntcp4 0 0 127.0.0.1.18899 *.* LISTEN\n"
 else
-  printf "udp4 0 0 *.5353 *.*\n"
+  printf "udp4 0 0 *.5353 *.*\nudp4 0 0 *.63446 *.*\n"
 fi`)
 	writeStub("launchctl", `printf "PID\tStatus\tLabel\n-\t1\tcom.apple.ignoreme\n-\t78\thomebrew.mxcl.redis\n"`)
 

@@ -20,9 +20,11 @@ type AlertCommandSuggestion struct {
 
 // AlertQuickAction represents a built-in UI quick-remediation action for an alert.
 type AlertQuickAction struct {
-	Kind        string `json:"kind"` // "accept_port_baseline", "accept_security_baseline", "open_vault_known_hosts"
+	Kind        string `json:"kind"` // "accept_port_baseline", "ignore_port_drift_process", "ignore_port_drift_port", "accept_security_baseline", "open_vault_known_hosts"
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
+	Target      string `json:"target,omitempty"` // Optional rule target (e.g. process name or proto/port for drift ignore)
+	Scope       string `json:"scope,omitempty"`  // Optional rule scope ("server" or "global")
 }
 
 // AlertRunbookRef points to an existing user-saved AI Runbook relevant to an alert.
@@ -133,16 +135,31 @@ func EnrichAlerts(
 	snapshots map[string]*vault.ServerMonitorSnapshot,
 	runbooks []vault.AIRunbook,
 ) []EnrichedMonitorAlert {
+	return EnrichAlertsWithBaselines(alerts, snapshots, nil, runbooks)
+}
+
+// EnrichAlertsWithBaselines decorates raw MonitorAlerts using live snapshots and trusted port baselines
+// so port_drift advice pinpoints exact newly exposed sockets and dynamic-port processes.
+func EnrichAlertsWithBaselines(
+	alerts []vault.MonitorAlert,
+	snapshots map[string]*vault.ServerMonitorSnapshot,
+	portBaselines map[string][]string,
+	runbooks []vault.AIRunbook,
+) []EnrichedMonitorAlert {
 	out := make([]EnrichedMonitorAlert, 0, len(alerts))
 	for _, al := range alerts {
 		var snap *vault.ServerMonitorSnapshot
 		if snapshots != nil {
 			snap = snapshots[al.ServerID]
 		}
+		var base []string
+		if portBaselines != nil {
+			base = portBaselines[al.ServerID]
+		}
 		out = append(out, EnrichedMonitorAlert{
 			MonitorAlert: al,
 			Category:     RuleCategoryForKind(al.RuleKind),
-			Advice:       BuildAlertAdvice(al, snap, runbooks),
+			Advice:       BuildAlertAdviceWithPortBaseline(al, snap, base, runbooks),
 		})
 	}
 	return out
@@ -367,6 +384,11 @@ func buildAlertAIPrompt(al vault.MonitorAlert, advice *AlertAdvice) string {
 
 // BuildAlertAdvice generates deterministic, context-aware remediation guidance for all 34 alert rule kinds.
 func BuildAlertAdvice(al vault.MonitorAlert, snap *vault.ServerMonitorSnapshot, runbooks []vault.AIRunbook) *AlertAdvice {
+	return BuildAlertAdviceWithPortBaseline(al, snap, nil, runbooks)
+}
+
+// BuildAlertAdviceWithPortBaseline generates deterministic remediation guidance with exact port-baseline diff context.
+func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerMonitorSnapshot, portBaseline []string, runbooks []vault.AIRunbook) *AlertAdvice {
 	mac := isMacOSSnap(snap)
 	adv := &AlertAdvice{
 		ContextAware: snap != nil && snap.Reachable,
@@ -1231,39 +1253,104 @@ func BuildAlertAdvice(al vault.MonitorAlert, snap *vault.ServerMonitorSnapshot, 
 		}
 
 	case "port_drift":
-		adv.Summary = "发现新增对外暴露的监听端口，请核实是否为正常发布的新服务，若确认合法可直接一键「采纳端口基线」"
-		adv.RootCause = "新部署应用默认绑定 0.0.0.0 对外暴露、调试端口遗留，或恶意程序开启了未授权后门监听。"
+		adv.Summary = "发现新增对外暴露的监听端口：若为固定新服务可一键「采纳当前端口基线」，若为动态轮换端口应用（如远程桌面/P2P/代理）可一键「忽略该进程漂移」"
+		adv.RootCause = "常见原因包括新发布服务绑定 0.0.0.0、远程桌面/P2P/代理程序自动分配并频繁轮换动态端口，或恶意程序开启未授权后门监听。"
+		var driftedPorts []vault.ListeningPortStat
+		ignoredDynamicCnt := 0
 		if snap != nil {
-			cnt := 0
 			for _, lp := range snap.ListeningPorts {
-				if lp.PublicExposed {
-					proc := fallbackStr(lp.Process, "未知进程")
-					adv.Evidence = append(adv.Evidence, fmt.Sprintf("%s/%d 绑定 %s — 进程 %s (PID %d)", lp.Proto, lp.Port, lp.BindAddr, proc, lp.PID))
-					cnt++
-					if cnt >= 5 {
-						break
+				if lp.PublicExposed && lp.DriftIgnored {
+					ignoredDynamicCnt++
+				}
+			}
+			if len(portBaseline) > 0 {
+				driftedPorts = vault.ComputeDriftedPorts(snap.ListeningPorts, portBaseline)
+			} else {
+				for _, lp := range snap.ListeningPorts {
+					if lp.PublicExposed && !lp.DriftIgnored {
+						driftedPorts = append(driftedPorts, lp)
 					}
 				}
 			}
+			for i, lp := range driftedPorts {
+				if i >= 6 {
+					break
+				}
+				proc := fallbackStr(lp.Process, "未知进程")
+				pidHint := ""
+				if lp.PID > 0 {
+					pidHint = fmt.Sprintf(" (PID %d)", lp.PID)
+				}
+				adv.Evidence = append(adv.Evidence, fmt.Sprintf("新增漂移：%s/%d 绑定 %s — 进程 %s%s", lp.Proto, lp.Port, lp.BindAddr, proc, pidHint))
+			}
+			if ignoredDynamicCnt > 0 {
+				adv.Evidence = append(adv.Evidence, fmt.Sprintf("另有 %d 个临时高端口 UDP 或白名单动态端口已自动免打扰过滤", ignoredDynamicCnt))
+			}
 		}
 		adv.Steps = []string{
-			"核查新暴露端口对应的进程、二进制路径及是否为预期业务变更",
-			"若属于仅限本机访问的数据库/缓存/管理端口，请改绑 127.0.0.1 或在防火墙中收紧访问来源",
-			"若确认为合法对外服务变更，直接点击下方「采纳端口基线」即可更新基线并关闭此告警",
+			"先核查新增端口所属进程与二进制路径，确认是合法固定服务、动态端口应用，还是异常未授权监听",
+			"若属固定对外业务端口变更，点击下方「采纳当前端口基线」更新基线并关闭告警",
+			"若属会反复更换随机端口的应用（如 RustDesk / ToDesk / P2P / 代理），直接点击下方「忽略进程漂移」将其加入白名单，或在「监控策略」中配置全局忽略规则",
 		}
-		adv.Commands = []AlertCommandSuggestion{
-			{
-				Label:       "核查全部对外暴露监听端口及进程路径",
-				Description: "列出非 127.0.0.1 监听套接字与对应进程信息",
-				Command:     "ss -tulnp | grep -vE '127\\.0\\.0\\.1|\\[::1\\]'",
-				Risk:        "readonly",
-			},
+		if mac {
+			adv.Commands = []AlertCommandSuggestion{
+				{
+					Label:       "核查 macOS 对外监听端口及归属进程",
+					Description: "列出 TCP LISTEN 端口与 UDP 未连接套接字以核对进程归属",
+					Command:     "lsof -nP -iTCP -sTCP:LISTEN; netstat -anv -p udp | awk '$5 == \"*.*\"'",
+					Risk:        "readonly",
+				},
+			}
+		} else {
+			adv.Commands = []AlertCommandSuggestion{
+				{
+					Label:       "核查全部对外暴露监听端口及进程路径",
+					Description: "列出非 127.0.0.1 监听套接字与对应进程信息",
+					Command:     "ss -tulnp | grep -vE '127\\.0\\.0\\.1|\\[::1\\]'",
+					Risk:        "readonly",
+				},
+			}
 		}
 		adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
 			Kind:        "accept_port_baseline",
 			Label:       "采纳当前端口基线",
-			Description: "确认新增监听端口属合法业务变更，立即更新端口基线并消除此告警",
+			Description: "确认新增监听端口属合法固定服务变更，立即更新端口基线并消除此告警",
 		})
+		seenIgnoreProcs := make(map[string]bool)
+		addedIgnoreActions := 0
+		for _, lp := range driftedPorts {
+			if addedIgnoreActions >= 3 {
+				break
+			}
+			proc := strings.TrimSpace(lp.Process)
+			if proc != "" {
+				cleanPat, err := vault.ValidatePortDriftProcessPattern(proc)
+				if err == nil && !seenIgnoreProcs[strings.ToLower(cleanPat)] {
+					seenIgnoreProcs[strings.ToLower(cleanPat)] = true
+					adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
+						Kind:        "ignore_port_drift_process",
+						Label:       fmt.Sprintf("忽略进程 %s 漂移", cleanPat),
+						Description: fmt.Sprintf("将该动态端口进程加入本机端口漂移白名单，后续 %s 轮换监听端口不再误报", cleanPat),
+						Target:      cleanPat,
+						Scope:       "server",
+					})
+					addedIgnoreActions++
+				}
+			} else if lp.Port > 0 {
+				spec := fmt.Sprintf("%s/%d", vault.NormalizeBaseProto(lp.Proto), lp.Port)
+				if !seenIgnoreProcs[spec] {
+					seenIgnoreProcs[spec] = true
+					adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
+						Kind:        "ignore_port_drift_port",
+						Label:       fmt.Sprintf("忽略端口 %s", spec),
+						Description: fmt.Sprintf("将 %s 加入本机端口漂移忽略白名单", spec),
+						Target:      spec,
+						Scope:       "server",
+					})
+					addedIgnoreActions++
+				}
+			}
+		}
 
 	// =========================================================================
 	// 6. Security & Intrusion (Zero-AI Deterministic)

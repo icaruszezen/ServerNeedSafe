@@ -115,8 +115,20 @@ func sanitizeMonitorSettings(in MonitorSettings) MonitorSettings {
 		in.MaxAlertRecords = 2000
 	}
 	in.WebhookURL = strings.TrimSpace(in.WebhookURL)
+	in.PortDriftIgnoreProcesses = SanitizePortDriftProcessPatterns(in.PortDriftIgnoreProcesses)
+	in.PortDriftIgnorePorts = SanitizePortDriftPortSpecs(in.PortDriftIgnorePorts)
 	in.PolicyVersion = CurrentMonitorPolicyVersion
-	return in
+	return cloneMonitorSettings(in)
+}
+
+func validateMonitorSettings(in MonitorSettings) error {
+	if _, err := ValidatePortDriftProcessPatternsStrict(in.PortDriftIgnoreProcesses); err != nil {
+		return err
+	}
+	if _, err := ValidatePortDriftPortSpecsStrict(in.PortDriftIgnorePorts); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateMonitorAlertRules(rules []MonitorAlertRule) error {
@@ -206,13 +218,19 @@ func ensureMonitorInitialized(state *VaultState) {
 	if m.Settings.IntervalSec == 0 && m.Settings.RetentionPoints == 0 {
 		m.Settings = DefaultMonitorSettings()
 	} else {
-		if m.Settings.PolicyVersion < CurrentMonitorPolicyVersion {
+		if m.Settings.PolicyVersion < 2 {
 			if m.Settings.SlowIntervalSec <= 0 {
 				m.Settings.SlowIntervalSec = 300
 			}
 			m.Settings.UseSSHConnectionPool = true
-			m.Settings.PolicyVersion = CurrentMonitorPolicyVersion
 		}
+		if m.Settings.PolicyVersion < 3 {
+			m.Settings.PortDriftIgnoreEphemeralUDP = true
+			if len(m.Settings.PortDriftIgnoreProcesses) == 0 {
+				m.Settings.PortDriftIgnoreProcesses = DefaultPortDriftIgnoreProcesses()
+			}
+		}
+		m.Settings.PolicyVersion = CurrentMonitorPolicyVersion
 		m.Settings = sanitizeMonitorSettings(m.Settings)
 	}
 	if m.LatestSnapshots == nil {
@@ -293,7 +311,7 @@ func cloneMonitorVaultData(in *MonitorVaultData) *MonitorVaultData {
 		return nil
 	}
 	cp := &MonitorVaultData{
-		Settings:          in.Settings,
+		Settings:          cloneMonitorSettings(in.Settings),
 		Rules:             slices.Clone(in.Rules),
 		LatestSnapshots:   make(map[string]*ServerMonitorSnapshot, len(in.LatestSnapshots)),
 		HistoryByServer:   make(map[string][]MonitorSamplePoint, len(in.HistoryByServer)),
@@ -540,24 +558,7 @@ func ComputeSnapshotHealth(snap *ServerMonitorSnapshot, effectiveBreaches []Cand
 }
 
 func extractPublicPortKeys(ports []ListeningPortStat) []string {
-	seen := make(map[string]struct{})
-	for _, p := range ports {
-		if !p.PublicExposed || p.Port <= 0 {
-			continue
-		}
-		baseProto := "tcp"
-		if strings.HasPrefix(strings.ToLower(p.Proto), "udp") {
-			baseProto = "udp"
-		}
-		key := fmt.Sprintf("%s/%d", baseProto, p.Port)
-		seen[key] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return ExtractEligiblePublicPortKeys(ports)
 }
 
 func isRuleSuppressedByCollectionToggles(ruleKind string, settings MonitorSettings) bool {
@@ -958,31 +959,10 @@ func evaluateSnapshotRules(
 		}
 	}
 
-	// 9. Newly Exposed Listening Ports (Baseline Drift — deduplicated across tcp/tcp6)
+	// 9. Newly Exposed Listening Ports (Baseline Drift — deduplicated across tcp/tcp6,
+	//    pre-filtered for ephemeral UDP, ignore allowlists, and per-port anti-flap streaks)
 	if r, ok := ruleMap["port_drift"]; ok && len(driftedPorts) > 0 {
-		var desc []string
-		for _, dp := range driftedPorts {
-			proc := dp.Process
-			if proc == "" {
-				proc = "未知进程"
-			}
-			scopeHint := dp.BindAddr
-			if dp.ExposureScope == "public_ip" {
-				scopeHint = dp.BindAddr + "/公网IP"
-			}
-			desc = append(desc, fmt.Sprintf("%s/%d@%s (%s)", dp.Proto, dp.Port, scopeHint, proc))
-		}
-		out = append(out, CandidateBreach{
-			DedupKey:       fmt.Sprintf("%s|port_drift|", srv.ID),
-			RuleKind:       "port_drift",
-			RuleName:       r.Name,
-			Severity:       SeverityWarning,
-			Title:          fmt.Sprintf("[%s] 发现 %d 个新暴露监听端口", srv.Name, len(driftedPorts)),
-			Detail:         fmt.Sprintf("相较安全基线新增对外监听端口: %s（若属正常变更可在监控详情采纳基线）", strings.Join(desc, ", ")),
-			MetricText:     fmt.Sprintf("+%d 端口", len(driftedPorts)),
-			ThresholdText:  "匹配端口基线",
-			ConsecutiveReq: max(1, r.ConsecutiveCount),
-		})
+		out = append(out, BuildPortDriftCandidateBreach(srv, r, driftedPorts, 1))
 	}
 
 	// 10. Security Posture & Zero-AI Intrusion Detection (L1 + L3)
@@ -1146,9 +1126,11 @@ func (s *Store) ListAllServerConfigs() ([]ServerConfig, MonitorSettings, error) 
 		cp.JumpServerIDs = slices.Clone(srv.EffectiveJumpServerIDs())
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
+		cp.IgnoredPortDriftProcesses = slices.Clone(srv.IgnoredPortDriftProcesses)
+		cp.IgnoredPortDriftPorts = slices.Clone(srv.IgnoredPortDriftPorts)
 		out[i] = cp
 	}
-	return out, s.secrets.MonitorSettings, nil
+	return out, cloneMonitorSettings(s.secrets.MonitorSettings), nil
 }
 
 // GetEnabledAIPatrolWebhooks returns enabled AI patrol WebhookChannels so monitor alerts can optionally reuse them.
@@ -1328,7 +1310,7 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		s.secMu.RUnlock()
 		return nil, nil, "", ErrVaultLocked
 	}
-	monSettings := s.secrets.MonitorSettings
+	monSettings := cloneMonitorSettings(s.secrets.MonitorSettings)
 	rules := slices.Clone(s.secrets.MonitorRules)
 	autoSyncMem := s.secrets.AISettings.MemoryConfig.AutoSyncMonitorToMemory
 	srvByID := make(map[string]ServerConfig, len(s.secrets.Servers))
@@ -1336,13 +1318,19 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		cp := srv
 		cp.WatchedServices = slices.Clone(srv.WatchedServices)
 		cp.WatchedPorts = slices.Clone(srv.WatchedPorts)
+		cp.IgnoredPortDriftProcesses = slices.Clone(srv.IgnoredPortDriftProcesses)
+		cp.IgnoredPortDriftPorts = slices.Clone(srv.IgnoredPortDriftPorts)
 		srvByID[srv.ID] = cp
 	}
 	s.secMu.RUnlock()
 
 	ruleEnabledMap := make(map[string]bool, len(rules))
+	portDriftConsecutiveReq := 1
 	for _, r := range rules {
 		ruleEnabledMap[r.Kind] = r.Enabled && !isRuleSuppressedByCollectionToggles(r.Kind, monSettings)
+		if r.Kind == "port_drift" {
+			portDriftConsecutiveReq = max(1, r.ConsecutiveCount)
+		}
 	}
 
 	webhookURL = monSettings.WebhookURL
@@ -1420,31 +1408,40 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			}
 		}
 
-		// Port baseline comparison (deduplicated across tcp/tcp6 & udp/udp6)
+		// Annotate ephemeral UDP & allowlisted dynamic-port processes on incoming snapshot
+		if incoming.Reachable && len(incoming.ListeningPorts) > 0 {
+			AnnotateListeningPorts(incoming.ListeningPorts, monSettings, srvCfg)
+		}
+
+		// Port baseline comparison (deduplicated across tcp/tcp6 & udp/udp6, with per-port anti-flap tracking)
 		var driftedPorts []ListeningPortStat
+		portStreakPrefix := srvCfg.ID + "|port_drift_port|"
 		if incoming.Reachable && monSettings.CollectPortsAndServices && len(incoming.ListeningPorts) > 0 {
-			curPublicKeys := extractPublicPortKeys(incoming.ListeningPorts)
+			curPublicKeys := ExtractEligiblePublicPortKeys(incoming.ListeningPorts)
 			baseKeys, hasBaseline := mon.PortBaselines[srvCfg.ID]
 			if !hasBaseline {
 				mon.PortBaselines[srvCfg.ID] = curPublicKeys
 			} else if monSettings.DetectPortDrift {
-				baseSet := make(map[string]bool, len(baseKeys))
-				for _, k := range baseKeys {
-					baseSet[k] = true
+				rawDrifted := ComputeDriftedPorts(incoming.ListeningPorts, baseKeys)
+				activeDriftKeys := make(map[string]bool, len(rawDrifted))
+				for _, dp := range rawDrifted {
+					key := fmt.Sprintf("%s/%d", NormalizeBaseProto(dp.Proto), dp.Port)
+					streakKey := portStreakPrefix + key
+					activeDriftKeys[streakKey] = true
+					mon.BreachStreaks[streakKey]++
+					if mon.BreachStreaks[streakKey] >= portDriftConsecutiveReq {
+						driftedPorts = append(driftedPorts, dp)
+					}
 				}
-				seenDrift := make(map[string]bool)
-				for _, lp := range incoming.ListeningPorts {
-					if !lp.PublicExposed || lp.Port <= 0 {
-						continue
+				for k := range mon.BreachStreaks {
+					if strings.HasPrefix(k, portStreakPrefix) && !activeDriftKeys[k] {
+						delete(mon.BreachStreaks, k)
 					}
-					proto := "tcp"
-					if strings.HasPrefix(strings.ToLower(lp.Proto), "udp") {
-						proto = "udp"
-					}
-					key := fmt.Sprintf("%s/%d", proto, lp.Port)
-					if !baseSet[key] && !seenDrift[key] {
-						seenDrift[key] = true
-						driftedPorts = append(driftedPorts, lp)
+				}
+			} else {
+				for k := range mon.BreachStreaks {
+					if strings.HasPrefix(k, portStreakPrefix) {
+						delete(mon.BreachStreaks, k)
 					}
 				}
 			}
@@ -1619,10 +1616,13 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 		}
 		mon.HistoryByServer[srvCfg.ID] = series
 
-		// Clear non-breached streaks for this server
+		// Clear non-breached streaks for this server (per-port port_drift_port| streaks are managed above)
 		prefix := srvCfg.ID + "|"
 		for k := range mon.BreachStreaks {
 			if strings.HasPrefix(k, prefix) {
+				if strings.HasPrefix(k, portStreakPrefix) {
+					continue
+				}
 				if _, stillBreached := activeBreachMap[k]; !stillBreached {
 					if incoming.Reachable ||
 						strings.HasPrefix(k, srvCfg.ID+"|offline|") ||
@@ -1728,7 +1728,7 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
-	monSettings := s.secrets.MonitorSettings
+	monSettings := cloneMonitorSettings(s.secrets.MonitorSettings)
 	serverViews := make([]ServerView, len(s.secrets.Servers))
 	for i, srv := range s.secrets.Servers {
 		serverViews[i] = srv.ToView()
@@ -1878,10 +1878,15 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 		s.secMu.RUnlock()
 		return nil, ErrVaultLocked
 	}
+	monSettings := cloneMonitorSettings(s.secrets.MonitorSettings)
 	var targetView *ServerView
+	var targetCfg ServerConfig
 	for i := range s.secrets.Servers {
 		if s.secrets.Servers[i].ID == serverID {
-			v := s.secrets.Servers[i].ToView()
+			targetCfg = s.secrets.Servers[i]
+			targetCfg.IgnoredPortDriftProcesses = slices.Clone(targetCfg.IgnoredPortDriftProcesses)
+			targetCfg.IgnoredPortDriftPorts = slices.Clone(targetCfg.IgnoredPortDriftPorts)
+			v := targetCfg.ToView()
 			targetView = &v
 			break
 		}
@@ -1903,6 +1908,9 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 	}
 
 	snap := cloneSnapshot(mon.LatestSnapshots[serverID])
+	if snap != nil && len(snap.ListeningPorts) > 0 {
+		AnnotateListeningPorts(snap.ListeningPorts, monSettings, targetCfg)
+	}
 	allPoints := mon.HistoryByServer[serverID]
 
 	var filtered []MonitorSamplePoint
@@ -1959,12 +1967,15 @@ func (s *Store) GetMonitorPolicy() (MonitorSettings, []MonitorAlertRule, error) 
 	if s.secrets == nil {
 		return MonitorSettings{}, nil, ErrVaultLocked
 	}
-	return s.secrets.MonitorSettings, slices.Clone(s.secrets.MonitorRules), nil
+	return cloneMonitorSettings(s.secrets.MonitorSettings), slices.Clone(s.secrets.MonitorRules), nil
 }
 
 // UpdateMonitorPolicy validates and saves updated schedule settings and alert rules,
 // and silently closes any active alerts belonging to newly disabled rules or dimensions.
 func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAlertRule, clientIP string) (MonitorSettings, []MonitorAlertRule, error) {
+	if err := validateMonitorSettings(settings); err != nil {
+		return MonitorSettings{}, nil, err
+	}
 	if len(rules) > 0 {
 		if err := validateMonitorAlertRules(rules); err != nil {
 			return MonitorSettings{}, nil, err
@@ -1973,13 +1984,15 @@ func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAle
 
 	var outSettings MonitorSettings
 	var outRules []MonitorAlertRule
+	var allServers []ServerConfig
 	err := s.mutateSecrets(func(sec *SecretsState) error {
 		sec.MonitorSettings = sanitizeMonitorSettings(settings)
 		if len(rules) > 0 {
 			sec.MonitorRules = mergeMonitorAlertRules(rules)
 		}
-		outSettings = sec.MonitorSettings
+		outSettings = cloneMonitorSettings(sec.MonitorSettings)
 		outRules = slices.Clone(sec.MonitorRules)
+		allServers = cloneServersWithoutRuntime(sec.Servers)
 		return nil
 	})
 	if err != nil {
@@ -2004,9 +2017,15 @@ func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAle
 		}
 		for k := range s.monitorRT.BreachStreaks {
 			parts := strings.SplitN(k, "|", 3)
-			if len(parts) >= 2 && !activeKinds[parts[1]] {
-				delete(s.monitorRT.BreachStreaks, k)
-				dirty = true
+			if len(parts) >= 2 {
+				kindKey := parts[1]
+				if kindKey == "port_drift_port" {
+					kindKey = "port_drift"
+				}
+				if !activeKinds[kindKey] {
+					delete(s.monitorRT.BreachStreaks, k)
+					dirty = true
+				}
 			}
 		}
 		for i := range s.monitorRT.Alerts {
@@ -2015,6 +2034,11 @@ func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAle
 				al.Status = AlertStatusResolved
 				al.ResolvedAt = &now
 				al.LastSeenAt = now
+				dirty = true
+			}
+		}
+		if activeKinds["port_drift"] {
+			if s.reconcilePortDriftRuntimeLocked(outSettings, outRules, allServers, now) > 0 {
 				dirty = true
 			}
 		}
@@ -2242,11 +2266,299 @@ func (s *Store) GetLatestMonitorSnapshotsMap() map[string]*ServerMonitorSnapshot
 	return out
 }
 
+// GetPortBaselinesMap returns cloned trusted port baselines keyed by server ID.
+func (s *Store) GetPortBaselinesMap() map[string][]string {
+	if !s.IsReady() {
+		return map[string][]string{}
+	}
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.monitorRT == nil || len(s.monitorRT.PortBaselines) == 0 {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string, len(s.monitorRT.PortBaselines))
+	for k, v := range s.monitorRT.PortBaselines {
+		out[k] = slices.Clone(v)
+	}
+	return out
+}
+
+// reconcilePortDriftRuntimeLocked re-evaluates snapshot ignore flags and active port_drift alerts
+// immediately after monitor policy or per-server ignore rules change. Caller must hold s.rtMu.Lock().
+func (s *Store) reconcilePortDriftRuntimeLocked(settings MonitorSettings, rules []MonitorAlertRule, servers []ServerConfig, now time.Time) int {
+	if s.monitorRT == nil {
+		return 0
+	}
+	var portDriftRule MonitorAlertRule
+	for _, r := range rules {
+		if r.Kind == "port_drift" {
+			portDriftRule = r
+			break
+		}
+	}
+	if portDriftRule.Kind == "" {
+		portDriftRule = MonitorAlertRule{Kind: "port_drift", Name: "新增对外暴露监听端口漂移"}
+	}
+
+	resolvedCnt := 0
+	for _, srv := range servers {
+		snap := s.monitorRT.LatestSnapshots[srv.ID]
+		if snap == nil || len(snap.ListeningPorts) == 0 {
+			continue
+		}
+		AnnotateListeningPorts(snap.ListeningPorts, settings, srv)
+		s.dirtyMonitor = true
+
+		baseKeys, hasBase := s.monitorRT.PortBaselines[srv.ID]
+		if !hasBase {
+			continue
+		}
+		remaining := ComputeDriftedPorts(snap.ListeningPorts, baseKeys)
+		portPrefix := srv.ID + "|port_drift_port|"
+		remainingKeys := make(map[string]bool, len(remaining))
+		for _, dp := range remaining {
+			remainingKeys[portPrefix+fmt.Sprintf("%s/%d", NormalizeBaseProto(dp.Proto), dp.Port)] = true
+		}
+		for k := range s.monitorRT.BreachStreaks {
+			if strings.HasPrefix(k, portPrefix) && !remainingKeys[k] {
+				delete(s.monitorRT.BreachStreaks, k)
+			}
+		}
+
+		for i := range s.monitorRT.Alerts {
+			al := &s.monitorRT.Alerts[i]
+			if al.ServerID != srv.ID || al.RuleKind != "port_drift" || al.Status == AlertStatusResolved {
+				continue
+			}
+			if len(remaining) == 0 {
+				al.Status = AlertStatusResolved
+				al.ResolvedAt = &now
+				al.LastSeenAt = now
+				delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|port_drift|", srv.ID))
+				resolvedCnt++
+			} else {
+				breach := BuildPortDriftCandidateBreach(srv, portDriftRule, remaining, 1)
+				al.Title = breach.Title
+				al.Detail = breach.Detail
+				al.MetricText = breach.MetricText
+				al.LastSeenAt = now
+			}
+		}
+	}
+	return resolvedCnt
+}
+
+// ReconcilePortDriftForServer re-annotates a server's latest snapshot and reconciles active port_drift alerts.
+func (s *Store) ReconcilePortDriftForServer(serverID string) {
+	if !s.IsReady() || strings.TrimSpace(serverID) == "" {
+		return
+	}
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
+		return
+	}
+	monSettings := cloneMonitorSettings(s.secrets.MonitorSettings)
+	rules := slices.Clone(s.secrets.MonitorRules)
+	var target *ServerConfig
+	for i := range s.secrets.Servers {
+		if s.secrets.Servers[i].ID == serverID {
+			cp := s.secrets.Servers[i]
+			cp.IgnoredPortDriftProcesses = slices.Clone(cp.IgnoredPortDriftProcesses)
+			cp.IgnoredPortDriftPorts = slices.Clone(cp.IgnoredPortDriftPorts)
+			target = &cp
+			break
+		}
+	}
+	s.secMu.RUnlock()
+	if target == nil {
+		return
+	}
+
+	s.rtMu.Lock()
+	if s.monitorRT != nil {
+		s.reconcilePortDriftRuntimeLocked(monSettings, rules, []ServerConfig{*target}, time.Now().UTC())
+	}
+	s.rtMu.Unlock()
+	s.triggerFlush()
+}
+
+// UpdatePortDriftIgnoreRule adds or removes a process or port/range ignore rule globally or per server,
+// and immediately reconciles affected snapshots and active port_drift alerts.
+func (s *Store) UpdatePortDriftIgnoreRule(req PortDriftIgnoreMutation, clientIP string) (*PortDriftIgnoreResult, error) {
+	scope := strings.ToLower(strings.TrimSpace(req.Scope))
+	if scope == "" {
+		scope = "server"
+	}
+	if scope != "server" && scope != "global" {
+		return nil, fmt.Errorf("%w: scope 仅支持 server 或 global", ErrInvalidInput)
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action == "" {
+		action = "add"
+	}
+	if action != "add" && action != "remove" {
+		return nil, fmt.Errorf("%w: action 仅支持 add 或 remove", ErrInvalidInput)
+	}
+
+	rawProc := strings.TrimSpace(req.Process)
+	rawPort := strings.TrimSpace(req.Port)
+	if (rawProc == "" && rawPort == "") || (rawProc != "" && rawPort != "") {
+		return nil, fmt.Errorf("%w: 请指定要忽略的进程名或端口规则（二选一）", ErrInvalidInput)
+	}
+
+	var ruleType, canonical string
+	var err error
+	if rawProc != "" {
+		ruleType = "process"
+		canonical, err = ValidatePortDriftProcessPattern(rawProc)
+	} else {
+		ruleType = "port"
+		canonical, err = ValidatePortDriftPortSpec(rawPort)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	serverID := strings.TrimSpace(req.ServerID)
+	if scope == "server" && serverID == "" {
+		return nil, fmt.Errorf("%w: 本机级忽略规则必须提供 server_id", ErrInvalidInput)
+	}
+
+	mutateList := func(list []string, item string, remove bool) []string {
+		out := make([]string, 0, len(list)+1)
+		exists := false
+		for _, cur := range list {
+			if strings.EqualFold(strings.TrimSpace(cur), item) {
+				exists = true
+				if remove {
+					continue
+				}
+			}
+			out = append(out, cur)
+		}
+		if !remove && !exists {
+			out = append(out, item)
+		}
+		return out
+	}
+
+	var outSettings MonitorSettings
+	var outRules []MonitorAlertRule
+	var affectedServers []ServerConfig
+	var targetName string
+	var srvIgnoreProcs, srvIgnorePorts []string
+
+	err = s.mutateSecrets(func(sec *SecretsState) error {
+		if scope == "global" {
+			if ruleType == "process" {
+				sec.MonitorSettings.PortDriftIgnoreProcesses = mutateList(sec.MonitorSettings.PortDriftIgnoreProcesses, canonical, action == "remove")
+			} else {
+				sec.MonitorSettings.PortDriftIgnorePorts = mutateList(sec.MonitorSettings.PortDriftIgnorePorts, canonical, action == "remove")
+			}
+			sec.MonitorSettings = sanitizeMonitorSettings(sec.MonitorSettings)
+			outSettings = cloneMonitorSettings(sec.MonitorSettings)
+			outRules = slices.Clone(sec.MonitorRules)
+			affectedServers = cloneServersWithoutRuntime(sec.Servers)
+			targetName = "全局策略"
+			return nil
+		}
+
+		idx := -1
+		for i := range sec.Servers {
+			if sec.Servers[i].ID == serverID {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return ErrNotFound
+		}
+		srv := sec.Servers[idx]
+		if ruleType == "process" {
+			srv.IgnoredPortDriftProcesses = SanitizePortDriftProcessPatterns(mutateList(srv.IgnoredPortDriftProcesses, canonical, action == "remove"))
+		} else {
+			srv.IgnoredPortDriftPorts = SanitizePortDriftPortSpecs(mutateList(srv.IgnoredPortDriftPorts, canonical, action == "remove"))
+		}
+		srv.UpdatedAt = time.Now().UTC()
+		sec.Servers[idx] = srv
+
+		outSettings = cloneMonitorSettings(sec.MonitorSettings)
+		outRules = slices.Clone(sec.MonitorRules)
+		srvCp := srv
+		srvCp.IgnoredPortDriftProcesses = slices.Clone(srv.IgnoredPortDriftProcesses)
+		srvCp.IgnoredPortDriftPorts = slices.Clone(srv.IgnoredPortDriftPorts)
+		affectedServers = []ServerConfig{srvCp}
+		targetName = srv.Name
+		srvIgnoreProcs = slices.Clone(srv.IgnoredPortDriftProcesses)
+		srvIgnorePorts = slices.Clone(srv.IgnoredPortDriftPorts)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	s.rtMu.Lock()
+	resolvedCnt := 0
+	if s.monitorRT != nil {
+		resolvedCnt = s.reconcilePortDriftRuntimeLocked(outSettings, outRules, affectedServers, now)
+	}
+	actionVerb := "新增"
+	if action == "remove" {
+		actionVerb = "移除"
+	}
+	ruleLabel := "进程"
+	if ruleType == "port" {
+		ruleLabel = "端口"
+	}
+	s.appendAuditRuntimeLocked("monitor.port_drift_ignore", targetName,
+		fmt.Sprintf("%s端口漂移忽略%s规则: %s（作用域: %s）", actionVerb, ruleLabel, canonical, scope), clientIP, true)
+	s.rtMu.Unlock()
+	s.triggerFlush()
+
+	if srvIgnoreProcs == nil {
+		srvIgnoreProcs = []string{}
+	}
+	if srvIgnorePorts == nil {
+		srvIgnorePorts = []string{}
+	}
+	return &PortDriftIgnoreResult{
+		Scope:                 scope,
+		Action:                action,
+		ServerID:              serverID,
+		AppliedRule:           canonical,
+		RuleType:              ruleType,
+		ResolvedAlerts:        resolvedCnt,
+		GlobalIgnoreProcesses: outSettings.PortDriftIgnoreProcesses,
+		GlobalIgnorePorts:     outSettings.PortDriftIgnorePorts,
+		ServerIgnoreProcesses: srvIgnoreProcs,
+		ServerIgnorePorts:     srvIgnorePorts,
+	}, nil
+}
+
 // AcceptServerPortBaseline pins the server's current exposed listening ports as its trusted port baseline.
 func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked
 	}
+
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
+		return nil, ErrVaultLocked
+	}
+	monSettings := cloneMonitorSettings(s.secrets.MonitorSettings)
+	var srvCfg ServerConfig
+	for i := range s.secrets.Servers {
+		if s.secrets.Servers[i].ID == serverID {
+			srvCfg = s.secrets.Servers[i]
+			srvCfg.IgnoredPortDriftProcesses = slices.Clone(srvCfg.IgnoredPortDriftProcesses)
+			srvCfg.IgnoredPortDriftPorts = slices.Clone(srvCfg.IgnoredPortDriftPorts)
+			break
+		}
+	}
+	s.secMu.RUnlock()
 
 	s.rtMu.Lock()
 	if s.monitorRT == nil {
@@ -2258,9 +2570,16 @@ func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, e
 		s.rtMu.Unlock()
 		return nil, ErrNotFound
 	}
-	newBase := extractPublicPortKeys(snap.ListeningPorts)
+	AnnotateListeningPorts(snap.ListeningPorts, monSettings, srvCfg)
+	newBase := ExtractEligiblePublicPortKeys(snap.ListeningPorts)
 	s.monitorRT.PortBaselines[serverID] = newBase
 	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|port_drift|", serverID))
+	portPrefix := serverID + "|port_drift_port|"
+	for k := range s.monitorRT.BreachStreaks {
+		if strings.HasPrefix(k, portPrefix) {
+			delete(s.monitorRT.BreachStreaks, k)
+		}
+	}
 
 	now := time.Now().UTC()
 	for i := range s.monitorRT.Alerts {

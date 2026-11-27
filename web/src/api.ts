@@ -36,6 +36,7 @@ import type {
   PatrolConfigView,
   PatrolRecord,
   PatrolStatusView,
+  PortDriftIgnoreResult,
   ServerMonitorDetailResponse,
   ServerMonitorSnapshot,
   ServerMutationPayload,
@@ -778,6 +779,19 @@ export const api = {
     requestJSON<{ ok: boolean; port_baseline: string[] }>('POST', '/api/monitor/port-baseline', {
       id,
     }),
+
+  updatePortDriftIgnore: (payload: {
+    server_id?: string;
+    scope?: 'server' | 'global';
+    action?: 'add' | 'remove';
+    process?: string;
+    port?: string;
+  }) =>
+    requestJSON<{ ok: boolean; result: PortDriftIgnoreResult }>(
+      'POST',
+      '/api/monitor/port-drift/ignore',
+      payload
+    ),
 
   acceptSecurityBaseline: (id: string) =>
     requestJSON<{ ok: boolean; security_baseline: import('./types').ServerSecurityBaseline }>(

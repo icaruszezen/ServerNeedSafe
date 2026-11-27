@@ -109,6 +109,8 @@ export interface ServerView {
   custom_interval_sec?: number;
   watched_services?: string[];
   watched_ports?: number[];
+  ignored_port_drift_processes?: string[];
+  ignored_port_drift_ports?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -136,6 +138,8 @@ export interface ServerMutationPayload {
   custom_interval_sec?: number;
   watched_services?: string[];
   watched_ports?: number[];
+  ignored_port_drift_processes?: string[];
+  ignored_port_drift_ports?: string[];
 }
 
 export interface HostKeyUntrustedInfo {
@@ -317,6 +321,9 @@ export interface MonitorSettings {
   collect_ports_and_services: boolean;
   collect_security: boolean;
   detect_port_drift: boolean;
+  port_drift_ignore_ephemeral_udp: boolean;
+  port_drift_ignore_processes?: string[];
+  port_drift_ignore_ports?: string[];
   use_ssh_connection_pool: boolean;
   reuse_ai_patrol_webhooks: boolean;
   include_remote_mounts: boolean;
@@ -401,6 +408,8 @@ export interface ListeningPortStat {
   watched: boolean;
   pid?: number;
   process?: string;
+  drift_ignored?: boolean;
+  ignore_reason?: string;
 }
 
 export interface ServiceStat {
@@ -648,9 +657,30 @@ export interface AlertCommandSuggestion {
 }
 
 export interface AlertQuickAction {
-  kind: 'accept_port_baseline' | 'accept_security_baseline' | 'open_vault_known_hosts' | string;
+  kind:
+    | 'accept_port_baseline'
+    | 'ignore_port_drift_process'
+    | 'ignore_port_drift_port'
+    | 'accept_security_baseline'
+    | 'open_vault_known_hosts'
+    | string;
   label: string;
   description?: string;
+  target?: string;
+  scope?: 'server' | 'global' | string;
+}
+
+export interface PortDriftIgnoreResult {
+  scope: 'server' | 'global' | string;
+  action: 'add' | 'remove' | string;
+  server_id?: string;
+  applied_rule: string;
+  rule_type: 'process' | 'port' | string;
+  resolved_alerts: number;
+  global_ignore_processes: string[];
+  global_ignore_ports: string[];
+  server_ignore_processes?: string[];
+  server_ignore_ports?: string[];
 }
 
 export interface AlertRunbookRef {
@@ -785,6 +815,7 @@ export interface MonitorPolicyResponse {
   settings: MonitorSettings;
   rules: MonitorAlertRule[];
   runtime: MonitorRuntimeStatus;
+  default_port_drift_ignore_processes?: string[];
 }
 
 // ============================================================================

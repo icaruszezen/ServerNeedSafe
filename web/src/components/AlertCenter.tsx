@@ -381,6 +381,32 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
         const res = await api.acceptPortBaseline(al.server_id);
         onNotify(`已采纳 [${al.server_name}] 端口基线（${res.port_baseline.length} 个端口），漂移告警已消除`);
         await loadAlerts(true);
+      } else if (action.kind === 'ignore_port_drift_process' && action.target) {
+        const res = await api.updatePortDriftIgnore({
+          server_id: al.server_id,
+          scope: action.scope === 'global' ? 'global' : 'server',
+          action: 'add',
+          process: action.target,
+        });
+        onNotify(
+          `已将进程 ${res.result.applied_rule} 加入 [${al.server_name}] 端口漂移忽略白名单${
+            res.result.resolved_alerts > 0 ? '，告警已消除' : ''
+          }`
+        );
+        await loadAlerts(true);
+      } else if (action.kind === 'ignore_port_drift_port' && action.target) {
+        const res = await api.updatePortDriftIgnore({
+          server_id: al.server_id,
+          scope: action.scope === 'global' ? 'global' : 'server',
+          action: 'add',
+          port: action.target,
+        });
+        onNotify(
+          `已将端口 ${res.result.applied_rule} 加入 [${al.server_name}] 端口漂移忽略白名单${
+            res.result.resolved_alerts > 0 ? '，告警已消除' : ''
+          }`
+        );
+        await loadAlerts(true);
       } else if (action.kind === 'accept_security_baseline') {
         await api.acceptSecurityBaseline(al.server_id);
         onNotify(`已采纳 [${al.server_name}] 安全基线，对应漂移告警已消除`);

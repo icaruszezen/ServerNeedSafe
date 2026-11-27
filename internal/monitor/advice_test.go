@@ -15,46 +15,46 @@ func TestBuildAlertAdviceCoversAllDefaultRules(t *testing.T) {
 	}
 
 	snap := &vault.ServerMonitorSnapshot{
-		ServerID:         "srv-1",
-		ServerName:       "prod-app-01",
-		Host:             "10.0.0.10",
-		Port:             22,
-		Reachable:        true,
-		OS:               "Ubuntu 24.04 LTS",
-		Kernel:           "6.8.0-generic",
-		Uptime:           "12d 3h",
-		BootTime:         "2026-11-15 06:00:00",
-		CPUCores:         4,
-		CPUPercent:       95.2,
-		CPUStealPct:      24.5,
-		CPUIowaitPct:     42.0,
-		Load1:            8.4,
-		LoadPerCore:      2.1,
-		MemPercent:       93.5,
-		SwapPercent:      78.0,
-		SwapTotalMB:      2048,
-		SwapUsedMB:       1600,
-		OOMKills:         3,
-		OOMKillsDelta:    1,
-		FDUsed:           90000,
-		FDMax:            100000,
-		FDPercent:        90.0,
-		ProcsTotal:       240,
-		ProcsRunning:     12,
-		ProcsZombie:      8,
-		ProcsBlocked:     6,
-		CPUTempC:         86.5,
-		DiskPercent:      94.0,
-		MaxPartMount:     "/var/log",
-		MaxPartPercent:   94.0,
-		MaxInodeMount:    "/var/spool",
-		MaxInodePercent:  93.0,
+		ServerID:              "srv-1",
+		ServerName:            "prod-app-01",
+		Host:                  "10.0.0.10",
+		Port:                  22,
+		Reachable:             true,
+		OS:                    "Ubuntu 24.04 LTS",
+		Kernel:                "6.8.0-generic",
+		Uptime:                "12d 3h",
+		BootTime:              "2026-11-15 06:00:00",
+		CPUCores:              4,
+		CPUPercent:            95.2,
+		CPUStealPct:           24.5,
+		CPUIowaitPct:          42.0,
+		Load1:                 8.4,
+		LoadPerCore:           2.1,
+		MemPercent:            93.5,
+		SwapPercent:           78.0,
+		SwapTotalMB:           2048,
+		SwapUsedMB:            1600,
+		OOMKills:              3,
+		OOMKillsDelta:         1,
+		FDUsed:                90000,
+		FDMax:                 100000,
+		FDPercent:             90.0,
+		ProcsTotal:            240,
+		ProcsRunning:          12,
+		ProcsZombie:           8,
+		ProcsBlocked:          6,
+		CPUTempC:              86.5,
+		DiskPercent:           94.0,
+		MaxPartMount:          "/var/log",
+		MaxPartPercent:        94.0,
+		MaxInodeMount:         "/var/spool",
+		MaxInodePercent:       93.0,
 		DiskFullForecastHours: 4.5,
 		DiskFullForecastMount: "/var/log",
-		ReadOnlyMounts:   []string{"/data"},
-		RAIDDegraded:     []string{"md0 [2/1] [U_]"},
-		KernelErrorCount: 2,
-		KernelErrors:     []string{"EXT4-fs error (device vda1): ext4_find_entry"},
+		ReadOnlyMounts:        []string{"/data"},
+		RAIDDegraded:          []string{"md0 [2/1] [U_]"},
+		KernelErrorCount:      2,
+		KernelErrors:          []string{"EXT4-fs error (device vda1): ext4_find_entry"},
 		Disks: []vault.DiskPartitionStat{
 			{MountPoint: "/var/log", Device: "/dev/vdb1", FSType: "ext4", TotalGB: 100, UsedGB: 94, AvailGB: 6, UsedPercent: 94.0, InodePercent: 40.0},
 			{MountPoint: "/var/spool", Device: "/dev/vda1", FSType: "ext4", TotalGB: 50, UsedGB: 20, AvailGB: 30, UsedPercent: 40.0, InodePercent: 93.0},
@@ -302,6 +302,28 @@ func TestBuildAlertAdviceMacOSCompatibility(t *testing.T) {
 	inodeAdv := BuildAlertAdvice(vault.MonitorAlert{ServerID: "srv-mac", RuleKind: "inode_high"}, macSnap, nil)
 	if len(inodeAdv.Commands) == 0 || strings.Contains(inodeAdv.Commands[0].Command, "-printf") {
 		t.Fatalf("expected BSD-safe inode command on macOS without GNU find -printf, got %+v", inodeAdv.Commands)
+	}
+
+	macSnap.ListeningPorts = []vault.ListeningPortStat{
+		{Proto: "tcp", BindAddr: "0.0.0.0", Port: 22, PublicExposed: true, Process: "sshd", PID: 100},
+		{Proto: "udp", BindAddr: "0.0.0.0", Port: 63446, PublicExposed: true, Process: "RustDesk", PID: 200, DriftIgnored: true, IgnoreReason: "全局进程白名单: rustdesk*"},
+		{Proto: "tcp", BindAddr: "0.0.0.0", Port: 9876, PublicExposed: true, Process: "CustomP2P", PID: 300},
+	}
+	driftAdv := BuildAlertAdviceWithPortBaseline(
+		vault.MonitorAlert{ServerID: "srv-mac", RuleKind: "port_drift"},
+		macSnap,
+		[]string{"tcp/22"},
+		nil,
+	)
+	if len(driftAdv.Commands) == 0 || strings.Contains(driftAdv.Commands[0].Command, "ss -tulnp") {
+		t.Fatalf("expected macOS lsof/netstat command for port_drift, got %+v", driftAdv.Commands)
+	}
+	if len(driftAdv.Evidence) == 0 || !strings.Contains(driftAdv.Evidence[0], "CustomP2P") || strings.Contains(driftAdv.Evidence[0], "sshd") {
+		t.Fatalf("expected port_drift evidence to pinpoint actual drifted port CustomP2P (not baseline sshd), got %+v", driftAdv.Evidence)
+	}
+	if len(driftAdv.QuickActions) < 2 || driftAdv.QuickActions[0].Kind != "accept_port_baseline" ||
+		driftAdv.QuickActions[1].Kind != "ignore_port_drift_process" || driftAdv.QuickActions[1].Target != "CustomP2P" {
+		t.Fatalf("expected accept_port_baseline + ignore_port_drift_process(CustomP2P), got %+v", driftAdv.QuickActions)
 	}
 }
 

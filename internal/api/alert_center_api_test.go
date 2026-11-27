@@ -220,6 +220,74 @@ func TestAlertCenterAPIEndpointsAndAdviceEnrichment(t *testing.T) {
 	if len(remResolved) != 1 || remResolved[0].ServerID != srv2.ID {
 		t.Fatalf("expected srv2 resolved alert to remain, got %+v", remResolved)
 	}
+
+	// 7. Port drift alert quick-action ignore API end-to-end
+	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{{
+		ServerID:    srv1.ID,
+		Reachable:   true,
+		CollectedAt: now.Add(time.Minute),
+		OS:          "Ubuntu 24.04",
+		ListeningPorts: []vault.ListeningPortStat{
+			{Proto: "tcp", BindAddr: "0.0.0.0", Port: 22, PublicExposed: true, ExposureScope: "wildcard", Process: "sshd", PID: 10},
+		},
+	}})
+	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{{
+		ServerID:    srv1.ID,
+		Reachable:   true,
+		CollectedAt: now.Add(2 * time.Minute),
+		OS:          "Ubuntu 24.04",
+		ListeningPorts: []vault.ListeningPortStat{
+			{Proto: "tcp", BindAddr: "0.0.0.0", Port: 22, PublicExposed: true, ExposureScope: "wildcard", Process: "sshd", PID: 10},
+			{Proto: "tcp", BindAddr: "0.0.0.0", Port: 49876, PublicExposed: true, ExposureScope: "wildcard", Process: "CustomRotator", PID: 99},
+		},
+	}})
+
+	driftListRec := doJSON(http.MethodGet, "/api/monitor/alerts?status=active&server_id="+srv1.ID+"&category=network", nil)
+	if driftListRec.Code != http.StatusOK {
+		t.Fatalf("list port_drift alert failed: %d %s", driftListRec.Code, driftListRec.Body.String())
+	}
+	var driftListPayload struct {
+		Alerts []monitor.EnrichedMonitorAlert `json:"alerts"`
+	}
+	_ = json.Unmarshal(driftListRec.Body.Bytes(), &driftListPayload)
+	if len(driftListPayload.Alerts) != 1 || driftListPayload.Alerts[0].RuleKind != "port_drift" {
+		t.Fatalf("expected 1 active port_drift alert, got %+v", driftListPayload.Alerts)
+	}
+	qa := driftListPayload.Alerts[0].Advice.QuickActions
+	if len(qa) < 2 || qa[1].Kind != "ignore_port_drift_process" || qa[1].Target != "CustomRotator" {
+		t.Fatalf("expected ignore_port_drift_process quick action for CustomRotator, got %+v", qa)
+	}
+
+	ignoreRec := doJSON(http.MethodPost, "/api/monitor/port-drift/ignore", map[string]any{
+		"server_id": srv1.ID,
+		"scope":     "server",
+		"action":    "add",
+		"process":   "CustomRotator",
+	})
+	if ignoreRec.Code != http.StatusOK {
+		t.Fatalf("port-drift ignore API failed: %d %s", ignoreRec.Code, ignoreRec.Body.String())
+	}
+	var ignorePayload struct {
+		OK     bool                        `json:"ok"`
+		Result vault.PortDriftIgnoreResult `json:"result"`
+	}
+	_ = json.Unmarshal(ignoreRec.Body.Bytes(), &ignorePayload)
+	if !ignorePayload.OK || ignorePayload.Result.ResolvedAlerts != 1 || ignorePayload.Result.AppliedRule != "CustomRotator" {
+		t.Fatalf("unexpected ignore API payload: %+v", ignorePayload)
+	}
+
+	policyRec := doJSON(http.MethodGet, "/api/monitor/policy", nil)
+	if policyRec.Code != http.StatusOK {
+		t.Fatalf("get policy failed: %d", policyRec.Code)
+	}
+	var policyPayload struct {
+		Settings           vault.MonitorSettings `json:"settings"`
+		DefaultIgnoreProcs []string              `json:"default_port_drift_ignore_processes"`
+	}
+	_ = json.Unmarshal(policyRec.Body.Bytes(), &policyPayload)
+	if !policyPayload.Settings.PortDriftIgnoreEphemeralUDP || len(policyPayload.DefaultIgnoreProcs) == 0 {
+		t.Fatalf("expected ephemeral UDP default & default_port_drift_ignore_processes in policy API, got %+v", policyPayload)
+	}
 }
 
 func ptrStr(s string) *string { return &s }

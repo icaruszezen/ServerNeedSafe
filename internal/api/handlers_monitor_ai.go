@@ -107,6 +107,23 @@ func (s *Server) handleAcceptPortBaseline(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (s *Server) handleUpdatePortDriftIgnore(w http.ResponseWriter, r *http.Request) {
+	var req vault.PortDriftIgnoreMutation
+	if err := decodeJSON(r, &req, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "端口漂移忽略规则请求格式错误")
+		return
+	}
+	res, err := s.cfg.Store.UpdatePortDriftIgnoreRule(req, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"result": res,
+	})
+}
+
 func (s *Server) handleAcceptSecurityBaseline(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID string `json:"id"`
@@ -215,8 +232,9 @@ func (s *Server) handleListMonitorAlerts(w http.ResponseWriter, r *http.Request)
 	}
 
 	snapshots := s.cfg.Store.GetLatestMonitorSnapshotsMap()
+	portBaselines := s.cfg.Store.GetPortBaselinesMap()
 	runbooks, _ := s.cfg.Store.ListRunbooks()
-	enriched := monitor.EnrichAlerts(filtered, snapshots, runbooks)
+	enriched := monitor.EnrichAlertsWithBaselines(filtered, snapshots, portBaselines, runbooks)
 
 	payload := map[string]any{
 		"alerts":  enriched,
@@ -309,9 +327,10 @@ func (s *Server) handleGetMonitorPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"settings": settings,
-		"rules":    rules,
-		"runtime":  s.cfg.Monitor.Status(),
+		"settings":                            settings,
+		"rules":                               rules,
+		"runtime":                             s.cfg.Monitor.Status(),
+		"default_port_drift_ignore_processes": vault.DefaultPortDriftIgnoreProcesses(),
 	})
 }
 

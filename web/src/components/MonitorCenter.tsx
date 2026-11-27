@@ -121,6 +121,8 @@ function exposureScopeLabel(scope?: string, publicExposed?: boolean): { text: st
       return { text: '绑定公网 IP 暴露', tone: 'danger' };
     case 'private_ip':
       return { text: '绑定网卡内网 IP', tone: 'amber' };
+    case 'vpn_overlay':
+      return { text: '组网内网 (VPN/CGNAT)', tone: '' };
     case 'link_local':
       return { text: '链路本地 (Link-Local)', tone: '' };
     case 'loopback':
@@ -168,10 +170,14 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   // Policy tab state
   const [policySettings, setPolicySettings] = useState<MonitorSettings | null>(null);
   const [policyRules, setPolicyRules] = useState<MonitorAlertRule[]>([]);
+  const [defaultIgnoreProcs, setDefaultIgnoreProcs] = useState<string[]>([]);
+  const [ignoreProcsText, setIgnoreProcsText] = useState<string>('');
+  const [ignorePortsText, setIgnorePortsText] = useState<string>('');
   const [savingPolicy, setSavingPolicy] = useState(false);
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [ruleCategoryFilter, setRuleCategoryFilter] = useState<string>('all');
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [mutatingIgnoreKey, setMutatingIgnoreKey] = useState<string>('');
 
   // HostKey verification modal on manual single-node collect
   const [hostKeyPrompt, setHostKeyPrompt] = useState<{
@@ -226,6 +232,9 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       const res = await api.getMonitorPolicy();
       setPolicySettings(res.settings);
       setPolicyRules(res.rules || []);
+      setDefaultIgnoreProcs(res.default_port_drift_ignore_processes || []);
+      setIgnoreProcsText((res.settings.port_drift_ignore_processes || []).join(', '));
+      setIgnorePortsText((res.settings.port_drift_ignore_ports || []).join(', '));
       setRuntime(res.runtime);
     } catch {
       // ignore
@@ -395,14 +404,62 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     }
   };
 
+  const handleMutateServerPortDriftIgnore = async (
+    serverId: string,
+    opts: { action: 'add' | 'remove'; process?: string; port?: string }
+  ) => {
+    const busyKey = `${opts.action}:${opts.process || opts.port || ''}`;
+    setMutatingIgnoreKey(busyKey);
+    try {
+      const res = await api.updatePortDriftIgnore({
+        server_id: serverId,
+        scope: 'server',
+        action: opts.action,
+        process: opts.process,
+        port: opts.port,
+      });
+      const label = res.result.rule_type === 'port' ? '端口' : '进程';
+      onNotify(
+        opts.action === 'remove'
+          ? `已从本机端口漂移白名单移除${label}规则 ${res.result.applied_rule}`
+          : `已将${label} ${res.result.applied_rule} 加入本机端口漂移白名单${
+              res.result.resolved_alerts > 0 ? '，对应告警已自动消除' : ''
+            }`
+      );
+      await Promise.all([
+        loadServerDetail(serverId, historyRange, true),
+        loadOverview(),
+      ]);
+    } catch (err: any) {
+      onNotify(err?.message || '更新端口漂移白名单失败');
+    } finally {
+      setMutatingIgnoreKey('');
+    }
+  };
+
   const handleSavePolicy = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!policySettings) return;
     setSavingPolicy(true);
     try {
-      const res = await api.updateMonitorPolicy(policySettings, policyRules);
+      const parsedProcs = ignoreProcsText
+        .split(/[,，\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const parsedPorts = ignorePortsText
+        .split(/[,，\n\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const payloadSettings: MonitorSettings = {
+        ...policySettings,
+        port_drift_ignore_processes: parsedProcs,
+        port_drift_ignore_ports: parsedPorts,
+      };
+      const res = await api.updateMonitorPolicy(payloadSettings, policyRules);
       setPolicySettings(res.settings);
       setPolicyRules(res.rules);
+      setIgnoreProcsText((res.settings.port_drift_ignore_processes || []).join(', '));
+      setIgnorePortsText((res.settings.port_drift_ignore_ports || []).join(', '));
       setRuntime(res.runtime);
       await loadOverview();
       onNotify('监控调度周期与告警阈值策略已加密保存');
@@ -470,7 +527,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     [servers, selectedServerId, nodeDetail?.server]
   );
 
-  // Detect drifted public ports on current node detail
+  // Detect drifted public ports on current node detail (excluding ephemeral UDP & allowlisted dynamic ports)
   const driftedPublicPorts = useMemo(() => {
     if (!snap?.listening_ports || !nodeDetail?.port_baseline || nodeDetail.port_baseline.length === 0) {
       return [];
@@ -478,7 +535,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     const baseSet = new Set(nodeDetail.port_baseline);
     const seen = new Set<string>();
     return snap.listening_ports.filter((lp) => {
-      if (!lp.public_exposed) return false;
+      if (!lp.public_exposed || lp.drift_ignored) return false;
       const proto = lp.proto.toLowerCase().startsWith('udp') ? 'udp' : 'tcp';
       const key = `${proto}/${lp.port}`;
       if (baseSet.has(key) || seen.has(key)) return false;
@@ -2003,6 +2060,86 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                     : '将在首次采集公网端口时自动锁定'}
                                 </span>
                               </p>
+                              {((nodeDetail.server.ignored_port_drift_processes?.length || 0) > 0 ||
+                                (nodeDetail.server.ignored_port_drift_ports?.length || 0) > 0) && (
+                                <div
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    flexWrap: 'wrap',
+                                    gap: 6,
+                                    marginTop: 6,
+                                  }}
+                                >
+                                  <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                                    本机漂移忽略白名单：
+                                  </span>
+                                  {(nodeDetail.server.ignored_port_drift_processes || []).map((proc) => (
+                                    <span
+                                      key={`ig-proc-${proc}`}
+                                      className="tag-chip mono"
+                                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                                    >
+                                      进程:{proc}
+                                      <button
+                                        type="button"
+                                        style={{
+                                          border: 'none',
+                                          background: 'transparent',
+                                          color: 'inherit',
+                                          cursor: 'pointer',
+                                          padding: 0,
+                                          lineHeight: 1,
+                                          fontSize: 13,
+                                        }}
+                                        disabled={mutatingIgnoreKey === `remove:${proc}`}
+                                        onClick={() =>
+                                          void handleMutateServerPortDriftIgnore(nodeDetail.server.id, {
+                                            action: 'remove',
+                                            process: proc,
+                                          })
+                                        }
+                                        title={`移除本机忽略进程 ${proc}`}
+                                        aria-label={`移除忽略进程 ${proc}`}
+                                      >
+                                        ×
+                                      </button>
+                                    </span>
+                                  ))}
+                                  {(nodeDetail.server.ignored_port_drift_ports || []).map((pt) => (
+                                    <span
+                                      key={`ig-port-${pt}`}
+                                      className="tag-chip mono"
+                                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                                    >
+                                      端口:{pt}
+                                      <button
+                                        type="button"
+                                        style={{
+                                          border: 'none',
+                                          background: 'transparent',
+                                          color: 'inherit',
+                                          cursor: 'pointer',
+                                          padding: 0,
+                                          lineHeight: 1,
+                                          fontSize: 13,
+                                        }}
+                                        disabled={mutatingIgnoreKey === `remove:${pt}`}
+                                        onClick={() =>
+                                          void handleMutateServerPortDriftIgnore(nodeDetail.server.id, {
+                                            action: 'remove',
+                                            port: pt,
+                                          })
+                                        }
+                                        title={`移除本机忽略端口 ${pt}`}
+                                        aria-label={`移除忽略端口 ${pt}`}
+                                      >
+                                        ×
+                                      </button>
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                             <button
                               type="button"
@@ -2062,12 +2199,54 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                       <td>
                                         {!lp.public_exposed ? (
                                           <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-                                            仅本地安全
+                                            {lp.exposure_scope === 'vpn_overlay'
+                                              ? '组网内网免漂移'
+                                              : '仅本地安全'}
                                           </span>
+                                        ) : lp.drift_ignored ? (
+                                          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                            <span
+                                              className="tag-chip"
+                                              title={lp.ignore_reason || '动态端口已免打扰过滤'}
+                                            >
+                                              动态端口已忽略
+                                            </span>
+                                            {lp.ignore_reason && (
+                                              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                                {lp.ignore_reason}
+                                              </span>
+                                            )}
+                                          </div>
                                         ) : inBaseline ? (
                                           <span className="tag-chip teal">已纳入基线</span>
                                         ) : (
-                                          <span className="tag-chip danger">基线外新暴露!</span>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                            <span className="tag-chip danger">基线外新暴露!</span>
+                                            <button
+                                              type="button"
+                                              className="btn btn-sm btn-ghost"
+                                              style={{ padding: '1px 6px', fontSize: 11, height: 'auto' }}
+                                              disabled={
+                                                mutatingIgnoreKey ===
+                                                `add:${lp.process || `${protoKey}/${lp.port}`}`
+                                              }
+                                              onClick={() =>
+                                                void handleMutateServerPortDriftIgnore(
+                                                  nodeDetail.server.id,
+                                                  lp.process
+                                                    ? { action: 'add', process: lp.process }
+                                                    : { action: 'add', port: `${protoKey}/${lp.port}` }
+                                                )
+                                              }
+                                              title={
+                                                lp.process
+                                                  ? `将进程 ${lp.process} 加入本机端口漂移忽略白名单`
+                                                  : `将端口 ${protoKey}/${lp.port} 加入本机端口漂移忽略白名单`
+                                              }
+                                            >
+                                              {lp.process ? '忽略该进程' : '忽略此端口'}
+                                            </button>
+                                          </div>
                                         )}
                                       </td>
                                       <td className="mono">
@@ -2817,9 +2996,95 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                         />
                         <div>
                           <strong>开启对外监听端口安全基线漂移检测</strong>
-                          <p>覆盖 0.0.0.0/:: 及直接绑定网卡具体 IP 的新开放端口</p>
+                          <p>
+                            覆盖 0.0.0.0/:: 及直接绑定网卡具体 IP 的新开放端口（自动排除 100.64/10 CGNAT 与 Tailscale 组网内网）
+                          </p>
                         </div>
                       </label>
+
+                      {policySettings.detect_port_drift && (
+                        <div
+                          style={{
+                            marginLeft: 18,
+                            padding: '10px 12px',
+                            borderRadius: 'var(--radius-sm)',
+                            background: 'var(--bg-surface)',
+                            border: '1px solid var(--border-subtle)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 10,
+                          }}
+                        >
+                          <label
+                            style={{
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              gap: 8,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              style={{ marginTop: 3 }}
+                              checked={Boolean(policySettings.port_drift_ignore_ephemeral_udp)}
+                              onChange={(e) =>
+                                setPolicySettings({
+                                  ...policySettings,
+                                  port_drift_ignore_ephemeral_udp: e.target.checked,
+                                })
+                              }
+                            />
+                            <div>
+                              <strong style={{ fontSize: 12.5 }}>
+                                自动忽略临时高端口 UDP 套接字 (UDP ≥ 32768)（推荐）
+                              </strong>
+                              <p style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>
+                                UDP 无 LISTEN 握手，RustDesk / ToDesk / P2P / QUIC / STUN 等应用会自动分配并轮换 32768-65535 临时 UDP 端口；开启后仍严格监控全部 TCP 监听与低端口 UDP
+                              </p>
+                            </div>
+                          </label>
+
+                          <div className="field" style={{ marginBottom: 0 }}>
+                            <label className="field-label" style={{ fontSize: 12 }}>
+                              <span>全局动态端口进程白名单（逗号分隔，支持 * 与 tcp:/udp: 前缀）</span>
+                              {defaultIgnoreProcs.length > 0 && (
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-ghost"
+                                  style={{ padding: '1px 6px', fontSize: 11, height: 'auto' }}
+                                  onClick={() => setIgnoreProcsText(defaultIgnoreProcs.join(', '))}
+                                >
+                                  恢复推荐默认
+                                </button>
+                              )}
+                            </label>
+                            <input
+                              className="input mono"
+                              style={{ fontSize: 12 }}
+                              placeholder="rustdesk*, hbbs, hbbr, todesk*, tailscaled, udp:xray*, tcp:rapportd"
+                              value={ignoreProcsText}
+                              onChange={(e) => setIgnoreProcsText(e.target.value)}
+                            />
+                            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
+                              匹配进程将免触发端口漂移告警（仍保留在端口审计列表中可见）；加 <span className="mono">udp:</span> 前缀可仅忽略 UDP 而不放过异常 TCP 监听
+                            </div>
+                          </div>
+
+                          <div className="field" style={{ marginBottom: 0 }}>
+                            <label className="field-label" style={{ fontSize: 12 }}>
+                              <span>全局忽略端口 / 端口段 (选填，逗号分隔)</span>
+                              <span className="field-hint">支持 5353、udp/10000-20000、tcp/49152-65535</span>
+                            </label>
+                            <input
+                              className="input mono"
+                              style={{ fontSize: 12 }}
+                              placeholder="例如 udp/10000-20000, tcp/49152-65535"
+                              value={ignorePortsText}
+                              onChange={(e) => setIgnorePortsText(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      )}
 
                       <label className="mon-check-row">
                         <input
