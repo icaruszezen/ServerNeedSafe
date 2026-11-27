@@ -389,6 +389,27 @@ async function runSuite() {
     );
     assert.equal(modalFieldCols, 1, 'Expected single-column .field-row in modal at 390px');
 
+    // Verify custom searchable group dropdown shows ALL groups even when default group is pre-filled
+    await page.click('#srv-group-input-toggle');
+    await page.waitForSelector('#srv-group-input-listbox', { state: 'visible' });
+    await assertNoHorizontalOverflow(page, 'AddServerModal-GroupDropdown-390');
+    const initialGroupOptions = await page.$$eval(
+      '#srv-group-input-listbox [role="option"]',
+      (els) => els.map((el) => (el.textContent || '').trim())
+    );
+    assert.ok(
+      initialGroupOptions.length >= 4,
+      `Expected all default groups visible on dropdown open even with pre-filled value, got ${JSON.stringify(initialGroupOptions)}`
+    );
+    await page.click('#srv-group-input-listbox [role="option"]:has-text("核心数据库")');
+    await page.waitForSelector('#srv-group-input-listbox', { state: 'hidden' });
+    assert.equal(await page.inputValue('#srv-group-input'), '核心数据库');
+    await page.click('#srv-group-input-toggle');
+    await page.waitForSelector('#srv-group-input-listbox', { state: 'visible' });
+    await page.click('#srv-group-input-listbox [role="option"]:has-text("生产环境")');
+    await page.waitForSelector('#srv-group-input-listbox', { state: 'hidden' });
+    assert.equal(await page.inputValue('#srv-group-input'), '生产环境');
+
     await page.fill('#srv-name-input', '香港边缘接入网关-01');
     await page.fill('#srv-group-input', '生产环境');
     await page.fill('#srv-host-input', info.ssh_host);

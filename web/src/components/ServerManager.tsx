@@ -29,6 +29,7 @@ import type {
   ServerView,
 } from '../types';
 import { HostKeyModal } from './HostKeyModal';
+import { GroupSelectField, normalizeGroupOptions } from './GroupSelectField';
 import { PrivateKeyField } from './PrivateKeyField';
 import { SftpPanel } from './SftpPanel';
 import type { ParsedPrivateKeyFile } from '../utils/sshKeyFile';
@@ -147,6 +148,21 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     return map;
   }, [credentials]);
 
+  const availableGroups = useMemo(
+    () => normalizeGroupOptions([...groups, ...servers.map((s) => s.group)]),
+    [groups, servers]
+  );
+
+  const groupServerCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const s of servers) {
+      const g = s.group.trim();
+      if (!g) continue;
+      counts[g] = (counts[g] || 0) + 1;
+    }
+    return counts;
+  }, [servers]);
+
   const filteredServers = useMemo(() => {
     const q = search.trim().toLowerCase();
     return [...servers]
@@ -171,7 +187,10 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
     setEditingServer(null);
     setForm({
       ...emptyForm,
-      group: selectedGroup !== 'ALL' ? selectedGroup : groups[0] || '生产环境',
+      group:
+        selectedGroup !== 'ALL' && availableGroups.includes(selectedGroup)
+          ? selectedGroup
+          : availableGroups[0] || '生产环境',
       credential_id: credentials[0]?.id || '',
     });
     setTagsText('');
@@ -248,6 +267,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
       const cleanJumpIds = form.jump_server_ids.filter(Boolean);
       const payload: ServerMutationPayload = {
         ...form,
+        group: form.group.trim(),
         jump_server_id: cleanJumpIds[0] || '',
         jump_server_ids: cleanJumpIds,
         jump_fallback_direct: cleanJumpIds.length > 0 ? Boolean(form.jump_fallback_direct) : false,
@@ -308,13 +328,14 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
 
   const handleAddGroup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGroupName.trim()) return;
+    const trimmed = newGroupName.trim();
+    if (!trimmed) return;
     try {
-      await api.addGroup(newGroupName.trim());
+      await api.addGroup(trimmed);
       setGroupModalOpen(false);
       setNewGroupName('');
       await onRefresh();
-      onNotify(`已新建分组 ${newGroupName.trim()}`);
+      onNotify(`已新建分组 ${trimmed}`);
     } catch (err: any) {
       onNotify(err?.message || '创建分组失败');
     }
@@ -387,8 +408,8 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
             >
               全部主机 <span className="tabular">({servers.length})</span>
             </button>
-            {groups.map((g) => {
-              const cnt = servers.filter((s) => s.group === g).length;
+            {availableGroups.map((g) => {
+              const cnt = groupServerCounts[g] || 0;
               return (
                 <button
                   key={g}
@@ -699,20 +720,16 @@ export const ServerManager: React.FC<ServerManagerProps> = ({
                   />
                 </div>
                 <div className="field">
-                  <label className="field-label">所属分组</label>
-                  <input
+                  <label className="field-label" htmlFor="srv-group-input">
+                    所属分组
+                  </label>
+                  <GroupSelectField
                     id="srv-group-input"
-                    list="server-groups-datalist"
-                    className="input"
                     value={form.group}
-                    onChange={(e) => setForm({ ...form, group: e.target.value })}
-                    placeholder="选择或输入新分组"
+                    groups={availableGroups}
+                    groupCounts={groupServerCounts}
+                    onChange={(nextGroup) => setForm({ ...form, group: nextGroup })}
                   />
-                  <datalist id="server-groups-datalist">
-                    {groups.map((g) => (
-                      <option key={g} value={g} />
-                    ))}
-                  </datalist>
                 </div>
               </div>
 
