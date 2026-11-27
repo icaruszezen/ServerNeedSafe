@@ -29,6 +29,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api';
+import { buildAlertMCPPrompt } from '../utils/alertMcpPrompt';
 import { copyTextToClipboard } from '../utils/clipboard';
 import type {
   AlertQuickAction,
@@ -144,6 +145,16 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
   const [clearingResolved, setClearingResolved] = useState(false);
   const [recheckingServerId, setRecheckingServerId] = useState<string>('');
   const [copiedCmdKey, setCopiedCmdKey] = useState<string>('');
+  const [copiedMcpAlertId, setCopiedMcpAlertId] = useState<string>('');
+  const copiedMcpTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copiedMcpTimerRef.current !== null) {
+        window.clearTimeout(copiedMcpTimerRef.current);
+      }
+    };
+  }, []);
 
   const serverById = useMemo(() => {
     const map: Record<string, ServerView> = {};
@@ -483,12 +494,31 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
     onDiagnoseWithAI(al.server_id, prompt);
   };
 
+  const handleCopyMCPPrompt = async (al: MonitorAlert) => {
+    const prompt = buildAlertMCPPrompt(al, serverById[al.server_id]);
+    try {
+      await copyTextToClipboard(prompt);
+      setCopiedMcpAlertId(al.id);
+      if (copiedMcpTimerRef.current !== null) {
+        window.clearTimeout(copiedMcpTimerRef.current);
+      }
+      copiedMcpTimerRef.current = window.setTimeout(() => {
+        setCopiedMcpAlertId((prev) => (prev === al.id ? '' : prev));
+        copiedMcpTimerRef.current = null;
+      }, 2000);
+      onNotify('已复制外部 MCP AI 诊断文案，可直接粘贴至 Claude Code / Codex / Antigravity / Cursor');
+    } catch {
+      onNotify('复制失败，请检查浏览器剪贴板权限');
+    }
+  };
+
   const renderAlertCard = (al: MonitorAlert) => {
     const isExpanded = Boolean(expandedIds[al.id]);
     const advice = al.advice;
     const isResolved = al.status === 'resolved';
     const isBusy = busyAlertId === al.id;
     const isRechecking = recheckingServerId === al.server_id;
+    const isMcpCopied = copiedMcpAlertId === al.id;
     const tone = isResolved ? 'resolved' : al.severity === 'critical' ? 'critical' : 'warning';
     const cmdCount = advice?.commands?.length || 0;
     const quickCount = advice?.quick_actions?.length || 0;
@@ -705,6 +735,17 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
               </button>
               <button
                 type="button"
+                className={`btn btn-sm al-btn-mcp-copy ${isMcpCopied ? 'is-copied' : ''}`}
+                data-action="copy-mcp-prompt"
+                onClick={() => void handleCopyMCPPrompt(al)}
+                title="一键复制面向外部 MCP AI（Claude Code / Codex / Antigravity / Cursor）的告警排障提示词，粘贴即用"
+                aria-label={`一键复制「${headline}」的外部 MCP AI 诊断文案`}
+              >
+                {isMcpCopied ? <Check size={13} /> : <Copy size={13} />}
+                <span>{isMcpCopied ? '已复制 MCP 文案' : '复制 MCP 文案'}</span>
+              </button>
+              <button
+                type="button"
                 className="btn btn-sm btn-teal"
                 onClick={() => handleTriggerAI(al)}
                 title="跳转至 AI 智能运维，自动选中该主机并预填告警排障提示词（不会自动发送）"
@@ -884,7 +925,7 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
             )}
           </div>
           <p>
-            集中展示所有服务器监控告警与事件记录，结合实时主机快照自动提供根因线索、风险分级修复指令及 AI 深度诊断入口
+            集中展示所有服务器监控告警与事件记录，结合实时主机快照自动提供根因线索、风险分级修复指令，以及内置 AI 深度诊断与外部 MCP 提示词一键复制
           </p>
         </div>
 

@@ -153,6 +153,14 @@ func TestBuildAlertAdviceCoversAllDefaultRules(t *testing.T) {
 		if strings.TrimSpace(adv.AIPrompt) == "" {
 			t.Errorf("rule %s missing ai_prompt", r.Kind)
 		}
+		if strings.TrimSpace(adv.MCPPrompt) == "" {
+			t.Errorf("rule %s missing mcp_prompt", r.Kind)
+		}
+		for _, want := range []string{"serverneedsafe", `"srv-1"`, "get_ops_context", "get_server_detail", "propose_change_plan"} {
+			if !strings.Contains(adv.MCPPrompt, want) {
+				t.Errorf("rule %s mcp_prompt missing %q", r.Kind, want)
+			}
+		}
 		if RuleCategoryForKind(r.Kind) == "other" {
 			t.Errorf("rule %s mapped to unexpected 'other' category", r.Kind)
 		}
@@ -352,5 +360,125 @@ func TestBuildAlertSummaryGlobalAndScoped(t *testing.T) {
 	scoped := BuildAlertSummary(alerts, "s2")
 	if scoped.TotalActive != 1 || scoped.Firing != 1 || scoped.Resolved != 1 || scoped.AffectedServers != 1 {
 		t.Fatalf("unexpected scoped summary for s2: %+v", scoped)
+	}
+}
+
+func TestBuildAlertMCPPromptVariants(t *testing.T) {
+	now := time.Date(2026, 11, 27, 16, 10, 0, 0, time.UTC)
+	resolvedAt := now.Add(5 * time.Minute)
+
+	// 1. Standard Linux alert includes OS/kernel, readonly & mutating guidance, matched runbook, and MCP tools
+	linuxSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       "srv-prod-1",
+		Reachable:      true,
+		OS:             "Ubuntu 24.04 LTS",
+		Kernel:         "6.8.0-generic",
+		DiskPercent:    94.0,
+		MaxPartMount:   "/var/log",
+		MaxPartPercent: 94.0,
+		Disks: []vault.DiskPartitionStat{
+			{MountPoint: "/var/log", Device: "/dev/vdb1", FSType: "ext4", TotalGB: 100, UsedGB: 94, AvailGB: 6, UsedPercent: 94.0},
+		},
+	}
+	runbooks := []vault.AIRunbook{
+		{ID: "rb-disk-01", Title: "日志轮转与磁盘清理 SOP", Category: "storage", Symptom: "磁盘空间不足", Tags: []string{"disk", "日志"}},
+	}
+	diskAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ID:            "al-disk-1",
+		DedupKey:      "srv-prod-1|disk_high|/var/log",
+		ServerID:      "srv-prod-1",
+		ServerName:    "prod-api-01",
+		Host:          "10.0.0.10:22",
+		RuleKind:      "disk_high",
+		RuleName:      "磁盘空间高水位",
+		Severity:      vault.SeverityCritical,
+		Status:        vault.AlertStatusFiring,
+		Title:         "磁盘 /var/log 使用率达 94.0%",
+		Detail:        "可用空间仅剩 6.0 GB",
+		MetricText:    "94.0%",
+		ThresholdText: ">= 90%",
+		Occurrences:   3,
+		TriggeredAt:   now.Add(-15 * time.Minute),
+		LastSeenAt:    now,
+	}, linuxSnap, runbooks)
+
+	for _, want := range []string{
+		"serverneedsafe",
+		"server_id: `srv-prod-1`",
+		"Ubuntu 24.04 LTS（内核 6.8.0-generic）",
+		"`rb-disk-01` — 日志轮转与磁盘清理 SOP",
+		"get_ops_context(server_ids=[\"srv-prod-1\"])",
+		"get_server_detail(server_id=\"srv-prod-1\", range=\"1h\")",
+		"exec_readonly_ssh(server_ids=[\"srv-prod-1\"], ...)",
+		"propose_change_plan",
+		"wait_for_approval",
+	} {
+		if !strings.Contains(diskAdv.MCPPrompt, want) {
+			t.Errorf("disk_high MCPPrompt missing %q:\n%s", want, diskAdv.MCPPrompt)
+		}
+	}
+
+	// 2. macOS alert includes BSD/macOS compatibility note
+	macSnap := &vault.ServerMonitorSnapshot{
+		ServerID:  "srv-mac-1",
+		Reachable: true,
+		OS:        "macOS 15.1",
+		Kernel:    "Darwin 24.1.0",
+	}
+	macAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ID:         "al-mac-cpu",
+		ServerID:   "srv-mac-1",
+		ServerName: "mac-mini-build",
+		RuleKind:   "cpu_high",
+		Severity:   vault.SeverityWarning,
+		Status:     vault.AlertStatusFiring,
+	}, macSnap, nil)
+	if !strings.Contains(macAdv.MCPPrompt, "BSD/macOS") {
+		t.Errorf("expected BSD/macOS hint in macOS MCPPrompt, got:\n%s", macAdv.MCPPrompt)
+	}
+
+	// 3. offline alert uses probe_server instead of directing immediate exec_readonly_ssh
+	offlineAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ID:         "al-off-1",
+		ServerID:   "srv-off-1",
+		ServerName: "edge-01",
+		RuleKind:   "offline",
+		Severity:   vault.SeverityCritical,
+		Status:     vault.AlertStatusFiring,
+	}, nil, nil)
+	if !strings.Contains(offlineAdv.MCPPrompt, `probe_server(server_id="srv-off-1")`) {
+		t.Errorf("expected probe_server guidance for offline alert, got:\n%s", offlineAdv.MCPPrompt)
+	}
+	if strings.Contains(offlineAdv.MCPPrompt, "通过 `exec_readonly_ssh` 执行") {
+		t.Errorf("offline alert should label commands as out-of-band/post-recovery, got:\n%s", offlineAdv.MCPPrompt)
+	}
+
+	// 4. host_key_changed alert warns against bypassing host key verification
+	hkAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ID:         "al-hk-1",
+		ServerID:   "srv-hk-1",
+		ServerName: "edge-02",
+		RuleKind:   "host_key_changed",
+		Severity:   vault.SeverityCritical,
+		Status:     vault.AlertStatusFiring,
+	}, nil, nil)
+	if !strings.Contains(hkAdv.MCPPrompt, "切勿尝试绕过或忽略 SSH 主机指纹校验") {
+		t.Errorf("expected strict host key safety instruction, got:\n%s", hkAdv.MCPPrompt)
+	}
+
+	// 5. Resolved alert switches to post-mortem phrasing and includes resolved timestamp
+	resAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ID:          "al-res-1",
+		ServerID:    "srv-prod-1",
+		ServerName:  "prod-api-01",
+		RuleKind:    "cpu_high",
+		Severity:    vault.SeverityWarning,
+		Status:      vault.AlertStatusResolved,
+		TriggeredAt: now,
+		LastSeenAt:  resolvedAt,
+		ResolvedAt:  &resolvedAt,
+	}, linuxSnap, nil)
+	if !strings.Contains(resAdv.MCPPrompt, "复盘以下已恢复的服务器监控告警") || !strings.Contains(resAdv.MCPPrompt, "恢复时间：2026-11-27T16:15:00Z") {
+		t.Errorf("expected post-mortem wording and resolved timestamp, got:\n%s", resAdv.MCPPrompt)
 	}
 }

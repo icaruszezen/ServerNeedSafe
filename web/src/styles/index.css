@@ -5910,6 +5910,19 @@ pre,
   color: var(--text-primary);
 }
 
+.al-btn-mcp-copy {
+  background: var(--al-card-bg);
+  border-color: var(--al-card-border-hover);
+  color: var(--text-primary);
+}
+
+.al-btn-mcp-copy:hover:not(:disabled),
+.al-btn-mcp-copy.is-copied {
+  background: var(--accent-teal-soft);
+  border-color: var(--accent-teal-border);
+  color: var(--accent-teal);
+}
+
 /* Zone 4: Expanded Smart Remediation Panel */
 .al-remediation-panel {
   padding: 15px 16px 16px;

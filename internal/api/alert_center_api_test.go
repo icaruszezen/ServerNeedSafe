@@ -157,6 +157,9 @@ func TestAlertCenterAPIEndpointsAndAdviceEnrichment(t *testing.T) {
 		if al.Advice == nil || al.Advice.Summary == "" || len(al.Advice.Commands) == 0 {
 			t.Fatalf("expected enriched advice on alert %s, got %+v", al.RuleKind, al.Advice)
 		}
+		if al.Advice.MCPPrompt == "" {
+			t.Fatalf("expected enriched mcp_prompt on alert %s, got %+v", al.RuleKind, al.Advice)
+		}
 		if al.Category == "" {
 			t.Fatalf("expected category on alert %s", al.RuleKind)
 		}

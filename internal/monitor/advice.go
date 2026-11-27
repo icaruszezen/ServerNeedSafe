@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
 )
@@ -45,6 +46,7 @@ type AlertAdvice struct {
 	QuickActions []AlertQuickAction       `json:"quick_actions,omitempty"`
 	Runbooks     []AlertRunbookRef        `json:"runbooks,omitempty"`
 	AIPrompt     string                   `json:"ai_prompt,omitempty"`
+	MCPPrompt    string                   `json:"mcp_prompt,omitempty"`
 	ContextAware bool                     `json:"context_aware"`
 }
 
@@ -379,6 +381,224 @@ func buildAlertAIPrompt(al vault.MonitorAlert, advice *AlertAdvice) string {
 		}
 	}
 	sb.WriteString("\n请先使用只读探针核实根因与影响范围，再给出安全、可回滚的分步修复方案；涉及修改系统状态的操作请先提交人工审批。")
+	return sb.String()
+}
+
+func severityLabelZH(sev vault.AlertSeverity) string {
+	switch sev {
+	case vault.SeverityCritical:
+		return "严重 (critical)"
+	case vault.SeverityWarning:
+		return "警告 (warning)"
+	default:
+		if s := strings.TrimSpace(string(sev)); s != "" {
+			return s
+		}
+		return "未知"
+	}
+}
+
+func statusLabelZH(st vault.AlertStatus) string {
+	switch st {
+	case vault.AlertStatusFiring:
+		return "触发中 (firing)"
+	case vault.AlertStatusAcknowledged:
+		return "已知晓 (acknowledged)"
+	case vault.AlertStatusResolved:
+		return "已恢复 (resolved)"
+	default:
+		if s := strings.TrimSpace(string(st)); s != "" {
+			return s
+		}
+		return "未知"
+	}
+}
+
+func formatInlineCode(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "`") {
+		return "`" + s + "`"
+	}
+	return "`` " + s + " ``"
+}
+
+func buildAlertMCPPrompt(al vault.MonitorAlert, snap *vault.ServerMonitorSnapshot, advice *AlertAdvice) string {
+	var sb strings.Builder
+	isResolved := al.Status == vault.AlertStatusResolved
+	isConnBlocked := al.RuleKind == "offline" || al.RuleKind == "host_key_changed"
+	serverName := strings.TrimSpace(al.ServerName)
+	serverID := strings.TrimSpace(al.ServerID)
+	if serverName == "" {
+		serverName = fallbackStr(serverID, "未知主机")
+	}
+
+	if isResolved {
+		sb.WriteString("请使用已接入的 ServerNeedSafe MCP（`serverneedsafe`）协助复盘以下已恢复的服务器监控告警，确认根因与隐患是否彻底消除：\n\n")
+	} else {
+		sb.WriteString("请使用已接入的 ServerNeedSafe MCP（`serverneedsafe`）协助对以下服务器监控告警进行深度排查与处置：\n\n")
+	}
+
+	sb.WriteString("【目标主机与告警上下文】\n")
+	if serverID != "" {
+		sb.WriteString(fmt.Sprintf("- 服务器名称：%s（server_id: %s）\n", serverName, formatInlineCode(serverID)))
+	} else {
+		sb.WriteString(fmt.Sprintf("- 服务器名称：%s\n", serverName))
+	}
+	if host := strings.TrimSpace(al.Host); host != "" {
+		sb.WriteString(fmt.Sprintf("- 主机地址：%s\n", host))
+	}
+	if snap != nil {
+		osStr := strings.TrimSpace(snap.OS)
+		kernelStr := strings.TrimSpace(snap.Kernel)
+		if osStr != "" && kernelStr != "" {
+			sb.WriteString(fmt.Sprintf("- 系统环境：%s（内核 %s）\n", osStr, kernelStr))
+		} else if osStr != "" {
+			sb.WriteString(fmt.Sprintf("- 系统环境：%s\n", osStr))
+		} else if kernelStr != "" {
+			sb.WriteString(fmt.Sprintf("- 系统环境：%s\n", kernelStr))
+		}
+	}
+	if id := strings.TrimSpace(al.ID); id != "" {
+		sb.WriteString(fmt.Sprintf("- 告警 ID：%s\n", formatInlineCode(id)))
+	}
+	if title := strings.TrimSpace(al.Title); title != "" {
+		sb.WriteString(fmt.Sprintf("- 告警标题：%s\n", title))
+	}
+	ruleName := strings.TrimSpace(al.RuleName)
+	ruleKind := strings.TrimSpace(al.RuleKind)
+	if ruleName != "" && ruleKind != "" {
+		sb.WriteString(fmt.Sprintf("- 规则类型：%s (%s)\n", ruleName, formatInlineCode(ruleKind)))
+	} else if ruleName != "" {
+		sb.WriteString(fmt.Sprintf("- 规则类型：%s\n", ruleName))
+	} else if ruleKind != "" {
+		sb.WriteString(fmt.Sprintf("- 规则类型：%s\n", formatInlineCode(ruleKind)))
+	}
+
+	statusParts := []string{
+		"严重级别：" + severityLabelZH(al.Severity),
+		"当前状态：" + statusLabelZH(al.Status),
+	}
+	if al.Occurrences > 0 {
+		statusParts = append(statusParts, fmt.Sprintf("累计触发：%d 次", al.Occurrences))
+	}
+	sb.WriteString("- " + strings.Join(statusParts, " · ") + "\n")
+
+	var timeParts []string
+	if !al.TriggeredAt.IsZero() {
+		timeParts = append(timeParts, "首次触发："+al.TriggeredAt.UTC().Format(time.RFC3339))
+	}
+	if !al.LastSeenAt.IsZero() {
+		timeParts = append(timeParts, "最近检测："+al.LastSeenAt.UTC().Format(time.RFC3339))
+	}
+	if isResolved && al.ResolvedAt != nil && !al.ResolvedAt.IsZero() {
+		timeParts = append(timeParts, "恢复时间："+al.ResolvedAt.UTC().Format(time.RFC3339))
+	}
+	if len(timeParts) > 0 {
+		sb.WriteString("- 时间信息：" + strings.Join(timeParts, " · ") + "\n")
+	}
+
+	if metric := strings.TrimSpace(al.MetricText); metric != "" {
+		sb.WriteString("- 实测指标：" + metric)
+		if thresh := strings.TrimSpace(al.ThresholdText); thresh != "" {
+			sb.WriteString(fmt.Sprintf("（阈值条件：%s）", thresh))
+		}
+		sb.WriteString("\n")
+	}
+	if detail := strings.TrimSpace(al.Detail); detail != "" {
+		sb.WriteString(fmt.Sprintf("- 告警详情：%s\n", detail))
+	}
+	if advice != nil {
+		if summary := strings.TrimSpace(advice.Summary); summary != "" {
+			sb.WriteString(fmt.Sprintf("- 系统初判摘要：%s\n", summary))
+		}
+		if len(advice.Evidence) > 0 {
+			sb.WriteString("- 最新监控快照线索：\n")
+			for _, ev := range advice.Evidence {
+				if trimmed := strings.TrimSpace(ev); trimmed != "" {
+					sb.WriteString("  * " + trimmed + "\n")
+				}
+			}
+		}
+
+		var readonlyCmds []AlertCommandSuggestion
+		var mutatingCmds []AlertCommandSuggestion
+		for _, c := range advice.Commands {
+			if strings.TrimSpace(c.Command) == "" {
+				continue
+			}
+			if c.Risk == "readonly" && len(readonlyCmds) < 4 {
+				readonlyCmds = append(readonlyCmds, c)
+			} else if c.Risk == "mutating" && len(mutatingCmds) < 2 {
+				mutatingCmds = append(mutatingCmds, c)
+			}
+		}
+		if len(readonlyCmds) > 0 {
+			if isConnBlocked {
+				sb.WriteString("- 带外/恢复连通后参考排查命令：\n")
+			} else {
+				sb.WriteString("- 可优先参考的只读排查命令（通过 `exec_readonly_ssh` 执行）：\n")
+			}
+			for _, c := range readonlyCmds {
+				sb.WriteString(fmt.Sprintf("  * %s：%s\n", c.Label, formatInlineCode(c.Command)))
+			}
+		}
+		if len(mutatingCmds) > 0 && !isConnBlocked {
+			sb.WriteString("- 参考修复操作（如经取证确认需执行，必须走 `propose_change_plan` 提交审批）：\n")
+			for _, c := range mutatingCmds {
+				sb.WriteString(fmt.Sprintf("  * %s：%s\n", c.Label, formatInlineCode(c.Command)))
+			}
+		}
+		if len(advice.Runbooks) > 0 {
+			sb.WriteString("- 已匹配关联 Runbook（可调用 `get_runbook` 调阅完整 SOP）：\n")
+			for _, rb := range advice.Runbooks {
+				sb.WriteString(fmt.Sprintf("  * %s — %s\n", formatInlineCode(rb.ID), rb.Title))
+			}
+		}
+		if len(advice.QuickActions) > 0 {
+			labels := make([]string, 0, len(advice.QuickActions))
+			for _, qa := range advice.QuickActions {
+				if lbl := strings.TrimSpace(qa.Label); lbl != "" {
+					labels = append(labels, lbl)
+				}
+			}
+			if len(labels) > 0 {
+				sb.WriteString(fmt.Sprintf("- 面板内置快捷处置项（若取证确认属于预期变更，可提醒我在告警页一键操作）：%s\n", strings.Join(labels, "、")))
+			}
+		}
+	}
+
+	sidArg := `"<server_id>"`
+	if serverID != "" {
+		sidArg = fmt.Sprintf("%q", serverID)
+	}
+
+	sb.WriteString("\n【MCP 排查与处置要求】\n")
+	if serverID != "" {
+		sb.WriteString(fmt.Sprintf("1. 加载规范与态势：先调用 `get_ops_context(server_ids=[%s])` 与 `get_server_detail(server_id=%s, range=\"1h\")`（必要时结合 `list_alerts(server_id=%s)`、`search_memory` 或 `get_runbook`），阅读 `AGENTS.md` 运维规范、该主机画像（已知端口用途、部署路径与运维红线）及近期时序变化，避免误判正常业务。\n", sidArg, sidArg, sidArg))
+	} else {
+		sb.WriteString("1. 加载规范与态势：先调用 `list_servers` 确认目标主机的 `server_id`，再调用 `get_ops_context`、`get_server_detail` 与 `list_alerts` 获取 `AGENTS.md` 运维规范、主机画像与近期时序变化，避免误判正常业务。\n")
+	}
+
+	switch al.RuleKind {
+	case "offline":
+		sb.WriteString(fmt.Sprintf("2. 连通性核查：先调用 `probe_server(server_id=%s)` 复核实时连通性与报错；若已恢复连通再通过 `exec_readonly_ssh` 核查宕机/sshd 日志；若仍不可达，请结合跳板链路与历史监控指标分析可能原因，并给出云控制台 / VNC 带外排查清单。\n", sidArg))
+	case "host_key_changed":
+		sb.WriteString("2. 指纹核验与风险排查：切勿尝试绕过或忽略 SSH 主机指纹校验；请结合 `get_server_detail` 与长期记忆核实是否存在计划重装、迁移或换 IP 记录，并给出带外核验 `/etc/ssh/ssh_host_*_key.pub` 指纹及排查中间人风险的步骤；仅当人工核验合法后，才指引我在「安全保险库 → 已信任主机指纹」更新指纹。\n")
+	default:
+		macNote := ""
+		if isMacOSSnap(snap) {
+			macNote = "；目标主机为 macOS/Darwin，请使用 BSD/macOS 兼容命令"
+		}
+		sb.WriteString(fmt.Sprintf("2. 只读深度取证：使用 `exec_readonly_ssh(server_ids=[%s], ...)` 与 `sftp_read_file` / `sftp_list_dir` 深入核查进程、日志、端口或配置现场证据，锁定确凿根因（严禁在只读接口尝试变更命令，也勿尝试读取敏感凭据/私钥文件%s）。\n", sidArg, macNote))
+	}
+
+	if isResolved {
+		sb.WriteString("3. 复盘结论与受控加固 (HITL)：按「根因复盘 → 关键证据 → 残留风险评估 → 加固预防建议」输出中文报告；若确需执行线上加固或修改配置，严禁绕过审批，必须统一调用 `propose_change_plan` 提交有序变更计划（写明变更目的、影响范围与回滚方案），等待我在 ServerNeedSafe Web 端「执行审批」批准后，再通过 `wait_for_approval` / `get_approval_status` 查看回显并复测核验。\n")
+	} else {
+		sb.WriteString("3. 诊断结论与受控修复 (HITL)：按「根因结论 → 关键现场证据 → 影响范围 → 处置与加固建议」输出中文报告；若确需执行线上修复命令或修改配置文件，严禁绕过审批，必须统一调用 `propose_change_plan` 提交有序变更计划（可在同一计划内混合编排 `sftp_write_file` 与 `exec_ssh_command`，写明变更目的、影响范围与回滚方案），等待我在 ServerNeedSafe Web 端「执行审批」批准后，再通过 `wait_for_approval` / `get_approval_status` 查看每步执行回显并做只读复测核验。\n")
+	}
+
+	sb.WriteString("4. 知识沉淀：若发现该主机的新服务、端口业务用途、典型故障根因或可复用 SOP，可调用 `update_host_memory`、`save_memory` 或 `save_runbook` 沉淀长期知识（严禁写入任何密码、私钥或 Token）。")
 	return sb.String()
 }
 
@@ -1674,6 +1894,7 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 
 	adv.Runbooks = matchRelevantRunbooks(al, runbooks)
 	adv.AIPrompt = buildAlertAIPrompt(al, adv)
+	adv.MCPPrompt = buildAlertMCPPrompt(al, snap, adv)
 	return adv
 }
 
