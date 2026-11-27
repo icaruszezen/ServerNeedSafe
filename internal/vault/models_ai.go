@@ -11,9 +11,133 @@ import (
 type AIProtocol string
 
 const (
-	AIProtocolOpenAI    AIProtocol = "openai"    // OpenAI-compatible /chat/completions (OpenAI, DeepSeek, Qwen, Ollama, vLLM, OpenRouter, etc.)
-	AIProtocolAnthropic AIProtocol = "anthropic" // Anthropic native /v1/messages protocol (Claude)
+	AIProtocolOpenAI          AIProtocol = "openai"           // OpenAI-compatible /chat/completions (OpenAI, DeepSeek, Qwen, Ollama, vLLM, OpenRouter, etc.)
+	AIProtocolOpenAIResponses AIProtocol = "openai_responses" // OpenAI Responses API (/responses)
+	AIProtocolAnthropic       AIProtocol = "anthropic"        // Anthropic Messages API (/messages)
+	AIProtocolGemini          AIProtocol = "gemini"           // Google Gemini API (:streamGenerateContent?alt=sse)
 )
+
+// IsValidAIProtocol reports whether p is a supported LLM wire protocol.
+func IsValidAIProtocol(p AIProtocol) bool {
+	switch p {
+	case AIProtocolOpenAI, AIProtocolOpenAIResponses, AIProtocolAnthropic, AIProtocolGemini:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeAIProtocol returns a canonical AIProtocol (defaulting empty to OpenAI Chat Completions).
+func NormalizeAIProtocol(p AIProtocol) AIProtocol {
+	p = AIProtocol(strings.ToLower(strings.TrimSpace(string(p))))
+	switch p {
+	case AIProtocolOpenAIResponses, AIProtocolAnthropic, AIProtocolGemini:
+		return p
+	default:
+		return AIProtocolOpenAI
+	}
+}
+
+// AIEndpointMode controls how the final HTTP request URL is derived from BaseURL.
+type AIEndpointMode string
+
+const (
+	AIEndpointModeAuto  AIEndpointMode = "auto"  // Automatically append protocol-standard endpoint suffix when needed
+	AIEndpointModeExact AIEndpointMode = "exact" // Send requests directly to BaseURL verbatim
+)
+
+func NormalizeAIEndpointMode(m AIEndpointMode) AIEndpointMode {
+	if strings.EqualFold(strings.TrimSpace(string(m)), string(AIEndpointModeExact)) {
+		return AIEndpointModeExact
+	}
+	return AIEndpointModeAuto
+}
+
+// AIAuthMode controls how APIKey is attached to outbound LLM HTTP requests.
+type AIAuthMode string
+
+const (
+	AIAuthModeAuto        AIAuthMode = "auto"           // Protocol default (OpenAI: Bearer, Anthropic: x-api-key, Gemini: x-goog-api-key)
+	AIAuthModeBearer      AIAuthMode = "bearer"         // Authorization: Bearer <key>
+	AIAuthModeXAPIKey     AIAuthMode = "x-api-key"      // x-api-key: <key>
+	AIAuthModeXGoogAPIKey AIAuthMode = "x-goog-api-key" // x-goog-api-key: <key>
+	AIAuthModeQueryKey    AIAuthMode = "query_key"      // ?key=<key>
+	AIAuthModeNone        AIAuthMode = "none"           // Do not send API key automatically
+)
+
+func NormalizeAIAuthMode(m AIAuthMode) AIAuthMode {
+	switch AIAuthMode(strings.ToLower(strings.TrimSpace(string(m)))) {
+	case AIAuthModeBearer:
+		return AIAuthModeBearer
+	case AIAuthModeXAPIKey:
+		return AIAuthModeXAPIKey
+	case AIAuthModeXGoogAPIKey:
+		return AIAuthModeXGoogAPIKey
+	case AIAuthModeQueryKey:
+		return AIAuthModeQueryKey
+	case AIAuthModeNone:
+		return AIAuthModeNone
+	default:
+		return AIAuthModeAuto
+	}
+}
+
+// AIReasoningEffort specifies unified thinking/reasoning depth across providers.
+type AIReasoningEffort string
+
+const (
+	AIReasoningDefault AIReasoningEffort = ""       // Follow provider/model default
+	AIReasoningOff     AIReasoningEffort = "off"    // Disable thinking/reasoning when supported
+	AIReasoningLow     AIReasoningEffort = "low"    // Fast, low-token reasoning
+	AIReasoningMedium  AIReasoningEffort = "medium" // Balanced reasoning
+	AIReasoningHigh    AIReasoningEffort = "high"   // Deep reasoning
+	AIReasoningMax     AIReasoningEffort = "max"    // Maximum reasoning (maps to xhigh/max)
+)
+
+func NormalizeAIReasoningEffort(r AIReasoningEffort) AIReasoningEffort {
+	switch AIReasoningEffort(strings.ToLower(strings.TrimSpace(string(r)))) {
+	case AIReasoningOff, "none", "disabled":
+		return AIReasoningOff
+	case AIReasoningLow, "minimal":
+		return AIReasoningLow
+	case AIReasoningMedium:
+		return AIReasoningMedium
+	case AIReasoningHigh:
+		return AIReasoningHigh
+	case AIReasoningMax, "xhigh":
+		return AIReasoningMax
+	default:
+		return AIReasoningDefault
+	}
+}
+
+// AICustomHeader represents an arbitrary custom HTTP header encrypted inside secrets.enc.
+type AICustomHeader struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// AICustomHeaderView redacts sensitive custom header values when returned to the UI.
+type AICustomHeaderView struct {
+	Key          string `json:"key"`
+	ValuePreview string `json:"value_preview"`
+	IsSensitive  bool   `json:"is_sensitive"`
+	HasValue     bool   `json:"has_value"`
+}
+
+// IsSensitiveHeaderKey reports whether an HTTP header name likely carries credentials or secrets.
+func IsSensitiveHeaderKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+	for _, needle := range []string{"auth", "key", "token", "secret", "cookie", "pass", "credential", "signature"} {
+		if strings.Contains(k, needle) {
+			return true
+		}
+	}
+	return false
+}
 
 // AIExecutionMode controls Human-in-the-Loop (HITL) gating for remote SSH/SFTP tool execution.
 type AIExecutionMode string
@@ -24,33 +148,90 @@ const (
 	AIModeAutonomous AIExecutionMode = "autonomous" // Auto-execute except catastrophic hard-blocked commands
 )
 
-// AIProviderConfig stores an LLM endpoint and secret API key strictly inside encrypted vault.sns.
+// AIProviderConfig stores an LLM endpoint, secret credentials, and unrestricted model parameters strictly inside encrypted secrets.enc.
 type AIProviderConfig struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	Protocol      AIProtocol `json:"protocol"`
-	BaseURL       string     `json:"base_url"`
-	APIKey        string     `json:"api_key,omitempty"`
-	Model         string     `json:"model"`
-	MaxTokens     int        `json:"max_tokens,omitempty"`
-	ContextWindow int        `json:"context_window,omitempty"` // 0 = auto-infer from model name (default 65536)
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Protocol        AIProtocol        `json:"protocol"`
+	BaseURL         string            `json:"base_url"`
+	EndpointMode    AIEndpointMode    `json:"endpoint_mode,omitempty"`
+	AuthMode        AIAuthMode        `json:"auth_mode,omitempty"`
+	APIKey          string            `json:"api_key,omitempty"`
+	Model           string            `json:"model"`
+	MaxTokens       int               `json:"max_tokens,omitempty"`        // Legacy alias synced with MaxOutputTokens
+	MaxOutputTokens int               `json:"max_output_tokens,omitempty"` // 0 = unset (use model/provider default); unrestricted positive integer
+	MaxInputTokens  int               `json:"max_input_tokens,omitempty"`  // 0 = auto from catalog/ContextWindow; unrestricted positive integer
+	ContextWindow   int               `json:"context_window,omitempty"`    // 0 = auto from catalog; unrestricted positive integer
+	Temperature     *float64          `json:"temperature,omitempty"`       // nil = omit / follow model default
+	TopP            *float64          `json:"top_p,omitempty"`             // nil = omit / follow model default
+	ReasoningEffort AIReasoningEffort `json:"reasoning_effort,omitempty"`  // "", "off", "low", "medium", "high", "max"
+	CustomHeaders   []AICustomHeader  `json:"custom_headers,omitempty"`    // Arbitrary encrypted HTTP headers
+	ExtraBodyJSON   string            `json:"extra_body_json,omitempty"`   // Unrestricted JSON object deep-merged into outbound payload
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
 }
 
-// AIProviderView omits the raw API key when listing providers to UI views.
+// EffectiveMaxOutputTokens returns the configured max output token cap (0 means unset / model default).
+func (p AIProviderConfig) EffectiveMaxOutputTokens() int {
+	if p.MaxOutputTokens > 0 {
+		return p.MaxOutputTokens
+	}
+	if p.MaxTokens > 0 {
+		return p.MaxTokens
+	}
+	return 0
+}
+
+// CloneAIProviderConfig returns a deep copy of AIProviderConfig so callers can safely mutate copies.
+func CloneAIProviderConfig(p AIProviderConfig) AIProviderConfig {
+	cp := p
+	if p.Temperature != nil {
+		v := *p.Temperature
+		cp.Temperature = &v
+	}
+	if p.TopP != nil {
+		v := *p.TopP
+		cp.TopP = &v
+	}
+	if p.CustomHeaders != nil {
+		cp.CustomHeaders = slices.Clone(p.CustomHeaders)
+	}
+	return cp
+}
+
+func cloneAIProviders(in []AIProviderConfig) []AIProviderConfig {
+	if in == nil {
+		return []AIProviderConfig{}
+	}
+	out := make([]AIProviderConfig, len(in))
+	for i, p := range in {
+		out[i] = CloneAIProviderConfig(p)
+	}
+	return out
+}
+
+// AIProviderView omits raw secrets when listing providers to UI views.
 type AIProviderView struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	Protocol      AIProtocol `json:"protocol"`
-	BaseURL       string     `json:"base_url"`
-	HasAPIKey     bool       `json:"has_api_key"`
-	APIKeyPreview string     `json:"api_key_preview,omitempty"`
-	Model         string     `json:"model"`
-	MaxTokens     int        `json:"max_tokens"`
-	ContextWindow int        `json:"context_window"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	Protocol        AIProtocol           `json:"protocol"`
+	BaseURL         string               `json:"base_url"`
+	EndpointMode    AIEndpointMode       `json:"endpoint_mode"`
+	AuthMode        AIAuthMode           `json:"auth_mode"`
+	HasAPIKey       bool                 `json:"has_api_key"`
+	APIKeyPreview   string               `json:"api_key_preview,omitempty"`
+	Model           string               `json:"model"`
+	MaxTokens       int                  `json:"max_tokens"`
+	MaxOutputTokens int                  `json:"max_output_tokens"`
+	MaxInputTokens  int                  `json:"max_input_tokens"`
+	ContextWindow   int                  `json:"context_window"`
+	Temperature     *float64             `json:"temperature,omitempty"`
+	TopP            *float64             `json:"top_p,omitempty"`
+	ReasoningEffort AIReasoningEffort    `json:"reasoning_effort,omitempty"`
+	CustomHeaders   []AICustomHeaderView `json:"custom_headers,omitempty"`
+	ExtraBodyJSON   string               `json:"extra_body_json,omitempty"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
 }
 
 func maskSecretPreview(secret string) string {
@@ -66,23 +247,110 @@ func maskSecretPreview(secret string) string {
 }
 
 func (p AIProviderConfig) ToView() AIProviderView {
-	maxTok := p.MaxTokens
-	if maxTok <= 0 {
-		maxTok = 4096
+	maxOut := p.EffectiveMaxOutputTokens()
+	var tempPtr, topPPtr *float64
+	if p.Temperature != nil {
+		v := *p.Temperature
+		tempPtr = &v
+	}
+	if p.TopP != nil {
+		v := *p.TopP
+		topPPtr = &v
+	}
+	var hdrViews []AICustomHeaderView
+	if len(p.CustomHeaders) > 0 {
+		hdrViews = make([]AICustomHeaderView, 0, len(p.CustomHeaders))
+		for _, h := range p.CustomHeaders {
+			k := strings.TrimSpace(h.Key)
+			if k == "" {
+				continue
+			}
+			sens := IsSensitiveHeaderKey(k)
+			preview := h.Value
+			if sens {
+				preview = maskSecretPreview(h.Value)
+			}
+			hdrViews = append(hdrViews, AICustomHeaderView{
+				Key:          k,
+				ValuePreview: preview,
+				IsSensitive:  sens,
+				HasValue:     h.Value != "",
+			})
+		}
 	}
 	return AIProviderView{
-		ID:            p.ID,
-		Name:          p.Name,
-		Protocol:      p.Protocol,
-		BaseURL:       p.BaseURL,
-		HasAPIKey:     p.APIKey != "",
-		APIKeyPreview: maskSecretPreview(p.APIKey),
-		Model:         p.Model,
-		MaxTokens:     maxTok,
-		ContextWindow: p.ContextWindow,
-		CreatedAt:     p.CreatedAt,
-		UpdatedAt:     p.UpdatedAt,
+		ID:              p.ID,
+		Name:            p.Name,
+		Protocol:        NormalizeAIProtocol(p.Protocol),
+		BaseURL:         p.BaseURL,
+		EndpointMode:    NormalizeAIEndpointMode(p.EndpointMode),
+		AuthMode:        NormalizeAIAuthMode(p.AuthMode),
+		HasAPIKey:       p.APIKey != "",
+		APIKeyPreview:   maskSecretPreview(p.APIKey),
+		Model:           p.Model,
+		MaxTokens:       maxOut,
+		MaxOutputTokens: maxOut,
+		MaxInputTokens:  max(0, p.MaxInputTokens),
+		ContextWindow:   max(0, p.ContextWindow),
+		Temperature:     tempPtr,
+		TopP:            topPPtr,
+		ReasoningEffort: NormalizeAIReasoningEffort(p.ReasoningEffort),
+		CustomHeaders:   hdrViews,
+		ExtraBodyJSON:   p.ExtraBodyJSON,
+		CreatedAt:       p.CreatedAt,
+		UpdatedAt:       p.UpdatedAt,
 	}
+}
+
+// AITokenUsage captures real token usage reported by an upstream LLM streaming response.
+type AITokenUsage struct {
+	InputTokens       int `json:"input_tokens,omitempty"`
+	OutputTokens      int `json:"output_tokens,omitempty"`
+	ReasoningTokens   int `json:"reasoning_tokens,omitempty"`
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
+	TotalTokens       int `json:"total_tokens,omitempty"`
+}
+
+// AIAnthropicThinkingBlock preserves Claude thinking/redacted_thinking blocks with signatures for multi-turn tool calling.
+type AIAnthropicThinkingBlock struct {
+	Type      string `json:"type"` // "thinking" or "redacted_thinking"
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
+}
+
+// AIMessageMeta stores protocol-specific opaque reasoning state required to round-trip multi-turn tool calls cleanly.
+type AIMessageMeta struct {
+	Protocol               AIProtocol                 `json:"protocol,omitempty"`
+	AnthropicThinking      []AIAnthropicThinkingBlock `json:"anthropic_thinking,omitempty"`
+	GeminiThoughtSignature string                     `json:"gemini_thought_signature,omitempty"`
+	GeminiToolSignatures   map[string]string          `json:"gemini_tool_signatures,omitempty"`
+	GeminiToolIDs          map[string]string          `json:"gemini_tool_ids,omitempty"`
+	ResponsesReasoningRaw  []string                   `json:"responses_reasoning_raw,omitempty"`
+}
+
+// AIModelCatalogEntry stores default limits and capability metadata for a known LLM model.
+type AIModelCatalogEntry struct {
+	ID                      string     `json:"id"`
+	Name                    string     `json:"name,omitempty"`
+	Vendor                  string     `json:"vendor,omitempty"`
+	Protocol                AIProtocol `json:"protocol,omitempty"`
+	ContextWindow           int        `json:"context_window,omitempty"`
+	MaxInputTokens          int        `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens         int        `json:"max_output_tokens,omitempty"`
+	SupportsReasoning       bool       `json:"supports_reasoning,omitempty"`
+	SupportsTemperature     *bool      `json:"supports_temperature,omitempty"` // nil defaults to true
+	SupportsTools           bool       `json:"supports_tools,omitempty"`
+	InterleavedReasoningKey string     `json:"interleaved_reasoning_key,omitempty"`
+	ReleaseDate             string     `json:"release_date,omitempty"`
+	Source                  string     `json:"source,omitempty"` // "builtin", "models.dev", "openrouter", "provider"
+}
+
+// AIModelCatalogCache caches synced public model metadata inside aiops_runtime.json.
+type AIModelCatalogCache struct {
+	Source   string                `json:"source,omitempty"`
+	SyncedAt *time.Time            `json:"synced_at,omitempty"`
+	Models   []AIModelCatalogEntry `json:"models,omitempty"`
 }
 
 // WebhookChannel configures an external IM/HTTP alert target stored inside vault.sns.
@@ -693,14 +961,17 @@ type AIRunbookProposal struct {
 
 // AIChatMessage represents one conversational or tool-result turn inside AIChatSession.
 type AIChatMessage struct {
-	ID         string             `json:"id"`
-	Role       string             `json:"role"` // "user", "assistant", "tool"
-	Content    string             `json:"content"`
-	ToolCalls  []AIToolCallRecord `json:"tool_calls,omitempty"`
-	ToolCallID string             `json:"tool_call_id,omitempty"`
-	ToolName   string             `json:"tool_name,omitempty"`
-	IsError    bool               `json:"is_error,omitempty"`
-	Timestamp  time.Time          `json:"timestamp"`
+	ID               string             `json:"id"`
+	Role             string             `json:"role"` // "user", "assistant", "tool"
+	Content          string             `json:"content"`
+	ReasoningContent string             `json:"reasoning_content,omitempty"`
+	ProviderState    *AIMessageMeta     `json:"provider_state,omitempty"`
+	Usage            *AITokenUsage      `json:"usage,omitempty"`
+	ToolCalls        []AIToolCallRecord `json:"tool_calls,omitempty"`
+	ToolCallID       string             `json:"tool_call_id,omitempty"`
+	ToolName         string             `json:"tool_name,omitempty"`
+	IsError          bool               `json:"is_error,omitempty"`
+	Timestamp        time.Time          `json:"timestamp"`
 }
 
 // AIChatSession stores an encrypted AI Ops troubleshooting or Terminal Copilot conversation.
@@ -1034,6 +1305,8 @@ func scrubAIData(st *VaultState) {
 	for i := range st.AISettings.Providers {
 		st.AISettings.Providers[i].APIKey = ""
 		st.AISettings.Providers[i].BaseURL = ""
+		st.AISettings.Providers[i].CustomHeaders = nil
+		st.AISettings.Providers[i].ExtraBodyJSON = ""
 	}
 	for i := range st.AISettings.Patrol.Webhooks {
 		st.AISettings.Patrol.Webhooks[i].URL = ""
@@ -1056,7 +1329,7 @@ func cloneAIData(dst, src *VaultState) {
 		return
 	}
 	dst.AISettings = src.AISettings
-	dst.AISettings.Providers = slices.Clone(src.AISettings.Providers)
+	dst.AISettings.Providers = cloneAIProviders(src.AISettings.Providers)
 	dst.AISettings.Patrol.ServerIDs = slices.Clone(src.AISettings.Patrol.ServerIDs)
 	dst.AISettings.Patrol.Webhooks = slices.Clone(src.AISettings.Patrol.Webhooks)
 	dst.AISettings.MCP.Tokens = cloneMCPTokens(src.AISettings.MCP.Tokens)

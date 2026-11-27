@@ -742,10 +742,10 @@ func TestExternalPatrolTimeoutFallbackToBuiltinLLM(t *testing.T) {
 	srv := NewServer(Config{DeployMode: "server", Store: store})
 	defer srv.Close()
 
-	// Mock OpenAI-compatible server for built-in fallback
+	// Mock OpenAI-compatible SSE streaming server for built-in fallback
 	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"summary\":\"内置兜底：根分区日志满载\",\"root_cause\":\"超过外部等待时间，由内置模型兜底定位日志膨胀\",\"recommendations\":[\"执行 journalctl --vacuum-size=200M\"]}"}}]}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"summary\\\":\\\"内置兜底：根分区日志满载\\\",\\\"root_cause\\\":\\\"超过外部等待时间，由内置模型兜底定位日志膨胀\\\",\\\"recommendations\\\":[\\\"执行 journalctl --vacuum-size=200M\\\"]}\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
 	defer mockLLM.Close()
 

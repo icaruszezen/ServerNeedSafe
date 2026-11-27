@@ -385,6 +385,7 @@ type AIOpsRuntimeState struct {
 	PatrolRecords     []PatrolRecord                  `json:"patrol_records"`
 	ExternalApprovals []ExternalApproval              `json:"external_approvals,omitempty"`
 	MCPTokenUsage     map[string]MCPTokenRuntimeUsage `json:"mcp_token_usage,omitempty"`
+	ModelCatalog      *AIModelCatalogCache            `json:"model_catalog,omitempty"`
 }
 
 // AuditRuntimeState is persisted asynchronously to audit_logs.json without encryption overhead.

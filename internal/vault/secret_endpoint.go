@@ -25,8 +25,5 @@ func normalizeEndpointURL(u string) string {
 }
 
 func normalizeAIProtocol(p AIProtocol) AIProtocol {
-	if p == "" {
-		return AIProtocolOpenAI
-	}
-	return p
+	return NormalizeAIProtocol(p)
 }

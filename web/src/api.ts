@@ -1,16 +1,23 @@
 import type {
   AgentsMDConfig,
   AIAgentsMDProposal,
+  AIAuthMode,
   AIChatSession,
   AIChatSessionSummary,
+  AICustomHeader,
+  AIEndpointMode,
   AIExecutionMode,
   AIMemoryConfig,
   AIMemoryEntry,
+  AIModelCatalogEntry,
+  AIModelCatalogOverview,
   AIOverviewResponse,
   AIProtocol,
   AIProviderView,
+  AIReasoningEffort,
   AIRunbook,
   AIStreamEvent,
+  AITokenUsage,
   AppSettings,
   AuthStatusResponse,
   BatchExecResult,
@@ -881,13 +888,23 @@ export const api = {
 
   upsertAIProvider: (payload: {
     id?: string;
+    clone_from_id?: string;
     name: string;
     protocol: AIProtocol;
     base_url: string;
+    endpoint_mode?: AIEndpointMode;
+    auth_mode?: AIAuthMode;
     api_key?: string;
     model: string;
     max_tokens?: number;
+    max_output_tokens?: number;
+    max_input_tokens?: number;
     context_window?: number;
+    temperature?: number | null;
+    top_p?: number | null;
+    reasoning_effort?: AIReasoningEffort;
+    custom_headers?: AICustomHeader[];
+    extra_body_json?: string;
     set_active?: boolean;
   }) =>
     requestJSON<{ provider: AIProviderView; active_provider_id: string }>(
@@ -911,15 +928,52 @@ export const api = {
 
   testAIProvider: (payload: {
     id?: string;
+    clone_from_id?: string;
     protocol: AIProtocol;
     base_url: string;
+    endpoint_mode?: AIEndpointMode;
+    auth_mode?: AIAuthMode;
     api_key?: string;
     model: string;
+    max_output_tokens?: number;
+    temperature?: number | null;
+    top_p?: number | null;
+    reasoning_effort?: AIReasoningEffort;
+    custom_headers?: AICustomHeader[];
+    extra_body_json?: string;
   }) =>
-    requestJSON<{ ok: boolean; latency_ms: number; reply: string }>(
+    requestJSON<{
+      ok: boolean;
+      latency_ms: number;
+      first_token_ms?: number;
+      reply: string;
+      reasoning_preview?: string;
+      protocol?: AIProtocol;
+      model?: string;
+      usage?: AITokenUsage;
+    }>('POST', '/api/ai/test-provider', payload),
+
+  fetchAIProviderModels: (payload: {
+    id?: string;
+    clone_from_id?: string;
+    protocol: AIProtocol;
+    base_url: string;
+    endpoint_mode?: AIEndpointMode;
+    auth_mode?: AIAuthMode;
+    api_key?: string;
+    custom_headers?: AICustomHeader[];
+  }) =>
+    requestJSON<{ ok: boolean; count: number; models: AIModelCatalogEntry[] }>(
       'POST',
-      '/api/ai/test-provider',
+      '/api/ai/provider-models',
       payload
+    ),
+
+  syncAIModelCatalog: (custom_url?: string) =>
+    requestJSON<{ ok: boolean; model_catalog: AIModelCatalogOverview }>(
+      'POST',
+      '/api/ai/model-catalog/sync',
+      custom_url ? { custom_url } : {}
     ),
 
   updateAgentsMD: (payload: { enabled: boolean; content: string; reset_default?: boolean }) =>

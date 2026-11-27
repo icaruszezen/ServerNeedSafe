@@ -440,6 +440,7 @@ func (s *Server) handleGetAIOverview(w http.ResponseWriter, r *http.Request) {
 		"default_mode":               defaultMode,
 		"providers":                  providers,
 		"presets":                    aiops.BuiltinProviderPresets(),
+		"model_catalog":              s.cfg.AI.GetModelCatalogOverview(),
 		"agents_md":                  agentsMD,
 		"agents_md_template":         vault.DefaultAgentsMDTemplate(),
 		"memory_config":              memoryCfg,
@@ -510,69 +511,97 @@ func (s *Server) handleDeleteAIProvider(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleTestAIProvider(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ID       string           `json:"id"`
-		Protocol vault.AIProtocol `json:"protocol"`
-		BaseURL  string           `json:"base_url"`
-		APIKey   string           `json:"api_key"`
-		Model    string           `json:"model"`
-	}
-	if err := decodeJSON(r, &req, 64*1024); err != nil {
+	var req vault.AIProviderMutationInput
+	if err := decodeJSON(r, &req, 128*1024); err != nil {
 		writeError(w, http.StatusBadRequest, "BAD_JSON", "测试连接参数格式错误")
 		return
 	}
-	var cfg vault.AIProviderConfig
-	var storedBaseURL string
-	var storedProtocol vault.AIProtocol
-	if req.ID != "" {
-		if stored, sErr := s.cfg.Store.GetAIProviderSecret(req.ID); sErr == nil && stored != nil {
-			cfg = *stored
-			storedBaseURL = cfg.BaseURL
-			storedProtocol = cfg.Protocol
-			if storedProtocol == "" {
-				storedProtocol = vault.AIProtocolOpenAI
-			}
-		}
+	cfg, err := s.cfg.Store.ResolveAIProviderForTransientCall(req)
+	if req.APIKey != nil {
+		*req.APIKey = ""
 	}
-	if req.Protocol != "" {
-		cfg.Protocol = req.Protocol
-	}
-	if cfg.Protocol == "" {
-		cfg.Protocol = vault.AIProtocolOpenAI
-	}
-	if strings.TrimSpace(req.BaseURL) != "" {
-		cfg.BaseURL = strings.TrimSpace(req.BaseURL)
-	}
-	if strings.TrimSpace(req.Model) != "" {
-		cfg.Model = strings.TrimSpace(req.Model)
-	}
-	if strings.TrimSpace(req.APIKey) != "" {
-		cfg.APIKey = strings.TrimSpace(req.APIKey)
-	} else if cfg.APIKey != "" && (!vault.SameEndpointURL(cfg.BaseURL, storedBaseURL) || cfg.Protocol != storedProtocol) {
-		// The stored (masked) API key must never be sent to a caller-chosen endpoint: otherwise anyone
-		// holding a session could exfiltrate the plaintext key by "testing" against their own server.
-		cfg.APIKey = ""
-		req.APIKey = ""
-		writeDomainError(w, fmt.Errorf("%w: 更换接口地址或协议时必须重新填写 API Key", vault.ErrInvalidInput))
+	if err != nil {
+		writeDomainError(w, err)
 		return
 	}
-	req.APIKey = ""
+	defer func() {
+		cfg.APIKey = ""
+		cfg.CustomHeaders = nil
+	}()
 	if cfg.BaseURL == "" || cfg.Model == "" {
 		writeDomainError(w, fmt.Errorf("%w: 请填写接口地址与模型名称", vault.ErrInvalidInput))
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
 	defer cancel()
-	latencyMs, reply, err := s.cfg.AI.LLM().TestConnection(ctx, cfg)
-	cfg.APIKey = ""
+	res, err := s.cfg.AI.LLM().TestConnectionDetailed(ctx, *cfg)
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":         true,
-		"latency_ms": latencyMs,
-		"reply":      reply,
+		"ok":                true,
+		"latency_ms":        res.LatencyMs,
+		"first_token_ms":    res.FirstTokenMs,
+		"reply":             res.Reply,
+		"reasoning_preview": res.ReasoningPreview,
+		"protocol":          res.Protocol,
+		"model":             res.Model,
+		"usage":             res.Usage,
+	})
+}
+
+func (s *Server) handleFetchAIProviderModels(w http.ResponseWriter, r *http.Request) {
+	var req vault.AIProviderMutationInput
+	if err := decodeJSON(r, &req, 128*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "拉取模型列表参数格式错误")
+		return
+	}
+	cfg, err := s.cfg.Store.ResolveAIProviderForTransientCall(req)
+	if req.APIKey != nil {
+		*req.APIKey = ""
+	}
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	defer func() {
+		cfg.APIKey = ""
+		cfg.CustomHeaders = nil
+	}()
+	if cfg.BaseURL == "" {
+		writeDomainError(w, fmt.Errorf("%w: 请先填写 API Base URL", vault.ErrInvalidInput))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	models, err := s.cfg.AI.FetchProviderModels(ctx, *cfg)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"count":  len(models),
+		"models": models,
+	})
+}
+
+func (s *Server) handleSyncAIModelCatalog(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomURL string `json:"custom_url"`
+	}
+	_ = decodeJSON(r, &req, 32*1024)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	ov, err := s.cfg.AI.SyncModelCatalog(ctx, strings.TrimSpace(req.CustomURL))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"model_catalog": ov,
 	})
 }
 

@@ -822,19 +822,75 @@ export interface MonitorPolicyResponse {
 // Client-Side Zero-Knowledge AI Ops, Hybrid Memory, Runbooks & Scheduled Patrol
 // ============================================================================
 
-export type AIProtocol = 'openai' | 'anthropic';
+export type AIProtocol = 'openai' | 'openai_responses' | 'anthropic' | 'gemini';
+export type AIEndpointMode = 'auto' | 'exact';
+export type AIAuthMode = 'auto' | 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'query_key' | 'none';
+export type AIReasoningEffort = '' | 'off' | 'low' | 'medium' | 'high' | 'max';
 export type AIExecutionMode = 'suggest' | 'standard' | 'autonomous';
+
+export interface AICustomHeader {
+  key: string;
+  value: string;
+}
+
+export interface AICustomHeaderView {
+  key: string;
+  value_preview: string;
+  is_sensitive: boolean;
+  has_value: boolean;
+}
+
+export interface AITokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  reasoning_tokens?: number;
+  cached_input_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface AIModelCatalogEntry {
+  id: string;
+  name?: string;
+  vendor?: string;
+  protocol?: AIProtocol;
+  context_window?: number;
+  max_input_tokens?: number;
+  max_output_tokens?: number;
+  supports_reasoning?: boolean;
+  supports_temperature?: boolean;
+  supports_tools?: boolean;
+  interleaved_reasoning_key?: string;
+  release_date?: string;
+  source?: string;
+}
+
+export interface AIModelCatalogOverview {
+  source: string;
+  synced_at?: string;
+  builtin_count: number;
+  synced_count: number;
+  models: AIModelCatalogEntry[];
+}
 
 export interface AIProviderView {
   id: string;
   name: string;
   protocol: AIProtocol;
   base_url: string;
+  endpoint_mode?: AIEndpointMode;
+  auth_mode?: AIAuthMode;
   has_api_key: boolean;
   api_key_preview?: string;
   model: string;
   max_tokens: number;
+  max_output_tokens?: number;
+  max_input_tokens?: number;
   context_window?: number;
+  temperature?: number | null;
+  top_p?: number | null;
+  reasoning_effort?: AIReasoningEffort;
+  custom_headers?: AICustomHeaderView[];
+  extra_body_json?: string;
   created_at: string;
   updated_at: string;
 }
@@ -844,7 +900,12 @@ export interface ProviderPreset {
   name: string;
   protocol: AIProtocol;
   base_url: string;
+  endpoint_mode?: AIEndpointMode;
+  auth_mode?: AIAuthMode;
   default_model: string;
+  context_window?: number;
+  max_input_tokens?: number;
+  max_output_tokens?: number;
   description: string;
 }
 
@@ -1181,6 +1242,8 @@ export interface AIChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'tool';
   content: string;
+  reasoning_content?: string;
+  usage?: AITokenUsage;
   tool_calls?: AIToolCallRecord[];
   tool_call_id?: string;
   tool_name?: string;
@@ -1297,9 +1360,13 @@ export interface SessionContextInspection {
   estimated_history_tokens: number;
   estimated_total_tokens: number;
   context_window_tokens: number;
+  max_input_tokens?: number;
+  max_output_tokens?: number;
   compaction_threshold_tokens: number;
   usage_percent: number;
   needs_compaction: boolean;
+  last_usage?: AITokenUsage;
+  session_total_usage?: AITokenUsage;
 }
 
 export interface AIOverviewResponse {
@@ -1307,6 +1374,7 @@ export interface AIOverviewResponse {
   default_mode: AIExecutionMode;
   providers: AIProviderView[];
   presets: ProviderPreset[];
+  model_catalog?: AIModelCatalogOverview;
   agents_md: AgentsMDConfig;
   agents_md_template: string;
   memory_config: AIMemoryConfig;
@@ -1327,6 +1395,7 @@ export interface AIOverviewResponse {
 export interface AIStreamEvent {
   type:
     | 'delta'
+    | 'reasoning_delta'
     | 'tool_start'
     | 'tool_result'
     | 'approval_required'
@@ -1339,6 +1408,8 @@ export interface AIStreamEvent {
     | 'done'
     | 'error';
   delta?: string;
+  reasoning_delta?: string;
+  usage?: AITokenUsage;
   tool?: AIToolCallRecord;
   approval?: AIPendingApproval;
   memory?: HostMemory;

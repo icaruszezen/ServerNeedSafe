@@ -584,7 +584,7 @@ func (s *Service) evaluateServerPatrol(
 }
 
 func (s *Service) enrichPatrolWithLLM(ctx context.Context, prov vault.AIProviderConfig, rec *vault.PatrolRecord) {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	serverIDs := make([]string, 0, len(rec.Findings))
@@ -617,7 +617,7 @@ func (s *Service) enrichPatrolWithLLM(ctx context.Context, prov vault.AIProvider
 			Role:    "user",
 			Content: userBody.String(),
 		},
-	}, nil, nil)
+	}, nil, StreamCallbacks{})
 	if err != nil || turn == nil {
 		return
 	}
