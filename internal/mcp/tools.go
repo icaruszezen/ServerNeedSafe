@@ -263,22 +263,34 @@ func (s *Server) listToolsForToken(tok *vault.MCPToken) []mcpToolDef {
 		},
 		{
 			Name:        "list_approvals",
-			Description: "列出外部 AI 提交的 HITL 变更审批记录（可按 pending/approved/rejected 过滤）。",
+			Description: "列出外部 AI 提交的 HITL 变更计划审批记录（支持按 pending / running / active / completed / partial_failed / failed / cancelled / rejected / all 过滤），返回每份计划及步骤摘要。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"status": map[string]any{"type": "string", "description": "pending / approved / rejected / all（默认 pending）"},
+					"status": map[string]any{"type": "string", "description": "状态过滤：pending / running / active / completed / partial_failed / failed / cancelled / rejected / all（默认 pending）"},
 					"limit":  map[string]any{"type": "integer", "description": "最大返回条数（默认 20）"},
 				},
 			},
 		},
 		{
 			Name:        "get_approval_status",
-			Description: "查询某条外部 AI 变更审批单 (approval_id) 的最新审批结论与远端执行回显 (stdout/stderr)，便于在管理员批准后执行二次核验。",
+			Description: "查询某份外部 AI 变更计划审批单 (approval_id) 的最新总状态、执行进度及每一步的远端执行状态、回显 (execution_out)、报错与耗时。",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"approval_id": map[string]any{"type": "string", "description": "审批单 ID"},
+					"approval_id": map[string]any{"type": "string", "description": "变更计划审批单 ID"},
+				},
+				"required": []string{"approval_id"},
+			},
+		},
+		{
+			Name:        "wait_for_approval",
+			Description: "等待某份外部 AI 变更计划 (approval_id) 完成审批并执行到终态（completed / partial_failed / failed / cancelled / rejected）后立即返回每步完整结果；若超过 timeout_sec 尚未结束，会友好返回当前进度快照 (timed_out=true) 而非报错。",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"approval_id": map[string]any{"type": "string", "description": "变更计划审批单 ID"},
+					"timeout_sec": map[string]any{"type": "integer", "description": "最长等待秒数（默认 30，最大 120）"},
 				},
 				"required": []string{"approval_id"},
 			},
@@ -288,32 +300,38 @@ func (s *Server) listToolsForToken(tok *vault.MCPToken) []mcpToolDef {
 	if tok != nil && tok.Scope == vault.MCPScopeOpsPropose {
 		tools = append(tools,
 			mcpToolDef{
-				Name:        "propose_ssh_command",
-				Description: "【受控变更 · HITL】提交一条状态变更类 SSH 修复/运维命令进入 ServerNeedSafe Web 端审批队列。命令绝不会自动执行，且毁灭性指令会被安全熔断器硬拦截。提交后会返回 approval_id，管理员在控制台点击批准后立即执行。",
+				Name:        "propose_change_plan",
+				Description: "【受控变更 · HITL 统一入口】一次性提交包含 1~20 个有序步骤的变更执行计划进入 ServerNeedSafe Web 端审批队列。可在同一列表中混合编排 SSH 命令 (exec_ssh_command) 与 SFTP 配置文件修改 (sftp_write_file)，每步可独立指定目标主机、超时时间与 continue_on_error（默认 false 遇错即停）。提案绝不会自动执行；命中安全熔断的高危步骤会被标红锁定且无法执行。管理员可一键批准整份列表（或剔除个别步骤）按你给定的顺序依次执行，随后可调用 wait_for_approval 或 get_approval_status 获取每步回显。",
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"server_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "目标服务器 server_id 列表"},
-						"command":          map[string]any{"type": "string", "description": "拟执行的修复或控制命令（如 journalctl --vacuum-size=200M 或 systemctl reload nginx）"},
-						"reason":           map[string]any{"type": "string", "description": "清晰说明变更目的、影响范围与回滚方案（将展示在审批卡片与通知中）"},
+						"title":            map[string]any{"type": "string", "description": "变更计划简明标题（如：调整 Nginx 超时并平滑重载）"},
+						"reason":           map[string]any{"type": "string", "description": "整体变更目的、业务影响范围与回滚方案（展示在审批卡片与聚合 Webhook 通知中）"},
 						"patrol_record_id": map[string]any{"type": "string", "description": "可选：关联的巡检记录 ID"},
+						"steps": map[string]any{
+							"type":        "array",
+							"minItems":    1,
+							"maxItems":    aiops.MaxExternalPlanSteps,
+							"description": "按期望执行顺序排列的变更步骤列表（1~20 步；单步变更传 1 个元素）",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"type":              map[string]any{"type": "string", "enum": []string{"exec_ssh_command", "sftp_write_file"}, "description": "步骤类型：exec_ssh_command（远程命令）或 sftp_write_file（配置文件修改，服务端自动生成 Unified Diff）"},
+									"title":             map[string]any{"type": "string", "description": "可选：本步骤简短标题（如：修改 nginx.conf / 校验配置语法 / 重载服务）"},
+									"reason":            map[string]any{"type": "string", "description": "可选：本步骤目的说明"},
+									"server_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "目标服务器 server_id 列表（exec_ssh_command 支持单/多台主机；sftp_write_file 仅限单台主机，也可直接传 server_id）"},
+									"server_id":         map[string]any{"type": "string", "description": "单台目标服务器 server_id（sftp_write_file 推荐填写，exec_ssh_command 单机时也可使用）"},
+									"command":           map[string]any{"type": "string", "description": "当 type=exec_ssh_command 时必填：拟执行的非交互式 Shell 命令"},
+									"timeout_sec":       map[string]any{"type": "integer", "description": "可选：SSH 步骤超时秒数（默认 45，最大 300）"},
+									"path":              map[string]any{"type": "string", "description": "当 type=sftp_write_file 时必填：远程配置文件完整路径"},
+									"content":           map[string]any{"type": "string", "description": "当 type=sftp_write_file 时必填：修改后的完整文件内容"},
+									"continue_on_error": map[string]any{"type": "boolean", "description": "可选：本步骤执行失败时是否继续执行后续步骤（默认 false，遇错即停并跳过后续步骤）"},
+								},
+								"required": []string{"type"},
+							},
+						},
 					},
-					"required": []string{"server_ids", "command", "reason"},
-				},
-			},
-			mcpToolDef{
-				Name:        "propose_sftp_write",
-				Description: "【受控变更 · HITL】提交远程配置文件修改提案进入 ServerNeedSafe Web 端审批队列。服务端会自动拉取现网原文件计算 Unified Diff 供管理员逐行审查批准，绝不会绕过审批直接写盘。",
-				InputSchema: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"server_id":        map[string]any{"type": "string", "description": "目标服务器 server_id"},
-						"path":             map[string]any{"type": "string", "description": "远程配置文件完整路径"},
-						"content":          map[string]any{"type": "string", "description": "完整的修改后文件内容"},
-						"reason":           map[string]any{"type": "string", "description": "修改原因、影响与验证计划"},
-						"patrol_record_id": map[string]any{"type": "string", "description": "可选：关联的巡检记录 ID"},
-					},
-					"required": []string{"server_id", "path", "content", "reason"},
+					"required": []string{"title", "reason", "steps"},
 				},
 			},
 		)
@@ -450,7 +468,7 @@ func (s *Server) getPrompt(name string, args map[string]string) (string, []map[s
 3. 针对每台出现告警或异常的主机，使用 `+"`exec_readonly_ssh`"+`（例如 `+"`journalctl`"+`、`+"`ss -tulnp`"+`、`+"`ps aux --sort=-%%cpu | head -n 15`"+`、`+"`df -h`"+`、`+"`systemctl status`"+`）或 `+"`sftp_read_file`"+` 进行深一层只读取证，拿到确凿根因证据。
 4. 调用 `+"`submit_patrol_report`"+` 将结构化的 `+"`summary`"+`、`+"`root_cause`"+`、`+"`deep_evidence`"+` 与 `+"`recommendations`"+` 回写到 ServerNeedSafe 面板并推送告警。
 5. 若发现新的主机服务、端口用途或典型故障根因，调用 `+"`update_host_memory`"+` / `+"`save_memory`"+` 沉淀知识（严禁写入任何明文凭据）。
-6. 若确认需要线上修复或配置加固且拥有 `+"`ops_propose`"+` 权限，使用 `+"`propose_ssh_command`"+` 或 `+"`propose_sftp_write`"+` 提交 HITL 审批提案（关联 `+"`patrol_record_id`"+`），等待管理员在 Web 控制台批准后查询执行结果。`, targetHint)
+6. 若确认需要线上修复或配置加固且拥有 `+"`ops_propose`"+` 权限，使用 `+"`propose_change_plan`"+` 一次性提交完整的有序变更步骤列表（可在同一计划内混合编排 `+"`sftp_write_file`"+` 与 `+"`exec_ssh_command`"+`，并关联 `+"`patrol_record_id`"+`），等待管理员一键批准按序执行后通过 `+"`wait_for_approval`"+` 或 `+"`get_approval_status`"+` 核验每步回显。`, targetHint)
 		return "认领并完成 ServerNeedSafe 巡检队列的深度研判与回写", []map[string]any{
 			{"role": "user", "content": map[string]any{"type": "text", "text": text}},
 		}, nil
@@ -477,7 +495,7 @@ func (s *Server) getPrompt(name string, args map[string]string) (string, []map[s
 		text := fmt.Sprintf(`请对主机「%s」执行深度只读安全基线与性能体检：
 1. 调用 `+"`list_servers`"+` 找到该主机的 `+"`server_id`"+`，再调用 `+"`get_server_detail`"+` 与 `+"`get_ops_context`"+` 查阅现有态势、端口基线与运维红线。
 2. 使用 `+"`exec_readonly_ssh`"+` 与 `+"`sftp_read_file`"+` 检查系统负载、Top 进程、公网监听端口、SSH 登录安全配置 (/etc/ssh/sshd_config)、近期认证失败日志、磁盘/Inode 水位与失败服务。
-3. 调用 `+"`update_host_memory`"+` 补齐最新服务与端口画像，并输出「结论先行 → 关键证据 → 加固建议」的中文报告；如需配置修改，通过 `+"`propose_sftp_write`"+` 生成 Diff 审批单。`, target)
+3. 调用 `+"`update_host_memory`"+` 补齐最新服务与端口画像，并输出「结论先行 → 关键证据 → 加固建议」的中文报告；如需配置修改与服务重载，通过 `+"`propose_change_plan`"+` 一次性提交包含 `+"`sftp_write_file`"+`（含 Diff 预览）、语法校验与服务重载的有序变更计划单。`, target)
 		return "单主机深度只读安全基线体检", []map[string]any{
 			{"role": "user", "content": map[string]any{"type": "text", "text": text}},
 		}, nil
@@ -747,7 +765,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		}
 		if risk != aiops.RiskReadOnly {
 			s.store.RecordAudit("mcp.readonly_denied", strings.Join(args.ServerIDs, ","), fmt.Sprintf("外部 AI (%s) 只读接口拒绝状态变更命令: %.80s (%s)", clientName, cmd, why), c.clientIP, false)
-			return fmt.Sprintf("已拒绝在只读接口执行非只读命令（原因：%s）。如需执行状态变更或修复命令，请调用 propose_ssh_command 提交至 ServerNeedSafe Web 端 HITL 审批队列。", why), true
+			return fmt.Sprintf("已拒绝在只读接口执行非只读命令（原因：%s）。如需执行状态变更或修复命令，请调用 propose_change_plan 提交有序变更计划至 ServerNeedSafe Web 端 HITL 审批队列。", why), true
 		}
 		timeout := time.Duration(args.TimeoutSec) * time.Second
 		if timeout <= 0 || timeout > 60*time.Second {
@@ -965,89 +983,120 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		}
 		return mustMarshalPretty(map[string]any{"ok": true, "runbook": rb}), false
 
-	case "propose_ssh_command":
-		if c.token.Scope != vault.MCPScopeOpsPropose {
-			return "权限不足：当前 MCP 令牌作用域为 patrol_readonly，仅支持只读取证与报告回写；如需提交变更审批提案，请使用 ops_propose 作用域令牌。", true
-		}
-		var args struct {
-			ServerIDs      []string `json:"server_ids"`
-			Command        string   `json:"command"`
-			Reason         string   `json:"reason"`
-			PatrolRecordID string   `json:"patrol_record_id"`
-		}
-		if err := json.Unmarshal(rawArgs, &args); err != nil {
-			return "参数解析失败: " + err.Error(), true
-		}
-		for _, sid := range args.ServerIDs {
-			if !isServerAllowed(c.token, sid) {
-				return fmt.Sprintf("当前 MCP 令牌无权对服务器 %s 提交变更提案", sid), true
-			}
-		}
-		ap, err := s.ai.CreateExternalApprovalProposal(c.reqCtx, aiops.ExternalApprovalProposalInput{
-			PatrolRecordID: args.PatrolRecordID,
-			TokenID:        c.token.ID,
-			TokenName:      c.token.Name,
-			ClientName:     clientName,
-			ToolName:       "exec_ssh_command",
-			ServerIDs:      args.ServerIDs,
-			Command:        args.Command,
-			Reason:         args.Reason,
-			ClientIP:       c.clientIP,
-		})
-		if err != nil {
-			return "提交命令审批提案失败: " + err.Error(), true
-		}
-		return mustMarshalPretty(map[string]any{
-			"ok":               true,
-			"approval_id":      ap.ID,
-			"status":           ap.Status,
-			"webhook_notified": ap.WebhookNotified,
-			"message":          "变更命令已提交至 ServerNeedSafe Web 端「外部 AI 接管 (MCP) → 变更审批队列」，等待管理员手工批准后执行。批准后可调用 get_approval_status 查询真实执行输出。",
-		}), false
+	case "propose_ssh_command", "propose_sftp_write":
+		return fmt.Sprintf("工具 %s 已下线并统一收口至 propose_change_plan。请改用 propose_change_plan 提交有序步骤列表 steps（单步变更传 1 个元素，多步可按执行顺序混合编排 exec_ssh_command 与 sftp_write_file）。", name), true
 
-	case "propose_sftp_write":
+	case "propose_change_plan":
 		if c.token.Scope != vault.MCPScopeOpsPropose {
-			return "权限不足：当前 MCP 令牌作用域为 patrol_readonly，仅支持只读取证与报告回写；如需提交配置文件修改提案，请使用 ops_propose 作用域令牌。", true
+			return "权限不足：当前 MCP 令牌作用域为 patrol_readonly，仅支持只读取证与报告回写；如需提交变更审批计划，请使用 ops_propose 作用域令牌。", true
 		}
 		var args struct {
-			ServerID       string `json:"server_id"`
-			Path           string `json:"path"`
-			Content        string `json:"content"`
+			Title          string `json:"title"`
 			Reason         string `json:"reason"`
 			PatrolRecordID string `json:"patrol_record_id"`
+			Steps          []struct {
+				Type            string   `json:"type"`
+				Title           string   `json:"title"`
+				Reason          string   `json:"reason"`
+				ServerIDs       []string `json:"server_ids"`
+				ServerID        string   `json:"server_id"`
+				Command         string   `json:"command"`
+				TimeoutSec      int      `json:"timeout_sec"`
+				Path            string   `json:"path"`
+				Content         string   `json:"content"`
+				ContinueOnError bool     `json:"continue_on_error"`
+			} `json:"steps"`
 		}
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "参数解析失败: " + err.Error(), true
 		}
-		sid := strings.TrimSpace(args.ServerID)
-		if sid == "" {
-			return "缺少必填参数 server_id", true
+		if len(args.Steps) == 0 {
+			return "缺少必填参数 steps（至少包含 1 个有序变更步骤）", true
 		}
-		if !isServerAllowed(c.token, sid) {
-			return fmt.Sprintf("当前 MCP 令牌无权对服务器 %s 提交配置修改提案", sid), true
+		stepInputs := make([]aiops.ExternalApprovalStepInput, 0, len(args.Steps))
+		for idx, st := range args.Steps {
+			sids := make([]string, 0, len(st.ServerIDs)+1)
+			for _, sid := range st.ServerIDs {
+				sid = strings.TrimSpace(sid)
+				if sid != "" && !slices.Contains(sids, sid) {
+					sids = append(sids, sid)
+				}
+			}
+			if single := strings.TrimSpace(st.ServerID); single != "" && !slices.Contains(sids, single) {
+				sids = append(sids, single)
+			}
+			if len(sids) == 0 {
+				return fmt.Sprintf("第 %d 步缺少目标服务器参数 server_id 或 server_ids", idx+1), true
+			}
+			for _, sid := range sids {
+				if !isServerAllowed(c.token, sid) {
+					return fmt.Sprintf("当前 MCP 令牌无权对第 %d 步指定的服务器 %s 提交变更计划", idx+1, sid), true
+				}
+			}
+			stepInputs = append(stepInputs, aiops.ExternalApprovalStepInput{
+				Title:           st.Title,
+				ToolName:        strings.TrimSpace(st.Type),
+				ServerIDs:       sids,
+				Command:         st.Command,
+				TimeoutSec:      st.TimeoutSec,
+				FilePath:        st.Path,
+				NewContent:      st.Content,
+				Reason:          st.Reason,
+				ContinueOnError: st.ContinueOnError,
+			})
 		}
-		ap, err := s.ai.CreateExternalApprovalProposal(c.reqCtx, aiops.ExternalApprovalProposalInput{
+
+		ap, err := s.ai.CreateExternalChangePlan(c.reqCtx, aiops.ExternalChangePlanInput{
+			Title:          args.Title,
+			Reason:         args.Reason,
 			PatrolRecordID: args.PatrolRecordID,
 			TokenID:        c.token.ID,
 			TokenName:      c.token.Name,
 			ClientName:     clientName,
-			ToolName:       "sftp_write_file",
-			ServerIDs:      []string{sid},
-			FilePath:       args.Path,
-			NewContent:     args.Content,
-			Reason:         args.Reason,
+			Steps:          stepInputs,
 			ClientIP:       c.clientIP,
 		})
 		if err != nil {
-			return "提交文件修改提案失败: " + err.Error(), true
+			return "提交变更审批计划失败: " + err.Error(), true
+		}
+
+		stepSummary := make([]map[string]any, 0, len(ap.Steps))
+		for _, st := range ap.Steps {
+			item := map[string]any{
+				"id":                st.ID,
+				"index":             st.Index,
+				"title":             st.Title,
+				"type":              st.ToolName,
+				"server_ids":        st.ServerIDs,
+				"server_names":      st.ServerNames,
+				"status":            st.Status,
+				"blocked":           st.Blocked,
+				"continue_on_error": st.ContinueOnError,
+			}
+			if st.BlockedReason != "" {
+				item["blocked_reason"] = st.BlockedReason
+			}
+			if st.DiffPreview != "" {
+				item["diff_preview"] = st.DiffPreview
+			}
+			stepSummary = append(stepSummary, item)
+		}
+		msg := fmt.Sprintf("已将包含 %d 个有序步骤的变更计划提交至 ServerNeedSafe Web 端「外部 AI 接管 (MCP) → 变更审批队列」，等待管理员一键批准后按序执行。可调用 wait_for_approval 或 get_approval_status 查询每步执行进度与输出。", ap.TotalSteps)
+		if ap.BlockedSteps > 0 {
+			msg = fmt.Sprintf("变更计划已进入审批队列，但其中 %d/%d 步命中安全熔断已被标红锁定且无法执行（其余 %d 步待管理员审阅批准）。", ap.BlockedSteps, ap.TotalSteps, ap.ExecutableSteps)
 		}
 		return mustMarshalPretty(map[string]any{
-			"ok":               true,
-			"approval_id":      ap.ID,
-			"status":           ap.Status,
-			"diff_preview":     ap.DiffPreview,
-			"webhook_notified": ap.WebhookNotified,
-			"message":          "配置文件修改与 Unified Diff 已提交至 ServerNeedSafe Web 端审批队列，等待管理员批准后写盘。批准后可调用 get_approval_status 查询执行结果。",
+			"ok":                true,
+			"approval_id":       ap.ID,
+			"title":             ap.Title,
+			"status":            ap.Status,
+			"total_steps":       ap.TotalSteps,
+			"executable_steps":  ap.ExecutableSteps,
+			"blocked_steps":     ap.BlockedSteps,
+			"has_blocked_steps": ap.BlockedSteps > 0,
+			"webhook_notified":  ap.WebhookNotified,
+			"steps":             stepSummary,
+			"message":           msg,
 		}), false
 
 	case "list_approvals":
@@ -1069,13 +1118,16 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		}
 		allowedAll := filterApprovalsByToken(c.token, allAps)
 		pendingTotal := 0
+		runningTotal := 0
 		filtered := make([]vault.ExternalApproval, 0, min(args.Limit, len(allowedAll)))
 		statusFilter := strings.ToLower(status)
 		for _, ap := range allowedAll {
 			if ap.Status == "pending" {
 				pendingTotal++
+			} else if ap.Status == "running" {
+				runningTotal++
 			}
-			if statusFilter != "all" && ap.Status != statusFilter {
+			if !matchMCPApprovalStatusFilter(ap.Status, statusFilter) {
 				continue
 			}
 			if len(filtered) < args.Limit {
@@ -1084,6 +1136,7 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		}
 		return mustMarshalPretty(map[string]any{
 			"pending_total": pendingTotal,
+			"running_total": runningTotal,
 			"count":         len(filtered),
 			"approvals":     filtered,
 		}), false
@@ -1101,14 +1154,45 @@ func (s *Server) callTool(c *mcpCallContext, clientName, name string, rawArgs js
 		if err != nil {
 			return "查询审批单失败: " + err.Error(), true
 		}
-		for _, sid := range ap.ServerIDs {
-			if !isServerAllowed(c.token, sid) {
-				return "当前 MCP 令牌无权查看该审批单", true
-			}
+		if !isApprovalAllowedByToken(c.token, *ap) {
+			return "当前 MCP 令牌无权查看该审批单", true
 		}
-		// Omit raw NewContent to keep response concise; DiffPreview & ExecutionOut carry full context.
-		ap.NewContent = ""
-		return mustMarshalPretty(ap), false
+		return mustMarshalPretty(sanitizeApprovalForMCP(*ap, false)), false
+
+	case "wait_for_approval":
+		var args struct {
+			ApprovalID string `json:"approval_id"`
+			TimeoutSec int    `json:"timeout_sec"`
+		}
+		_ = json.Unmarshal(rawArgs, &args)
+		apID := strings.TrimSpace(args.ApprovalID)
+		if apID == "" {
+			return "缺少必填参数 approval_id", true
+		}
+		existing, err := s.store.GetExternalApproval(apID)
+		if err != nil {
+			return "查询审批单失败: " + err.Error(), true
+		}
+		if !isApprovalAllowedByToken(c.token, *existing) {
+			return "当前 MCP 令牌无权查看该审批单", true
+		}
+		timeoutSec := args.TimeoutSec
+		if timeoutSec <= 0 {
+			timeoutSec = 30
+		} else if timeoutSec > 120 {
+			timeoutSec = 120
+		}
+		ap, timedOut, err := s.ai.WaitForExternalApproval(c.reqCtx, apID, time.Duration(timeoutSec)*time.Second)
+		if err != nil {
+			return "等待审批单状态失败: " + err.Error(), true
+		}
+		sanitized := sanitizeApprovalForMCP(*ap, false)
+		return mustMarshalPretty(map[string]any{
+			"ok":        true,
+			"timed_out": timedOut,
+			"terminal":  vault.IsExternalApprovalTerminal(sanitized.Status),
+			"approval":  sanitized,
+		}), false
 
 	default:
 		return "未知工具名称: " + name, true
@@ -1214,25 +1298,68 @@ func isPatrolRecordAllowedForWrite(tok *vault.MCPToken, rec vault.PatrolRecord) 
 	return true
 }
 
-func filterApprovalsByToken(tok *vault.MCPToken, aps []vault.ExternalApproval) []vault.ExternalApproval {
-	restricted := tok != nil && len(tok.AllowedServers) > 0
-	out := make([]vault.ExternalApproval, 0, len(aps))
-	for _, ap := range aps {
-		if restricted {
-			ok := true
-			for _, sid := range ap.ServerIDs {
-				if !slices.Contains(tok.AllowedServers, sid) {
-					ok = false
-					break
-				}
-			}
-			if !ok {
-				continue
+func isApprovalAllowedByToken(tok *vault.MCPToken, ap vault.ExternalApproval) bool {
+	if tok == nil || len(tok.AllowedServers) == 0 {
+		return true
+	}
+	for _, sid := range ap.ServerIDs {
+		if !slices.Contains(tok.AllowedServers, sid) {
+			return false
+		}
+	}
+	for _, st := range ap.Steps {
+		for _, sid := range st.ServerIDs {
+			if !slices.Contains(tok.AllowedServers, sid) {
+				return false
 			}
 		}
-		cp := ap
-		cp.NewContent = ""
-		out = append(out, cp)
+	}
+	return true
+}
+
+func sanitizeApprovalForMCP(ap vault.ExternalApproval, compactList bool) vault.ExternalApproval {
+	cp := ap
+	cp.NewContent = ""
+	if compactList {
+		cp.DiffPreview = ""
+		cp.ExecutionOut = ""
+	}
+	if len(ap.Steps) > 0 {
+		steps := make([]vault.ExternalApprovalStep, len(ap.Steps))
+		for i, st := range ap.Steps {
+			st.NewContent = ""
+			if compactList {
+				st.DiffPreview = ""
+				st.ExecutionOut = ""
+			}
+			steps[i] = st
+		}
+		cp.Steps = steps
+	}
+	return cp
+}
+
+func matchMCPApprovalStatusFilter(actual, filter string) bool {
+	if filter == "" || filter == "all" {
+		return true
+	}
+	switch filter {
+	case "active":
+		return actual == "pending" || actual == "running"
+	case "approved":
+		return actual == "completed" || actual == "partial_failed" || actual == "failed" || actual == "cancelled" || actual == "running" || actual == "approved"
+	default:
+		return actual == filter
+	}
+}
+
+func filterApprovalsByToken(tok *vault.MCPToken, aps []vault.ExternalApproval) []vault.ExternalApproval {
+	out := make([]vault.ExternalApproval, 0, len(aps))
+	for _, ap := range aps {
+		if !isApprovalAllowedByToken(tok, ap) {
+			continue
+		}
+		out = append(out, sanitizeApprovalForMCP(ap, true))
 	}
 	return out
 }

@@ -1206,6 +1206,37 @@ func ensureAIOpsRuntimeDefaults(a *AIOpsRuntimeState) {
 	}
 	if a.ExternalApprovals == nil {
 		a.ExternalApprovals = []ExternalApproval{}
+	} else {
+		now := time.Now().UTC()
+		for i := range a.ExternalApprovals {
+			ap := &a.ExternalApprovals[i]
+			NormalizeExternalApproval(ap)
+			// Recover any approval plan orphaned in "running" state across a daemon restart
+			if ap.Status == "running" {
+				for si := range ap.Steps {
+					st := &ap.Steps[si]
+					switch st.Status {
+					case "running":
+						st.Status = "failed"
+						st.ExecutionError = "服务重启导致步骤执行中断"
+						st.CompletedAt = &now
+					case "pending":
+						if st.Selected && !st.Blocked {
+							st.Status = "cancelled"
+							st.ExecutionError = "服务重启导致前序执行中断，剩余步骤未执行"
+						}
+					}
+				}
+				ap.RecalculateSummary()
+				if ap.CompletedSteps > 0 {
+					ap.Status = "partial_failed"
+				} else {
+					ap.Status = "failed"
+				}
+				ap.ExecutionError = "服务重启导致顺序执行中断"
+				ap.ResolvedAt = &now
+			}
+		}
 	}
 	if a.MCPTokenUsage == nil {
 		a.MCPTokenUsage = make(map[string]MCPTokenRuntimeUsage)

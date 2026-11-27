@@ -361,7 +361,7 @@ func (s *Server) handleRPC(c *mcpCallContext, req jsonRPCRequest) (*jsonRPCRespo
 					"name":    ServerName,
 					"version": version.Current().Version,
 				},
-				"instructions": "ServerNeedSafe 安全运维与 AI 巡检 MCP 网关。受管主机 SSH 密码/私钥已严格物理隔离。巡检时请优先调用 get_ops_context 或读取 serverneedsafe://agents-md 了解运维规范与主机画像；使用 list_patrol_records(pending_only=true) / claim_patrol 或 run_patrol 接管巡检，通过 exec_readonly_ssh / sftp_read_file 深度取证后调用 submit_patrol_report 回写结构化结论；如需线上修复变更，请调用 propose_ssh_command 或 propose_sftp_write 提交至 Web 端 HITL 审批队列。",
+				"instructions": "ServerNeedSafe 安全运维与 AI 巡检 MCP 网关。受管主机 SSH 密码/私钥已严格物理隔离。巡检时请优先调用 get_ops_context 或读取 serverneedsafe://agents-md 了解运维规范与主机画像；使用 list_patrol_records(pending_only=true) / claim_patrol 或 run_patrol 接管巡检，通过 exec_readonly_ssh / sftp_read_file 深度取证后调用 submit_patrol_report 回写结构化结论；如需线上修复变更，请调用 propose_change_plan 一次性提交有序步骤列表（可混合编排 exec_ssh_command 与 sftp_write_file）至 Web 端 HITL 审批队列，随后可通过 wait_for_approval 或 get_approval_status 获取每步执行结果。",
 			},
 		}, sid
 

@@ -1,7 +1,9 @@
 package vault
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -291,30 +293,254 @@ func DefaultMCPConfig() MCPConfig {
 	}
 }
 
-// ExternalApproval represents a mutating SSH command or SFTP file change proposed by an external AI via MCP.
-// Proposals NEVER auto-execute remotely; an administrator must explicitly approve them in the Web console.
-type ExternalApproval struct {
+// ExternalApprovalStep represents one ordered action inside an external MCP AI change plan.
+type ExternalApprovalStep struct {
 	ID              string     `json:"id"`
-	PatrolRecordID  string     `json:"patrol_record_id,omitempty"`
-	TokenID         string     `json:"token_id"`
-	TokenName       string     `json:"token_name"`
-	ClientName      string     `json:"client_name"`
+	Index           int        `json:"index"` // 1-based execution order submitted by the AI
+	Title           string     `json:"title,omitempty"`
 	ToolName        string     `json:"tool_name"` // "exec_ssh_command" or "sftp_write_file"
 	ServerIDs       []string   `json:"server_ids"`
 	ServerNames     []string   `json:"server_names"`
-	RiskLevel       string     `json:"risk_level"` // "medium" or "high"
-	Reason          string     `json:"reason"`
+	RiskLevel       string     `json:"risk_level"` // "medium", "high", or "blocked"
+	Reason          string     `json:"reason,omitempty"`
 	Command         string     `json:"command,omitempty"`
+	TimeoutSec      int        `json:"timeout_sec,omitempty"`
 	FilePath        string     `json:"file_path,omitempty"`
 	NewContent      string     `json:"new_content,omitempty"`
 	DiffPreview     string     `json:"diff_preview,omitempty"`
-	Status          string     `json:"status"` // "pending", "approved", "rejected"
+	ContinueOnError bool       `json:"continue_on_error,omitempty"`
+	Blocked         bool       `json:"blocked,omitempty"`
+	BlockedReason   string     `json:"blocked_reason,omitempty"`
+	Selected        bool       `json:"selected"`
+	Status          string     `json:"status"` // "pending", "blocked", "running", "succeeded", "failed", "skipped", "cancelled", "rejected"
 	ExecutionOut    string     `json:"execution_out,omitempty"`
 	ExecutionError  string     `json:"execution_error,omitempty"`
 	DurationMs      int64      `json:"duration_ms,omitempty"`
-	WebhookNotified bool       `json:"webhook_notified,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+}
+
+// ExternalApproval represents an ordered change plan (1..N steps) proposed by an external AI via MCP.
+// Proposals NEVER auto-execute remotely; an administrator must explicitly approve them in the Web console.
+type ExternalApproval struct {
+	ID              string                 `json:"id"`
+	Title           string                 `json:"title,omitempty"`
+	PatrolRecordID  string                 `json:"patrol_record_id,omitempty"`
+	TokenID         string                 `json:"token_id"`
+	TokenName       string                 `json:"token_name"`
+	ClientName      string                 `json:"client_name"`
+	ToolName        string                 `json:"tool_name,omitempty"` // "change_plan" or legacy single-step tool
+	ServerIDs       []string               `json:"server_ids"`
+	ServerNames     []string               `json:"server_names"`
+	RiskLevel       string                 `json:"risk_level"` // "medium", "high", or "blocked"
+	Reason          string                 `json:"reason"`
+	Command         string                 `json:"command,omitempty"`
+	FilePath        string                 `json:"file_path,omitempty"`
+	NewContent      string                 `json:"new_content,omitempty"`
+	DiffPreview     string                 `json:"diff_preview,omitempty"`
+	Steps           []ExternalApprovalStep `json:"steps"`
+	TotalSteps      int                    `json:"total_steps"`
+	ExecutableSteps int                    `json:"executable_steps"`
+	BlockedSteps    int                    `json:"blocked_steps"`
+	CompletedSteps  int                    `json:"completed_steps"`
+	FailedSteps     int                    `json:"failed_steps"`
+	SkippedSteps    int                    `json:"skipped_steps"`
+	CurrentStepIdx  int                    `json:"current_step_index,omitempty"`
+	Status          string                 `json:"status"` // "pending", "running", "completed", "partial_failed", "failed", "cancelled", "rejected"
+	ExecutionOut    string                 `json:"execution_out,omitempty"`
+	ExecutionError  string                 `json:"execution_error,omitempty"`
+	DurationMs      int64                  `json:"duration_ms,omitempty"`
+	WebhookNotified bool                   `json:"webhook_notified,omitempty"`
+	CreatedAt       time.Time              `json:"created_at"`
+	StartedAt       *time.Time             `json:"started_at,omitempty"`
+	ResolvedAt      *time.Time             `json:"resolved_at,omitempty"`
+}
+
+// IsExternalApprovalTerminal reports whether an external change plan has reached an immutable final state.
+func IsExternalApprovalTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "partial_failed", "failed", "cancelled", "rejected", "approved":
+		return true
+	default:
+		return false
+	}
+}
+
+// RecalculateSummary refreshes aggregate step counters, server union, and risk level on an ExternalApproval.
+func (ap *ExternalApproval) RecalculateSummary() {
+	if ap == nil {
+		return
+	}
+	ap.TotalSteps = len(ap.Steps)
+	ap.ExecutableSteps = 0
+	ap.BlockedSteps = 0
+	ap.CompletedSteps = 0
+	ap.FailedSteps = 0
+	ap.SkippedSteps = 0
+	ap.CurrentStepIdx = 0
+
+	hasHigh := false
+	hasBlocked := false
+	serverIDs := make([]string, 0, len(ap.ServerIDs))
+	serverNames := make([]string, 0, len(ap.ServerNames))
+	seenID := make(map[string]bool)
+	seenName := make(map[string]bool)
+
+	for i := range ap.Steps {
+		st := &ap.Steps[i]
+		if st.Index <= 0 {
+			st.Index = i + 1
+		}
+		if st.Blocked {
+			st.Selected = false
+			st.Status = "blocked"
+			if st.RiskLevel == "" {
+				st.RiskLevel = "blocked"
+			}
+			ap.BlockedSteps++
+			hasBlocked = true
+		} else {
+			ap.ExecutableSteps++
+			if st.RiskLevel == "high" {
+				hasHigh = true
+			}
+			switch st.Status {
+			case "running":
+				ap.CurrentStepIdx = st.Index
+			case "succeeded":
+				ap.CompletedSteps++
+			case "failed":
+				ap.FailedSteps++
+			case "skipped", "cancelled", "rejected":
+				ap.SkippedSteps++
+			}
+		}
+		for _, sid := range st.ServerIDs {
+			if sid != "" && !seenID[sid] {
+				seenID[sid] = true
+				serverIDs = append(serverIDs, sid)
+			}
+		}
+		for _, sname := range st.ServerNames {
+			if sname != "" && !seenName[sname] {
+				seenName[sname] = true
+				serverNames = append(serverNames, sname)
+			}
+		}
+	}
+
+	if len(serverIDs) > 0 {
+		ap.ServerIDs = serverIDs
+	} else if ap.ServerIDs == nil {
+		ap.ServerIDs = []string{}
+	}
+	if len(serverNames) > 0 {
+		ap.ServerNames = serverNames
+	} else if ap.ServerNames == nil {
+		ap.ServerNames = []string{}
+	}
+
+	switch {
+	case hasBlocked:
+		ap.RiskLevel = "blocked"
+	case hasHigh:
+		ap.RiskLevel = "high"
+	case ap.RiskLevel == "":
+		ap.RiskLevel = "medium"
+	}
+}
+
+// NormalizeExternalApproval migrates legacy flat single-step ExternalApproval records into the unified step-list schema.
+func NormalizeExternalApproval(ap *ExternalApproval) {
+	if ap == nil {
+		return
+	}
+	if len(ap.Steps) == 0 && (ap.ToolName == "exec_ssh_command" || ap.ToolName == "sftp_write_file" || ap.Command != "" || ap.FilePath != "") {
+		tool := ap.ToolName
+		if tool == "" {
+			if ap.FilePath != "" {
+				tool = "sftp_write_file"
+			} else {
+				tool = "exec_ssh_command"
+			}
+		}
+		stepStatus := "pending"
+		selected := true
+		switch ap.Status {
+		case "rejected":
+			stepStatus = "rejected"
+			selected = false
+		case "approved", "completed":
+			if ap.ExecutionError != "" {
+				stepStatus = "failed"
+				ap.Status = "failed"
+			} else {
+				stepStatus = "succeeded"
+				ap.Status = "completed"
+			}
+		case "failed":
+			stepStatus = "failed"
+		}
+		stepTitle := ap.Title
+		if stepTitle == "" {
+			if tool == "sftp_write_file" {
+				stepTitle = fmt.Sprintf("修改配置 %s", ap.FilePath)
+			} else {
+				stepTitle = strings.TrimSpace(ap.Command)
+				if len([]rune(stepTitle)) > 48 {
+					stepTitle = string([]rune(stepTitle)[:48]) + "..."
+				}
+			}
+		}
+		ap.Steps = []ExternalApprovalStep{
+			{
+				ID:             ap.ID + "-step-1",
+				Index:          1,
+				Title:          stepTitle,
+				ToolName:       tool,
+				ServerIDs:      slices.Clone(ap.ServerIDs),
+				ServerNames:    slices.Clone(ap.ServerNames),
+				RiskLevel:      ap.RiskLevel,
+				Reason:         ap.Reason,
+				Command:        ap.Command,
+				FilePath:       ap.FilePath,
+				NewContent:     ap.NewContent,
+				DiffPreview:    ap.DiffPreview,
+				Selected:       selected,
+				Status:         stepStatus,
+				ExecutionOut:   ap.ExecutionOut,
+				ExecutionError: ap.ExecutionError,
+				DurationMs:     ap.DurationMs,
+				CompletedAt:    ap.ResolvedAt,
+			},
+		}
+		if ap.Title == "" {
+			ap.Title = stepTitle
+		}
+	}
+	if ap.Status == "approved" {
+		if ap.ExecutionError != "" {
+			ap.Status = "failed"
+		} else {
+			ap.Status = "completed"
+		}
+	}
+	if ap.Steps == nil {
+		ap.Steps = []ExternalApprovalStep{}
+	}
+	if ap.ToolName == "" {
+		ap.ToolName = "change_plan"
+	}
+	if ap.Title == "" {
+		if len(ap.Steps) == 1 && strings.TrimSpace(ap.Steps[0].Title) != "" {
+			ap.Title = ap.Steps[0].Title
+		} else if len(ap.Steps) > 0 {
+			ap.Title = fmt.Sprintf("%d 步变更执行计划", len(ap.Steps))
+		} else {
+			ap.Title = "外部 AI 变更计划"
+		}
+	}
+	ap.RecalculateSummary()
 }
 
 // AgentsMDConfig stores the encrypted global AGENTS.md operational charter for all AI surfaces.
@@ -926,10 +1152,37 @@ func cloneSinglePatrolRecord(rec PatrolRecord) PatrolRecord {
 	return rc
 }
 
+func cloneExternalApprovalStep(st ExternalApprovalStep) ExternalApprovalStep {
+	cp := st
+	cp.ServerIDs = slices.Clone(st.ServerIDs)
+	cp.ServerNames = slices.Clone(st.ServerNames)
+	if st.StartedAt != nil {
+		t := *st.StartedAt
+		cp.StartedAt = &t
+	}
+	if st.CompletedAt != nil {
+		t := *st.CompletedAt
+		cp.CompletedAt = &t
+	}
+	return cp
+}
+
 func cloneExternalApproval(ap ExternalApproval) ExternalApproval {
 	cp := ap
 	cp.ServerIDs = slices.Clone(ap.ServerIDs)
 	cp.ServerNames = slices.Clone(ap.ServerNames)
+	if ap.Steps != nil {
+		cp.Steps = make([]ExternalApprovalStep, len(ap.Steps))
+		for i, st := range ap.Steps {
+			cp.Steps[i] = cloneExternalApprovalStep(st)
+		}
+	} else {
+		cp.Steps = []ExternalApprovalStep{}
+	}
+	if ap.StartedAt != nil {
+		t := *ap.StartedAt
+		cp.StartedAt = &t
+	}
 	if ap.ResolvedAt != nil {
 		t := *ap.ResolvedAt
 		cp.ResolvedAt = &t

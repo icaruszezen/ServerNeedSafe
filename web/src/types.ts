@@ -964,13 +964,60 @@ export interface MCPRuntimeStatus {
   desktop_loopback_error?: string;
 }
 
+export type ExternalApprovalStepStatus =
+  | 'pending'
+  | 'blocked'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled'
+  | 'rejected';
+
+export type ExternalApprovalStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'partial_failed'
+  | 'failed'
+  | 'cancelled'
+  | 'rejected'
+  | 'approved';
+
+export interface ExternalApprovalStep {
+  id: string;
+  index: number;
+  title?: string;
+  tool_name: 'exec_ssh_command' | 'sftp_write_file' | string;
+  server_ids: string[];
+  server_names: string[];
+  risk_level: string;
+  reason?: string;
+  command?: string;
+  timeout_sec?: number;
+  file_path?: string;
+  new_content?: string;
+  diff_preview?: string;
+  continue_on_error?: boolean;
+  blocked?: boolean;
+  blocked_reason?: string;
+  selected: boolean;
+  status: ExternalApprovalStepStatus;
+  execution_out?: string;
+  execution_error?: string;
+  duration_ms?: number;
+  started_at?: string;
+  completed_at?: string;
+}
+
 export interface ExternalApproval {
   id: string;
+  title?: string;
   patrol_record_id?: string;
   token_id: string;
   token_name: string;
   client_name: string;
-  tool_name: 'exec_ssh_command' | 'sftp_write_file' | string;
+  tool_name?: 'change_plan' | 'exec_ssh_command' | 'sftp_write_file' | string;
   server_ids: string[];
   server_names: string[];
   risk_level: string;
@@ -979,12 +1026,21 @@ export interface ExternalApproval {
   file_path?: string;
   new_content?: string;
   diff_preview?: string;
-  status: 'pending' | 'approved' | 'rejected';
+  steps?: ExternalApprovalStep[];
+  total_steps?: number;
+  executable_steps?: number;
+  blocked_steps?: number;
+  completed_steps?: number;
+  failed_steps?: number;
+  skipped_steps?: number;
+  current_step_index?: number;
+  status: ExternalApprovalStatus;
   execution_out?: string;
   execution_error?: string;
   duration_ms?: number;
   webhook_notified?: boolean;
   created_at: string;
+  started_at?: string;
   resolved_at?: string;
 }
 

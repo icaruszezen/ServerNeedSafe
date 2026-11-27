@@ -623,7 +623,8 @@ func (s *Store) MarkPatrolWebhookNotified(id string) {
 
 // --- External AI HITL Approval Queue (aiops_runtime.json) ---
 
-// ListExternalApprovals returns external AI mutation proposals filtered by optional status ("pending"/"approved"/"rejected").
+// ListExternalApprovals returns external AI change plans filtered by optional status
+// ("pending"/"running"/"active"/"completed"/"partial_failed"/"failed"/"cancelled"/"rejected"/"approved"/"all").
 func (s *Store) ListExternalApprovals(status string, limit int) ([]ExternalApproval, int, error) {
 	if !s.IsReady() {
 		return nil, 0, ErrVaultLocked
@@ -636,21 +637,37 @@ func (s *Store) ListExternalApprovals(status string, limit int) ([]ExternalAppro
 	pending := 0
 	out := make([]ExternalApproval, 0, len(s.aiopsRT.ExternalApprovals))
 	filter := strings.ToLower(strings.TrimSpace(status))
-	for _, ap := range s.aiopsRT.ExternalApprovals {
+	for _, raw := range s.aiopsRT.ExternalApprovals {
+		ap := cloneExternalApproval(raw)
+		NormalizeExternalApproval(&ap)
 		if ap.Status == "pending" {
 			pending++
 		}
-		if filter != "" && filter != "all" && ap.Status != filter {
+		if !matchExternalApprovalStatus(ap.Status, filter) {
 			continue
 		}
 		if limit <= 0 || len(out) < limit {
-			out = append(out, cloneExternalApproval(ap))
+			out = append(out, ap)
 		}
 	}
 	return out, pending, nil
 }
 
-// GetExternalApproval fetches a single external HITL approval by ID.
+func matchExternalApprovalStatus(actual, filter string) bool {
+	if filter == "" || filter == "all" {
+		return true
+	}
+	switch filter {
+	case "active":
+		return actual == "pending" || actual == "running"
+	case "approved":
+		return actual == "completed" || actual == "partial_failed" || actual == "failed" || actual == "cancelled" || actual == "running" || actual == "approved"
+	default:
+		return actual == filter
+	}
+}
+
+// GetExternalApproval fetches a single external HITL approval plan by ID.
 func (s *Store) GetExternalApproval(id string) (*ExternalApproval, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked
@@ -663,13 +680,14 @@ func (s *Store) GetExternalApproval(id string) (*ExternalApproval, error) {
 	for _, ap := range s.aiopsRT.ExternalApprovals {
 		if ap.ID == id {
 			cp := cloneExternalApproval(ap)
+			NormalizeExternalApproval(&cp)
 			return &cp, nil
 		}
 	}
 	return nil, ErrNotFound
 }
 
-// CreateExternalApproval enqueues a new external AI mutation proposal awaiting admin approval.
+// CreateExternalApproval enqueues a new external AI change plan awaiting admin approval.
 func (s *Store) CreateExternalApproval(ap ExternalApproval, clientIP string) (*ExternalApproval, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked
@@ -682,7 +700,13 @@ func (s *Store) CreateExternalApproval(ap ExternalApproval, clientIP string) (*E
 		ap.CreatedAt = now
 	}
 	ap.Status = "pending"
+	ap.Title = RedactSensitiveText(strings.TrimSpace(ap.Title))
 	ap.Reason = RedactSensitiveText(strings.TrimSpace(ap.Reason))
+	for i := range ap.Steps {
+		ap.Steps[i].Title = RedactSensitiveText(strings.TrimSpace(ap.Steps[i].Title))
+		ap.Steps[i].Reason = RedactSensitiveText(strings.TrimSpace(ap.Steps[i].Reason))
+	}
+	NormalizeExternalApproval(&ap)
 
 	s.rtMu.Lock()
 	if s.aiopsRT == nil {
@@ -693,10 +717,12 @@ func (s *Store) CreateExternalApproval(ap ExternalApproval, clientIP string) (*E
 		s.aiopsRT.ExternalApprovals = s.aiopsRT.ExternalApprovals[:maxExternalApprovals]
 	}
 	s.dirtyAIOps = true
+	auditDetail := fmt.Sprintf("外部 AI (%s) 提交待审批变更计划「%s」(%d 步, 可执行 %d, 已拦截 %d): %.80s",
+		ap.ClientName, ap.Title, ap.TotalSteps, ap.ExecutableSteps, ap.BlockedSteps, ap.Reason)
 	s.appendAuditRuntimeLocked(
 		"mcp.approval_propose",
 		strings.Join(ap.ServerNames, ","),
-		fmt.Sprintf("外部 AI (%s) 提交待审批变更 [%s]: %.80s", ap.ClientName, ap.ToolName, ap.Reason),
+		auditDetail,
 		clientIP,
 		true,
 	)
@@ -711,6 +737,7 @@ func (s *Store) UpdateExternalApproval(ap ExternalApproval) error {
 	if !s.IsReady() {
 		return ErrVaultLocked
 	}
+	NormalizeExternalApproval(&ap)
 	s.rtMu.Lock()
 	if s.aiopsRT == nil {
 		s.rtMu.Unlock()

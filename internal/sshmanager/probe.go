@@ -3,11 +3,14 @@ package sshmanager
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // ServerProbeResult holds handshake latency and agentless remote system metrics.
@@ -243,10 +246,37 @@ type BatchExecResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // BatchExecute runs command concurrently across serverIDs with bounded concurrency.
 func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.Duration, clientIP string) []BatchExecResult {
-	if timeout <= 0 || timeout > 2*time.Minute {
+	return m.BatchExecuteContext(context.Background(), serverIDs, command, timeout, clientIP)
+}
+
+// BatchExecuteContext runs command concurrently across serverIDs with bounded concurrency and context cancellation support.
+func (m *Manager) BatchExecuteContext(ctx context.Context, serverIDs []string, command string, timeout time.Duration, clientIP string) []BatchExecResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
 		timeout = 25 * time.Second
+	} else if timeout > 5*time.Minute {
+		timeout = 5 * time.Minute
 	}
 	results := make([]BatchExecResult, len(serverIDs))
 	sem := make(chan struct{}, 8)
@@ -256,14 +286,31 @@ func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.
 		wg.Add(1)
 		go func(i int, serverID string) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
 			start := time.Now()
 			res := BatchExecResult{ServerID: serverID}
 			if srv, err := m.store.GetServerSecret(serverID); err == nil {
 				res.ServerName = srv.Name
 				res.Host = fmt.Sprintf("%s:%d", srv.Host, srv.Port)
+			}
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				res.Error = "执行已中止"
+				res.ExitCode = 130
+				res.DurationMs = time.Since(start).Milliseconds()
+				results[i] = res
+				return
+			}
+
+			if ctx.Err() != nil {
+				res.Error = "执行已中止"
+				res.ExitCode = 130
+				res.DurationMs = time.Since(start).Milliseconds()
+				results[i] = res
+				return
 			}
 
 			client, err := m.Dial(serverID, DialOptions{
@@ -279,6 +326,14 @@ func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.
 			defer client.Close()
 			res.RouteLabel = client.Route.Label
 
+			if ctx.Err() != nil {
+				res.Error = "执行已中止"
+				res.ExitCode = 130
+				res.DurationMs = time.Since(start).Milliseconds()
+				results[i] = res
+				return
+			}
+
 			sess, err := client.NewSession()
 			if err != nil {
 				res.Error = err.Error()
@@ -288,7 +343,7 @@ func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.
 			}
 			defer sess.Close()
 
-			var stdoutBuf, stderrBuf bytes.Buffer
+			var stdoutBuf, stderrBuf lockedBuffer
 			sess.Stdout = &stdoutBuf
 			sess.Stderr = &stderrBuf
 
@@ -297,19 +352,35 @@ func (m *Manager) BatchExecute(serverIDs []string, command string, timeout time.
 				done <- sess.Run(command)
 			}()
 
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+
 			select {
 			case runErr := <-done:
 				res.Stdout = stdoutBuf.String()
 				res.Stderr = stderrBuf.String()
 				if runErr != nil {
 					res.Error = runErr.Error()
-					res.ExitCode = 1
+					var exitErr *ssh.ExitError
+					if errors.As(runErr, &exitErr) && exitErr.ExitStatus() != 0 {
+						res.ExitCode = exitErr.ExitStatus()
+					} else {
+						res.ExitCode = 1
+					}
 				} else {
 					res.Success = true
 					res.ExitCode = 0
 				}
-			case <-time.After(timeout):
+			case <-ctx.Done():
 				_ = sess.Close()
+				_ = client.Close()
+				res.Stdout = stdoutBuf.String()
+				res.Stderr = stderrBuf.String()
+				res.Error = "执行已中止"
+				res.ExitCode = 130
+			case <-timer.C:
+				_ = sess.Close()
+				_ = client.Close()
 				res.Stdout = stdoutBuf.String()
 				res.Stderr = stderrBuf.String()
 				res.Error = "命令执行超时"

@@ -115,7 +115,7 @@ func SendPatrolAlertWebhook(ctx context.Context, transport HTTPTransport, ch vau
 	return sendFormattedWebhook(ctx, transport, ch, titleText, colorTemplate, markdownText, customPayload)
 }
 
-// SendExternalApprovalWebhook notifies operators via Webhook when an external MCP AI submits a HITL mutation proposal.
+// SendExternalApprovalWebhook notifies operators via Webhook when an external MCP AI submits a HITL change plan.
 func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, ch vault.WebhookChannel, ap vault.ExternalApproval) error {
 	if strings.TrimSpace(ch.URL) == "" {
 		return fmt.Errorf("Webhook URL 不能为空")
@@ -126,34 +126,76 @@ func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, c
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
-	opLabel := "远程命令执行"
-	if ap.ToolName == "sftp_write_file" {
-		opLabel = "远程配置文件修改"
-	}
+	vault.NormalizeExternalApproval(&ap)
 
 	var md strings.Builder
-	md.WriteString("### [ServerNeedSafe] 外部 AI 提交变更审批请求\n")
+	md.WriteString(fmt.Sprintf("### [ServerNeedSafe] 外部 AI 提交变更审批计划（共 %d 步）\n", ap.TotalSteps))
+	md.WriteString(fmt.Sprintf("- **计划标题**：%s\n", nonEmpty(ap.Title, "外部 AI 变更计划")))
 	md.WriteString(fmt.Sprintf("- **提交来源**：%s (令牌: `%s`)\n", nonEmpty(ap.ClientName, "外部 MCP AI"), nonEmpty(ap.TokenName, ap.TokenID)))
-	md.WriteString(fmt.Sprintf("- **变更类型**：%s（风险等级: `%s`）\n", opLabel, nonEmpty(ap.RiskLevel, "high")))
+	if ap.BlockedSteps > 0 {
+		md.WriteString(fmt.Sprintf("- **风险提醒**：⚠️ 共 %d 步（可执行 %d 步 · **%d 步触发安全熔断已标红锁定**）\n", ap.TotalSteps, ap.ExecutableSteps, ap.BlockedSteps))
+	} else {
+		md.WriteString(fmt.Sprintf("- **风险等级**：`%s`（共 %d 步将按序执行）\n", nonEmpty(ap.RiskLevel, "high"), ap.TotalSteps))
+	}
 	md.WriteString(fmt.Sprintf("- **目标主机**：%s\n", nonEmpty(strings.Join(ap.ServerNames, ", "), strings.Join(ap.ServerIDs, ", "))))
 	if ap.PatrolRecordID != "" {
 		md.WriteString(fmt.Sprintf("- **关联巡检单**：`%s`\n", ap.PatrolRecordID))
 	}
 	md.WriteString(fmt.Sprintf("- **变更原因**：%s\n", ap.Reason))
-	if ap.Command != "" {
-		md.WriteString(fmt.Sprintf("- **拟执行命令**：`%s`\n", truncateStr(ap.Command, 240)))
+
+	stepSummaries := make([]map[string]any, 0, len(ap.Steps))
+	if len(ap.Steps) > 0 {
+		md.WriteString("\n**有序执行步骤清单**：\n")
+		for idx, st := range ap.Steps {
+			opTag := "SSH"
+			detail := truncateStr(st.Command, 140)
+			if st.ToolName == "sftp_write_file" {
+				opTag = "SFTP"
+				detail = st.FilePath
+			}
+			flags := ""
+			if st.Blocked {
+				flags += " [已拦截锁定]"
+			}
+			if st.ContinueOnError {
+				flags += " [遇错继续]"
+			}
+			if idx < 10 {
+				md.WriteString(fmt.Sprintf("%d. **[%s]%s** (%s) `%s`\n",
+					st.Index, opTag, flags, nonEmpty(strings.Join(st.ServerNames, ","), strings.Join(st.ServerIDs, ",")), detail))
+			}
+			stepSummaries = append(stepSummaries, map[string]any{
+				"id":                st.ID,
+				"index":             st.Index,
+				"title":             st.Title,
+				"tool_name":         st.ToolName,
+				"server_ids":        st.ServerIDs,
+				"server_names":      st.ServerNames,
+				"command":           st.Command,
+				"file_path":         st.FilePath,
+				"continue_on_error": st.ContinueOnError,
+				"blocked":           st.Blocked,
+				"blocked_reason":    st.BlockedReason,
+				"status":            st.Status,
+			})
+		}
+		if len(ap.Steps) > 10 {
+			md.WriteString(fmt.Sprintf("... 其余 %d 步请在 Web 控制台查看完整清单。\n", len(ap.Steps)-10))
+		}
 	}
-	if ap.FilePath != "" {
-		md.WriteString(fmt.Sprintf("- **拟修改文件**：`%s`\n", ap.FilePath))
-	}
-	md.WriteString("\n> 该变更处于 **等待管理员审批** 状态，尚未在远端服务器执行。请登录 ServerNeedSafe 控制台「AI 智能运维 → 外部 AI 接管 (MCP)」审阅 Diff 并决定批准或拒绝。\n")
+	md.WriteString("\n> 该变更计划处于 **等待管理员审批** 状态，尚未在远端服务器执行。请登录 ServerNeedSafe 控制台「AI 智能运维 → 外部 AI 接管 (MCP)」审阅全部步骤与 Diff 后一键批准按序执行或拒绝。\n")
 
 	markdownText := md.String()
-	titleText := fmt.Sprintf("ServerNeedSafe · 待审批外部 AI 变更 (%s)", nonEmpty(ap.ClientName, "MCP"))
+	titleText := fmt.Sprintf("ServerNeedSafe · 待审批外部 AI 变更计划 (%s · %d 步)", nonEmpty(ap.ClientName, "MCP"), ap.TotalSteps)
+	color := "orange"
+	if ap.BlockedSteps > 0 {
+		color = "red"
+	}
 	customPayload := map[string]any{
 		"source":           "ServerNeedSafe",
 		"event":            "aiops.external_approval_pending",
 		"approval_id":      ap.ID,
+		"title":            ap.Title,
 		"patrol_record_id": ap.PatrolRecordID,
 		"client_name":      ap.ClientName,
 		"token_name":       ap.TokenName,
@@ -162,13 +204,15 @@ func SendExternalApprovalWebhook(ctx context.Context, transport HTTPTransport, c
 		"server_ids":       ap.ServerIDs,
 		"server_names":     ap.ServerNames,
 		"reason":           ap.Reason,
-		"command":          ap.Command,
-		"file_path":        ap.FilePath,
+		"total_steps":      ap.TotalSteps,
+		"executable_steps": ap.ExecutableSteps,
+		"blocked_steps":    ap.BlockedSteps,
+		"steps":            stepSummaries,
 		"created_at":       ap.CreatedAt.Format(time.RFC3339),
 		"markdown":         markdownText,
 	}
 
-	return sendFormattedWebhook(ctx, transport, ch, titleText, "orange", markdownText, customPayload)
+	return sendFormattedWebhook(ctx, transport, ch, titleText, color, markdownText, customPayload)
 }
 
 func sendFormattedWebhook(
