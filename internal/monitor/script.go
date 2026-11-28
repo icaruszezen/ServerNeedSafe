@@ -787,14 +787,18 @@ if [ "$SNS_OS" = "Darwin" ]; then
         if (match($0, /Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+/)) {
           s = substr($0, RSTART, RLENGTH);
           split(s, f, " ");
-          k = f[4] "|" f[6] "|" f[2];
-          if (!seen_ok[k]++ && ok_n < 15) {
-            ok_n++;
-            printf "SSH_LOGIN=%s|%s|%s|%s %s\n", f[4], f[6], f[2], $1, $2;
+          pid = "";
+          if (match($0, /sshd(-session)?\[[0-9]+\]/)) pid = substr($0, RSTART, RLENGTH);
+          ts = $1 " " $2;
+          k = f[4] "|" f[6] "|" f[2] "|" ts "|" pid;
+          if (!seen_ok[k]++) {
+            ok_lines[++ok_tot] = sprintf("SSH_LOGIN=%s|%s|%s|%s|%s", f[4], f[6], f[2], ts, pid);
           }
         }
       }
       END {
+        start_ok = (ok_tot > 20 ? ok_tot - 19 : 1);
+        for (i = start_ok; i <= ok_tot; i++) print ok_lines[i];
         printf "SSH_FAIL_CNT=%d\n", cnt+0;
         for (ip in ipcnt) printf "SSH_FAIL_IP_RAW=%d|%s\n", ipcnt[ip], ip;
       }
@@ -819,7 +823,15 @@ if [ "$SNS_OS" = "Darwin" ]; then
     echo "SSH_FAIL_CNT=0"
   fi
 else
-  who 2>/dev/null | head -n 12 | awk '{printf "WHO=%s|%s|%s %s|%s\n", $1, $2, $3, $4, $5}'
+  who 2>/dev/null | head -n 12 | awk 'NF >= 3 {
+    if ($NF ~ /^\(.*\)$/) {
+      tm = $3; for (i=4; i<NF; i++) tm = tm " " $i;
+      printf "WHO=%s|%s|%s|%s\n", $1, $2, tm, $NF;
+    } else {
+      tm = $3; for (i=4; i<=NF; i++) tm = tm " " $i;
+      printf "WHO=%s|%s|%s|\n", $1, $2, tm;
+    }
+  }'
   [ -r /etc/passwd ] && awk -F: '($3 == 0) {printf "UID0=%s\n", $1}' /etc/passwd 2>/dev/null
   if [ -f /var/run/reboot-required ]; then echo "REBOOT_REQ=1"; else echo "REBOOT_REQ=0"; fi
   # Zero-Python firewall detection: check systemd units and /etc/ufw/ufw.conf first
@@ -921,14 +933,20 @@ else
         if (match($0, /Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+/)) {
           s = substr($0, RSTART, RLENGTH);
           split(s, f, " ");
-          k = f[4] "|" f[6] "|" f[2];
-          if (!seen_ok[k]++ && ok_n < 15) {
-            ok_n++;
-            printf "SSH_LOGIN=%s|%s|%s|%s %s\n", f[4], f[6], f[2], $1, $2;
+          pid = "";
+          if (match($0, /sshd(-session)?\[[0-9]+\]/)) pid = substr($0, RSTART, RLENGTH);
+          ts = $1 " " $2;
+          if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) ts = $1;
+          else if ($1 ~ /^[A-Z][a-z][a-z]$/ && $3 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) ts = $1 " " $2 " " $3;
+          k = f[4] "|" f[6] "|" f[2] "|" ts "|" pid;
+          if (!seen_ok[k]++) {
+            ok_lines[++ok_tot] = sprintf("SSH_LOGIN=%s|%s|%s|%s|%s", f[4], f[6], f[2], ts, pid);
           }
         }
       }
       END {
+        start_ok = (ok_tot > 20 ? ok_tot - 19 : 1);
+        for (i = start_ok; i <= ok_tot; i++) print ok_lines[i];
         printf "SSH_FAIL_CNT=%d\n", cnt+0;
         for (ip in ipcnt) printf "SSH_FAIL_IP_RAW=%d|%s\n", ipcnt[ip], ip;
       }

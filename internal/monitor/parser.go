@@ -988,17 +988,24 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 				snap.Security.TopFailedIPs = append(snap.Security.TopFailedIPs, ip)
 			}
 		case strings.HasPrefix(l, "SSH_LOGIN="):
-			p := strings.SplitN(strings.TrimPrefix(l, "SSH_LOGIN="), "|", 4)
+			p := strings.SplitN(strings.TrimPrefix(l, "SSH_LOGIN="), "|", 5)
 			if len(p) >= 2 && strings.TrimSpace(p[1]) != "" {
+				fromIP := strings.TrimSpace(p[1])
+				if norm := vault.NormalizeSSHLoginIP(fromIP); norm != "" {
+					fromIP = norm
+				}
 				ev := vault.SSHLoginEvent{
 					User:   strings.TrimSpace(p[0]),
-					FromIP: strings.TrimSpace(p[1]),
+					FromIP: fromIP,
 				}
 				if len(p) >= 3 {
 					ev.Method = strings.TrimSpace(p[2])
 				}
 				if len(p) >= 4 {
 					ev.Timestamp = strings.TrimSpace(p[3])
+				}
+				if len(p) >= 5 {
+					ev.SessionID = strings.TrimSpace(p[4])
 				}
 				snap.Security.RecentSSHLogins = append(snap.Security.RecentSSHLogins, ev)
 			}

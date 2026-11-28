@@ -347,6 +347,7 @@ export interface MonitorAlertRule {
   unit?: string;
   enabled: boolean;
   state_based: boolean;
+  manual_resolve?: boolean;
   lower_is_worse?: boolean;
   warning_threshold: number;
   critical_threshold: number;
@@ -475,6 +476,7 @@ export interface SSHLoginEvent {
   from_ip: string;
   method?: string;
   timestamp?: string;
+  session_id?: string;
 }
 
 export interface ServerSecurityBaseline {
@@ -669,12 +671,21 @@ export interface AlertQuickAction {
     | 'ignore_port_drift_process'
     | 'ignore_port_drift_port'
     | 'accept_security_baseline'
+    | 'trust_ssh_login_ip'
     | 'open_vault_known_hosts'
     | string;
   label: string;
   description?: string;
   target?: string;
   scope?: 'server' | 'global' | string;
+}
+
+export interface SSHLoginIPBaselineResult {
+  server_id: string;
+  action: 'add' | 'remove' | string;
+  ip: string;
+  resolved_alerts: number;
+  security_baseline?: ServerSecurityBaseline;
 }
 
 export interface PortDriftIgnoreResult {
@@ -721,6 +732,7 @@ export interface MonitorAlert {
   category?: string;
   severity: AlertSeverity;
   status: AlertStatus;
+  manual_resolve?: boolean;
   title: string;
   detail: string;
   metric_text: string;

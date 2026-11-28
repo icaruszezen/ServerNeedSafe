@@ -21,10 +21,10 @@ type AlertCommandSuggestion struct {
 
 // AlertQuickAction represents a built-in UI quick-remediation action for an alert.
 type AlertQuickAction struct {
-	Kind        string `json:"kind"` // "accept_port_baseline", "ignore_port_drift_process", "ignore_port_drift_port", "accept_security_baseline", "open_vault_known_hosts"
+	Kind        string `json:"kind"` // "accept_port_baseline", "ignore_port_drift_process", "ignore_port_drift_port", "accept_security_baseline", "trust_ssh_login_ip", "open_vault_known_hosts"
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
-	Target      string `json:"target,omitempty"` // Optional rule target (e.g. process name or proto/port for drift ignore)
+	Target      string `json:"target,omitempty"` // Optional rule target (e.g. process name, proto/port, or trusted SSH IP)
 	Scope       string `json:"scope,omitempty"`  // Optional rule scope ("server" or "global")
 }
 
@@ -150,6 +150,9 @@ func EnrichAlertsWithBaselines(
 ) []EnrichedMonitorAlert {
 	out := make([]EnrichedMonitorAlert, 0, len(alerts))
 	for _, al := range alerts {
+		if !al.ManualResolve && vault.IsRuleKindManualResolve(al.RuleKind) {
+			al.ManualResolve = true
+		}
 		var snap *vault.ServerMonitorSnapshot
 		if snapshots != nil {
 			snap = snapshots[al.ServerID]
@@ -688,6 +691,7 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 		adv.Steps = []string{
 			"查看最近启动历史与重启前最后一条内核/系统日志，判断是优雅关机还是硬掉电",
 			"核对业务守护服务、Docker 容器及挂载盘在重启后是否均已自启恢复",
+			"排查确认后请点击「标记已解决」手动关闭该事件型告警（本规则不会自动恢复）",
 		}
 		if mac {
 			adv.Commands = []AlertCommandSuggestion{
@@ -943,6 +947,7 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 		adv.Steps = []string{
 			"第一时间从 dmesg / journalctl 确认被击杀的具体进程名、PID 及是否属容器 Cgroup OOM",
 			"确认受影响业务服务是否已自动拉起，随后排查内存泄漏或调整容器内存限制/扩容主机内存",
+			"排查确认后请点击「标记已解决」手动关闭该事件型告警（本规则不会自动恢复）",
 		}
 		adv.Commands = []AlertCommandSuggestion{
 			{
@@ -1244,6 +1249,7 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 		adv.Steps = []string{
 			"拉取带时间戳的内核日志完整上下文，区分存储错误、内存硬件错误还是网络文件系统异常",
 			"若确认底层硬件或云盘异常，尽快迁移业务并创建数据快照",
+			"核实处理后点击「标记已解决」手动关闭该事件型告警（同一旧日志不再复发，新增内核错误将重新告警）",
 		}
 		adv.Commands = []AlertCommandSuggestion{
 			{
@@ -1821,20 +1827,54 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 		}
 
 	case "ssh_new_login_ip":
-		if snap != nil && len(snap.Security.NewSSHLoginIPs) > 0 {
-			adv.Evidence = append(adv.Evidence, "新来源登录 IP："+strings.Join(snap.Security.NewSSHLoginIPs, ", "))
-			for i, ev := range snap.Security.RecentSSHLogins {
-				if i >= 3 {
-					break
-				}
-				adv.Evidence = append(adv.Evidence, fmt.Sprintf("近期成功登录：%s@%s (%s · %s)", ev.User, ev.FromIP, ev.Method, ev.Timestamp))
-			}
+		targetIP := vault.NormalizeSSHLoginIP(extractDedupSubKey(al.DedupKey))
+		if targetIP == "" && snap != nil && len(snap.Security.NewSSHLoginIPs) == 1 {
+			targetIP = vault.NormalizeSSHLoginIP(snap.Security.NewSSHLoginIPs[0])
 		}
-		adv.Summary = "检测到未在已知基线中的新来源 IP 成功登录 SSH，请核实是否为本人操作，确认合法可一键「采纳安全基线」"
+		if targetIP != "" {
+			adv.Evidence = append(adv.Evidence, "待核实新来源 IP："+targetIP)
+			if snap != nil {
+				loginShown := 0
+				for _, ev := range snap.Security.RecentSSHLogins {
+					if vault.NormalizeSSHLoginIP(ev.FromIP) != targetIP {
+						continue
+					}
+					if loginShown >= 3 {
+						break
+					}
+					loginShown++
+					adv.Evidence = append(adv.Evidence, fmt.Sprintf("近期成功登录：%s@%s (%s · %s)", ev.User, targetIP, fallbackStr(ev.Method, "ssh"), fallbackStr(ev.Timestamp, "近期")))
+				}
+				activeShown := 0
+				for _, u := range snap.Security.ActiveUsers {
+					if vault.NormalizeSSHLoginIP(u.FromIP) != targetIP {
+						continue
+					}
+					if activeShown >= 2 {
+						break
+					}
+					activeShown++
+					adv.Evidence = append(adv.Evidence, fmt.Sprintf("当前在线会话：%s@%s (%s · %s)", u.User, targetIP, u.TTY, fallbackStr(u.LoginTime, "活跃")))
+				}
+			}
+			adv.Summary = fmt.Sprintf("检测到未在已知基线中的来源 IP %s 成功登录 SSH；该告警不会自动恢复，确认合法可一键「信任该 IP」，异常请排查后「标记已解决」", targetIP)
+		} else {
+			if snap != nil && len(snap.Security.NewSSHLoginIPs) > 0 {
+				adv.Evidence = append(adv.Evidence, "新来源登录 IP："+strings.Join(snap.Security.NewSSHLoginIPs, ", "))
+				for i, ev := range snap.Security.RecentSSHLogins {
+					if i >= 3 {
+						break
+					}
+					adv.Evidence = append(adv.Evidence, fmt.Sprintf("近期成功登录：%s@%s (%s · %s)", ev.User, ev.FromIP, ev.Method, ev.Timestamp))
+				}
+			}
+			adv.Summary = "检测到未在已知基线中的新来源 IP 成功登录 SSH；该告警不会自动恢复，请人工核实后「信任该 IP」或「标记已解决」"
+		}
 		adv.RootCause = "办公网络/家庭宽带 IP 变动、使用新跳板节点登录，或 SSH 凭据/私钥已泄露被第三方登录。"
 		adv.Steps = []string{
 			"核对新 IP 归属地、登录时间、使用账号以及该会话执行过的命令历史",
-			"若确认属于本人合法登录，点击下方「采纳安全基线」加入信任列表；若非本人操作，立即踢出会话并更换密码与全部 SSH 密钥",
+			"若确认属于本人合法登录，点击下方「信任 IP」仅将该 IP 加入已知登录基线并关闭告警（不改动 FIM 文件基线）",
+			"若为可疑或一次性登录，请立即踢出会话、更换凭据后点击「标记已解决」（不加白，同一旧日志不再复发，该 IP 再次登录将重新告警）",
 		}
 		adv.Commands = []AlertCommandSuggestion{
 			{
@@ -1844,11 +1884,23 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 				Risk:        "readonly",
 			},
 		}
-		adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
-			Kind:        "accept_security_baseline",
-			Label:       "采纳当前安全基线",
-			Description: "将本次新来源登录 IP 纳入已知安全基线并消除告警",
-		})
+		if targetIP != "" {
+			if blk := buildFirewallBlockCommand(snap, targetIP); blk != nil {
+				adv.Commands = append(adv.Commands, *blk)
+			}
+			adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
+				Kind:        "trust_ssh_login_ip",
+				Label:       fmt.Sprintf("信任 IP %s（加入基线）", targetIP),
+				Description: "确认属于本人合法来源，仅将该 IP 写入已知登录基线并关闭此告警（不影响文件完整性基线）",
+				Target:      targetIP,
+			})
+		} else {
+			adv.QuickActions = append(adv.QuickActions, AlertQuickAction{
+				Kind:        "accept_security_baseline",
+				Label:       "采纳当前安全基线",
+				Description: "将本次新来源登录 IP 纳入已知安全基线并消除告警",
+			})
+		}
 
 	case "clock_ntp_drift":
 		adv.Summary = "主机系统时钟偏移过大，可能导致 TLS 证书校验、TOTP 令牌或分布式日志时序错乱，建议检查 NTP 同步"

@@ -202,9 +202,13 @@ func TestBuildAlertAdviceCoversAllDefaultRules(t *testing.T) {
 			if len(adv.QuickActions) == 0 || adv.QuickActions[0].Kind != "accept_port_baseline" {
 				t.Errorf("port_drift should expose accept_port_baseline quick action, got %+v", adv.QuickActions)
 			}
-		case "security_file_drift", "ssh_new_login_ip":
+		case "security_file_drift":
 			if len(adv.QuickActions) == 0 || adv.QuickActions[0].Kind != "accept_security_baseline" {
 				t.Errorf("%s should expose accept_security_baseline quick action, got %+v", r.Kind, adv.QuickActions)
+			}
+		case "ssh_new_login_ip":
+			if len(adv.QuickActions) == 0 || adv.QuickActions[0].Kind != "trust_ssh_login_ip" || adv.QuickActions[0].Target != "198.51.100.99" {
+				t.Errorf("%s should expose trust_ssh_login_ip quick action for 198.51.100.99, got %+v", r.Kind, adv.QuickActions)
 			}
 		case "host_key_changed":
 			if len(adv.QuickActions) == 0 || adv.QuickActions[0].Kind != "open_vault_known_hosts" {
@@ -246,6 +250,27 @@ func TestBuildAlertAdvicePreventsShellInjection(t *testing.T) {
 		if strings.Contains(c.Command, "evil.sh") || strings.Contains(c.Command, "1.2.3.4;") {
 			t.Fatalf("malicious IP leaked into command: %q", c.Command)
 		}
+	}
+
+	// 1b. Malicious IP in ssh_new_login_ip dedup key must also be rejected, while valid IP works even when snapshot is nil
+	evilLoginAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ServerID: "srv-evil", DedupKey: "srv-evil|ssh_new_login_ip|1.2.3.4; rm -rf /", RuleKind: "ssh_new_login_ip", Severity: vault.SeverityWarning, Status: vault.AlertStatusFiring,
+	}, maliciousSnap, nil)
+	for _, c := range evilLoginAdv.Commands {
+		if strings.Contains(c.Command, "rm -rf") || strings.Contains(c.Command, "1.2.3.4;") {
+			t.Fatalf("malicious ssh_new_login_ip dedup IP leaked into command: %q", c.Command)
+		}
+	}
+	for _, qa := range evilLoginAdv.QuickActions {
+		if qa.Kind == "trust_ssh_login_ip" {
+			t.Fatalf("malicious IP should not produce trust_ssh_login_ip quick action: %+v", qa)
+		}
+	}
+	staleLoginAdv := BuildAlertAdvice(vault.MonitorAlert{
+		ServerID: "srv-1", DedupKey: "srv-1|ssh_new_login_ip|203.0.113.88", RuleKind: "ssh_new_login_ip", Severity: vault.SeverityWarning, Status: vault.AlertStatusFiring,
+	}, nil, nil)
+	if len(staleLoginAdv.QuickActions) == 0 || staleLoginAdv.QuickActions[0].Kind != "trust_ssh_login_ip" || staleLoginAdv.QuickActions[0].Target != "203.0.113.88" {
+		t.Fatalf("expected trust_ssh_login_ip action even after 15m window with nil snapshot, got %+v", staleLoginAdv.QuickActions)
 	}
 
 	// 2. Malicious systemd unit / container name / username must be ignored by strict identifier sanitizer

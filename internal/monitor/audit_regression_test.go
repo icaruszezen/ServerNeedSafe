@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1054,4 +1055,439 @@ func TestBuildTelemetryScriptShellSyntaxMatrixAndFastTierExecution(t *testing.T)
 		t.Fatalf("expected fast-tier snapshot to preserve cached OS/Hostname after merge, got os=%q host=%q", fastSnap.OS, fastSnap.Hostname)
 	}
 	_ = srvView
+}
+
+func TestManualResolveEventAlertsAndPerIPSSHLoginLifecycle(t *testing.T) {
+	store, srv := setupTestMonitorStore(t)
+
+	// Enable ssh_new_login_ip and verify all 4 event rules carry ManualResolve=true
+	settings, rules, err := store.GetMonitorPolicy()
+	if err != nil {
+		t.Fatalf("GetMonitorPolicy: %v", err)
+	}
+	manualSet := make(map[string]bool)
+	for i := range rules {
+		if rules[i].Kind == "ssh_new_login_ip" {
+			rules[i].Enabled = true
+		}
+		if rules[i].ManualResolve {
+			manualSet[rules[i].Kind] = true
+		}
+	}
+	for _, want := range []string{"ssh_new_login_ip", "unexpected_reboot", "oom_kill", "kernel_error"} {
+		if !manualSet[want] {
+			t.Fatalf("expected rule %q to default to ManualResolve=true", want)
+		}
+	}
+	if _, _, err := store.UpdateMonitorPolicy(settings, rules, "127.0.0.1"); err != nil {
+		t.Fatalf("UpdateMonitorPolicy: %v", err)
+	}
+
+	t0 := time.Now().UTC().Add(-40 * time.Minute)
+	baseSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       srv.ID,
+		CollectedAt:    t0,
+		CollectionTier: string(TierFull),
+		Reachable:      true,
+		UptimeSec:      86400,
+		CPUCores:       4,
+		CPUPercent:     10,
+		MemPercent:     30,
+		DiskPercent:    40,
+		MaxPartPercent: 40,
+		OOMKills:       0,
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v1"},
+			PersistenceHash: "pers-v1",
+			RecentSSHLogins: []vault.SSHLoginEvent{
+				{User: "ops", FromIP: "198.51.100.10", Method: "publickey", Timestamp: "Nov 28 09:00:00", SessionID: "sshd[100]"},
+			},
+		},
+	}
+	if _, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{baseSnap}); err != nil {
+		t.Fatalf("RecordMonitorSnapshots base: %v", err)
+	}
+
+	// Sweep 2: Two distinct unknown SSH IPs (one from auth log, one from active who session only) + local ":0" (must be ignored)
+	//          + FIM drift + unexpected reboot + OOM kill + kernel error!
+	t1 := t0.Add(5 * time.Minute)
+	incidentSnap := &vault.ServerMonitorSnapshot{
+		ServerID:         srv.ID,
+		CollectedAt:      t1,
+		CollectionTier:   string(TierFull),
+		Reachable:        true,
+		UptimeSec:        120, // drops from 86400 -> unexpected_reboot
+		Uptime:           "2m",
+		CPUCores:         4,
+		CPUPercent:       12,
+		MemPercent:       35,
+		DiskPercent:      40,
+		MaxPartPercent:   40,
+		OOMKills:         1, // delta +1 -> oom_kill
+		KernelErrorCount: 1,
+		KernelErrors:     []string{"EXT4-fs error (device vda1): journal commit I/O error"},
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v2-tampered"},
+			PersistenceHash: "pers-v1",
+			RecentSSHLogins: []vault.SSHLoginEvent{
+				{User: "root", FromIP: "203.0.113.88", Method: "password", Timestamp: "Nov 28 09:04:12", SessionID: "sshd[2001]"},
+			},
+			ActiveUsers: []vault.LoggedInUserStat{
+				{User: "admin", TTY: "pts/1", FromIP: "203.0.113.99", LoginTime: "2026-11-28 09:03"},
+				{User: "desktop", TTY: "tty1", FromIP: ":0", LoginTime: "2026-11-28 08:00"},
+			},
+		},
+	}
+	trig1, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{incidentSnap})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots incident: %v", err)
+	}
+	if len(trig1) < 6 {
+		t.Fatalf("expected >= 6 triggered alerts (2x ssh_new_login_ip, fim, reboot, oom, kerr), got %d: %+v", len(trig1), trig1)
+	}
+
+	active1, _ := store.ListMonitorAlerts("active", srv.ID, 0)
+	byDedup := make(map[string]vault.MonitorAlert, len(active1))
+	for _, al := range active1 {
+		byDedup[al.DedupKey] = al
+	}
+	for _, wantKey := range []string{
+		srv.ID + "|ssh_new_login_ip|203.0.113.88",
+		srv.ID + "|ssh_new_login_ip|203.0.113.99",
+		srv.ID + "|unexpected_reboot|",
+		srv.ID + "|oom_kill|",
+		srv.ID + "|kernel_error|",
+		srv.ID + "|security_file_drift|",
+	} {
+		al, ok := byDedup[wantKey]
+		if !ok {
+			t.Fatalf("missing expected alert %q in active alerts: %+v", wantKey, byDedup)
+		}
+		if wantKey != srv.ID+"|security_file_drift|" && !al.ManualResolve {
+			t.Fatalf("expected alert %q to have ManualResolve=true", wantKey)
+		}
+	}
+	if _, bad := byDedup[srv.ID+"|ssh_new_login_ip|:0"]; bad {
+		t.Fatalf("local display ':0' must not trigger ssh_new_login_ip alert")
+	}
+
+	// Sweep 3: 20 minutes later — 15m log window has completely expired, active sessions closed,
+	// Uptime monotonic, OOM delta = 0, KernelErrorCount = 0, FIM restored to hash-v1!
+	t2 := t1.Add(20 * time.Minute)
+	calmSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       srv.ID,
+		CollectedAt:    t2,
+		CollectionTier: string(TierFull),
+		Reachable:      true,
+		UptimeSec:      1320,
+		CPUCores:       4,
+		CPUPercent:     10,
+		MemPercent:     30,
+		DiskPercent:    40,
+		MaxPartPercent: 40,
+		OOMKills:       1, // same cumulative -> delta 0
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v1"}, // restored -> continuous FIM recovers!
+			PersistenceHash: "pers-v1",
+		},
+	}
+	_, resolved2, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{calmSnap})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots calm: %v", err)
+	}
+	// ONLY security_file_drift (continuous state) should auto-resolve; ALL manual-resolve event alerts MUST stay firing!
+	if len(resolved2) != 1 || resolved2[0].RuleKind != "security_file_drift" {
+		t.Fatalf("expected only security_file_drift to auto-resolve, got resolved=%+v", resolved2)
+	}
+	active2, _ := store.ListMonitorAlerts("active", srv.ID, 0)
+	if len(active2) != 5 {
+		t.Fatalf("expected all 5 manual-resolve alerts to remain active after 15m window expires, got %d: %+v", len(active2), active2)
+	}
+	// While manual-resolve alerts are still FIRING, server health must NOT flip back to healthy!
+	if calmSnap.HealthLevel == vault.HealthHealthy {
+		t.Fatalf("expected host health to remain degraded while manual-resolve alerts are firing, got %s (score=%d)", calmSnap.HealthLevel, calmSnap.HealthScore)
+	}
+
+	// Acknowledge all firing manual-resolve alerts -> host health MUST immediately recover to healthy!
+	ackedCnt, err := store.AcknowledgeMonitorAlertsBulk(nil, srv.ID, "127.0.0.1")
+	if err != nil || ackedCnt != 5 {
+		t.Fatalf("AcknowledgeMonitorAlertsBulk: count=%d err=%v", ackedCnt, err)
+	}
+	detailAfterAck, err := store.GetServerMonitorDetail(srv.ID, time.Hour)
+	if err != nil || detailAfterAck.Snapshot == nil {
+		t.Fatalf("GetServerMonitorDetail after ack: err=%v", err)
+	}
+	if detailAfterAck.Snapshot.HealthLevel != vault.HealthHealthy {
+		t.Fatalf("expected host health to recover to healthy immediately after acknowledging manual-resolve alerts, got %s (score=%d)",
+			detailAfterAck.Snapshot.HealthLevel, detailAfterAck.Snapshot.HealthScore)
+	}
+
+	// Re-introduce a FIM drift so we can prove trusting a single SSH IP NEVER touches FIM baselines!
+	t3 := t2.Add(2 * time.Minute)
+	fimDriftSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       srv.ID,
+		CollectedAt:    t3,
+		CollectionTier: string(TierFull),
+		Reachable:      true,
+		UptimeSec:      1440,
+		CPUCores:       4,
+		CPUPercent:     10,
+		MemPercent:     30,
+		DiskPercent:    40,
+		MaxPartPercent: 40,
+		OOMKills:       1,
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v3-still-drifted"},
+			PersistenceHash: "pers-v1",
+		},
+	}
+	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{fimDriftSnap})
+
+	// Trust ONLY 203.0.113.88 (even though it is NO LONGER in latest snapshot's RecentSSHLogins!)
+	trustRes, err := store.UpdateServerSSHLoginIPBaseline(srv.ID, "203.0.113.88", "add", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("UpdateServerSSHLoginIPBaseline add: %v", err)
+	}
+	if trustRes.ResolvedAlerts != 1 || !slices.Contains(trustRes.SecurityBaseline.KnownSSHLoginIPs, "203.0.113.88") {
+		t.Fatalf("expected 203.0.113.88 added to KnownSSHLoginIPs and 1 alert resolved, got %+v", trustRes)
+	}
+	if trustRes.SecurityBaseline.FileHashes["/etc/passwd"] != "hash-v1" {
+		t.Fatalf("trusting SSH login IP must NOT alter FIM file hash baseline, got %+v", trustRes.SecurityBaseline.FileHashes)
+	}
+	// 203.0.113.99 alert must STILL be active (not resolved by trusting .88)!
+	activeAfterTrust88, _ := store.ListMonitorAlerts("active", srv.ID, 0)
+	found99, found88 := false, false
+	var alert99ID, alertKerrID string
+	for _, al := range activeAfterTrust88 {
+		if al.DedupKey == srv.ID+"|ssh_new_login_ip|203.0.113.99" {
+			found99 = true
+			alert99ID = al.ID
+		}
+		if al.DedupKey == srv.ID+"|ssh_new_login_ip|203.0.113.88" {
+			found88 = true
+		}
+		if al.DedupKey == srv.ID+"|kernel_error|" {
+			alertKerrID = al.ID
+		}
+	}
+	if !found99 || found88 {
+		t.Fatalf("expected .99 still active and .88 resolved, found99=%v found88=%v", found99, found88)
+	}
+
+	// Manually resolve untrusted IP 203.0.113.99 AND kernel_error WITHOUT trusting .99!
+	if _, err := store.ResolveMonitorAlert(alert99ID, "127.0.0.1"); err != nil {
+		t.Fatalf("ResolveMonitorAlert .99: %v", err)
+	}
+	if _, err := store.ResolveMonitorAlert(alertKerrID, "127.0.0.1"); err != nil {
+		t.Fatalf("ResolveMonitorAlert kernel_error: %v", err)
+	}
+
+	// Sweep 4 (within 15m window): the EXACT SAME old active session & old kernel_error line reappear -> MUST NOT re-trigger!
+	t4 := t3.Add(2 * time.Minute)
+	sameOldEventSnap := &vault.ServerMonitorSnapshot{
+		ServerID:         srv.ID,
+		CollectedAt:      t4,
+		CollectionTier:   string(TierFull),
+		Reachable:        true,
+		UptimeSec:        1560,
+		CPUCores:         4,
+		CPUPercent:       10,
+		MemPercent:       30,
+		DiskPercent:      40,
+		MaxPartPercent:   40,
+		OOMKills:         1,
+		KernelErrorCount: 1,
+		KernelErrors:     []string{"EXT4-fs error (device vda1): journal commit I/O error"},
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v1"},
+			PersistenceHash: "pers-v1",
+			ActiveUsers: []vault.LoggedInUserStat{
+				{User: "admin", TTY: "pts/1", FromIP: "203.0.113.99", LoginTime: "2026-11-28 09:03"},
+			},
+		},
+	}
+	trigOld, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{sameOldEventSnap})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots sameOldEvent: %v", err)
+	}
+	for _, al := range trigOld {
+		if al.RuleKind == "ssh_new_login_ip" || al.RuleKind == "kernel_error" {
+			t.Fatalf("already-resolved historical event must NOT re-trigger inside 15m window: %+v", al)
+		}
+	}
+
+	// Sweep 5: Untrusted IP 203.0.113.99 logs in AGAIN (new session/timestamp) + brand new kernel error -> MUST re-trigger immediately!
+	t5 := t4.Add(2 * time.Minute)
+	newOccurrenceSnap := &vault.ServerMonitorSnapshot{
+		ServerID:         srv.ID,
+		CollectedAt:      t5,
+		CollectionTier:   string(TierFull),
+		Reachable:        true,
+		UptimeSec:        1680,
+		CPUCores:         4,
+		CPUPercent:       10,
+		MemPercent:       30,
+		DiskPercent:      40,
+		MaxPartPercent:   40,
+		OOMKills:         1,
+		KernelErrorCount: 2,
+		KernelErrors: []string{
+			"EXT4-fs error (device vda1): journal commit I/O error",
+			"blk_update_request: I/O error, dev vda, sector 9999",
+		},
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v1"},
+			PersistenceHash: "pers-v1",
+			RecentSSHLogins: []vault.SSHLoginEvent{
+				{User: "root", FromIP: "203.0.113.99", Method: "password", Timestamp: "Nov 28 09:35:01", SessionID: "sshd[7777]"},
+			},
+		},
+	}
+	trigNew, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{newOccurrenceSnap})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots newOccurrence: %v", err)
+	}
+	reFiredSSH, reFiredKerr := false, false
+	for _, al := range trigNew {
+		if al.DedupKey == srv.ID+"|ssh_new_login_ip|203.0.113.99" {
+			reFiredSSH = true
+		}
+		if al.DedupKey == srv.ID+"|kernel_error|" {
+			reFiredKerr = true
+		}
+	}
+	if !reFiredSSH || !reFiredKerr {
+		t.Fatalf("expected brand-new login & new kernel error to re-trigger, reFiredSSH=%v reFiredKerr=%v trigNew=%+v", reFiredSSH, reFiredKerr, trigNew)
+	}
+
+	// Remove all trusted IPs from baseline -> must NOT silently auto-re-seed on next login!
+	if _, err := store.UpdateServerSSHLoginIPBaseline(srv.ID, "203.0.113.88", "remove", "127.0.0.1"); err != nil {
+		t.Fatalf("remove .88: %v", err)
+	}
+	remRes, err := store.UpdateServerSSHLoginIPBaseline(srv.ID, "198.51.100.10", "remove", "127.0.0.1")
+	if err != nil || len(remRes.SecurityBaseline.KnownSSHLoginIPs) != 0 {
+		t.Fatalf("expected empty KnownSSHLoginIPs after removing all trusted IPs, got %+v err=%v", remRes, err)
+	}
+	t6 := t5.Add(2 * time.Minute)
+	afterEmptyBaseSnap := &vault.ServerMonitorSnapshot{
+		ServerID:       srv.ID,
+		CollectedAt:    t6,
+		CollectionTier: string(TierFull),
+		Reachable:      true,
+		UptimeSec:      1800,
+		CPUCores:       4,
+		CPUPercent:     10,
+		MemPercent:     30,
+		DiskPercent:    40,
+		MaxPartPercent: 40,
+		OOMKills:       1,
+		Security: vault.SecurityPostureStat{
+			FirewallStatus:  "active",
+			UIDZeroUsers:    []string{"root"},
+			FileHashes:      map[string]string{"/etc/passwd": "hash-v1"},
+			PersistenceHash: "pers-v1",
+			RecentSSHLogins: []vault.SSHLoginEvent{
+				{User: "root", FromIP: "203.0.113.88", Method: "publickey", Timestamp: "Nov 28 09:37:00", SessionID: "sshd[8888]"},
+			},
+		},
+	}
+	trigAfterRemove, _, _, err := store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{afterEmptyBaseSnap})
+	if err != nil {
+		t.Fatalf("RecordMonitorSnapshots afterEmptyBase: %v", err)
+	}
+	reAlertedRemoved := false
+	for _, al := range trigAfterRemove {
+		if al.DedupKey == srv.ID+"|ssh_new_login_ip|203.0.113.88" {
+			reAlertedRemoved = true
+		}
+	}
+	if !reAlertedRemoved {
+		t.Fatalf("expected removed IP 203.0.113.88 to trigger new alert instead of auto-seeding empty baseline")
+	}
+}
+
+func TestParseSSHLoginFullTimestampAndSessionID(t *testing.T) {
+	snap := &vault.ServerMonitorSnapshot{ServerID: "s1", Reachable: true}
+	ParseDeepTelemetry(`
+===SNS_SEC:SEC===
+WHO=root|pts/0|2026-11-28 10:00|(203.0.113.88)
+WHO=alice|pts/1|Nov 28 10:01|(::ffff:198.51.100.22)
+WHO=local|tty1|2026-11-28 09:00|(:0)
+SSH_LOGIN=root|203.0.113.88|publickey|Nov 28 10:00:05|sshd[4321]
+SSH_LOGIN=root|::ffff:198.51.100.22|password|2026-11-28T10:02:09+08:00|sshd[4322]
+SSH_LOGIN=legacy|198.51.100.10|publickey|Nov 28 09:50
+===SNS_END===
+`, snap, nil)
+
+	if len(snap.Security.RecentSSHLogins) != 3 {
+		t.Fatalf("expected 3 parsed SSH login events, got %+v", snap.Security.RecentSSHLogins)
+	}
+	if snap.Security.RecentSSHLogins[0].Timestamp != "Nov 28 10:00:05" || snap.Security.RecentSSHLogins[0].SessionID != "sshd[4321]" {
+		t.Fatalf("unexpected 5-field SSH_LOGIN parse: %+v", snap.Security.RecentSSHLogins[0])
+	}
+	if snap.Security.RecentSSHLogins[1].FromIP != "198.51.100.22" || snap.Security.RecentSSHLogins[1].SessionID != "sshd[4322]" {
+		t.Fatalf("expected IPv4-mapped IPv6 canonicalized to 198.51.100.22, got %+v", snap.Security.RecentSSHLogins[1])
+	}
+	if snap.Security.RecentSSHLogins[2].Timestamp != "Nov 28 09:50" || snap.Security.RecentSSHLogins[2].SessionID != "" {
+		t.Fatalf("legacy 4-field SSH_LOGIN compatibility broken: %+v", snap.Security.RecentSSHLogins[2])
+	}
+
+	// Verify actual awk extraction inside buildTelemetryScript on Linux/Unix hosts
+	if runtime.GOOS != "windows" {
+		if awkBin, err := exec.LookPath("awk"); err == nil && awkBin != "" {
+			sampleLog := strings.Join([]string{
+				"Nov 28 09:00:05 web01 sshd[1001]: Accepted publickey for root from 203.0.113.88 port 50001 ssh2",
+				"Nov 28 09:05:12 web01 sshd[1002]: Accepted publickey for root from 203.0.113.88 port 50002 ssh2",
+				"2026-11-28T09:10:33+08:00 web01 sshd[1003]: Accepted password for ops from 198.51.100.77 port 50003 ssh2",
+			}, "\n")
+			awkProg := `
+      /Accepted (publickey|password|keyboard-interactive)/ {
+        if (match($0, /Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+/)) {
+          s = substr($0, RSTART, RLENGTH);
+          split(s, f, " ");
+          pid = "";
+          if (match($0, /sshd(-session)?\[[0-9]+\]/)) pid = substr($0, RSTART, RLENGTH);
+          ts = $1 " " $2;
+          if ($1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) ts = $1;
+          else if ($1 ~ /^[A-Z][a-z][a-z]$/ && $3 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) ts = $1 " " $2 " " $3;
+          k = f[4] "|" f[6] "|" f[2] "|" ts "|" pid;
+          if (!seen_ok[k]++) {
+            ok_lines[++ok_tot] = sprintf("SSH_LOGIN=%s|%s|%s|%s|%s", f[4], f[6], f[2], ts, pid);
+          }
+        }
+      }
+      END {
+        start_ok = (ok_tot > 20 ? ok_tot - 19 : 1);
+        for (i = start_ok; i <= ok_tot; i++) print ok_lines[i];
+      }`
+			cmd := exec.Command(awkBin, awkProg)
+			cmd.Stdin = strings.NewReader(sampleLog)
+			out, runErr := cmd.CombinedOutput()
+			if runErr != nil {
+				t.Fatalf("awk SSH_LOGIN extraction failed: %v\n%s", runErr, string(out))
+			}
+			parsedAwk := &vault.ServerMonitorSnapshot{ServerID: "s-awk", Reachable: true}
+			ParseDeepTelemetry("===SNS_SEC:SEC===\n"+string(out)+"\n===SNS_END===\n", parsedAwk, nil)
+			if len(parsedAwk.Security.RecentSSHLogins) != 3 {
+				t.Fatalf("expected all 3 distinct SSH logins (including 2nd login from same user+IP) preserved, got %+v\nraw=%s", parsedAwk.Security.RecentSSHLogins, string(out))
+			}
+			if parsedAwk.Security.RecentSSHLogins[0].Timestamp != "Nov 28 09:00:05" || parsedAwk.Security.RecentSSHLogins[0].SessionID != "sshd[1001]" ||
+				parsedAwk.Security.RecentSSHLogins[1].Timestamp != "Nov 28 09:05:12" || parsedAwk.Security.RecentSSHLogins[1].SessionID != "sshd[1002]" ||
+				parsedAwk.Security.RecentSSHLogins[2].Timestamp != "2026-11-28T09:10:33+08:00" || parsedAwk.Security.RecentSSHLogins[2].SessionID != "sshd[1003]" {
+				t.Fatalf("unexpected awk extracted login timestamps/sessions: %+v", parsedAwk.Security.RecentSSHLogins)
+			}
+		}
+	}
 }

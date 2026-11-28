@@ -291,6 +291,104 @@ func TestAlertCenterAPIEndpointsAndAdviceEnrichment(t *testing.T) {
 	if !policyPayload.Settings.PortDriftIgnoreEphemeralUDP || len(policyPayload.DefaultIgnoreProcs) == 0 {
 		t.Fatalf("expected ephemeral UDP default & default_port_drift_ignore_processes in policy API, got %+v", policyPayload)
 	}
+
+	// Verify SSH new login IP per-IP manual-resolve API workflow (/api/monitor/security-baseline/ssh-ip)
+	curSettings, curRules, err := store.GetMonitorPolicy()
+	if err != nil {
+		t.Fatalf("GetMonitorPolicy: %v", err)
+	}
+	for i := range curRules {
+		if curRules[i].Kind == "ssh_new_login_ip" {
+			curRules[i].Enabled = true
+		}
+	}
+	if _, _, err := store.UpdateMonitorPolicy(curSettings, curRules, "127.0.0.1"); err != nil {
+		t.Fatalf("UpdateMonitorPolicy enable ssh_new_login_ip: %v", err)
+	}
+	// Seed initial baseline with known IP 198.51.100.10, then record a login from unknown IP 203.0.113.77
+	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{
+		{
+			ServerID: srv1.ID, CollectedAt: now.Add(40 * time.Second), CollectionTier: "full", Reachable: true,
+			Security: vault.SecurityPostureStat{
+				FirewallStatus: "active", UIDZeroUsers: []string{"root"},
+				RecentSSHLogins: []vault.SSHLoginEvent{{User: "ops", FromIP: "198.51.100.10", Method: "publickey", Timestamp: "Nov 28 09:00:00", SessionID: "sshd[10]"}},
+			},
+		},
+	})
+	_, _, _, _ = store.RecordMonitorSnapshots([]*vault.ServerMonitorSnapshot{
+		{
+			ServerID: srv1.ID, CollectedAt: now.Add(50 * time.Second), CollectionTier: "full", Reachable: true,
+			Security: vault.SecurityPostureStat{
+				FirewallStatus: "active", UIDZeroUsers: []string{"root"},
+				RecentSSHLogins: []vault.SSHLoginEvent{{User: "root", FromIP: "203.0.113.77", Method: "password", Timestamp: "Nov 28 09:05:00", SessionID: "sshd[11]"}},
+			},
+		},
+	})
+
+	sshListRec := doJSON(http.MethodGet, "/api/monitor/alerts?status=active&server_id="+srv1.ID+"&category=security", nil)
+	if sshListRec.Code != http.StatusOK {
+		t.Fatalf("list ssh_new_login_ip alert failed: %d %s", sshListRec.Code, sshListRec.Body.String())
+	}
+	var sshListPayload struct {
+		Alerts []monitor.EnrichedMonitorAlert `json:"alerts"`
+	}
+	_ = json.Unmarshal(sshListRec.Body.Bytes(), &sshListPayload)
+	var sshAlert *monitor.EnrichedMonitorAlert
+	for i := range sshListPayload.Alerts {
+		if sshListPayload.Alerts[i].RuleKind == "ssh_new_login_ip" {
+			sshAlert = &sshListPayload.Alerts[i]
+			break
+		}
+	}
+	if sshAlert == nil || !sshAlert.ManualResolve || sshAlert.DedupKey != srv1.ID+"|ssh_new_login_ip|203.0.113.77" {
+		t.Fatalf("expected per-IP manual_resolve ssh_new_login_ip alert, got %+v", sshListPayload.Alerts)
+	}
+	if sshAlert.Advice == nil || len(sshAlert.Advice.QuickActions) == 0 ||
+		sshAlert.Advice.QuickActions[0].Kind != "trust_ssh_login_ip" ||
+		sshAlert.Advice.QuickActions[0].Target != "203.0.113.77" {
+		t.Fatalf("expected trust_ssh_login_ip quick action for 203.0.113.77, got %+v", sshAlert.Advice)
+	}
+
+	// Trust via dedicated API endpoint
+	trustRec := doJSON(http.MethodPost, "/api/monitor/security-baseline/ssh-ip", map[string]any{
+		"server_id": srv1.ID,
+		"ip":        "203.0.113.77",
+		"action":    "add",
+	})
+	if trustRec.Code != http.StatusOK {
+		t.Fatalf("trust ssh ip API failed: %d %s", trustRec.Code, trustRec.Body.String())
+	}
+	var trustPayload struct {
+		OK     bool                           `json:"ok"`
+		Result vault.SSHLoginIPBaselineResult `json:"result"`
+	}
+	_ = json.Unmarshal(trustRec.Body.Bytes(), &trustPayload)
+	if !trustPayload.OK || trustPayload.Result.ResolvedAlerts != 1 || trustPayload.Result.IP != "203.0.113.77" {
+		t.Fatalf("unexpected trust ssh ip response: %+v", trustPayload)
+	}
+
+	// Remove via dedicated API endpoint
+	removeRec := doJSON(http.MethodPost, "/api/monitor/security-baseline/ssh-ip", map[string]any{
+		"server_id": srv1.ID,
+		"ip":        "203.0.113.77",
+		"action":    "remove",
+	})
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("remove ssh ip API failed: %d %s", removeRec.Code, removeRec.Body.String())
+	}
+	var removePayload struct {
+		OK     bool                           `json:"ok"`
+		Result vault.SSHLoginIPBaselineResult `json:"result"`
+	}
+	_ = json.Unmarshal(removeRec.Body.Bytes(), &removePayload)
+	if !removePayload.OK || removePayload.Result.Action != "remove" {
+		t.Fatalf("unexpected remove ssh ip response: %+v", removePayload)
+	}
+	for _, ip := range removePayload.Result.SecurityBaseline.KnownSSHLoginIPs {
+		if ip == "203.0.113.77" {
+			t.Fatalf("expected 203.0.113.77 removed from known_ssh_login_ips, got %+v", removePayload.Result.SecurityBaseline.KnownSSHLoginIPs)
+		}
+	}
 }
 
 func ptrStr(s string) *string { return &s }

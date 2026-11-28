@@ -68,6 +68,7 @@ type MonitorAlertRule struct {
 	Unit              string  `json:"unit,omitempty"`
 	Enabled           bool    `json:"enabled"`
 	StateBased        bool    `json:"state_based"`
+	ManualResolve     bool    `json:"manual_resolve,omitempty"` // Discrete event rule: stays active until manually resolved (never auto-recovers)
 	LowerIsWorse      bool    `json:"lower_is_worse,omitempty"` // True when smaller positive value is worse (e.g. disk_will_fill hours)
 	WarningThreshold  float64 `json:"warning_threshold"`
 	CriticalThreshold float64 `json:"critical_threshold"`
@@ -192,6 +193,7 @@ type SSHLoginEvent struct {
 	FromIP    string `json:"from_ip"`
 	Method    string `json:"method,omitempty"`
 	Timestamp string `json:"timestamp,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // ServerSecurityBaseline stores operator-trusted deterministic security fingerprints for drift alerts.
@@ -437,24 +439,26 @@ func (s *ServerMonitorSnapshot) ToSamplePoint() MonitorSamplePoint {
 
 // MonitorAlert records a triggered, acknowledged, or resolved monitoring alert event.
 type MonitorAlert struct {
-	ID             string        `json:"id"`
-	DedupKey       string        `json:"dedup_key"` // server_id|rule_kind|sub_target
-	ServerID       string        `json:"server_id"`
-	ServerName     string        `json:"server_name"`
-	Host           string        `json:"host"`
-	RuleKind       string        `json:"rule_kind"`
-	RuleName       string        `json:"rule_name"`
-	Severity       AlertSeverity `json:"severity"`
-	Status         AlertStatus   `json:"status"`
-	Title          string        `json:"title"`
-	Detail         string        `json:"detail"`
-	MetricText     string        `json:"metric_text"`
-	ThresholdText  string        `json:"threshold_text,omitempty"`
-	Occurrences    int           `json:"occurrences"`
-	TriggeredAt    time.Time     `json:"triggered_at"`
-	LastSeenAt     time.Time     `json:"last_seen_at"`
-	AcknowledgedAt *time.Time    `json:"acknowledged_at,omitempty"`
-	ResolvedAt     *time.Time    `json:"resolved_at,omitempty"`
+	ID                string        `json:"id"`
+	DedupKey          string        `json:"dedup_key"` // server_id|rule_kind|sub_target
+	ServerID          string        `json:"server_id"`
+	ServerName        string        `json:"server_name"`
+	Host              string        `json:"host"`
+	RuleKind          string        `json:"rule_kind"`
+	RuleName          string        `json:"rule_name"`
+	Severity          AlertSeverity `json:"severity"`
+	Status            AlertStatus   `json:"status"`
+	ManualResolve     bool          `json:"manual_resolve,omitempty"`
+	Title             string        `json:"title"`
+	Detail            string        `json:"detail"`
+	MetricText        string        `json:"metric_text"`
+	ThresholdText     string        `json:"threshold_text,omitempty"`
+	Occurrences       int           `json:"occurrences"`
+	EventFingerprints []string      `json:"event_fingerprints,omitempty"`
+	TriggeredAt       time.Time     `json:"triggered_at"`
+	LastSeenAt        time.Time     `json:"last_seen_at"`
+	AcknowledgedAt    *time.Time    `json:"acknowledged_at,omitempty"`
+	ResolvedAt        *time.Time    `json:"resolved_at,omitempty"`
 }
 
 // ServerSLASummary aggregates historical availability & peak metrics for a server.
@@ -534,9 +538,10 @@ func DefaultMonitorAlertRules() []MonitorAlertRule {
 			Kind:             "unexpected_reboot",
 			Category:         "availability",
 			Name:             "主机非预期重启检测",
-			Description:      "检测到目标主机 Uptime 运行时间显著回落（疑似宕机重启）",
+			Description:      "检测到目标主机 Uptime 运行时间显著回落（疑似宕机重启），需人工核实后手动关闭",
 			Enabled:          true,
 			StateBased:       true,
+			ManualResolve:    true,
 			ConsecutiveCount: 1,
 		},
 		{
@@ -622,9 +627,10 @@ func DefaultMonitorAlertRules() []MonitorAlertRule {
 			Kind:              "oom_kill",
 			Category:          "compute",
 			Name:              "内核 OOM Killer 击杀进程",
-			Description:       "两次采样周期内检测到 /proc/vmstat oom_kill 计数新增",
+			Description:       "两次采样周期内检测到 /proc/vmstat oom_kill 计数新增，需人工排查后手动关闭",
 			Unit:              "次",
 			Enabled:           true,
+			ManualResolve:     true,
 			WarningThreshold:  1,
 			CriticalThreshold: 1,
 			ConsecutiveCount:  1,
@@ -731,9 +737,10 @@ func DefaultMonitorAlertRules() []MonitorAlertRule {
 			Kind:              "kernel_error",
 			Category:          "storage",
 			Name:              "内核硬件 / 存储 / NFS 严重错误",
-			Description:       "慢层内核日志捕获 I/O error、EXT4/XFS 损坏、NFS 无响应、MCE 或 Call Trace",
+			Description:       "慢层内核日志捕获 I/O error、EXT4/XFS 损坏、NFS 无响应、MCE 或 Call Trace，需人工核实后手动关闭",
 			Unit:              "条",
 			Enabled:           true,
+			ManualResolve:     true,
 			WarningThreshold:  1,
 			CriticalThreshold: 5,
 			ConsecutiveCount:  1,
@@ -862,9 +869,10 @@ func DefaultMonitorAlertRules() []MonitorAlertRule {
 			Kind:             "ssh_new_login_ip",
 			Category:         "security",
 			Name:             "新来源 IP 成功登录 SSH",
-			Description:      "检测到不在已知基线 IP 列表中的外部 IP 成功 SSH 登录（默认关闭防办公网浮动 IP 误报）",
+			Description:      "检测到不在已知基线 IP 列表中的来源 IP 成功 SSH 登录或保持在线会话（按 IP 独立建单且需人工确认/信任后关闭，默认关闭防办公网浮动 IP 误报）",
 			Enabled:          false,
 			StateBased:       true,
+			ManualResolve:    true,
 			ConsecutiveCount: 1,
 		},
 		{

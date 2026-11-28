@@ -22,6 +22,7 @@ import {
   ShieldCheck,
   Terminal,
   Trash2,
+  X,
 } from 'lucide-react';
 import { api, ApiError } from '../api';
 import type {
@@ -178,6 +179,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   const [ruleCategoryFilter, setRuleCategoryFilter] = useState<string>('all');
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [mutatingIgnoreKey, setMutatingIgnoreKey] = useState<string>('');
+  const [mutatingLoginIPKey, setMutatingLoginIPKey] = useState<string>('');
 
   // HostKey verification modal on manual single-node collect
   const [hostKeyPrompt, setHostKeyPrompt] = useState<{
@@ -384,6 +386,35 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
       ]);
     } catch (err: any) {
       onNotify(err?.message || '更新安全基线失败');
+    }
+  };
+
+  const handleMutateSSHLoginIP = async (
+    serverId: string,
+    ip: string,
+    action: 'add' | 'remove'
+  ) => {
+    const busyKey = `${action}:${ip}`;
+    setMutatingLoginIPKey(busyKey);
+    try {
+      const res = await api.updateSSHLoginIPBaseline({ server_id: serverId, ip, action });
+      if (action === 'add') {
+        onNotify(
+          `已将来源 IP ${res.result.ip} 加入已知登录基线${
+            res.result.resolved_alerts > 0 ? '，对应告警已关闭' : ''
+          }`
+        );
+      } else {
+        onNotify(`已从已知登录基线移除来源 IP ${res.result.ip}`);
+      }
+      await Promise.all([
+        loadServerDetail(serverId, historyRange, true),
+        loadOverview(),
+      ]);
+    } catch (err: any) {
+      onNotify(err?.message || (action === 'add' ? '信任来源 IP 失败' : '移除来源 IP 失败'));
+    } finally {
+      setMutatingLoginIPKey('');
     }
   };
 
@@ -2614,6 +2645,75 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             )}
                           </div>
 
+                          <div style={{ marginBottom: 14 }}>
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                gap: 8,
+                                marginBottom: 8,
+                                flexWrap: 'wrap',
+                              }}
+                            >
+                              <h4 style={{ fontSize: 13, fontWeight: 630, margin: 0 }}>
+                                已知信任 SSH 登录 IP 基线
+                                <span className="tag-chip" style={{ marginLeft: 8, fontSize: 11 }}>
+                                  {(nodeDetail.security_baseline?.known_ssh_login_ips || []).length} 个 IP
+                                </span>
+                              </h4>
+                              <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                                非基线 IP 登录或保持在线会话将按 IP 独立告警且需人工确认关闭
+                              </span>
+                            </div>
+                            {(nodeDetail.security_baseline?.known_ssh_login_ips || []).length > 0 ? (
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                                {(nodeDetail.security_baseline?.known_ssh_login_ips || []).map((ip) => {
+                                  const removing = mutatingLoginIPKey === `remove:${ip}`;
+                                  return (
+                                    <span
+                                      key={`known-ip-${ip}`}
+                                      className="tag-chip teal mono"
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: 5,
+                                        paddingRight: 4,
+                                      }}
+                                    >
+                                      <span>{ip}</span>
+                                      <button
+                                        type="button"
+                                        disabled={removing}
+                                        onClick={() =>
+                                          void handleMutateSSHLoginIP(nodeDetail.server.id, ip, 'remove')
+                                        }
+                                        title={`从已知登录基线移除 ${ip}`}
+                                        aria-label={`移除已知登录 IP ${ip}`}
+                                        style={{
+                                          border: 'none',
+                                          background: 'transparent',
+                                          color: 'inherit',
+                                          cursor: removing ? 'wait' : 'pointer',
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          padding: 1,
+                                          opacity: 0.78,
+                                        }}
+                                      >
+                                        <X size={12} />
+                                      </button>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <div className="mon-empty-inline">
+                                尚未登记已知信任 SSH 登录 IP（首次慢层采集会自动初始化，或从下方记录/告警中单条信任）
+                              </div>
+                            )}
+                          </div>
+
                           {snap.security.recent_ssh_logins && snap.security.recent_ssh_logins.length > 0 && (
                             <div style={{ marginBottom: 14 }}>
                               <h4 style={{ fontSize: 13, fontWeight: 630, marginBottom: 8 }}>
@@ -2631,22 +2731,45 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                       <th>用户</th>
                                       <th>来源 IP</th>
                                       <th>认证方式</th>
+                                      <th>登录时间</th>
                                       <th>基线状态</th>
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {snap.security.recent_ssh_logins.slice(0, 8).map((ev, idx) => {
+                                    {snap.security.recent_ssh_logins.slice(0, 10).map((ev, idx) => {
                                       const isNew = (snap.security.new_ssh_login_ips || []).includes(
                                         ev.from_ip
                                       );
+                                      const trusting = mutatingLoginIPKey === `add:${ev.from_ip}`;
                                       return (
                                         <tr key={`login-${idx}`}>
                                           <td className="mono">{ev.user}</td>
                                           <td className="mono">{ev.from_ip}</td>
                                           <td className="mono">{ev.method || '—'}</td>
+                                          <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                                            {ev.timestamp || '—'}
+                                          </td>
                                           <td>
                                             {isNew ? (
-                                              <span className="tag-chip amber">新来源 IP</span>
+                                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                                <span className="tag-chip amber">新来源 IP</span>
+                                                <button
+                                                  type="button"
+                                                  className="btn btn-sm btn-ghost"
+                                                  style={{ padding: '2px 7px', fontSize: 11.5, height: 'auto' }}
+                                                  disabled={trusting}
+                                                  onClick={() =>
+                                                    void handleMutateSSHLoginIP(
+                                                      nodeDetail.server.id,
+                                                      ev.from_ip,
+                                                      'add'
+                                                    )
+                                                  }
+                                                  title={`仅将 ${ev.from_ip} 加入已知登录基线，不影响文件完整性基线`}
+                                                >
+                                                  {trusting ? '处理中...' : '信任该 IP'}
+                                                </button>
+                                              </span>
                                             ) : (
                                               <span className="tag-chip teal">已知基线</span>
                                             )}
@@ -2675,18 +2798,48 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {snap.security.active_users.map((u, idx) => (
-                                    <tr key={`${u.user}-${u.tty}-${idx}`}>
-                                      <td className="mono" style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
-                                        {u.user}
-                                      </td>
-                                      <td className="mono" style={{ whiteSpace: 'nowrap' }}>{u.tty}</td>
-                                      <td className="mono" style={{ whiteSpace: 'nowrap' }}>{u.from_ip || '本地'}</td>
-                                      <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-                                        {u.login_time || '—'}
-                                      </td>
-                                    </tr>
-                                  ))}
+                                  {snap.security.active_users.map((u, idx) => {
+                                    const isNewActive =
+                                      Boolean(u.from_ip) &&
+                                      (snap.security.new_ssh_login_ips || []).includes(u.from_ip || '');
+                                    const trusting = mutatingLoginIPKey === `add:${u.from_ip || ''}`;
+                                    return (
+                                      <tr key={`${u.user}-${u.tty}-${idx}`}>
+                                        <td className="mono" style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
+                                          {u.user}
+                                        </td>
+                                        <td className="mono" style={{ whiteSpace: 'nowrap' }}>{u.tty}</td>
+                                        <td className="mono" style={{ whiteSpace: 'nowrap' }}>
+                                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                            <span>{u.from_ip || '本地'}</span>
+                                            {isNewActive && u.from_ip && (
+                                              <>
+                                                <span className="tag-chip amber">新来源 IP</span>
+                                                <button
+                                                  type="button"
+                                                  className="btn btn-sm btn-ghost"
+                                                  style={{ padding: '2px 7px', fontSize: 11.5, height: 'auto' }}
+                                                  disabled={trusting}
+                                                  onClick={() =>
+                                                    void handleMutateSSHLoginIP(
+                                                      nodeDetail.server.id,
+                                                      u.from_ip || '',
+                                                      'add'
+                                                    )
+                                                  }
+                                                >
+                                                  {trusting ? '处理中...' : '信任该 IP'}
+                                                </button>
+                                              </>
+                                            )}
+                                          </span>
+                                        </td>
+                                        <td className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                                          {u.login_time || '—'}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
                                 </tbody>
                               </table>
                             </div>
@@ -3271,6 +3424,15 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                   {rule.lower_is_worse && (
                                     <span className="tag-chip amber" style={{ fontSize: 10.5, padding: '1px 6px' }}>
                                       低于阈值触发 (≤)
+                                    </span>
+                                  )}
+                                  {rule.manual_resolve && (
+                                    <span
+                                      className="tag-chip"
+                                      style={{ fontSize: 10.5, padding: '1px 6px' }}
+                                      title="事件型规则不会因时间窗过期自动恢复，必须人工确认/处置后关闭"
+                                    >
+                                      需人工关闭
                                     </span>
                                   )}
                                 </div>

@@ -1237,6 +1237,9 @@ func ensureMonitorRuntimeDefaults(m *MonitorRuntimeState) {
 	if m.SecurityBaselines == nil {
 		m.SecurityBaselines = make(map[string]ServerSecurityBaseline)
 	}
+	if m.HandledEvents == nil {
+		m.HandledEvents = make(map[string]map[string]time.Time)
+	}
 	if m.ServerRuntime == nil {
 		m.ServerRuntime = make(map[string]ServerRuntimeMeta)
 	}
@@ -1366,6 +1369,8 @@ func cloneMonitorRuntimeState(in *MonitorRuntimeState) *MonitorRuntimeState {
 		Alerts:                make([]MonitorAlert, len(in.Alerts)),
 		BreachStreaks:         make(map[string]int, len(in.BreachStreaks)),
 		PortBaselines:         make(map[string][]string, len(in.PortBaselines)),
+		SecurityBaselines:     make(map[string]ServerSecurityBaseline, len(in.SecurityBaselines)),
+		HandledEvents:         make(map[string]map[string]time.Time, len(in.HandledEvents)),
 		ServerRuntime:         make(map[string]ServerRuntimeMeta, len(in.ServerRuntime)),
 		KnownHostLastVerified: make(map[string]time.Time, len(in.KnownHostLastVerified)),
 	}
@@ -1376,22 +1381,23 @@ func cloneMonitorRuntimeState(in *MonitorRuntimeState) *MonitorRuntimeState {
 		cp.HistoryByServer[k] = slices.Clone(v)
 	}
 	for i, al := range in.Alerts {
-		alCp := al
-		if al.AcknowledgedAt != nil {
-			t := *al.AcknowledgedAt
-			alCp.AcknowledgedAt = &t
-		}
-		if al.ResolvedAt != nil {
-			t := *al.ResolvedAt
-			alCp.ResolvedAt = &t
-		}
-		cp.Alerts[i] = alCp
+		cp.Alerts[i] = cloneMonitorAlert(al)
 	}
 	for k, v := range in.BreachStreaks {
 		cp.BreachStreaks[k] = v
 	}
 	for k, v := range in.PortBaselines {
 		cp.PortBaselines[k] = slices.Clone(v)
+	}
+	for k, v := range in.SecurityBaselines {
+		cp.SecurityBaselines[k] = cloneSecurityBaseline(v)
+	}
+	for dk, fps := range in.HandledEvents {
+		fpCp := make(map[string]time.Time, len(fps))
+		for fp, ts := range fps {
+			fpCp[fp] = ts
+		}
+		cp.HandledEvents[dk] = fpCp
 	}
 	for k, v := range in.ServerRuntime {
 		meta := v
@@ -1996,6 +2002,11 @@ func (s *Store) DeleteServer(id, clientIP string) error {
 		for k := range s.monitorRT.BreachStreaks {
 			if strings.HasPrefix(k, prefix) {
 				delete(s.monitorRT.BreachStreaks, k)
+			}
+		}
+		for k := range s.monitorRT.HandledEvents {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.monitorRT.HandledEvents, k)
 			}
 		}
 		s.monitorRT.Alerts = slices.DeleteFunc(s.monitorRT.Alerts, func(a MonitorAlert) bool {
