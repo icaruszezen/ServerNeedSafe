@@ -24,8 +24,9 @@ type Config struct {
 	Store           *vault.Store
 	Endpoints       SourceEndpoints
 	HTTPClient      *http.Client // Optional override (mainly for tests)
-	AICompleter     AICompleter  // Optional on-demand Chinese AI explainer
+	AICompleter     AICompleter // Optional on-demand Chinese AI explainer
 	WebhookSender   func(ctx context.Context, ch vault.WebhookChannel, title, color, md string, payload map[string]any) error
+	EventNotifier   func(ctx context.Context, hits []vault.VulnAdvisory) bool
 	StartupDelay    time.Duration
 	DisableAutoLoop bool
 }
@@ -475,8 +476,8 @@ func (s *Service) SyncNow(ctx context.Context, targetAppIDs []string) (*SyncResu
 		settings.MaxRecords,
 	)
 
-	// Optional Webhook notification for truly new Critical/High/KEV advisories (never spam on cold first sync)
-	if settings.NotifyWebhook && !isFirstSync && len(newlyAdded) > 0 {
+	// Optional Webhook / QQ Bot notification for truly new Critical/High/KEV advisories (never spam on cold first sync)
+	if !isFirstSync && len(newlyAdded) > 0 && (settings.NotifyWebhook || s.cfg.EventNotifier != nil) {
 		s.notifyNewAdvisories(ctx, settings, newlyAdded)
 	}
 
@@ -1121,55 +1122,63 @@ func (s *Service) notifyNewAdvisories(ctx context.Context, settings vault.VulnSe
 		return
 	}
 
-	channels := s.resolveWebhookChannels(settings.CustomWebhookURL, settings.ReuseAIPatrolWebhook)
-	if len(channels) == 0 {
+	var channels []vault.WebhookChannel
+	if settings.NotifyWebhook {
+		channels = s.resolveWebhookChannels(settings.CustomWebhookURL, settings.ReuseAIPatrolWebhook)
+	}
+	if len(channels) == 0 && s.cfg.EventNotifier == nil {
 		return
 	}
 
-	hasCritOrKEV := false
-	var md strings.Builder
-	md.WriteString(fmt.Sprintf("### [ServerNeedSafe] 发现 %d 条新的主流应用官方高危漏洞动态\n", len(hits)))
-	for i, a := range hits {
-		if a.Severity == vault.VulnSeverityCritical || a.IsKEV {
-			hasCritOrKEV = true
-		}
-		if i >= 8 {
-			md.WriteString(fmt.Sprintf("- ... 其余 %d 条请前往「漏洞监测」查看\n", len(hits)-8))
-			break
-		}
-		kevBadge := ""
-		if a.IsKEV {
-			kevBadge = " 🔥[在野利用 KEV]"
-		}
-		fixHint := "暂无明确补丁"
-		if a.FixedVersion != "" {
-			fixHint = "修复版本: `" + a.FixedVersion + "`"
-		}
-		md.WriteString(fmt.Sprintf("- **[%s]%s %s** (%s) — %s（%s）\n",
-			strings.ToUpper(string(a.Severity)), kevBadge, a.ID, strings.Join(a.AppNames, "/"), truncateRunes(a.Title, 90), fixHint))
-	}
-
-	color := "orange"
-	if hasCritOrKEV {
-		color = "red"
-	}
-	title := fmt.Sprintf("ServerNeedSafe · 发现 %d 条新官方漏洞修复动态", len(hits))
-	payload := map[string]any{
-		"source":     "ServerNeedSafe",
-		"event":      "vuln.new_advisories",
-		"count":      len(hits),
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-		"advisories": hits,
-		"markdown":   md.String(),
-	}
-
 	sentAny := false
-	for _, ch := range channels {
-		if err := s.cfg.WebhookSender(ctx, ch, title, color, md.String(), payload); err != nil {
-			log.Printf("[ServerNeedSafe] 漏洞监测 Webhook 推送失败 (%s): %v", ch.Name, err)
-		} else {
-			sentAny = true
+	if len(channels) > 0 {
+		hasCritOrKEV := false
+		var md strings.Builder
+		md.WriteString(fmt.Sprintf("### [ServerNeedSafe] 发现 %d 条新的主流应用官方高危漏洞动态\n", len(hits)))
+		for i, a := range hits {
+			if a.Severity == vault.VulnSeverityCritical || a.IsKEV {
+				hasCritOrKEV = true
+			}
+			if i >= 8 {
+				md.WriteString(fmt.Sprintf("- ... 其余 %d 条请前往「漏洞监测」查看\n", len(hits)-8))
+				break
+			}
+			kevBadge := ""
+			if a.IsKEV {
+				kevBadge = " 🔥[在野利用 KEV]"
+			}
+			fixHint := "暂无明确补丁"
+			if a.FixedVersion != "" {
+				fixHint = "修复版本: `" + a.FixedVersion + "`"
+			}
+			md.WriteString(fmt.Sprintf("- **[%s]%s %s** (%s) — %s（%s）\n",
+				strings.ToUpper(string(a.Severity)), kevBadge, a.ID, strings.Join(a.AppNames, "/"), truncateRunes(a.Title, 90), fixHint))
 		}
+
+		color := "orange"
+		if hasCritOrKEV {
+			color = "red"
+		}
+		title := fmt.Sprintf("ServerNeedSafe · 发现 %d 条新官方漏洞修复动态", len(hits))
+		payload := map[string]any{
+			"source":     "ServerNeedSafe",
+			"event":      "vuln.new_advisories",
+			"count":      len(hits),
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+			"advisories": hits,
+			"markdown":   md.String(),
+		}
+
+		for _, ch := range channels {
+			if err := s.cfg.WebhookSender(ctx, ch, title, color, md.String(), payload); err != nil {
+				log.Printf("[ServerNeedSafe] 漏洞监测 Webhook 推送失败 (%s): %v", ch.Name, err)
+			} else {
+				sentAny = true
+			}
+		}
+	}
+	if s.cfg.EventNotifier != nil && s.cfg.EventNotifier(ctx, hits) {
+		sentAny = true
 	}
 	if sentAny {
 		ids := make([]string, 0, len(hits))

@@ -66,6 +66,15 @@ import type {
   VulnSettingsUpdatePayload,
   VulnSettingsView,
   VulnSyncResult,
+  QQBotBindCodeInfo,
+  QQBotDispatchSummary,
+  QQBotOverviewResponse,
+  QQBotProbeResult,
+  QQBotRuntimeStatus,
+  QQBotSettingsUpdatePayload,
+  QQBotSettingsView,
+  QQBotTarget,
+  QQBotTargetType,
   WorkspaceBootstrapResponse,
 } from './types';
 
@@ -1392,4 +1401,74 @@ export const api = {
 
   testVulnWebhook: (payload?: { custom_webhook_url?: string; reuse_ai_patrol_webhook?: boolean }) =>
     requestJSON<{ ok: boolean }>('POST', '/api/vulns/test-webhook', payload || {}),
+
+  // 7x24 QQ Open Platform API v2 WebSocket Event Notifications
+  getQQBotOverview: () =>
+    requestJSON<QQBotOverviewResponse>('GET', '/api/notifications/qqbot/overview'),
+
+  updateQQBotConfig: (payload: QQBotSettingsUpdatePayload) =>
+    requestJSON<{
+      ok: boolean;
+      settings: QQBotSettingsView;
+      runtime: QQBotRuntimeStatus;
+    }>('PUT', '/api/notifications/qqbot/config', payload),
+
+  upsertQQBotTarget: (payload: {
+    id?: string;
+    name?: string;
+    target_type: QQBotTargetType;
+    target_id: string;
+    guild_id?: string;
+    enabled?: boolean;
+  }) =>
+    requestJSON<{
+      ok: boolean;
+      target: QQBotTarget;
+      settings: QQBotSettingsView;
+    }>('POST', '/api/notifications/qqbot/targets', payload),
+
+  deleteQQBotTarget: (id: string) =>
+    requestJSON<{ ok: boolean; settings: QQBotSettingsView }>(
+      'DELETE',
+      `/api/notifications/qqbot/targets/${encodeURIComponent(id)}`
+    ),
+
+  generateQQBotBindCode: () =>
+    requestJSON<{
+      ok: boolean;
+      bind_code: QQBotBindCodeInfo;
+      runtime: QQBotRuntimeStatus;
+    }>('POST', '/api/notifications/qqbot/bind-code', {}),
+
+  probeQQBot: (payload?: QQBotSettingsUpdatePayload) =>
+    requestJSON<{ ok: boolean; probe: QQBotProbeResult }>(
+      'POST',
+      '/api/notifications/qqbot/probe',
+      payload || {}
+    ),
+
+  reconnectQQBot: () =>
+    requestJSON<{ ok: boolean; runtime: QQBotRuntimeStatus }>(
+      'POST',
+      '/api/notifications/qqbot/reconnect',
+      {}
+    ),
+
+  testQQBotPush: (
+    payload?: QQBotSettingsUpdatePayload & {
+      target_id?: string;
+      target_type?: QQBotTargetType;
+      custom_message?: string;
+    }
+  ) =>
+    requestJSON<{
+      ok: boolean;
+      summary: QQBotDispatchSummary;
+      runtime: QQBotRuntimeStatus;
+    }>('POST', '/api/notifications/qqbot/test-push', payload || {}),
+
+  clearQQBotLogs: (include_discovered = false) =>
+    requestJSON<{ ok: boolean }>('POST', '/api/notifications/qqbot/clear-logs', {
+      include_discovered,
+    }),
 };

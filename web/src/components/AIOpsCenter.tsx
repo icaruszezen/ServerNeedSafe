@@ -74,6 +74,7 @@ interface AIOpsCenterProps {
   onConsumeInitialSessionId?: () => void;
   onConsumeInitialDraft?: () => void;
   onOpenApprovals?: () => void;
+  onOpenQQBotNotifications?: () => void;
   onApprovalsMutated?: () => void;
   onRefreshWorkspace: () => Promise<void>;
   onBadgeChange?: (unreadCount: number) => void;
@@ -126,6 +127,7 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
   onConsumeInitialSessionId,
   onConsumeInitialDraft,
   onOpenApprovals,
+  onOpenQQBotNotifications,
   onApprovalsMutated,
   onRefreshWorkspace,
   onBadgeChange,
@@ -2263,6 +2265,25 @@ export const AIOpsCenter: React.FC<AIOpsCenterProps> = ({
                     </div>
                   </div>
                 ))}
+
+                {onOpenQQBotNotifications && (
+                  <div className="qqbot-shortcut-strip" style={{ marginTop: 10 }}>
+                    <span>
+                      需要推送到 QQ 单聊 / QQ 群 / QQ 频道？可直接启用{' '}
+                      <strong>QQ 开放平台 WebSocket 长连接事件通知</strong>（同时覆盖 AI 巡检异常与待审批提醒）
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-teal"
+                      onClick={() => {
+                        setShowPatrolConfigModal(false);
+                        onOpenQQBotNotifications();
+                      }}
+                    >
+                      配置 QQ 机器人通知
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="modal-footer">
                 <button

@@ -401,6 +401,12 @@ func (s *Service) dispatchPatrolWebhooks(ctx context.Context, webhooks []vault.W
 			notified = true
 		}
 	}
+	s.mu.Lock()
+	hook := s.patrolNotifyHook
+	s.mu.Unlock()
+	if hook != nil && hook(ctx, rec) {
+		notified = true
+	}
 	return notified
 }
 
@@ -450,8 +456,12 @@ func (s *Service) ProcessExpiredExternalPatrolFallbacks(ctx context.Context) int
 		}
 		processed++
 
-		if cfg != nil && len(cfg.Webhooks) > 0 && updated.Status != "healthy" {
-			if notified := s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, *updated); notified {
+		if updated.Status != "healthy" {
+			var hooks []vault.WebhookChannel
+			if cfg != nil {
+				hooks = cfg.Webhooks
+			}
+			if notified := s.dispatchPatrolWebhooks(ctx, hooks, *updated); notified {
 				s.store.MarkPatrolWebhookNotified(working.ID)
 			}
 		}

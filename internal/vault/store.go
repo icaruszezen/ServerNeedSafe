@@ -894,6 +894,7 @@ func (s *Store) BuildBackupBundle(includeRuntime bool) (*BackupBundle, error) {
 			MonitorRules:    sec.MonitorRules,
 			AISettings:      sec.AISettings,
 			VulnSettings:    sec.VulnSettings,
+			QQBotSettings:   sec.QQBotSettings,
 		},
 		AIKnowledge: aiKnow,
 		Runtime:     rtSnap,
@@ -964,6 +965,7 @@ func (s *Store) ApplySyncSnapshot(bundle *BackupBundle, includeRuntime bool, ini
 	nextSec.MonitorRules = slices.Clone(bundle.Config.MonitorRules)
 	nextSec.AISettings = cloneAISettings(bundle.Config.AISettings)
 	nextSec.VulnSettings = cloneVulnSettings(bundle.Config.VulnSettings)
+	nextSec.QQBotSettings = cloneQQBotSettings(bundle.Config.QQBotSettings)
 	ensureSecretsDefaults(nextSec)
 
 	sealed, err := SealSecretsBytes(s.masterKey, nextSec)
@@ -1213,6 +1215,7 @@ func ensureSecretsDefaults(sec *SecretsState) {
 		sec.AISettings.MemoryConfig = SanitizeAIMemoryConfig(sec.AISettings.MemoryConfig)
 	}
 	sec.VulnSettings = NormalizeVulnSettings(sec.VulnSettings)
+	sec.QQBotSettings = NormalizeQQBotSettings(sec.QQBotSettings)
 }
 
 func ensureMonitorRuntimeDefaults(m *MonitorRuntimeState) {
@@ -1356,6 +1359,7 @@ func cloneSecretsState(src *SecretsState) *SecretsState {
 	cp.MonitorRules = slices.Clone(src.MonitorRules)
 	cp.AISettings = cloneAISettings(src.AISettings)
 	cp.VulnSettings = cloneVulnSettings(src.VulnSettings)
+	cp.QQBotSettings = cloneQQBotSettings(src.QQBotSettings)
 	return &cp
 }
 

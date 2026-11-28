@@ -1803,5 +1803,37 @@
   }
 }
 
+/* ==========================================================================
+   QQ Bot WebSocket Notification Panel Mobile Overrides
+   ========================================================================== */
+@media (max-width: 768px) {
+  .qqbot-sub-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .qqbot-hero-actions {
+    width: 100%;
+  }
+
+  .qqbot-hero-actions .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+
+  .qqbot-log-time {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 420px) {
+  .qqbot-kpi-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .qqbot-add-target-row {
+    flex-direction: column;
+  }
+}
+
 
 

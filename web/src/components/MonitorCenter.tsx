@@ -59,6 +59,7 @@ interface MonitorCenterProps {
   onConnectTerminal: (server: ServerView, openSftp?: boolean) => void;
   onNavigateServers: () => void;
   onOpenServerAlerts: (serverId?: string) => void;
+  onOpenQQBotNotifications?: () => void;
   onFiringCountChange?: (count: number) => void;
   onActiveByServerChange?: (byServer: Record<string, number>) => void;
   onNotify: (msg: string) => void;
@@ -144,6 +145,7 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
   onConnectTerminal,
   onNavigateServers,
   onOpenServerAlerts,
+  onOpenQQBotNotifications,
   onFiringCountChange,
   onActiveByServerChange,
   onNotify,
@@ -3050,6 +3052,20 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                       {!activeRuntime?.last_webhook_error && activeRuntime?.last_webhook_at && (
                         <div style={{ fontSize: 11.5, color: 'var(--status-online)', marginTop: 6 }}>
                           最近推送成功：{formatDateTime(activeRuntime.last_webhook_at)}
+                        </div>
+                      )}
+                      {onOpenQQBotNotifications && (
+                        <div className="qqbot-shortcut-strip">
+                          <span>
+                            也支持通过 <strong>QQ 开放平台 WebSocket 长连接</strong> 接收监控告警与恢复通知（免公网域名）
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn-xs btn-teal"
+                            onClick={onOpenQQBotNotifications}
+                          >
+                            配置 QQ 机器人通知
+                          </button>
                         </div>
                       )}
                     </div>

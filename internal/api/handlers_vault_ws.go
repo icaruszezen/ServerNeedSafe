@@ -177,6 +177,9 @@ func (s *Server) handleImportVaultFile(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
 	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.NotifyConfigUpdated()
+	}
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.NotifySettingsUpdated()
 	}
@@ -232,6 +235,9 @@ func (s *Server) handleVaultSyncApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
+	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.NotifyConfigUpdated()
 	}
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.NotifySettingsUpdated()
@@ -428,6 +434,9 @@ func (s *Server) handleVaultSyncPull(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
+	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.NotifyConfigUpdated()
 	}
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.NotifySettingsUpdated()
