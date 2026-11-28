@@ -380,8 +380,13 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
     try {
       const res = await api.acceptSecurityBaseline(serverId);
       const fileCnt = Object.keys(res.security_baseline?.file_hashes || {}).length;
+      const persistCnt = Object.keys(res.security_baseline?.persistence_items || {}).length;
       const ipCnt = (res.security_baseline?.known_ssh_login_ips || []).length;
-      onNotify(`已采纳并更新主机安全基线 (${fileCnt} 个关键文件 · ${ipCnt} 个已知登录 IP)`);
+      onNotify(
+        `已采纳并更新主机安全基线 (${fileCnt} 个关键文件${
+          persistCnt > 0 ? ` · ${persistCnt} 个持久化项` : ''
+        } · ${ipCnt} 个已知登录 IP)`
+      );
       await Promise.all([
         loadServerDetail(serverId, historyRange, true),
         loadOverview(),
@@ -2564,7 +2569,8 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                             <div className="kv-row">
                               <span className="kv-key">FIM 关键文件与持久化基线</span>
                               <span className="kv-val">
-                                {Object.keys(snap.security.file_hashes || {}).length > 0 ? (
+                                {Object.keys(snap.security.file_hashes || {}).length > 0 ||
+                                snap.security.persistence_hash ? (
                                   <span
                                     className={`tag-chip ${
                                       (snap.security.file_drifts?.length || 0) > 0 ||
@@ -2574,7 +2580,11 @@ export const MonitorCenter: React.FC<MonitorCenterProps> = ({
                                     }`}
                                   >
                                     已监控 {Object.keys(snap.security.file_hashes || {}).length} 个文件
-                                    {snap.security.persistence_hash ? ' + 持久化指纹' : ''}
+                                    {snap.security.persistence_hash
+                                      ? (snap.security.persistence_version || 0) >= 2
+                                        ? ` + ${Object.keys(snap.security.persistence_items || {}).length} 个持久化项 (v${snap.security.persistence_version})`
+                                        : ' + 持久化指纹'
+                                      : ''}
                                   </span>
                                 ) : (
                                   <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>

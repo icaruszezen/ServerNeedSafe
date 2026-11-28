@@ -1013,6 +1013,8 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 	}
 
 	// 12. L3 Zero-AI Deep Security (FIM, Persistence, Suspicious Procs, High-Risk Outbound, Weak SSH Config)
+	var legacyPersistHash string
+	hasStructuredPersist := false
 	for _, l := range sections["SEC_DEEP"] {
 		switch {
 		case strings.HasPrefix(l, "FIM="):
@@ -1023,8 +1025,47 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 				}
 				snap.Security.FileHashes[strings.TrimSpace(p[0])] = strings.TrimSpace(p[1])
 			}
+		case strings.HasPrefix(l, "PERSIST_VER="):
+			if ver, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(l, "PERSIST_VER="))); err == nil && ver >= vault.CurrentPersistenceVersion {
+				snap.Security.PersistenceVersion = ver
+				hasStructuredPersist = true
+			}
+		case strings.HasPrefix(l, "PERSIST_ITEM="):
+			rawItem := strings.TrimPrefix(l, "PERSIST_ITEM=")
+			switch {
+			case strings.HasPrefix(rawItem, "F|"):
+				p := strings.SplitN(strings.TrimPrefix(rawItem, "F|"), "|", 4)
+				if len(p) == 4 {
+					cleanPath := vault.NormalizePersistencePath(p[3])
+					if cleanPath != "" && !vault.IsIgnoredPersistencePath(cleanPath) {
+						mode := vault.NormalizePersistenceMode(p[0])
+						ug := strings.TrimSpace(p[1])
+						digest := strings.ToLower(strings.TrimSpace(p[2]))
+						if mode != "" && ug != "" && digest != "" {
+							if snap.Security.PersistenceItems == nil {
+								snap.Security.PersistenceItems = make(map[string]string)
+							}
+							snap.Security.PersistenceItems[cleanPath] = mode + "|" + ug + "|" + digest
+							hasStructuredPersist = true
+						}
+					}
+				}
+			case strings.HasPrefix(rawItem, "L|"):
+				rest := strings.TrimPrefix(rawItem, "L|")
+				if p := strings.SplitN(rest, "\t", 2); len(p) == 2 {
+					cleanPath := vault.NormalizePersistencePath(p[0])
+					target := strings.TrimSpace(p[1])
+					if cleanPath != "" && !vault.IsIgnoredPersistencePath(cleanPath) {
+						if snap.Security.PersistenceItems == nil {
+							snap.Security.PersistenceItems = make(map[string]string)
+						}
+						snap.Security.PersistenceItems[cleanPath] = "symlink->" + target
+						hasStructuredPersist = true
+					}
+				}
+			}
 		case strings.HasPrefix(l, "PERSIST_HASH="):
-			snap.Security.PersistenceHash = strings.TrimSpace(strings.TrimPrefix(l, "PERSIST_HASH="))
+			legacyPersistHash = strings.TrimSpace(strings.TrimPrefix(l, "PERSIST_HASH="))
 		case strings.HasPrefix(l, "SUSP_PROC="):
 			p := strings.SplitN(strings.TrimPrefix(l, "SUSP_PROC="), "|", 6)
 			if len(p) >= 5 {
@@ -1063,5 +1104,14 @@ func ParseDeepTelemetry(raw string, snap *vault.ServerMonitorSnapshot, prev *vau
 				snap.Security.SSHWeakConfigs = append(snap.Security.SSHWeakConfigs, v)
 			}
 		}
+	}
+	if hasStructuredPersist {
+		if snap.Security.PersistenceVersion < vault.CurrentPersistenceVersion {
+			snap.Security.PersistenceVersion = vault.CurrentPersistenceVersion
+		}
+		snap.Security.PersistenceItems = vault.NormalizePersistenceItems(snap.Security.PersistenceItems)
+		snap.Security.PersistenceHash = vault.ComputePersistenceHash(snap.Security.PersistenceItems)
+	} else if legacyPersistHash != "" {
+		snap.Security.PersistenceHash = legacyPersistHash
 	}
 }

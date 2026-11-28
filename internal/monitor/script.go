@@ -973,22 +973,172 @@ else
 fi
 echo "===SNS_SEC:SEC_DEEP==="
 if [ "$SNS_OS" != "Darwin" ]; then
-  # L3.1 Critical security file hashes (FIM) — single lightweight sha256sum pass
-  if command -v sha256sum >/dev/null 2>&1; then
+  # L3.1 Critical security file hashes (FIM) — single lightweight sha256 pass
+  SNS_SHA_MODE=0
+  if command -v sha256sum >/dev/null 2>&1; then SNS_SHA_MODE=1
+  elif command -v shasum >/dev/null 2>&1; then SNS_SHA_MODE=2
+  fi
+  if [ "$SNS_SHA_MODE" != "0" ]; then
     FIM_FILES=""
     for f in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/ssh/sshd_config /etc/ld.so.preload /root/.ssh/authorized_keys "$HOME/.ssh/authorized_keys"; do
       [ -r "$f" ] && [ -f "$f" ] && FIM_FILES="$FIM_FILES $f"
     done
     if [ -n "$FIM_FILES" ]; then
-      sns_to 2 sha256sum $FIM_FILES | awk '{printf "FIM=%s|%s\n", $2, substr($1, 1, 16)}'
+      if [ "$SNS_SHA_MODE" = "1" ]; then
+        sns_to 2 sha256sum $FIM_FILES | awk '{printf "FIM=%s|%s\n", $2, substr($1, 1, 16)}'
+      else
+        sns_to 2 shasum -a 256 $FIM_FILES | awk '{printf "FIM=%s|%s\n", $2, substr($1, 1, 16)}'
+      fi
     fi
-    # L3.2 Persistence fingerprint (crontab + cron.d + spool + /etc/systemd/system units)
-    PH=$( (
-      [ -r /etc/crontab ] && cat /etc/crontab 2>/dev/null
-      ls -la /etc/cron.d /var/spool/cron /var/spool/cron/crontabs /etc/systemd/system 2>/dev/null
-      cat /etc/cron.d/* /var/spool/cron/* /var/spool/cron/crontabs/* 2>/dev/null
-    ) | sha256sum 2>/dev/null | awk '{print substr($1, 1, 24)}' )
-    [ -n "$PH" ] && printf "PERSIST_HASH=%s\n" "$PH"
+    # L3.2 Deterministic structured persistence inventory (v2: path + mode + uid:gid + sha256 or symlink target;
+    # strictly excludes '.', '..', parent dir mtime, ls 'total' lines, and snapd dynamic snap-*.mount units)
+    SNS_PROOT=""
+    SNS_STAT_MODE=0
+    if stat -c '%a|%u:%g' / >/dev/null 2>&1; then SNS_STAT_MODE=1
+    elif stat -f '%OLp|%u:%g' / >/dev/null 2>&1; then SNS_STAT_MODE=2
+    fi
+    echo "PERSIST_VER=2"
+    (
+      set --
+      _sns_emit_sym() {
+        _p="$1"
+        _bn="${_p##*/}"
+        case "$_bn" in .|..|snap-*.mount) return 0 ;; esac
+        _tgt=$(readlink "$_p" 2>/dev/null || true)
+        _dp="$_p"
+        [ -n "$SNS_PROOT" ] && _dp="${_p#"$SNS_PROOT"}"
+        printf "PERSIST_ITEM=L|%s\t%s\n" "$_dp" "$_tgt"
+      }
+      for _sf in "$SNS_PROOT/etc/crontab" "$SNS_PROOT/etc/anacrontab" "$SNS_PROOT/etc/rc.local" "$SNS_PROOT/etc/rc.d/rc.local"; do
+        [ -e "$_sf" ] || [ -L "$_sf" ] || continue
+        if [ -L "$_sf" ]; then _sns_emit_sym "$_sf"
+        elif [ -f "$_sf" ]; then set -- "$@" "$_sf"
+        fi
+      done
+      _spool_ct="$SNS_PROOT/var/spool/cron/crontabs"
+      _etc_ct="$SNS_PROOT/etc/crontabs"
+      _scan_etc_ct=0
+      if [ -d "$_etc_ct" ]; then
+        _scan_etc_ct=1
+        if [ -L "$_spool_ct" ]; then
+          _r1=$(readlink -f "$_spool_ct" 2>/dev/null || readlink "$_spool_ct" 2>/dev/null || true)
+          _r2=$(readlink -f "$_etc_ct" 2>/dev/null || printf "%s" "$_etc_ct")
+          [ -n "$_r1" ] && [ "$_r1" = "$_r2" ] && _spool_ct=""
+        fi
+      fi
+      for _cd in "$SNS_PROOT/etc/cron.d" "$SNS_PROOT/etc/cron.hourly" "$SNS_PROOT/etc/cron.daily" "$SNS_PROOT/etc/cron.weekly" "$SNS_PROOT/etc/cron.monthly" "$_spool_ct" "$SNS_PROOT/var/spool/cron"; do
+        [ -n "$_cd" ] && [ -d "$_cd" ] || continue
+        for _p in "$_cd"/* "$_cd"/.[!.]* "$_cd"/..?*; do
+          [ -e "$_p" ] || [ -L "$_p" ] || continue
+          if [ "$_cd" = "$SNS_PROOT/var/spool/cron" ] && [ -d "$_p" ]; then continue; fi
+          if [ -L "$_p" ]; then _sns_emit_sym "$_p"
+          elif [ -f "$_p" ]; then set -- "$@" "$_p"
+          fi
+        done
+      done
+      if [ "$_scan_etc_ct" = "1" ]; then
+        for _p in "$_etc_ct"/* "$_etc_ct"/.[!.]* "$_etc_ct"/..?*; do
+          [ -e "$_p" ] || [ -L "$_p" ] || continue
+          if [ -L "$_p" ]; then _sns_emit_sym "$_p"
+          elif [ -f "$_p" ]; then set -- "$@" "$_p"
+          fi
+        done
+      fi
+      _sd="$SNS_PROOT/etc/systemd/system"
+      if [ -d "$_sd" ]; then
+        for _p in "$_sd"/* "$_sd"/.[!.]* "$_sd"/..?*; do
+          [ -e "$_p" ] || [ -L "$_p" ] || continue
+          _bn="${_p##*/}"
+          case "$_bn" in
+            snap-*.mount) continue ;;
+            *.service|*.timer|*.socket)
+              if [ -L "$_p" ]; then _sns_emit_sym "$_p"
+              elif [ -f "$_p" ]; then set -- "$@" "$_p"
+              fi
+              ;;
+            *.wants|*.requires)
+              if [ -d "$_p" ] && [ ! -L "$_p" ]; then
+                for _wp in "$_p"/* "$_p"/.[!.]* "$_p"/..?*; do
+                  [ -e "$_wp" ] || [ -L "$_wp" ] || continue
+                  case "${_wp##*/}" in snap-*.mount) continue ;; esac
+                  if [ -L "$_wp" ]; then _sns_emit_sym "$_wp"
+                  elif [ -f "$_wp" ]; then set -- "$@" "$_wp"
+                  fi
+                done
+              fi
+              ;;
+            *.service.d|*.timer.d|*.socket.d)
+              if [ -d "$_p" ] && [ ! -L "$_p" ]; then
+                for _dp in "$_p"/*.conf "$_p"/.[!.]*.conf "$_p"/..?*.conf; do
+                  [ -e "$_dp" ] || [ -L "$_dp" ] || continue
+                  if [ -L "$_dp" ]; then _sns_emit_sym "$_dp"
+                  elif [ -f "$_dp" ]; then set -- "$@" "$_dp"
+                  fi
+                done
+              fi
+              ;;
+          esac
+        done
+      fi
+      if [ "$#" -gt 0 ]; then
+        (
+          if [ "$SNS_STAT_MODE" = "1" ]; then
+            sns_to 3 stat -c 'M|%a|%u:%g|%n' "$@"
+          elif [ "$SNS_STAT_MODE" = "2" ]; then
+            sns_to 3 stat -f 'M|%OLp|%u:%g|%N' "$@"
+          else
+            for _pf in "$@"; do
+              ls -nd "$_pf" 2>/dev/null | awk -v p="$_pf" 'NR==1 {printf "M|%s|%s:%s|%s\n", $1, $3, $4, p}'
+            done
+          fi
+          (
+            _has_r=0
+            for _pf in "$@"; do
+              if [ -r "$_pf" ]; then
+                if [ "$_has_r" = "0" ]; then set -- "$_pf"; _has_r=1
+                else set -- "$@" "$_pf"
+                fi
+              fi
+            done
+            if [ "$_has_r" = "1" ]; then
+              if [ "$SNS_SHA_MODE" = "1" ]; then
+                sns_to 3 sha256sum "$@" | awk '{h=$1; sub(/^\\/, "", h); p=$0; sub(/^\\?[0-9a-fA-F]+[ \t]+\*?/, "", p); printf "H|%s|%s\n", substr(h,1,24), p}'
+              else
+                sns_to 3 shasum -a 256 "$@" | awk '{h=$1; sub(/^\\/, "", h); p=$0; sub(/^\\?[0-9a-fA-F]+[ \t]+\*?/, "", p); printf "H|%s|%s\n", substr(h,1,24), p}'
+              fi
+            fi
+          )
+        ) | awk -v proot="$SNS_PROOT" '
+          BEGIN { plen = length(proot) }
+          function strip_root(p) {
+            if (plen > 0 && substr(p, 1, plen) == proot) return substr(p, plen + 1);
+            return p;
+          }
+          /^M\|/ {
+            s = substr($0, 3);
+            p1 = index(s, "|"); if (p1 <= 0) next;
+            mode = substr(s, 1, p1 - 1); s = substr(s, p1 + 1);
+            p2 = index(s, "|"); if (p2 <= 0) next;
+            ug = substr(s, 1, p2 - 1); path = substr(s, p2 + 1);
+            meta[path] = mode "|" ug;
+            next;
+          }
+          /^H\|/ {
+            s = substr($0, 3);
+            p1 = index(s, "|"); if (p1 <= 0) next;
+            h = substr(s, 1, p1 - 1); path = substr(s, p1 + 1);
+            hash[path] = h;
+            next;
+          }
+          END {
+            for (path in meta) {
+              h = (path in hash && hash[path] != "" ? hash[path] : "unreadable");
+              printf "PERSIST_ITEM=F|%s|%s|%s\n", meta[path], h, strip_root(path);
+            }
+          }
+        '
+      fi
+    ) | LC_ALL=C sort -u
   fi
   # L3.3 Deterministic suspicious process cues (miner / reverse shell / /tmp or /dev/shm exec)
   sns_to 3 ps -eo pid=,user=,args= | awk '

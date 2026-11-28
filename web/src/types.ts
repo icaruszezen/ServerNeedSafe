@@ -481,7 +481,9 @@ export interface SSHLoginEvent {
 
 export interface ServerSecurityBaseline {
   file_hashes?: Record<string, string>;
+  persistence_version?: number;
   persistence_hash?: string;
+  persistence_items?: Record<string, string>;
   known_ssh_login_ips?: string[];
   updated_at?: string;
 }
@@ -498,7 +500,9 @@ export interface SecurityPostureStat {
   pending_updates: number;
   file_hashes?: Record<string, string>;
   file_drifts?: string[];
+  persistence_version?: number;
   persistence_hash?: string;
+  persistence_items?: Record<string, string>;
   persistence_drifts?: string[];
   suspicious_procs?: SuspiciousProcStat[];
   suspicious_outbound?: OutboundConnStat[];
