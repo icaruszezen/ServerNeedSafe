@@ -278,6 +278,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/monitor/port-baseline", s.requireAuth(s.handleAcceptPortBaseline))
 	s.mux.HandleFunc("POST /api/monitor/port-drift/ignore", s.requireAuth(s.handleUpdatePortDriftIgnore))
 	s.mux.HandleFunc("POST /api/monitor/security-baseline", s.requireAuth(s.handleAcceptSecurityBaseline))
+	s.mux.HandleFunc("POST /api/monitor/security-baseline/ssh-ip", s.requireAuth(s.handleUpdateSSHLoginIPBaseline))
 	s.mux.HandleFunc("POST /api/monitor/test-webhook", s.requireAuth(s.handleTestMonitorWebhook))
 	s.mux.HandleFunc("GET /api/monitor/alerts", s.requireAuth(s.handleListMonitorAlerts))
 	s.mux.HandleFunc("POST /api/monitor/alerts/ack", s.requireAuth(s.handleAckMonitorAlert))

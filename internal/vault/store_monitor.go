@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -67,15 +68,243 @@ type ServerMonitorDetail struct {
 
 // CandidateBreach represents a single detected rule violation during snapshot evaluation.
 type CandidateBreach struct {
-	DedupKey       string
-	RuleKind       string
-	RuleName       string
-	Severity       AlertSeverity
-	Title          string
-	Detail         string
-	MetricText     string
-	ThresholdText  string
-	ConsecutiveReq int
+	DedupKey          string
+	RuleKind          string
+	RuleName          string
+	Severity          AlertSeverity
+	Title             string
+	Detail            string
+	MetricText        string
+	ThresholdText     string
+	ConsecutiveReq    int
+	ManualResolve     bool
+	EventFingerprints []string
+}
+
+// SSHLoginIPBaselineResult reports the outcome of adding or removing a trusted SSH login IP.
+type SSHLoginIPBaselineResult struct {
+	ServerID         string                  `json:"server_id"`
+	Action           string                  `json:"action"` // "add" or "remove"
+	IP               string                  `json:"ip"`
+	ResolvedAlerts   int                     `json:"resolved_alerts"`
+	SecurityBaseline *ServerSecurityBaseline `json:"security_baseline"`
+}
+
+// IsRuleKindManualResolve reports whether a rule kind represents a discrete event alert
+// that must remain active until manually resolved instead of automatically recovering.
+func IsRuleKindManualResolve(kind string) bool {
+	switch kind {
+	case "unexpected_reboot", "oom_kill", "kernel_error", "ssh_new_login_ip":
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeSSHLoginIP validates and canonicalizes a remote SSH login IPv4/IPv6 address.
+// Non-IP values (such as local X11 ":0", tty labels, or tmux descriptors) return "".
+func NormalizeSSHLoginIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, "()[]")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if pct := strings.IndexByte(s, '%'); pct > 0 {
+		s = s[:pct]
+	}
+	if addr, err := netip.ParseAddr(s); err == nil {
+		return addr.Unmap().String()
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr().Unmap().String()
+	}
+	return ""
+}
+
+func sshLoginEventFingerprint(ev SSHLoginEvent) string {
+	ip := NormalizeSSHLoginIP(ev.FromIP)
+	if ip == "" {
+		return ""
+	}
+	return fmt.Sprintf("login|%s|%s|%s|%s|%s",
+		strings.TrimSpace(ev.User),
+		ip,
+		strings.TrimSpace(ev.Method),
+		strings.TrimSpace(ev.Timestamp),
+		strings.TrimSpace(ev.SessionID),
+	)
+}
+
+func activeUserEventFingerprint(u LoggedInUserStat) string {
+	ip := NormalizeSSHLoginIP(u.FromIP)
+	if ip == "" {
+		return ""
+	}
+	return fmt.Sprintf("who|%s|%s|%s|%s",
+		strings.TrimSpace(u.User),
+		strings.TrimSpace(u.TTY),
+		ip,
+		strings.TrimSpace(u.LoginTime),
+	)
+}
+
+func kernelErrorEventFingerprint(line string) string {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return ""
+	}
+	return "kerr|" + s
+}
+
+func extractAlertDedupSubKey(dedupKey string) string {
+	parts := strings.SplitN(dedupKey, "|", 3)
+	if len(parts) == 3 {
+		return strings.TrimSpace(parts[2])
+	}
+	return ""
+}
+
+func cloneMonitorAlert(al MonitorAlert) MonitorAlert {
+	cp := al
+	if !cp.ManualResolve && IsRuleKindManualResolve(cp.RuleKind) {
+		cp.ManualResolve = true
+	}
+	if al.AcknowledgedAt != nil {
+		t := *al.AcknowledgedAt
+		cp.AcknowledgedAt = &t
+	}
+	if al.ResolvedAt != nil {
+		t := *al.ResolvedAt
+		cp.ResolvedAt = &t
+	}
+	cp.EventFingerprints = slices.Clone(al.EventFingerprints)
+	return cp
+}
+
+func mergeEventFingerprints(existing, incoming []string, capLimit int) ([]string, bool) {
+	if len(incoming) == 0 {
+		return existing, false
+	}
+	seen := make(map[string]bool, len(existing)+len(incoming))
+	out := make([]string, 0, len(existing)+len(incoming))
+	for _, fp := range existing {
+		if fp != "" && !seen[fp] {
+			seen[fp] = true
+			out = append(out, fp)
+		}
+	}
+	added := false
+	for _, fp := range incoming {
+		if fp != "" && !seen[fp] {
+			seen[fp] = true
+			out = append(out, fp)
+			added = true
+		}
+	}
+	if capLimit > 0 && len(out) > capLimit {
+		out = slices.Clone(out[len(out)-capLimit:])
+	}
+	return out, added
+}
+
+func healthBreachesFromAlerts(alerts []MonitorAlert, serverID string, ruleManualMap map[string]bool) []CandidateBreach {
+	var out []CandidateBreach
+	for _, al := range alerts {
+		if al.ServerID != serverID || al.Status == AlertStatusResolved {
+			continue
+		}
+		isManual := al.ManualResolve || ruleManualMap[al.RuleKind] || IsRuleKindManualResolve(al.RuleKind)
+		// Manual-resolve event alerts degrade live host health only while unacknowledged (firing).
+		// Once acknowledged by an operator, live health reflects real-time metrics while the alert
+		// remains in the acknowledged queue awaiting final closure.
+		if isManual && al.Status != AlertStatusFiring {
+			continue
+		}
+		out = append(out, CandidateBreach{
+			DedupKey:      al.DedupKey,
+			RuleKind:      al.RuleKind,
+			RuleName:      al.RuleName,
+			Severity:      al.Severity,
+			Title:         al.Title,
+			ManualResolve: isManual,
+		})
+	}
+	return out
+}
+
+func recomputeSnapshotHealthLocked(mon *MonitorRuntimeState, serverID string, ruleManualMap map[string]bool) {
+	if mon == nil || serverID == "" {
+		return
+	}
+	snap := mon.LatestSnapshots[serverID]
+	if snap == nil {
+		return
+	}
+	ComputeSnapshotHealth(snap, healthBreachesFromAlerts(mon.Alerts, serverID, ruleManualMap))
+}
+
+func recordHandledEventsLocked(mon *MonitorRuntimeState, dedupKey string, fps []string, now time.Time) {
+	if mon == nil || dedupKey == "" || len(fps) == 0 {
+		return
+	}
+	if mon.HandledEvents == nil {
+		mon.HandledEvents = make(map[string]map[string]time.Time)
+	}
+	m := mon.HandledEvents[dedupKey]
+	if m == nil {
+		m = make(map[string]time.Time, len(fps))
+		mon.HandledEvents[dedupKey] = m
+	}
+	for _, fp := range fps {
+		if fp = strings.TrimSpace(fp); fp != "" {
+			m[fp] = now
+		}
+	}
+	const maxHandledPerKey = 100
+	if len(m) > maxHandledPerKey {
+		type kv struct {
+			k string
+			t time.Time
+		}
+		items := make([]kv, 0, len(m))
+		for k, t := range m {
+			items = append(items, kv{k: k, t: t})
+		}
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].t.After(items[j].t)
+		})
+		trimmed := make(map[string]time.Time, maxHandledPerKey)
+		for _, it := range items[:maxHandledPerKey] {
+			trimmed[it.k] = it.t
+		}
+		mon.HandledEvents[dedupKey] = trimmed
+	}
+}
+
+func pruneHandledEventsLocked(mon *MonitorRuntimeState, serverID string, currentEventFPs map[string]map[string]bool, now time.Time) {
+	if mon == nil || len(mon.HandledEvents) == 0 {
+		return
+	}
+	const minRetention = 30 * time.Minute
+	prefix := serverID + "|"
+	for dk, fpMap := range mon.HandledEvents {
+		if !strings.HasPrefix(dk, prefix) {
+			continue
+		}
+		curSet := currentEventFPs[dk]
+		for fp, handledAt := range fpMap {
+			if curSet[fp] {
+				continue
+			}
+			if now.Sub(handledAt) >= minRetention {
+				delete(fpMap, fp)
+			}
+		}
+		if len(fpMap) == 0 {
+			delete(mon.HandledEvents, dk)
+		}
+	}
 }
 
 func sanitizeMonitorSettings(in MonitorSettings) MonitorSettings {
@@ -177,6 +406,7 @@ func mergeMonitorAlertRules(existing []MonitorAlertRule) []MonitorAlertRule {
 			ex.Description = def.Description
 			ex.Unit = def.Unit
 			ex.StateBased = def.StateBased
+			ex.ManualResolve = def.ManualResolve
 			ex.LowerIsWorse = def.LowerIsWorse
 			if ex.ConsecutiveCount < 1 {
 				ex.ConsecutiveCount = 1
@@ -327,16 +557,7 @@ func cloneMonitorVaultData(in *MonitorVaultData) *MonitorVaultData {
 		cp.HistoryByServer[k] = slices.Clone(v)
 	}
 	for i, al := range in.Alerts {
-		alCp := al
-		if al.AcknowledgedAt != nil {
-			t := *al.AcknowledgedAt
-			alCp.AcknowledgedAt = &t
-		}
-		if al.ResolvedAt != nil {
-			t := *al.ResolvedAt
-			alCp.ResolvedAt = &t
-		}
-		cp.Alerts[i] = alCp
+		cp.Alerts[i] = cloneMonitorAlert(al)
 	}
 	for k, v := range in.BreachStreaks {
 		cp.BreachStreaks[k] = v
@@ -583,6 +804,8 @@ func evaluateSnapshotRules(
 	settings MonitorSettings,
 	rules []MonitorAlertRule,
 	driftedPorts []ListeningPortStat,
+	handledEvents map[string]map[string]time.Time,
+	currentEventFPs map[string]map[string]bool,
 ) []CandidateBreach {
 	ruleMap := make(map[string]MonitorAlertRule, len(rules))
 	for _, r := range rules {
@@ -591,8 +814,18 @@ func evaluateSnapshotRules(
 		}
 	}
 
+	recordCurrentFP := func(dedupKey, fp string) {
+		if currentEventFPs == nil || dedupKey == "" || fp == "" {
+			return
+		}
+		if currentEventFPs[dedupKey] == nil {
+			currentEventFPs[dedupKey] = make(map[string]bool)
+		}
+		currentEventFPs[dedupKey][fp] = true
+	}
+
 	var out []CandidateBreach
-	addThresholdBreach := func(kind string, val float64, subKey, titlePrefix, detailFmt string) {
+	addThresholdBreach := func(kind string, val float64, subKey, titlePrefix, detailFmt string, eventFPs ...string) {
 		r, ok := ruleMap[kind]
 		if !ok || r.StateBased {
 			return
@@ -636,15 +869,17 @@ func evaluateSnapshotRules(
 			threshTxt = fmt.Sprintf("%s %.0f %s", op, thresh, r.Unit)
 		}
 		out = append(out, CandidateBreach{
-			DedupKey:       dedup,
-			RuleKind:       kind,
-			RuleName:       r.Name,
-			Severity:       sev,
-			Title:          titlePrefix,
-			Detail:         detailFmt,
-			MetricText:     metricTxt,
-			ThresholdText:  threshTxt,
-			ConsecutiveReq: max(1, r.ConsecutiveCount),
+			DedupKey:          dedup,
+			RuleKind:          kind,
+			RuleName:          r.Name,
+			Severity:          sev,
+			Title:             titlePrefix,
+			Detail:            detailFmt,
+			MetricText:        metricTxt,
+			ThresholdText:     threshTxt,
+			ConsecutiveReq:    max(1, r.ConsecutiveCount),
+			ManualResolve:     r.ManualResolve || IsRuleKindManualResolve(kind),
+			EventFingerprints: slices.Clone(eventFPs),
 		})
 	}
 
@@ -709,6 +944,7 @@ func evaluateSnapshotRules(
 				MetricText:     snap.Uptime,
 				ThresholdText:  "Uptime 持续递增",
 				ConsecutiveReq: max(1, r.ConsecutiveCount),
+				ManualResolve:  r.ManualResolve || IsRuleKindManualResolve("unexpected_reboot"),
 			})
 		}
 	}
@@ -835,11 +1071,45 @@ func evaluateSnapshotRules(
 		})
 	}
 	if snap.KernelErrorCount > 0 {
-		sampleErr := strings.Join(snap.KernelErrors[:min(3, len(snap.KernelErrors))], " | ")
-		addThresholdBreach("kernel_error", float64(snap.KernelErrorCount), "",
-			fmt.Sprintf("[%s] 内核日志检测到 %d 条严重硬件/存储/NFS 错误", srv.Name, snap.KernelErrorCount),
-			sampleErr,
-		)
+		kerrDedup := fmt.Sprintf("%s|kernel_error|", srv.ID)
+		handledSet := handledEvents[kerrDedup]
+		var unhandledLines []string
+		var unhandledFPs []string
+		if len(snap.KernelErrors) > 0 {
+			for _, line := range snap.KernelErrors {
+				fp := kernelErrorEventFingerprint(line)
+				if fp == "" {
+					continue
+				}
+				recordCurrentFP(kerrDedup, fp)
+				if _, done := handledSet[fp]; !done {
+					unhandledLines = append(unhandledLines, line)
+					unhandledFPs = append(unhandledFPs, fp)
+				}
+			}
+			if len(unhandledLines) > 0 {
+				effCount := snap.KernelErrorCount
+				if len(unhandledLines) < len(snap.KernelErrors) {
+					effCount = len(unhandledLines)
+				}
+				sampleErr := strings.Join(unhandledLines[:min(3, len(unhandledLines))], " | ")
+				addThresholdBreach("kernel_error", float64(effCount), "",
+					fmt.Sprintf("[%s] 内核日志检测到 %d 条严重硬件/存储/NFS 错误", srv.Name, effCount),
+					sampleErr,
+					unhandledFPs...,
+				)
+			}
+		} else {
+			fp := fmt.Sprintf("kerr_cnt|%d", snap.KernelErrorCount)
+			recordCurrentFP(kerrDedup, fp)
+			if _, done := handledSet[fp]; !done {
+				addThresholdBreach("kernel_error", float64(snap.KernelErrorCount), "",
+					fmt.Sprintf("[%s] 内核日志检测到 %d 条严重硬件/存储/NFS 错误", srv.Name, snap.KernelErrorCount),
+					fmt.Sprintf("内核日志捕获 %d 条严重错误记录", snap.KernelErrorCount),
+					fp,
+				)
+			}
+		}
 	}
 
 	// 5. Network Sockets, Errors & Listening Ports
@@ -1077,17 +1347,100 @@ func evaluateSnapshotRules(
 		})
 	}
 	if r, ok := ruleMap["ssh_new_login_ip"]; ok && len(snap.Security.NewSSHLoginIPs) > 0 {
-		out = append(out, CandidateBreach{
-			DedupKey:       fmt.Sprintf("%s|ssh_new_login_ip|", srv.ID),
-			RuleKind:       "ssh_new_login_ip",
-			RuleName:       r.Name,
-			Severity:       SeverityWarning,
-			Title:          fmt.Sprintf("[%s] 检测到新来源 IP 成功登录 SSH: %s", srv.Name, strings.Join(snap.Security.NewSSHLoginIPs, ", ")),
-			Detail:         fmt.Sprintf("不在已知登录基线中的来源 IP 已成功通过 SSH 认证：%s（如为本人操作可点击「采纳安全基线」）", strings.Join(snap.Security.NewSSHLoginIPs, ", ")),
-			MetricText:     fmt.Sprintf("+%d 新IP", len(snap.Security.NewSSHLoginIPs)),
-			ThresholdText:  "匹配已知登录 IP",
-			ConsecutiveReq: max(1, r.ConsecutiveCount),
-		})
+		for _, rawIP := range snap.Security.NewSSHLoginIPs {
+			ip := NormalizeSSHLoginIP(rawIP)
+			if ip == "" {
+				continue
+			}
+			dedup := fmt.Sprintf("%s|ssh_new_login_ip|%s", srv.ID, ip)
+			handledSet := handledEvents[dedup]
+			var unhandledFPs []string
+			var detailSnippets []string
+			seenFP := make(map[string]bool)
+
+			for _, ev := range snap.Security.RecentSSHLogins {
+				if NormalizeSSHLoginIP(ev.FromIP) != ip {
+					continue
+				}
+				fp := sshLoginEventFingerprint(ev)
+				if fp == "" || seenFP[fp] {
+					continue
+				}
+				seenFP[fp] = true
+				recordCurrentFP(dedup, fp)
+				if _, done := handledSet[fp]; !done {
+					unhandledFPs = append(unhandledFPs, fp)
+					if len(detailSnippets) < 2 {
+						meta := strings.TrimSpace(ev.Method)
+						if ts := strings.TrimSpace(ev.Timestamp); ts != "" {
+							if meta != "" {
+								meta += " · " + ts
+							} else {
+								meta = ts
+							}
+						}
+						if meta != "" {
+							detailSnippets = append(detailSnippets, fmt.Sprintf("%s (%s)", ev.User, meta))
+						} else {
+							detailSnippets = append(detailSnippets, ev.User)
+						}
+					}
+				}
+			}
+
+			for _, u := range snap.Security.ActiveUsers {
+				if NormalizeSSHLoginIP(u.FromIP) != ip {
+					continue
+				}
+				fp := activeUserEventFingerprint(u)
+				if fp == "" || seenFP[fp] {
+					continue
+				}
+				seenFP[fp] = true
+				recordCurrentFP(dedup, fp)
+				if _, done := handledSet[fp]; !done {
+					unhandledFPs = append(unhandledFPs, fp)
+					if len(detailSnippets) < 2 {
+						desc := fmt.Sprintf("在线会话 %s@%s", u.User, u.TTY)
+						if lt := strings.TrimSpace(u.LoginTime); lt != "" {
+							desc += " (" + lt + ")"
+						}
+						detailSnippets = append(detailSnippets, desc)
+					}
+				}
+			}
+
+			// Fallback when NewSSHLoginIPs was set directly without raw event entries
+			if len(seenFP) == 0 {
+				fp := "ip|" + ip
+				recordCurrentFP(dedup, fp)
+				if _, done := handledSet[fp]; !done {
+					unhandledFPs = append(unhandledFPs, fp)
+				}
+			}
+
+			if len(unhandledFPs) == 0 {
+				continue
+			}
+
+			extra := ""
+			if len(detailSnippets) > 0 {
+				extra = "：" + strings.Join(detailSnippets, "；")
+			}
+			out = append(out, CandidateBreach{
+				DedupKey:          dedup,
+				RuleKind:          "ssh_new_login_ip",
+				RuleName:          r.Name,
+				Severity:          SeverityWarning,
+				Title:             fmt.Sprintf("[%s] 检测到新来源 IP 成功登录 SSH: %s", srv.Name, ip),
+				Detail:            fmt.Sprintf("不在已知登录基线中的来源 IP %s 已成功登录 SSH%s（如为本人操作可一键「信任该 IP」，否则核实排查后「标记已解决」）", ip, extra),
+				MetricText:        ip,
+				ThresholdText:     "匹配已知登录 IP",
+				ConsecutiveReq:    max(1, r.ConsecutiveCount),
+				ManualResolve:     r.ManualResolve || IsRuleKindManualResolve("ssh_new_login_ip"),
+				EventFingerprints: unhandledFPs,
+			})
+		}
 	}
 	if absOff := math.Abs(float64(snap.ClockOffsetSec)); absOff > 0 {
 		addThresholdBreach("clock_ntp_drift", absOff, "",
@@ -1280,12 +1633,12 @@ func mergeSlowTierFromPrev(incoming, prev *ServerMonitorSnapshot) {
 func collectCurrentLoginIPs(sec SecurityPostureStat) []string {
 	seen := make(map[string]struct{})
 	for _, ev := range sec.RecentSSHLogins {
-		if ip := strings.TrimSpace(ev.FromIP); ip != "" {
+		if ip := NormalizeSSHLoginIP(ev.FromIP); ip != "" {
 			seen[ip] = struct{}{}
 		}
 	}
 	for _, u := range sec.ActiveUsers {
-		if ip := strings.TrimSpace(u.FromIP); ip != "" {
+		if ip := NormalizeSSHLoginIP(u.FromIP); ip != "" {
 			seen[ip] = struct{}{}
 		}
 	}
@@ -1295,6 +1648,29 @@ func collectCurrentLoginIPs(sec SecurityPostureStat) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func computeNewSSHLoginIPs(sec SecurityPostureStat, knownIPs []string) []string {
+	curIPs := collectCurrentLoginIPs(sec)
+	if len(curIPs) == 0 {
+		return nil
+	}
+	knownSet := make(map[string]bool, len(knownIPs))
+	for _, raw := range knownIPs {
+		if ip := NormalizeSSHLoginIP(raw); ip != "" {
+			knownSet[ip] = true
+		} else if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			knownSet[trimmed] = true
+		}
+	}
+	var newIPs []string
+	for _, ip := range curIPs {
+		if !knownSet[ip] {
+			newIPs = append(newIPs, ip)
+		}
+	}
+	sort.Strings(newIPs)
+	return newIPs
 }
 
 // RecordMonitorSnapshots persists collected server snapshots, time-series samples, alerts, port & security baselines,
@@ -1325,9 +1701,11 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 	s.secMu.RUnlock()
 
 	ruleEnabledMap := make(map[string]bool, len(rules))
+	ruleManualResolveMap := make(map[string]bool, len(rules))
 	portDriftConsecutiveReq := 1
 	for _, r := range rules {
 		ruleEnabledMap[r.Kind] = r.Enabled && !isRuleSuppressedByCollectionToggles(r.Kind, monSettings)
+		ruleManualResolveMap[r.Kind] = r.ManualResolve || IsRuleKindManualResolve(r.Kind)
 		if r.Kind == "port_drift" {
 			portDriftConsecutiveReq = max(1, r.ConsecutiveCount)
 		}
@@ -1491,20 +1869,8 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 				if !hasSecBase && len(secBase.KnownSSHLoginIPs) == 0 {
 					secBase.KnownSSHLoginIPs = curIPs
 					baseUpdated = true
-				} else if len(incoming.Security.RecentSSHLogins) > 0 {
-					knownSet := make(map[string]bool, len(secBase.KnownSSHLoginIPs))
-					for _, ip := range secBase.KnownSSHLoginIPs {
-						knownSet[ip] = true
-					}
-					var newIPs []string
-					for _, ev := range incoming.Security.RecentSSHLogins {
-						ip := strings.TrimSpace(ev.FromIP)
-						if ip != "" && !knownSet[ip] && !slices.Contains(newIPs, ip) {
-							newIPs = append(newIPs, ip)
-						}
-					}
-					sort.Strings(newIPs)
-					incoming.Security.NewSSHLoginIPs = newIPs
+				} else if len(curIPs) > 0 {
+					incoming.Security.NewSSHLoginIPs = computeNewSSHLoginIPs(incoming.Security, secBase.KnownSSHLoginIPs)
 				}
 			}
 
@@ -1514,19 +1880,18 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			}
 		}
 
-		// Evaluate candidate breaches
-		breaches := evaluateSnapshotRules(incoming, srvCfg, monSettings, rules, driftedPorts)
+		// Evaluate candidate breaches (filtering out discrete event fingerprints already manually handled)
+		currentEventFPs := make(map[string]map[string]bool)
+		breaches := evaluateSnapshotRules(incoming, srvCfg, monSettings, rules, driftedPorts, mon.HandledEvents, currentEventFPs)
 
 		// Update breach streaks, apply strict consecutive debounce, handle escalation & de-escalation
 		activeBreachMap := make(map[string]CandidateBreach, len(breaches))
-		effectiveBreaches := make([]CandidateBreach, 0, len(breaches))
 		for _, b := range breaches {
 			activeBreachMap[b.DedupKey] = b
 			mon.BreachStreaks[b.DedupKey]++
 			if mon.BreachStreaks[b.DedupKey] < b.ConsecutiveReq {
 				continue
 			}
-			effectiveBreaches = append(effectiveBreaches, b)
 
 			foundExisting := false
 			for idx := range mon.Alerts {
@@ -1540,12 +1905,24 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 					al.Detail = b.Detail
 					al.MetricText = b.MetricText
 					al.ThresholdText = b.ThresholdText
+					al.ManualResolve = b.ManualResolve || ruleManualResolveMap[b.RuleKind]
+					mergedFPs, hasNewEvent := mergeEventFingerprints(al.EventFingerprints, b.EventFingerprints, 50)
+					al.EventFingerprints = mergedFPs
+					if len(b.EventFingerprints) == 0 && al.ManualResolve {
+						// Single-cycle delta event (e.g. unexpected_reboot / oom_kill) firing again is a new occurrence.
+						hasNewEvent = true
+					}
 					if b.Severity == SeverityCritical && al.Severity != SeverityCritical {
 						// Escalate Warning -> Critical: reactivate even if acknowledged & notify webhook!
 						al.Severity = SeverityCritical
 						al.Status = AlertStatusFiring
 						al.AcknowledgedAt = nil
-						triggered = append(triggered, *al)
+						triggered = append(triggered, cloneMonitorAlert(*al))
+					} else if al.Status == AlertStatusAcknowledged && al.ManualResolve && hasNewEvent {
+						// Brand-new occurrence of a manual-resolve event while acknowledged: reactivate & notify!
+						al.Status = AlertStatusFiring
+						al.AcknowledgedAt = nil
+						triggered = append(triggered, cloneMonitorAlert(*al))
 					} else if b.Severity == SeverityWarning && al.Severity == SeverityCritical {
 						// De-escalate Critical -> Warning cleanly without duplicate webhook spam
 						al.Severity = SeverityWarning
@@ -1556,30 +1933,84 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			}
 			if !foundExisting {
 				newAlert := MonitorAlert{
-					ID:            uuid.NewString(),
-					DedupKey:      b.DedupKey,
-					ServerID:      srvCfg.ID,
-					ServerName:    srvCfg.Name,
-					Host:          fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
-					RuleKind:      b.RuleKind,
-					RuleName:      b.RuleName,
-					Severity:      b.Severity,
-					Status:        AlertStatusFiring,
-					Title:         b.Title,
-					Detail:        b.Detail,
-					MetricText:    b.MetricText,
-					ThresholdText: b.ThresholdText,
-					Occurrences:   mon.BreachStreaks[b.DedupKey],
-					TriggeredAt:   incoming.CollectedAt,
-					LastSeenAt:    incoming.CollectedAt,
+					ID:                uuid.NewString(),
+					DedupKey:          b.DedupKey,
+					ServerID:          srvCfg.ID,
+					ServerName:        srvCfg.Name,
+					Host:              fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port),
+					RuleKind:          b.RuleKind,
+					RuleName:          b.RuleName,
+					Severity:          b.Severity,
+					Status:            AlertStatusFiring,
+					ManualResolve:     b.ManualResolve || ruleManualResolveMap[b.RuleKind],
+					Title:             b.Title,
+					Detail:            b.Detail,
+					MetricText:        b.MetricText,
+					ThresholdText:     b.ThresholdText,
+					Occurrences:       mon.BreachStreaks[b.DedupKey],
+					EventFingerprints: slices.Clone(b.EventFingerprints),
+					TriggeredAt:       incoming.CollectedAt,
+					LastSeenAt:        incoming.CollectedAt,
 				}
 				mon.Alerts = append([]MonitorAlert{newAlert}, mon.Alerts...)
-				triggered = append(triggered, newAlert)
+				triggered = append(triggered, cloneMonitorAlert(newAlert))
 			}
 		}
 
-		// Compute snapshot health strictly using debounced effective breaches
-		ComputeSnapshotHealth(incoming, effectiveBreaches)
+		// Clear non-breached streaks for this server (per-port port_drift_port| streaks are managed above)
+		prefix := srvCfg.ID + "|"
+		for k := range mon.BreachStreaks {
+			if strings.HasPrefix(k, prefix) {
+				if strings.HasPrefix(k, portStreakPrefix) {
+					continue
+				}
+				if _, stillBreached := activeBreachMap[k]; !stillBreached {
+					if incoming.Reachable ||
+						strings.HasPrefix(k, srvCfg.ID+"|offline|") ||
+						strings.HasPrefix(k, srvCfg.ID+"|host_key_changed|") {
+						delete(mon.BreachStreaks, k)
+					}
+				}
+			}
+		}
+
+		// Auto-resolve active alerts whose condition has recovered:
+		// - Never resolve host metrics on unreachable/partial failure!
+		// - Never auto-resolve enabled ManualResolve discrete event alerts (must be closed manually)!
+		for idx := range mon.Alerts {
+			al := &mon.Alerts[idx]
+			if al.ServerID != srvCfg.ID || al.Status == AlertStatusResolved {
+				continue
+			}
+			if _, stillBreached := activeBreachMap[al.DedupKey]; stillBreached {
+				continue
+			}
+			if !incoming.Reachable && al.RuleKind != "offline" && al.RuleKind != "host_key_changed" {
+				continue
+			}
+			if ruleEnabledMap[al.RuleKind] && (al.ManualResolve || ruleManualResolveMap[al.RuleKind]) {
+				continue
+			}
+			resTime := incoming.CollectedAt
+			al.Status = AlertStatusResolved
+			al.ResolvedAt = &resTime
+			al.LastSeenAt = resTime
+			// Only send recovery notification if rule is actually enabled; disabled rules close silently
+			if ruleEnabledMap[al.RuleKind] {
+				resolved = append(resolved, cloneMonitorAlert(*al))
+			}
+		}
+
+		// Prune expired handled event fingerprints only on full-tier reachable sweeps
+		// so active sessions / rolling log windows are never prematurely evicted on fast or failed sweeps.
+		if incoming.Reachable && incoming.CollectionTier != "fast" {
+			pruneHandledEventsLocked(mon, srvCfg.ID, currentEventFPs, incoming.CollectedAt)
+		}
+
+		// Compute snapshot health from reconciled active alerts:
+		// - Active non-manual alerts always contribute
+		// - Manual-resolve event alerts contribute while firing (unacknowledged), and clear once acknowledged
+		ComputeSnapshotHealth(incoming, healthBreachesFromAlerts(mon.Alerts, srvCfg.ID, ruleManualResolveMap))
 		*rawIncoming = *cloneSnapshot(incoming)
 
 		// Update lightweight per-server runtime metadata strictly inside monitor_runtime.json
@@ -1615,45 +2046,6 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 			series = slices.Clone(series[len(series)-maxPts:])
 		}
 		mon.HistoryByServer[srvCfg.ID] = series
-
-		// Clear non-breached streaks for this server (per-port port_drift_port| streaks are managed above)
-		prefix := srvCfg.ID + "|"
-		for k := range mon.BreachStreaks {
-			if strings.HasPrefix(k, prefix) {
-				if strings.HasPrefix(k, portStreakPrefix) {
-					continue
-				}
-				if _, stillBreached := activeBreachMap[k]; !stillBreached {
-					if incoming.Reachable ||
-						strings.HasPrefix(k, srvCfg.ID+"|offline|") ||
-						strings.HasPrefix(k, srvCfg.ID+"|host_key_changed|") {
-						delete(mon.BreachStreaks, k)
-					}
-				}
-			}
-		}
-
-		// Auto-resolve active alerts whose condition has recovered (never resolve host metrics on unreachable/partial failure!)
-		for idx := range mon.Alerts {
-			al := &mon.Alerts[idx]
-			if al.ServerID != srvCfg.ID || al.Status == AlertStatusResolved {
-				continue
-			}
-			if _, stillBreached := activeBreachMap[al.DedupKey]; stillBreached {
-				continue
-			}
-			if !incoming.Reachable && al.RuleKind != "offline" && al.RuleKind != "host_key_changed" {
-				continue
-			}
-			resTime := incoming.CollectedAt
-			al.Status = AlertStatusResolved
-			al.ResolvedAt = &resTime
-			al.LastSeenAt = resTime
-			// Only send recovery notification if rule is actually enabled; disabled rules close silently
-			if ruleEnabledMap[al.RuleKind] {
-				resolved = append(resolved, *al)
-			}
-		}
 	}
 
 	// Enforce MaxAlertRecords cap while keeping active alerts intact
@@ -1714,6 +2106,7 @@ func (s *Store) SilenceServerMonitorAlerts(serverID string) {
 			}
 		}
 		if changed {
+			recomputeSnapshotHealthLocked(s.monitorRT, serverID, nil)
 			s.dirtyMonitor = true
 		}
 	}
@@ -1858,9 +2251,9 @@ func (s *Store) GetMonitorOverview() (*MonitorOverviewData, error) {
 	}
 
 	alertLimit := min(100, len(mon.Alerts))
-	alertsOut := slices.Clone(mon.Alerts[:alertLimit])
-	if alertsOut == nil {
-		alertsOut = []MonitorAlert{}
+	alertsOut := make([]MonitorAlert, alertLimit)
+	for i := 0; i < alertLimit; i++ {
+		alertsOut[i] = cloneMonitorAlert(mon.Alerts[i])
 	}
 
 	return &MonitorOverviewData{
@@ -1931,7 +2324,7 @@ func (s *Store) GetServerMonitorDetail(serverID string, rangeDur time.Duration) 
 	var srvAlerts []MonitorAlert
 	for _, al := range mon.Alerts {
 		if al.ServerID == serverID {
-			srvAlerts = append(srvAlerts, al)
+			srvAlerts = append(srvAlerts, cloneMonitorAlert(al))
 		}
 	}
 	if srvAlerts == nil {
@@ -2028,14 +2421,19 @@ func (s *Store) UpdateMonitorPolicy(settings MonitorSettings, rules []MonitorAle
 				}
 			}
 		}
+		affectedHealthServers := make(map[string]bool)
 		for i := range s.monitorRT.Alerts {
 			al := &s.monitorRT.Alerts[i]
 			if al.Status != AlertStatusResolved && !activeKinds[al.RuleKind] {
 				al.Status = AlertStatusResolved
 				al.ResolvedAt = &now
 				al.LastSeenAt = now
+				affectedHealthServers[al.ServerID] = true
 				dirty = true
 			}
+		}
+		for sid := range affectedHealthServers {
+			recomputeSnapshotHealthLocked(s.monitorRT, sid, nil)
 		}
 		if activeKinds["port_drift"] {
 			if s.reconcilePortDriftRuntimeLocked(outSettings, outRules, allServers, now) > 0 {
@@ -2082,7 +2480,7 @@ func (s *Store) ListMonitorAlerts(statusFilter, serverID string, limit int) ([]M
 				continue
 			}
 		}
-		out = append(out, al)
+		out = append(out, cloneMonitorAlert(al))
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -2111,10 +2509,11 @@ func (s *Store) AcknowledgeMonitorAlert(alertID, clientIP string) (*MonitorAlert
 				now := time.Now().UTC()
 				al.Status = AlertStatusAcknowledged
 				al.AcknowledgedAt = &now
+				recomputeSnapshotHealthLocked(s.monitorRT, al.ServerID, nil)
 				s.dirtyMonitor = true
 				s.appendAuditRuntimeLocked("monitor.alert_ack", al.ServerName, al.Title, clientIP, true)
 			}
-			cp := *al
+			cp := cloneMonitorAlert(*al)
 			s.rtMu.Unlock()
 			s.triggerFlush()
 			return &cp, nil
@@ -2143,6 +2542,7 @@ func (s *Store) AcknowledgeMonitorAlertsBulk(alertIDs []string, serverID, client
 	}
 	now := time.Now().UTC()
 	acked := 0
+	affectedServers := make(map[string]bool)
 	for i := range s.monitorRT.Alerts {
 		al := &s.monitorRT.Alerts[i]
 		if al.Status != AlertStatusFiring {
@@ -2156,9 +2556,13 @@ func (s *Store) AcknowledgeMonitorAlertsBulk(alertIDs []string, serverID, client
 		}
 		al.Status = AlertStatusAcknowledged
 		al.AcknowledgedAt = &now
+		affectedServers[al.ServerID] = true
 		acked++
 	}
 	if acked > 0 {
+		for sid := range affectedServers {
+			recomputeSnapshotHealthLocked(s.monitorRT, sid, nil)
+		}
 		s.dirtyMonitor = true
 		target := "alerts"
 		if serverID != "" {
@@ -2174,7 +2578,9 @@ func (s *Store) AcknowledgeMonitorAlertsBulk(alertIDs []string, serverID, client
 }
 
 // ResolveMonitorAlert manually marks an active alert as resolved and resets its breach streak.
-// If the underlying condition remains breached on the next collection sweep, the rule will re-trigger cleanly.
+// For manual-resolve discrete event alerts (e.g. ssh_new_login_ip, kernel_error), handled event
+// fingerprints are recorded so the same historical log entries inside the rolling window do not
+// re-trigger, while brand-new occurrences will still fire immediately.
 func (s *Store) ResolveMonitorAlert(alertID, clientIP string) (*MonitorAlert, error) {
 	if !s.IsReady() {
 		return nil, ErrVaultLocked
@@ -2185,6 +2591,7 @@ func (s *Store) ResolveMonitorAlert(alertID, clientIP string) (*MonitorAlert, er
 		s.rtMu.Unlock()
 		return nil, ErrNotFound
 	}
+	ensureMonitorRuntimeDefaults(s.monitorRT)
 	for i := range s.monitorRT.Alerts {
 		al := &s.monitorRT.Alerts[i]
 		if al.ID == alertID {
@@ -2194,10 +2601,48 @@ func (s *Store) ResolveMonitorAlert(alertID, clientIP string) (*MonitorAlert, er
 				al.ResolvedAt = &now
 				al.LastSeenAt = now
 				delete(s.monitorRT.BreachStreaks, al.DedupKey)
+
+				if al.ManualResolve || IsRuleKindManualResolve(al.RuleKind) {
+					fps := slices.Clone(al.EventFingerprints)
+					if snap := s.monitorRT.LatestSnapshots[al.ServerID]; snap != nil {
+						switch al.RuleKind {
+						case "ssh_new_login_ip":
+							targetIP := NormalizeSSHLoginIP(extractAlertDedupSubKey(al.DedupKey))
+							for _, ev := range snap.Security.RecentSSHLogins {
+								evIP := NormalizeSSHLoginIP(ev.FromIP)
+								if evIP != "" && (targetIP == "" || evIP == targetIP) {
+									if fp := sshLoginEventFingerprint(ev); fp != "" {
+										fps = append(fps, fp)
+									}
+								}
+							}
+							for _, u := range snap.Security.ActiveUsers {
+								uIP := NormalizeSSHLoginIP(u.FromIP)
+								if uIP != "" && (targetIP == "" || uIP == targetIP) {
+									if fp := activeUserEventFingerprint(u); fp != "" {
+										fps = append(fps, fp)
+									}
+								}
+							}
+						case "kernel_error":
+							for _, line := range snap.KernelErrors {
+								if fp := kernelErrorEventFingerprint(line); fp != "" {
+									fps = append(fps, fp)
+								}
+							}
+							if len(snap.KernelErrors) == 0 && snap.KernelErrorCount > 0 {
+								fps = append(fps, fmt.Sprintf("kerr_cnt|%d", snap.KernelErrorCount))
+							}
+						}
+					}
+					recordHandledEventsLocked(s.monitorRT, al.DedupKey, fps, now)
+				}
+
+				recomputeSnapshotHealthLocked(s.monitorRT, al.ServerID, nil)
 				s.dirtyMonitor = true
 				s.appendAuditRuntimeLocked("monitor.alert_resolve", al.ServerName, "人工标记已解决: "+al.Title, clientIP, true)
 			}
-			cp := *al
+			cp := cloneMonitorAlert(*al)
 			s.rtMu.Unlock()
 			s.triggerFlush()
 			return &cp, nil
@@ -2343,6 +2788,9 @@ func (s *Store) reconcilePortDriftRuntimeLocked(settings MonitorSettings, rules 
 				al.MetricText = breach.MetricText
 				al.LastSeenAt = now
 			}
+		}
+		if resolvedCnt > 0 {
+			recomputeSnapshotHealthLocked(s.monitorRT, srv.ID, nil)
 		}
 	}
 	return resolvedCnt
@@ -2589,12 +3037,140 @@ func (s *Store) AcceptServerPortBaseline(serverID, clientIP string) ([]string, e
 			al.ResolvedAt = &now
 		}
 	}
+	recomputeSnapshotHealthLocked(s.monitorRT, serverID, nil)
 	s.dirtyMonitor = true
 	s.appendAuditRuntimeLocked("monitor.port_baseline", snap.ServerName, fmt.Sprintf("确认并更新对外监听端口安全基线 (%d 个端口)", len(newBase)), clientIP, true)
 	outBase := slices.Clone(newBase)
 	s.rtMu.Unlock()
 	s.triggerFlush()
 	return outBase, nil
+}
+
+// UpdateServerSSHLoginIPBaseline adds or removes a single trusted SSH login IP for a server
+// without modifying FIM file hashes or persistence baselines. Adding an IP resolves matching
+// ssh_new_login_ip alerts immediately and recomputes host health.
+func (s *Store) UpdateServerSSHLoginIPBaseline(serverID, rawIP, action, clientIP string) (*SSHLoginIPBaselineResult, error) {
+	if !s.IsReady() {
+		return nil, ErrVaultLocked
+	}
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return nil, fmt.Errorf("%w: 缺少目标服务器 server_id", ErrInvalidInput)
+	}
+	act := strings.ToLower(strings.TrimSpace(action))
+	if act == "" {
+		act = "add"
+	}
+	if act != "add" && act != "remove" {
+		return nil, fmt.Errorf("%w: action 仅支持 add 或 remove", ErrInvalidInput)
+	}
+	ip := NormalizeSSHLoginIP(rawIP)
+	if ip == "" {
+		return nil, fmt.Errorf("%w: 无效的 SSH 来源 IP 地址 %q", ErrInvalidInput, rawIP)
+	}
+
+	s.secMu.RLock()
+	if s.secrets == nil {
+		s.secMu.RUnlock()
+		return nil, ErrVaultLocked
+	}
+	srvName := ""
+	found := false
+	for i := range s.secrets.Servers {
+		if s.secrets.Servers[i].ID == serverID {
+			srvName = s.secrets.Servers[i].Name
+			found = true
+			break
+		}
+	}
+	s.secMu.RUnlock()
+	if !found {
+		return nil, ErrNotFound
+	}
+
+	now := time.Now().UTC()
+	s.rtMu.Lock()
+	if s.monitorRT == nil {
+		s.monitorRT = DefaultMonitorRuntimeState()
+	}
+	ensureMonitorRuntimeDefaults(s.monitorRT)
+
+	existing := s.monitorRT.SecurityBaselines[serverID]
+	nextBase := cloneSecurityBaseline(existing)
+
+	cleanKnown := make([]string, 0, len(nextBase.KnownSSHLoginIPs)+1)
+	seen := make(map[string]bool, len(nextBase.KnownSSHLoginIPs)+1)
+	for _, item := range nextBase.KnownSSHLoginIPs {
+		norm := NormalizeSSHLoginIP(item)
+		if norm == "" {
+			norm = strings.TrimSpace(item)
+		}
+		if norm == "" || seen[norm] {
+			continue
+		}
+		if act == "remove" && norm == ip {
+			continue
+		}
+		seen[norm] = true
+		cleanKnown = append(cleanKnown, norm)
+	}
+	if act == "add" && !seen[ip] {
+		cleanKnown = append(cleanKnown, ip)
+	}
+	sort.Strings(cleanKnown)
+	nextBase.KnownSSHLoginIPs = cleanKnown
+	nextBase.UpdatedAt = now
+	s.monitorRT.SecurityBaselines[serverID] = nextBase
+
+	snap := s.monitorRT.LatestSnapshots[serverID]
+	if snap != nil {
+		snap.Security.NewSSHLoginIPs = computeNewSSHLoginIPs(snap.Security, nextBase.KnownSSHLoginIPs)
+	}
+
+	resolvedCnt := 0
+	if act == "add" {
+		targetDedup := fmt.Sprintf("%s|ssh_new_login_ip|%s", serverID, ip)
+		legacyDedup := fmt.Sprintf("%s|ssh_new_login_ip|", serverID)
+		delete(s.monitorRT.BreachStreaks, targetDedup)
+		delete(s.monitorRT.HandledEvents, targetDedup)
+		for i := range s.monitorRT.Alerts {
+			al := &s.monitorRT.Alerts[i]
+			if al.ServerID != serverID || al.RuleKind != "ssh_new_login_ip" || al.Status == AlertStatusResolved {
+				continue
+			}
+			if al.DedupKey == targetDedup || (al.DedupKey == legacyDedup && (snap == nil || len(snap.Security.NewSSHLoginIPs) == 0)) {
+				al.Status = AlertStatusResolved
+				al.ResolvedAt = &now
+				al.LastSeenAt = now
+				resolvedCnt++
+			}
+		}
+		if snap == nil || len(snap.Security.NewSSHLoginIPs) == 0 {
+			delete(s.monitorRT.BreachStreaks, legacyDedup)
+			delete(s.monitorRT.HandledEvents, legacyDedup)
+		}
+		recomputeSnapshotHealthLocked(s.monitorRT, serverID, nil)
+		s.appendAuditRuntimeLocked("monitor.ssh_login_ip_trust", srvName,
+			fmt.Sprintf("信任 SSH 登录来源 IP %s（已知基线共 %d 个 IP）", ip, len(nextBase.KnownSSHLoginIPs)),
+			clientIP, true)
+	} else {
+		s.appendAuditRuntimeLocked("monitor.ssh_login_ip_untrust", srvName,
+			fmt.Sprintf("从已知登录基线移除 SSH 来源 IP %s（剩余 %d 个 IP）", ip, len(nextBase.KnownSSHLoginIPs)),
+			clientIP, true)
+	}
+
+	s.dirtyMonitor = true
+	outBase := cloneSecurityBaseline(nextBase)
+	s.rtMu.Unlock()
+	s.triggerFlush()
+
+	return &SSHLoginIPBaselineResult{
+		ServerID:         serverID,
+		Action:           act,
+		IP:               ip,
+		ResolvedAlerts:   resolvedCnt,
+		SecurityBaseline: &outBase,
+	}, nil
 }
 
 // AcceptServerSecurityBaseline pins the server's current critical file hashes, persistence hash, and SSH login IPs.
@@ -2630,6 +3206,14 @@ func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*Server
 			nextBase.KnownSSHLoginIPs = append(nextBase.KnownSSHLoginIPs, ip)
 		}
 	}
+	// Also include IPs from any retained active per-IP ssh_new_login_ip alerts whose 15m log window has already elapsed
+	for _, al := range s.monitorRT.Alerts {
+		if al.ServerID == serverID && al.RuleKind == "ssh_new_login_ip" && al.Status != AlertStatusResolved {
+			if ip := NormalizeSSHLoginIP(extractAlertDedupSubKey(al.DedupKey)); ip != "" && !slices.Contains(nextBase.KnownSSHLoginIPs, ip) {
+				nextBase.KnownSSHLoginIPs = append(nextBase.KnownSSHLoginIPs, ip)
+			}
+		}
+	}
 	sort.Strings(nextBase.KnownSSHLoginIPs)
 	nextBase.UpdatedAt = now
 
@@ -2639,7 +3223,17 @@ func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*Server
 	snap.Security.NewSSHLoginIPs = nil
 
 	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|security_file_drift|", serverID))
-	delete(s.monitorRT.BreachStreaks, fmt.Sprintf("%s|ssh_new_login_ip|", serverID))
+	sshIPPrefix := serverID + "|ssh_new_login_ip|"
+	for k := range s.monitorRT.BreachStreaks {
+		if strings.HasPrefix(k, sshIPPrefix) {
+			delete(s.monitorRT.BreachStreaks, k)
+		}
+	}
+	for k := range s.monitorRT.HandledEvents {
+		if strings.HasPrefix(k, sshIPPrefix) {
+			delete(s.monitorRT.HandledEvents, k)
+		}
+	}
 	for i := range s.monitorRT.Alerts {
 		al := &s.monitorRT.Alerts[i]
 		if al.ServerID == serverID &&
@@ -2647,8 +3241,10 @@ func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*Server
 			al.Status != AlertStatusResolved {
 			al.Status = AlertStatusResolved
 			al.ResolvedAt = &now
+			al.LastSeenAt = now
 		}
 	}
+	recomputeSnapshotHealthLocked(s.monitorRT, serverID, nil)
 	s.dirtyMonitor = true
 	s.appendAuditRuntimeLocked("monitor.security_baseline", snap.ServerName,
 		fmt.Sprintf("确认并更新主机安全基线 (%d 个关键文件, %d 个已知登录 IP)", len(nextBase.FileHashes), len(nextBase.KnownSSHLoginIPs)),

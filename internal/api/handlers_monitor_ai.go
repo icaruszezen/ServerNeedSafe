@@ -143,6 +143,27 @@ func (s *Server) handleAcceptSecurityBaseline(w http.ResponseWriter, r *http.Req
 	})
 }
 
+func (s *Server) handleUpdateSSHLoginIPBaseline(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServerID string `json:"server_id"`
+		IP       string `json:"ip"`
+		Action   string `json:"action"`
+	}
+	if err := decodeJSON(r, &req, 32*1024); err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_JSON", "SSH 登录 IP 基线请求格式错误")
+		return
+	}
+	res, err := s.cfg.Store.UpdateServerSSHLoginIPBaseline(req.ServerID, req.IP, req.Action, extractClientIP(r))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"result": res,
+	})
+}
+
 func (s *Server) handleTestMonitorWebhook(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		WebhookURL            string `json:"webhook_url"`

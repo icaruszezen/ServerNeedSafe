@@ -455,15 +455,31 @@ CPU=cpu 205 0 85 1810 0 0 0 0
 		t.Fatalf("AcceptServerPortBaseline failed: %v", err)
 	}
 
-	// Recover synthetic node (mode 2) -> all remaining resource & service alerts auto-resolve!
+	// Recover synthetic node (mode 2) -> all continuous resource & service alerts auto-resolve,
+	// while discrete manual-resolve event alerts (oom_kill from OOM_KILL=2 in mode 1) remain firing until manually closed!
 	syntheticMode.Store(2)
 	snapRec, err := engine.CollectServerNow(context.Background(), synSrv.ID, "", "127.0.0.1")
-	if err != nil || snapRec.HealthLevel != vault.HealthHealthy {
-		t.Fatalf("expected healthy snapshot after recovery, got %+v, err=%v", snapRec, err)
+	if err != nil {
+		t.Fatalf("CollectServerNow recovery: %v", err)
 	}
 	activeAfterRec, _ := store.ListMonitorAlerts("active", synSrv.ID, 0)
-	if len(activeAfterRec) != 0 {
-		t.Fatalf("expected all active alerts auto-resolved after recovery, still active: %+v", activeAfterRec)
+	if len(activeAfterRec) != 1 || activeAfterRec[0].RuleKind != "oom_kill" || !activeAfterRec[0].ManualResolve {
+		t.Fatalf("expected only manual-resolve oom_kill alert to remain active after recovery, got: %+v", activeAfterRec)
+	}
+	if snapRec.HealthLevel == vault.HealthHealthy {
+		t.Fatalf("expected host health to stay degraded while manual-resolve oom_kill is firing, got %+v", snapRec)
+	}
+	// Manually resolving the discrete oom_kill alert immediately restores host health to healthy!
+	if _, err := store.ResolveMonitorAlert(activeAfterRec[0].ID, "127.0.0.1"); err != nil {
+		t.Fatalf("ResolveMonitorAlert oom_kill: %v", err)
+	}
+	synDetailRec, err := store.GetServerMonitorDetail(synSrv.ID, time.Hour)
+	if err != nil || synDetailRec.Snapshot == nil || synDetailRec.Snapshot.HealthLevel != vault.HealthHealthy {
+		t.Fatalf("expected healthy snapshot after manually resolving oom_kill, got %+v, err=%v", synDetailRec, err)
+	}
+	activeAfterManual, _ := store.ListMonitorAlerts("active", synSrv.ID, 0)
+	if len(activeAfterManual) != 0 {
+		t.Fatalf("expected 0 active alerts after manual resolve, still active: %+v", activeAfterManual)
 	}
 
 	// Verify webhook received notifications

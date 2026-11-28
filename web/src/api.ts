@@ -816,6 +816,17 @@ export const api = {
       { id }
     ),
 
+  updateSSHLoginIPBaseline: (payload: {
+    server_id: string;
+    ip: string;
+    action: 'add' | 'remove';
+  }) =>
+    requestJSON<{ ok: boolean; result: import('./types').SSHLoginIPBaselineResult }>(
+      'POST',
+      '/api/monitor/security-baseline/ssh-ip',
+      payload
+    ),
+
   testMonitorWebhook: (webhook_url: string, reuse_ai_patrol_webhooks: boolean) =>
     requestJSON<{ ok: boolean; runtime: MonitorRuntimeStatus }>(
       'POST',

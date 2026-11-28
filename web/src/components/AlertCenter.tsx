@@ -379,11 +379,15 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
     }
   };
 
-  const handleResolveAlert = async (alertId: string) => {
-    setBusyAlertId(alertId);
+  const handleResolveAlert = async (al: MonitorAlert) => {
+    setBusyAlertId(al.id);
     try {
-      await api.resolveMonitorAlert(alertId);
-      onNotify('已人工标记为已解决（若下次采集仍超限将自动重新触发）');
+      await api.resolveMonitorAlert(al.id);
+      onNotify(
+        al.manual_resolve
+          ? '已人工标记为已解决并关闭（已处置的旧日志不再重复触发，若有新事件将重新告警）'
+          : '已人工标记为已解决（若下次采集仍超限将自动重新触发）'
+      );
       await loadAlerts(true);
     } catch (err: any) {
       onNotify(err?.message || '标记已解决失败');
@@ -462,6 +466,18 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
         onNotify(
           `已将端口 ${res.result.applied_rule} 加入 [${al.server_name}] 端口漂移忽略白名单${
             res.result.resolved_alerts > 0 ? '，告警已消除' : ''
+          }`
+        );
+        await loadAlerts(true);
+      } else if (action.kind === 'trust_ssh_login_ip' && action.target) {
+        const res = await api.updateSSHLoginIPBaseline({
+          server_id: al.server_id,
+          ip: action.target,
+          action: 'add',
+        });
+        onNotify(
+          `已信任来源 IP ${res.result.ip} 并加入 [${al.server_name}] 已知登录基线${
+            res.result.resolved_alerts > 0 ? '，对应告警已关闭' : ''
           }`
         );
         await loadAlerts(true);
@@ -550,7 +566,7 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
               {isResolved ? (
                 <>
                   <span className="al-sev-badge resolved">
-                    <CheckCircle2 size={12} /> 已恢复
+                    <CheckCircle2 size={12} /> {al.manual_resolve ? '已处置' : '已恢复'}
                   </span>
                   <span
                     className={`al-origin-sev ${al.severity === 'critical' ? 'critical' : 'warning'}`}
@@ -580,6 +596,14 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
                     <span className="al-status-flag acknowledged">
                       <Check size={12} />
                       已知晓
+                    </span>
+                  )}
+                  {al.manual_resolve && (
+                    <span
+                      className="al-manual-badge"
+                      title="事件型告警不会自动恢复，需人工确认处理后关闭"
+                    >
+                      需人工关闭
                     </span>
                   )}
                 </>
@@ -707,8 +731,12 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
                     al.status === 'acknowledged' ? 'al-btn-primary-action' : 'btn-ghost al-btn-quiet'
                   }`}
                   disabled={isBusy}
-                  onClick={() => void handleResolveAlert(al.id)}
-                  title="人工标记解决并关闭当前告警，若下次采集仍超限会重新触发"
+                  onClick={() => void handleResolveAlert(al)}
+                  title={
+                    al.manual_resolve
+                      ? '人工核实后关闭该事件型告警（不加入白名单，已处置旧日志不再复发，若有新事件将重新告警）'
+                      : '人工标记解决并关闭当前告警，若下次采集仍超限会重新触发'
+                  }
                 >
                   <CheckCircle2 size={13} /> 标记已解决
                 </button>
