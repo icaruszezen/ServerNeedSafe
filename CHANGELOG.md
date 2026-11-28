@@ -3,6 +3,89 @@
 All notable changes to **ServerNeedSafe** are documented in this file.
 本文件记录 **ServerNeedSafe** 每个正式版本的中英文更新日志。
 
+## v2.10.0 (2026-11-28)
+
+## 中文更新说明
+
+> 本版本扩展了 QQ 机器人全平台告警通知能力，并为事件型监控告警提供更精准的人工处置与来源 IP 基线管理。
+
+### ✨ 新功能与核心增强
+- 新增 QQ 开放平台 API v2 WebSocket 网关与通知中心：支持生产、沙箱和自定义代理端点，提供配置、连接诊断、目标管理、连通性测试及运行状态监控。 (#33)
+- QQ 通知支持单聊、QQ群和频道子频道三类目标，可配置纯文本或 Markdown；Markdown 失败时自动降级为纯文本，并支持主动推送与近期被动回复窗口复用。 (#33)
+- 新增状态监控告警、AI 巡检异常、外部 MCP 待审批变更和高危漏洞情报等事件推送，并可分别启停。 (#33)
+- 自动发现 QQ 单聊、群聊和频道目标，支持生成 10 分钟一次有效的 6 位绑定验证码；在已绑定目标中开放只读 `/status`、`/alerts`、`/help` 和 `/id` 指令，陌生会话不会泄露主机状态。 (#33)
+- 为事件型告警新增人工关闭机制：`ssh_new_login_ip`、`unexpected_reboot`、`oom_kill` 和 `kernel_error` 默认不再因快照窗口滑出而自动恢复，也不会发送虚假恢复通知。 (#32)
+- 调整 SSH 新来源 IP 告警去重为“主机 + 来源 IP”独立建单，保留旧去重键兼容，并允许每个 IP 独立告警、处置和推送。 (#32)
+- 新增单条 SSH 来源 IP 信任基线接口与「信任该 IP」快捷操作，不影响 FIM 文件基线或持久化基线，窗口过期后仍可准确写入已知登录 IP。 (#32)
+- 单机监控详情页新增已知可信 SSH 登录 IP 列表，支持逐条移除、添加信任和实时查看基线状态。 (#32)
+
+### 🔒 安全与权限加固
+- QQ App Secret、生产/沙箱配置、网关参数、推送目标与通知策略采用加密存储；Web API 不返回明文密钥，并保留审计日志。 (#33)
+- 完善 QQ AccessToken 缓冲与刷新：过期前 90 秒预刷新、HTTP 401 或 Token 错误码自动失效重试，并支持令牌与业务接口分离配置。 (#33)
+- WebSocket 网关覆盖心跳 RTT、连续失联、断线续传、会话重试和官方关闭码分类；权限不足、封禁或下架等情况会暂停重连并提供诊断状态。 (#33)
+- 入站事件支持消息与事件去重、单次绑定验证码、目标绑定授权及只读指令边界；未绑定陌生会话无法查询告警或主机状态。 (#33)
+- 标记事件告警已解决时记录处置指纹，窗口内相同旧日志或会话不会重复触发；未信任 IP 再次登录或新增内核错误仍会立即重新告警。 (#32)
+- 在线 SSH 会话检测同时检查近期登录记录与 `ActiveUsers`，并通过严格 IP 解析过滤 `:0`、`tmux` 等非远程来源。 (#32)
+
+### 🐛 问题修复与稳定性提升
+- 修复瞬时事件告警因采集快照滑出窗口而自动恢复的问题；规则关闭、主机静音或人工处置后才关闭告警，人工关闭不会向 Webhook 发送误恢复通知。 (#32)
+- 增强 Linux/macOS 日志采集与解析，保留完整 SSH 登录时分秒、`sshd[PID]` 会话标识和多格式 `WHO` 解析，并保存最近 20 条独立登录事件。 (#32)
+- 告警中心在需人工关闭事件的卡片上展示明确标签，并支持直接进行单 IP 信任处置。 (#32)
+- 联动主机健康快照：`firing` 状态持续影响健康灯和健康分，确认知晓或解决/信任后立即重算健康状态，实时指标恢复正常即可重新转绿。 (#32)
+- QQ 网关补充重连退避、配置指纹失效、手动重连、事件和推送诊断历史、被动回复配额及主动推送失败兜底等运行可靠性处理。 (#33)
+
+### ⚙️ 工程构建与运维体验
+- QQ 通知界面新增 Intent 位图、分片参数、沙箱模式、通知类别、绑定目标、目标发现、推送历史及最近事件等可视化配置与诊断面板，并适配移动端。 (#33)
+- 新增 QQ Bot 客户端、网关状态机、协议解析、目标绑定、只读指令、推送降级和多场景通知的后端测试，以及前端 Intent 工具测试和告警中心集成测试。 (#33)
+- 补充告警生命周期、指纹防重、脚本解析、SSH IP 基线及相关 API 集成测试，并覆盖告警中心与监控详情页交互。 (#32)
+- 增加前后端构建与运行时诊断覆盖，确保通知、告警处置、IP 基线、断线恢复和页面交互在全平台部署下保持一致。 (#32, #33)
+
+---
+
+## English Release Notes
+
+> This release expands QQ Bot notifications across operational events and improves manual alert handling with per-IP SSH trust controls.
+
+### ✨ New Features & Highlights
+- Adds a QQ Open Platform API v2 WebSocket gateway and notification console with production and sandbox endpoints, custom proxy support, connectivity probes, target management, diagnostics, and live runtime status. (#33)
+- Supports QQ direct messages, group chats, and guild sub-channels, plus plain-text or Markdown delivery. Markdown failures automatically fall back to plain text, with proactive and passive-reply delivery modes. (#33)
+- Dispatches notifications for monitor alerts, AI patrol anomalies, external MCP approval requests, and vulnerability advisories, with independent subscription switches for each category. (#33)
+- Automatically discovers C2C, group, and channel targets and generates 10-minute, single-use 6-character bind codes. Bound targets can use read-only `/status`, `/alerts`, `/help`, and `/id` commands without exposing host data to strangers. (#33)
+- Adds manual resolution for event alerts: `ssh_new_login_ip`, `unexpected_reboot`, `oom_kill`, and `kernel_error` no longer resolve simply because their data snapshot leaves the collection window. (#32)
+- Keys SSH new-login-IP alerts independently by “server + source IP,” preserving legacy key compatibility while allowing separate incidents, responses, and notifications for each IP. (#32)
+- Adds a per-IP SSH baseline API and “Trust this IP” action that affects only the SSH login-IP baseline, not FIM files or the persisted file baseline. (#32)
+- Adds a trusted SSH login-IP list to host monitoring with one-click removal and trust controls for individual addresses. (#32)
+
+### 🔒 Security & Hardening
+- Encrypts QQ App Secrets, endpoint settings, gateway parameters, targets, and notification policies; Web API responses redact credentials and retain auditable configuration actions. (#33)
+- Implements AccessToken caching and pre-refresh 90 seconds before expiry, plus HTTP 401 and token-error invalidation/retry behavior, with separate API and token base URL overrides. (#33)
+- Covers heartbeat RTT, missed-heartbeat detection, reconnect/resume behavior, session state, and official WebSocket close codes. Insufficient permissions, bans, and bot removal are surfaced and stop automatic retries safely. (#33)
+- Deduplicates inbound events and message IDs, validates bind codes, authorizes targets, and restricts bot commands to bound targets. Unbound users cannot query alerts or host state. (#33)
+- Records handled-event fingerprints when alerts are acknowledged or resolved, preventing repeated notifications for the same old log or session within the window. A new login from an untrusted IP or another kernel error still raises immediately. (#32)
+- Checks both recent SSH login logs and active user sessions, using strict address parsing to exclude pseudo-sources such as `:0` and `tmux`. (#32)
+
+### 🐛 Bug Fixes & Reliability
+- Fixes event alerts that previously resolved because collected events aged out of a 15-minute snapshot. Alerts now resolve only on rule disablement, host mute, or manual disposition. (#32)
+- Enhances Linux/macOS collection for complete HH:MM:SS timestamps, `sshd[PID]` session identifiers, multiple `WHO` formats, and the latest 20 distinct login events. (#32)
+- Labels alerts that require manual closure in the alert center and provides direct per-IP trust actions from each alert. (#32)
+- Immediately recalculates host health after acknowledgement or resolution; once live metrics are healthy again, the host snapshot returns to green. (#32)
+- Hardens QQ gateway lifecycle handling with exponential reconnect backoff, configuration-fingerprint invalidation, manual reconnects, passive-reply quotas, delivery fallbacks, and retained event/push diagnostics. (#33)
+
+### ⚙️ Build, CI/CD & Developer Experience
+- Adds a responsive QQ notification configuration and diagnostics panel for Intent masks, sharding, sandbox mode, notification categories, binding, target discovery, push history, and recent events. (#33)
+- Adds backend coverage for QQ token handling, gateway state, protocol parsing, target discovery, command binding, delivery fallback, and multi-channel notifications, along with frontend Intent and integration tests. (#33)
+- Adds alert lifecycle, fingerprint deduplication, SSH script parsing, IP baseline, and API integration coverage, including alert-center and host-monitor interactions. (#32)
+- Expands build and runtime diagnostics so alert disposition, SSH IP trust, gateway recovery, and notification delivery behave consistently across Docker and desktop deployments. (#32, #33)
+
+---
+
+### Included Changes / 包含的变更
+
+- #32 feat(monitor): 事件型告警需人工确认关闭与 SSH 新来源 IP 精细化处置 (@icaruszezen)
+- #33 feat(notifications): 事件通知接入 QQ 开放平台 API v2 WebSocket 网关 (@icaruszezen)
+
+**Full Changelog**: https://github.com/icaruszezen/ServerNeedSafe/compare/v2.9.0...v2.10.0
+
 ## v2.9.0 (2026-11-27)
 
 ## 中文更新说明
