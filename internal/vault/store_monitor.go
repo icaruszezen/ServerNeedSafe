@@ -2,6 +2,7 @@ package vault
 
 import (
 	"fmt"
+	"log"
 	"maps"
 	"math"
 	"net/netip"
@@ -486,9 +487,11 @@ func ensureMonitorInitialized(state *VaultState) {
 
 func cloneSecurityBaseline(in ServerSecurityBaseline) ServerSecurityBaseline {
 	cp := ServerSecurityBaseline{
-		PersistenceHash:  in.PersistenceHash,
-		KnownSSHLoginIPs: slices.Clone(in.KnownSSHLoginIPs),
-		UpdatedAt:        in.UpdatedAt,
+		PersistenceVersion: in.PersistenceVersion,
+		PersistenceHash:    in.PersistenceHash,
+		PersistenceItems:   cloneStringMap(in.PersistenceItems),
+		KnownSSHLoginIPs:   slices.Clone(in.KnownSSHLoginIPs),
+		UpdatedAt:          in.UpdatedAt,
 	}
 	if in.FileHashes != nil {
 		cp.FileHashes = make(map[string]string, len(in.FileHashes))
@@ -527,6 +530,7 @@ func cloneSnapshot(in *ServerMonitorSnapshot) *ServerMonitorSnapshot {
 		maps.Copy(cp.Security.FileHashes, in.Security.FileHashes)
 	}
 	cp.Security.FileDrifts = slices.Clone(in.Security.FileDrifts)
+	cp.Security.PersistenceItems = cloneStringMap(in.Security.PersistenceItems)
 	cp.Security.PersistenceDrifts = slices.Clone(in.Security.PersistenceDrifts)
 	cp.Security.SuspiciousProcs = slices.Clone(in.Security.SuspiciousProcs)
 	cp.Security.SuspiciousOutbound = slices.Clone(in.Security.SuspiciousOutbound)
@@ -1290,7 +1294,7 @@ func evaluateSnapshotRules(
 			parts = append(parts, "敏感文件变更: "+strings.Join(snap.Security.FileDrifts, ", "))
 		}
 		if len(snap.Security.PersistenceDrifts) > 0 {
-			parts = append(parts, "持久化项变更: "+strings.Join(snap.Security.PersistenceDrifts, ", "))
+			parts = append(parts, "持久化项变更: "+strings.Join(snap.Security.PersistenceDrifts, "；"))
 		}
 		out = append(out, CandidateBreach{
 			DedupKey:       fmt.Sprintf("%s|security_file_drift|", srv.ID),
@@ -1299,7 +1303,7 @@ func evaluateSnapshotRules(
 			Severity:       SeverityCritical,
 			Title:          fmt.Sprintf("高危：[%s] 关键安全文件或持久化配置基线发生漂移", srv.Name),
 			Detail:         fmt.Sprintf("%s（若属正常变更可在节点详情页点击「采纳安全基线」）", strings.Join(parts, "；")),
-			MetricText:     fmt.Sprintf("%d 项漂移", len(snap.Security.FileDrifts)+len(snap.Security.PersistenceDrifts)),
+			MetricText:     fmt.Sprintf("%d 项漂移", len(snap.Security.FileDrifts)+CountPersistenceDrifts(snap.Security.PersistenceDrifts)),
 			ThresholdText:  "匹配安全基线",
 			ConsecutiveReq: max(1, r.ConsecutiveCount),
 		})
@@ -1613,8 +1617,10 @@ func mergeSlowTierFromPrev(incoming, prev *ServerMonitorSnapshot) {
 		incoming.Security.FileHashes = make(map[string]string, len(prev.Security.FileHashes))
 		maps.Copy(incoming.Security.FileHashes, prev.Security.FileHashes)
 	}
-	if incoming.Security.PersistenceHash == "" {
+	if incoming.Security.PersistenceVersion == 0 && incoming.Security.PersistenceHash == "" && len(incoming.Security.PersistenceItems) == 0 {
+		incoming.Security.PersistenceVersion = prev.Security.PersistenceVersion
 		incoming.Security.PersistenceHash = prev.Security.PersistenceHash
+		incoming.Security.PersistenceItems = cloneStringMap(prev.Security.PersistenceItems)
 	}
 	if len(incoming.Security.SuspiciousProcs) == 0 {
 		incoming.Security.SuspiciousProcs = slices.Clone(prev.Security.SuspiciousProcs)
@@ -1855,11 +1861,56 @@ func (s *Store) RecordMonitorSnapshots(snapshots []*ServerMonitorSnapshot) (trig
 				}
 			}
 
-			if incoming.Security.PersistenceHash != "" {
+			// Normalize programmatic v2 persistence snapshots (e.g. callers populating PersistenceItems directly)
+			if len(incoming.Security.PersistenceItems) > 0 && incoming.Security.PersistenceVersion < CurrentPersistenceVersion {
+				incoming.Security.PersistenceVersion = CurrentPersistenceVersion
+			}
+			if incoming.Security.PersistenceVersion >= CurrentPersistenceVersion {
+				incoming.Security.PersistenceItems = NormalizePersistenceItems(incoming.Security.PersistenceItems)
+				incoming.Security.PersistenceHash = ComputePersistenceHash(incoming.Security.PersistenceItems)
+			}
+
+			if incoming.Security.PersistenceVersion >= CurrentPersistenceVersion {
+				if secBase.PersistenceVersion < CurrentPersistenceVersion {
+					// Initial v2 baseline seeding OR silent schema migration from legacy v0/v1 (ls -la) hash.
+					// Never trigger security_file_drift during schema upgrade; core FileHashes FIM remains unaffected.
+					wasLegacy := secBase.PersistenceHash != ""
+					secBase.PersistenceVersion = incoming.Security.PersistenceVersion
+					secBase.PersistenceHash = incoming.Security.PersistenceHash
+					secBase.PersistenceItems = cloneStringMap(incoming.Security.PersistenceItems)
+					baseUpdated = true
+					if wasLegacy {
+						log.Printf("[monitor] silently migrated persistence baseline for server %s (%s) from legacy v1 to v%d (%d items)",
+							srvCfg.Name, srvCfg.ID, secBase.PersistenceVersion, len(secBase.PersistenceItems))
+						s.appendAuditRuntimeLocked("monitor.security_baseline_migrate", srvCfg.Name,
+							fmt.Sprintf("持久化安全基线已自动平滑升级至 v%d（共 %d 项，已消除目录 mtime 误报，核心安全文件 FIM 基线保持不变）",
+								secBase.PersistenceVersion, len(secBase.PersistenceItems)),
+							"system", true)
+					}
+				} else {
+					baseItems := NormalizePersistenceItems(secBase.PersistenceItems)
+					baseHash := secBase.PersistenceHash
+					if len(baseItems) > 0 || baseHash == "" {
+						baseHash = ComputePersistenceHash(baseItems)
+					}
+					if incoming.Security.PersistenceHash != baseHash {
+						if len(baseItems) == 0 && baseHash != ComputePersistenceHash(nil) {
+							incoming.Security.PersistenceDrifts = []string{"crontab / systemd 持久化配置指纹变化"}
+						} else {
+							drifts := DiffPersistenceItems(baseItems, incoming.Security.PersistenceItems, MaxPersistenceDriftDetails)
+							if len(drifts) == 0 {
+								drifts = []string{"crontab / systemd 持久化配置指纹变化"}
+							}
+							incoming.Security.PersistenceDrifts = drifts
+						}
+					}
+				}
+			} else if incoming.Security.PersistenceHash != "" {
+				// Backward compatibility for legacy snapshots carrying only PersistenceHash without v2 items
 				if secBase.PersistenceHash == "" {
 					secBase.PersistenceHash = incoming.Security.PersistenceHash
 					baseUpdated = true
-				} else if incoming.Security.PersistenceHash != secBase.PersistenceHash {
+				} else if secBase.PersistenceVersion < CurrentPersistenceVersion && incoming.Security.PersistenceHash != secBase.PersistenceHash {
 					incoming.Security.PersistenceDrifts = []string{"crontab / systemd 持久化配置指纹变化"}
 				}
 			}
@@ -3198,7 +3249,16 @@ func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*Server
 		nextBase.FileHashes = make(map[string]string, len(snap.Security.FileHashes))
 		maps.Copy(nextBase.FileHashes, snap.Security.FileHashes)
 	}
-	if snap.Security.PersistenceHash != "" {
+	if snap.Security.PersistenceVersion >= CurrentPersistenceVersion || len(snap.Security.PersistenceItems) > 0 {
+		ver := snap.Security.PersistenceVersion
+		if ver < CurrentPersistenceVersion {
+			ver = CurrentPersistenceVersion
+		}
+		normItems := NormalizePersistenceItems(snap.Security.PersistenceItems)
+		nextBase.PersistenceVersion = ver
+		nextBase.PersistenceItems = normItems
+		nextBase.PersistenceHash = ComputePersistenceHash(normItems)
+	} else if snap.Security.PersistenceHash != "" {
 		nextBase.PersistenceHash = snap.Security.PersistenceHash
 	}
 	for _, ip := range collectCurrentLoginIPs(snap.Security) {
@@ -3246,9 +3306,12 @@ func (s *Store) AcceptServerSecurityBaseline(serverID, clientIP string) (*Server
 	}
 	recomputeSnapshotHealthLocked(s.monitorRT, serverID, nil)
 	s.dirtyMonitor = true
-	s.appendAuditRuntimeLocked("monitor.security_baseline", snap.ServerName,
-		fmt.Sprintf("确认并更新主机安全基线 (%d 个关键文件, %d 个已知登录 IP)", len(nextBase.FileHashes), len(nextBase.KnownSSHLoginIPs)),
-		clientIP, true)
+	auditDetail := fmt.Sprintf("确认并更新主机安全基线 (%d 个关键文件, %d 个已知登录 IP)", len(nextBase.FileHashes), len(nextBase.KnownSSHLoginIPs))
+	if nextBase.PersistenceVersion >= CurrentPersistenceVersion {
+		auditDetail = fmt.Sprintf("确认并更新主机安全基线 (%d 个关键文件, %d 个持久化项 v%d, %d 个已知登录 IP)",
+			len(nextBase.FileHashes), len(nextBase.PersistenceItems), nextBase.PersistenceVersion, len(nextBase.KnownSSHLoginIPs))
+	}
+	s.appendAuditRuntimeLocked("monitor.security_baseline", snap.ServerName, auditDetail, clientIP, true)
 	out := cloneSecurityBaseline(nextBase)
 	s.rtMu.Unlock()
 	s.triggerFlush()

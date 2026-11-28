@@ -1743,8 +1743,8 @@ func BuildAlertAdviceWithPortBaseline(al vault.MonitorAlert, snap *vault.ServerM
 		adv.Commands = []AlertCommandSuggestion{
 			{
 				Label:       "核查关键安全文件最近修改时间与内容",
-				Description: "查看 /etc/passwd、sudoers、sshd_config 与 ld.so.preload 状态",
-				Command:     "stat -c '%y %n' /etc/passwd /etc/shadow /etc/sudoers /etc/ssh/sshd_config /etc/ld.so.preload /root/.ssh/authorized_keys 2>/dev/null; ls -la /etc/cron.d /var/spool/cron/crontabs 2>/dev/null",
+				Description: "查看 /etc/passwd、sudoers、sshd_config、ld.so.preload 与 crontab/systemd 单元状态",
+				Command:     "stat -c '%y %a %u:%g %n' /etc/passwd /etc/shadow /etc/sudoers /etc/ssh/sshd_config /etc/ld.so.preload /root/.ssh/authorized_keys /etc/crontab /etc/rc.local 2>/dev/null; find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs /var/spool/cron /etc/systemd/system -maxdepth 2 \\( -type f -o -type l \\) ! -name 'snap-*.mount' -ls 2>/dev/null | head -n 60",
 				Risk:        "readonly",
 			},
 			{

@@ -198,10 +198,12 @@ type SSHLoginEvent struct {
 
 // ServerSecurityBaseline stores operator-trusted deterministic security fingerprints for drift alerts.
 type ServerSecurityBaseline struct {
-	FileHashes       map[string]string `json:"file_hashes,omitempty"`
-	PersistenceHash  string            `json:"persistence_hash,omitempty"`
-	KnownSSHLoginIPs []string          `json:"known_ssh_login_ips,omitempty"`
-	UpdatedAt        time.Time         `json:"updated_at,omitempty"`
+	FileHashes         map[string]string `json:"file_hashes,omitempty"`
+	PersistenceVersion int               `json:"persistence_version,omitempty"`
+	PersistenceHash    string            `json:"persistence_hash,omitempty"`
+	PersistenceItems   map[string]string `json:"persistence_items,omitempty"`
+	KnownSSHLoginIPs   []string          `json:"known_ssh_login_ips,omitempty"`
+	UpdatedAt          time.Time         `json:"updated_at,omitempty"`
 }
 
 // SecurityPostureStat captures security-relevant host telemetry.
@@ -217,7 +219,9 @@ type SecurityPostureStat struct {
 	PendingUpdates     int                  `json:"pending_updates"`
 	FileHashes         map[string]string    `json:"file_hashes,omitempty"`
 	FileDrifts         []string             `json:"file_drifts,omitempty"`
+	PersistenceVersion int                  `json:"persistence_version,omitempty"`
 	PersistenceHash    string               `json:"persistence_hash,omitempty"`
+	PersistenceItems   map[string]string    `json:"persistence_items,omitempty"`
 	PersistenceDrifts  []string             `json:"persistence_drifts,omitempty"`
 	SuspiciousProcs    []SuspiciousProcStat `json:"suspicious_procs,omitempty"`
 	SuspiciousOutbound []OutboundConnStat   `json:"suspicious_outbound,omitempty"`
