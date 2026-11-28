@@ -1784,6 +1784,191 @@ export interface VulnSyncResult {
   runtime: VulnRuntimeStatus;
 }
 
+// ============================================================================
+// QQ Open Platform API v2 WebSocket Event Notification Types
+// ============================================================================
+
+export type QQBotTargetType = 'c2c' | 'group' | 'channel';
+
+export type QQBotGatewayState =
+  | 'disabled'
+  | 'connecting'
+  | 'identifying'
+  | 'resuming'
+  | 'connected'
+  | 'reconnecting'
+  | 'error'
+  | 'stopped_error';
+
+export interface QQBotTarget {
+  id: string;
+  name: string;
+  target_type: QQBotTargetType;
+  target_id: string;
+  guild_id?: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface QQBotSettingsView {
+  enabled: boolean;
+  app_id: string;
+  has_app_secret: boolean;
+  app_secret_preview?: string;
+  sandbox: boolean;
+  api_base_url?: string;
+  token_base_url?: string;
+  effective_api_base_url: string;
+  effective_token_base_url: string;
+  intents: number;
+  shard_id: number;
+  shard_count: number;
+  message_format: 'text' | 'markdown';
+  push_mode: 'proactive' | 'passive_prefer';
+  allow_bot_commands: boolean;
+  notify_monitor_alerts: boolean;
+  notify_ai_patrol: boolean;
+  notify_external_approvals: boolean;
+  notify_vuln_advisories: boolean;
+  targets: QQBotTarget[];
+}
+
+export interface QQBotSettingsUpdatePayload {
+  enabled?: boolean;
+  app_id?: string;
+  app_secret?: string;
+  clear_app_secret?: boolean;
+  sandbox?: boolean;
+  api_base_url?: string;
+  token_base_url?: string;
+  intents?: number;
+  shard_id?: number;
+  shard_count?: number;
+  message_format?: 'text' | 'markdown';
+  push_mode?: 'proactive' | 'passive_prefer';
+  allow_bot_commands?: boolean;
+  notify_monitor_alerts?: boolean;
+  notify_ai_patrol?: boolean;
+  notify_external_approvals?: boolean;
+  notify_vuln_advisories?: boolean;
+}
+
+export interface QQBotBindCodeInfo {
+  code: string;
+  expires_at: string;
+}
+
+export interface QQBotRuntimeStatus {
+  state: QQBotGatewayState;
+  connected: boolean;
+  gateway_url?: string;
+  bot_user_id?: string;
+  bot_username?: string;
+  session_id_masked?: string;
+  last_seq: number;
+  shard: [number, number];
+  recommended_shards?: number;
+  session_total?: number;
+  session_remaining?: number;
+  heartbeat_interval_ms?: number;
+  heartbeat_latency_ms?: number;
+  last_heartbeat_ack_at?: string;
+  connected_since?: string;
+  reconnect_count: number;
+  resume_count: number;
+  events_received: number;
+  push_success_count: number;
+  push_failure_count: number;
+  last_push_at?: string;
+  last_push_error?: string;
+  last_error?: string;
+  active_bind_code?: QQBotBindCodeInfo;
+}
+
+export interface QQBotDiscoveredTarget {
+  target_type: QQBotTargetType;
+  target_id: string;
+  guild_id?: string;
+  label?: string;
+  last_event_type?: string;
+  last_message_preview?: string;
+  proactive_rejected?: boolean;
+  last_seen_at: string;
+  hit_count: number;
+}
+
+export interface QQBotEventRecord {
+  id: string;
+  seq?: number;
+  op: number;
+  event_type: string;
+  target_type?: QQBotTargetType;
+  target_id?: string;
+  sender?: string;
+  summary?: string;
+  received_at: string;
+}
+
+export interface QQBotPushRecord {
+  id: string;
+  category: string;
+  title: string;
+  target_type: QQBotTargetType;
+  target_id: string;
+  target_name?: string;
+  mode: string;
+  success: boolean;
+  error?: string;
+  sent_at: string;
+}
+
+export interface QQBotIntentOption {
+  key: string;
+  name: string;
+  bit: number;
+  value: number;
+  description: string;
+  recommended?: boolean;
+  private_only?: boolean;
+}
+
+export interface QQBotProbeResult {
+  ok: boolean;
+  latency_ms: number;
+  gateway_url: string;
+  recommended_shards?: number;
+  session_total?: number;
+  session_remaining?: number;
+  heartbeat_interval_ms?: number;
+}
+
+export interface QQBotTargetDeliveryResult {
+  target_id: string;
+  target_type: QQBotTargetType;
+  target_name: string;
+  mode: string;
+  success: boolean;
+  audit_pending?: boolean;
+  fallback_plain?: boolean;
+  error?: string;
+}
+
+export interface QQBotDispatchSummary {
+  total: number;
+  sent: number;
+  failed: number;
+  results: QQBotTargetDeliveryResult[];
+}
+
+export interface QQBotOverviewResponse {
+  settings: QQBotSettingsView;
+  runtime: QQBotRuntimeStatus;
+  discovered_targets: QQBotDiscoveredTarget[];
+  recent_events: QQBotEventRecord[];
+  push_history: QQBotPushRecord[];
+  intent_catalog: QQBotIntentOption[];
+}
+
 
 
 

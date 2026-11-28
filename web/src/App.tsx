@@ -31,7 +31,11 @@ import type {
 import { AuthGate } from './components/AuthGate';
 import { ServerManager } from './components/ServerManager';
 import { MonitorCenter, type MonitorSubTab } from './components/MonitorCenter';
-import { AlertCenter, type AlertTargetNavigation } from './components/AlertCenter';
+import {
+  AlertCenter,
+  type AlertCenterSubTab,
+  type AlertTargetNavigation,
+} from './components/AlertCenter';
 import { VulnCenter } from './components/VulnCenter';
 import {
   TerminalWorkspace,
@@ -87,6 +91,9 @@ export const App: React.FC = () => {
     undefined
   );
   const [alertsTarget, setAlertsTarget] = useState<AlertTargetNavigation | null>(null);
+  const [alertsInitialSubTab, setAlertsInitialSubTab] = useState<AlertCenterSubTab | undefined>(
+    undefined
+  );
   const [aiInitialTab, setAiInitialTab] = useState<CenterTab | undefined>(undefined);
   const [aiInitialMemorySection, setAiInitialMemorySection] = useState<MemorySubSection | undefined>(undefined);
   const [aiInitialSessionId, setAiInitialSessionId] = useState<string | undefined>(undefined);
@@ -393,7 +400,15 @@ export const App: React.FC = () => {
   };
 
   const handleOpenAlerts = (serverId?: string) => {
+    setAlertsInitialSubTab('alerts');
     setAlertsTarget({ serverId: serverId || '', nonce: Date.now() + Math.random() });
+    setMobileNavOpen(false);
+    setActiveNav('alerts');
+  };
+
+  const handleOpenQQBotNotifications = () => {
+    setAlertsTarget(null);
+    setAlertsInitialSubTab('qqbot');
     setMobileNavOpen(false);
     setActiveNav('alerts');
   };
@@ -966,6 +981,7 @@ export const App: React.FC = () => {
             onConnectTerminal={handleConnectTerminal}
             onNavigateServers={() => setActiveNav('servers')}
             onOpenServerAlerts={handleOpenAlerts}
+            onOpenQQBotNotifications={handleOpenQQBotNotifications}
             onFiringCountChange={setFiringAlertsCount}
             onActiveByServerChange={setActiveAlertsByServer}
             onNotify={notify}
@@ -976,7 +992,9 @@ export const App: React.FC = () => {
           <AlertCenter
             servers={servers}
             initialTarget={alertsTarget}
+            initialSubTab={alertsInitialSubTab}
             onClearInitialTarget={() => setAlertsTarget(null)}
+            onClearInitialSubTab={() => setAlertsInitialSubTab(undefined)}
             onFiringCountChange={setFiringAlertsCount}
             onActiveByServerChange={setActiveAlertsByServer}
             onOpenMonitorDetail={handleOpenMonitor}
@@ -998,6 +1016,7 @@ export const App: React.FC = () => {
             servers={servers}
             onUnreadHighChange={setVulnUnreadHighCount}
             onDiagnoseWithAI={handleDiagnoseAlertWithAI}
+            onOpenQQBotNotifications={handleOpenQQBotNotifications}
             onNotify={notify}
           />
         )}
@@ -1056,6 +1075,7 @@ export const App: React.FC = () => {
             onConsumeInitialSessionId={() => setAiInitialSessionId(undefined)}
             onConsumeInitialDraft={() => setAiInitialDraft(null)}
             onOpenApprovals={handleOpenApprovals}
+            onOpenQQBotNotifications={handleOpenQQBotNotifications}
             onApprovalsMutated={() => void refreshApprovalSummary(false)}
             onBadgeChange={setPatrolUnreadCount}
             onRefreshWorkspace={loadWorkspaceData}

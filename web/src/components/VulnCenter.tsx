@@ -48,6 +48,7 @@ export interface VulnCenterProps {
   servers: ServerView[];
   onUnreadHighChange?: (count: number) => void;
   onDiagnoseWithAI: (serverId: string, prompt: string) => void;
+  onOpenQQBotNotifications?: () => void;
   onNotify: (msg: string) => void;
 }
 
@@ -121,6 +122,7 @@ export const VulnCenter: React.FC<VulnCenterProps> = ({
   servers,
   onUnreadHighChange,
   onDiagnoseWithAI,
+  onOpenQQBotNotifications,
   onNotify,
 }) => {
   // Core Overview State
@@ -2268,6 +2270,23 @@ export const VulnCenter: React.FC<VulnCenterProps> = ({
                             </button>
                           </div>
                         </label>
+                      </div>
+                    )}
+                    {onOpenQQBotNotifications && (
+                      <div className="qqbot-shortcut-strip" style={{ marginTop: 10 }}>
+                        <span>
+                          也支持通过 <strong>QQ 机器人 WebSocket</strong> 推送高危 / CISA KEV 漏洞动态
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-teal"
+                          onClick={() => {
+                            setSettingsOpen(false);
+                            onOpenQQBotNotifications();
+                          }}
+                        >
+                          配置 QQ 机器人通知
+                        </button>
                       </div>
                     )}
                   </div>

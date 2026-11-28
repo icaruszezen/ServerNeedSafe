@@ -355,6 +355,7 @@ type SecretsState struct {
 	MonitorRules      []MonitorAlertRule      `json:"monitor_rules"`
 	AISettings        AISettings              `json:"ai_settings"`
 	VulnSettings      VulnSettings            `json:"vuln_settings"`
+	QQBotSettings     QQBotSettings           `json:"qqbot_settings,omitempty"`
 }
 
 // ServerRuntimeMeta tracks volatile per-server telemetry/connection metadata outside secrets.enc.
@@ -387,6 +388,7 @@ type AIOpsRuntimeState struct {
 	ExternalApprovals []ExternalApproval              `json:"external_approvals,omitempty"`
 	MCPTokenUsage     map[string]MCPTokenRuntimeUsage `json:"mcp_token_usage,omitempty"`
 	ModelCatalog      *AIModelCatalogCache            `json:"model_catalog,omitempty"`
+	QQBot             *QQBotRuntimeState              `json:"qqbot,omitempty"`
 }
 
 // AuditRuntimeState is persisted asynchronously to audit_logs.json without encryption overhead.
@@ -408,6 +410,7 @@ type CoreConfigSnapshot struct {
 	MonitorRules    []MonitorAlertRule `json:"monitor_rules"`
 	AISettings      AISettings         `json:"ai_settings"`
 	VulnSettings    VulnSettings       `json:"vuln_settings,omitempty"`
+	QQBotSettings   QQBotSettings      `json:"qqbot_settings,omitempty"`
 }
 
 // AIKnowledgeSnapshot carries reusable SRE knowledge (host profiles, long-term memories, runbooks).
@@ -611,5 +614,6 @@ func DefaultSecretsState(vaultID string) *SecretsState {
 		MonitorRules:    def.Monitor.Rules,
 		AISettings:      def.AISettings,
 		VulnSettings:    DefaultVulnSettings(),
+		QQBotSettings:   DefaultQQBotSettings(),
 	}
 }

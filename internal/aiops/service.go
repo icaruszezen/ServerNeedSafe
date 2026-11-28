@@ -63,10 +63,12 @@ type Service struct {
 	patrolRunning    bool
 	lastPatrolAt     *time.Time
 	nextPatrolAt     *time.Time
-	patrolWakeCh     chan struct{}
-	stopCh           chan struct{}
-	onPersist        func()
-	sessionLocksMu   sync.Mutex
+	patrolWakeCh       chan struct{}
+	stopCh             chan struct{}
+	onPersist          func()
+	patrolNotifyHook   func(ctx context.Context, rec vault.PatrolRecord) bool
+	approvalNotifyHook func(ctx context.Context, ap vault.ExternalApproval) bool
+	sessionLocksMu     sync.Mutex
 	sessionLocks     map[string]*sync.Mutex
 	extApprovalMu    sync.Mutex
 	extApprovalLocks map[string]*sync.Mutex
@@ -159,6 +161,18 @@ func (s *Service) UpdateSession(sessionID string, mode vault.AIExecutionMode, se
 func (s *Service) SetOnPersist(fn func()) {
 	s.mu.Lock()
 	s.onPersist = fn
+	s.mu.Unlock()
+}
+
+// SetEventNotifyHooks registers external event notification dispatchers (e.g. QQ Bot WebSocket)
+// invoked alongside HTTP Webhooks for patrol anomalies and pending external MCP change plans.
+func (s *Service) SetEventNotifyHooks(
+	onPatrol func(ctx context.Context, rec vault.PatrolRecord) bool,
+	onApproval func(ctx context.Context, ap vault.ExternalApproval) bool,
+) {
+	s.mu.Lock()
+	s.patrolNotifyHook = onPatrol
+	s.approvalNotifyHook = onApproval
 	s.mu.Unlock()
 }
 

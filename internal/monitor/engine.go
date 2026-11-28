@@ -74,8 +74,9 @@ type Engine struct {
 	tickInterval     time.Duration
 	webhookRetryWait time.Duration
 
-	webhookPost func(urlClean string, body []byte) error
-	onPersist   func()
+	webhookPost    func(urlClean string, body []byte) error
+	onPersist      func()
+	alertEventHook func(ctx context.Context, triggered, resolved []vault.MonitorAlert)
 }
 
 // NewEngine creates a new monitoring engine wired to store ready hooks and SSH connection pooling.
@@ -911,10 +912,30 @@ func (e *Engine) probeSingleServer(
 	return snap, nil
 }
 
+// SetAlertEventHook registers an optional asynchronous event notification listener (e.g. QQ Bot WebSocket).
+func (e *Engine) SetAlertEventHook(fn func(ctx context.Context, triggered, resolved []vault.MonitorAlert)) {
+	e.mu.Lock()
+	e.alertEventHook = fn
+	e.mu.Unlock()
+}
+
 func (e *Engine) maybeDispatchNotifications(settings vault.MonitorSettings, webhookURL string, triggered, resolved []vault.MonitorAlert) {
 	if len(triggered) == 0 && len(resolved) == 0 {
 		return
 	}
+	e.mu.Lock()
+	hook := e.alertEventHook
+	e.mu.Unlock()
+	if hook != nil {
+		trigCopy := slices.Clone(triggered)
+		resCopy := slices.Clone(resolved)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			hook(ctx, trigCopy, resCopy)
+		}()
+	}
+
 	urlClean := strings.TrimSpace(webhookURL)
 	var extraChannels []vault.WebhookChannel
 	if settings.ReuseAIPatrolWebhooks && e.store != nil {

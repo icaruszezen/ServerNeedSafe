@@ -25,12 +25,14 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  Wifi,
   Wrench,
   X,
 } from 'lucide-react';
 import { api } from '../api';
 import { buildAlertMCPPrompt } from '../utils/alertMcpPrompt';
 import { copyTextToClipboard } from '../utils/clipboard';
+import { qqGatewayStateMeta } from '../utils/qqbotIntents';
 import type {
   AlertQuickAction,
   AlertSummaryStats,
@@ -38,6 +40,9 @@ import type {
   ServerView,
 } from '../types';
 import { formatDateTime } from './MonitorCharts';
+import { QQBotNotificationPanel } from './QQBotNotificationPanel';
+
+export type AlertCenterSubTab = 'alerts' | 'qqbot';
 
 export interface AlertTargetNavigation {
   serverId: string;
@@ -47,7 +52,9 @@ export interface AlertTargetNavigation {
 export interface AlertCenterProps {
   servers: ServerView[];
   initialTarget?: AlertTargetNavigation | null;
+  initialSubTab?: AlertCenterSubTab;
   onClearInitialTarget?: () => void;
+  onClearInitialSubTab?: () => void;
   onFiringCountChange?: (count: number) => void;
   onActiveByServerChange?: (byServer: Record<string, number>) => void;
   onOpenMonitorDetail: (serverId: string) => void;
@@ -108,7 +115,9 @@ function formatDuration(startIso?: string, endIso?: string): string {
 export const AlertCenter: React.FC<AlertCenterProps> = ({
   servers,
   initialTarget,
+  initialSubTab,
   onClearInitialTarget,
+  onClearInitialSubTab,
   onFiringCountChange,
   onActiveByServerChange,
   onOpenMonitorDetail,
@@ -119,6 +128,12 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
   onOpenRunbook,
   onNotify,
 }) => {
+  const [subTab, setSubTab] = useState<AlertCenterSubTab>(initialSubTab || 'alerts');
+  const [qqStatus, setQqStatus] = useState<{
+    enabled: boolean;
+    state: string;
+    connected: boolean;
+  } | null>(null);
   const [alerts, setAlerts] = useState<MonitorAlert[]>([]);
   const [globalSummary, setGlobalSummary] = useState<AlertSummaryStats | null>(null);
   const [scopedSummary, setScopedSummary] = useState<AlertSummaryStats | null>(null);
@@ -166,8 +181,29 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
 
   // Handle deep-link jump from MonitorCenter, ServerManager, or sidebar reset
   useEffect(() => {
+    if (initialSubTab) {
+      setSubTab(initialSubTab);
+      onClearInitialSubTab?.();
+    }
+  }, [initialSubTab, onClearInitialSubTab]);
+
+  useEffect(() => {
+    void api
+      .getQQBotOverview()
+      .then((ov) =>
+        setQqStatus({
+          enabled: Boolean(ov.settings.enabled),
+          state: ov.runtime.state,
+          connected: Boolean(ov.runtime.connected),
+        })
+      )
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (initialTarget && consumedTargetNonceRef.current !== initialTarget.nonce) {
       consumedTargetNonceRef.current = initialTarget.nonce;
+      setSubTab('alerts');
       setServerFilter(initialTarget.serverId);
       setStatusFilter('active');
       setSeverityFilter('all');
@@ -930,48 +966,103 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
         </div>
 
         <div className="page-header-actions">
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={onOpenMonitorPolicy}
-            title="前往状态监控配置告警规则阈值与 Webhook 推送通道"
-          >
-            <Settings2 size={13.5} /> 阈值与推送策略
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm"
-            disabled={refreshing}
-            onClick={() => void loadAlerts(true)}
-          >
-            <RefreshCw size={13.5} className={refreshing ? 'spin-icon' : ''} /> 刷新
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm"
-            disabled={clearingResolved || (activeSummary?.resolved || 0) === 0}
-            onClick={() => void handleClearResolved()}
-            title={serverFilter ? '清理当前筛选服务器的已恢复记录' : '清理全部已恢复历史告警'}
-          >
-            <Trash2 size={13.5} /> 清理已恢复
-            {(activeSummary?.resolved || 0) > 0 ? ` (${activeSummary?.resolved})` : ''}
-          </button>
-          {firingIdsInView.length > 0 && (
-            <button
-              type="button"
-              id="alerts-bulk-ack-btn"
-              className="btn btn-primary btn-sm"
-              disabled={bulkAcking}
-              onClick={() => void handleBulkAck(firingIdsInView, serverFilter)}
-            >
-              <CheckCheck size={14} />
-              {bulkAcking ? '确认中...' : `批量确认知晓 (${firingIdsInView.length})`}
-            </button>
+          {subTab === 'alerts' && (
+            <>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={onOpenMonitorPolicy}
+                title="前往状态监控配置告警规则阈值与 Webhook 推送通道"
+              >
+                <Settings2 size={13.5} /> 阈值与推送策略
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={refreshing}
+                onClick={() => void loadAlerts(true)}
+              >
+                <RefreshCw size={13.5} className={refreshing ? 'spin-icon' : ''} /> 刷新
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={clearingResolved || (activeSummary?.resolved || 0) === 0}
+                onClick={() => void handleClearResolved()}
+                title={serverFilter ? '清理当前筛选服务器的已恢复记录' : '清理全部已恢复历史告警'}
+              >
+                <Trash2 size={13.5} /> 清理已恢复
+                {(activeSummary?.resolved || 0) > 0 ? ` (${activeSummary?.resolved})` : ''}
+              </button>
+              {firingIdsInView.length > 0 && (
+                <button
+                  type="button"
+                  id="alerts-bulk-ack-btn"
+                  className="btn btn-primary btn-sm"
+                  disabled={bulkAcking}
+                  onClick={() => void handleBulkAck(firingIdsInView, serverFilter)}
+                >
+                  <CheckCheck size={14} />
+                  {bulkAcking ? '确认中...' : `批量确认知晓 (${firingIdsInView.length})`}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
 
+      {/* Sub-navigation bar: Alert Feed & QQ Open Platform WebSocket Notification Gateway */}
+      <div className="mon-subnav-bar" id="alert-center-subnav">
+        <div className="mon-subnav-tabs">
+          <button
+            type="button"
+            id="alert-subtab-feed-btn"
+            className={`mon-subtab-btn ${subTab === 'alerts' ? 'active' : ''}`}
+            onClick={() => setSubTab('alerts')}
+          >
+            <Bell size={14} />
+            告警事件流
+            {(globalSummary?.total_active || 0) > 0 && (
+              <span className="mon-tab-count danger">{globalSummary?.total_active}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            id="alert-subtab-qqbot-btn"
+            className={`mon-subtab-btn ${subTab === 'qqbot' ? 'active' : ''}`}
+            onClick={() => setSubTab('qqbot')}
+          >
+            <Wifi size={14} />
+            QQ 机器人通知 (WebSocket)
+            {qqStatus?.enabled && (
+              <span
+                className={`mon-tab-count ${
+                  qqStatus.connected
+                    ? 'teal'
+                    : qqGatewayStateMeta(qqStatus.state).tone === 'danger'
+                    ? 'danger'
+                    : 'amber'
+                }`}
+              >
+                {qqStatus.connected
+                  ? '在线'
+                  : qqGatewayStateMeta(qqStatus.state).tone === 'danger'
+                  ? '异常'
+                  : '连接中'}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
       <div className="page-body">
+        {subTab === 'qqbot' ? (
+          <QQBotNotificationPanel
+            onStatusChange={(st) => setQqStatus(st)}
+            onNotify={onNotify}
+          />
+        ) : (
+          <>
         {/* Server Scoped Context Banner (when jumped from MonitorCenter / ServerManager) */}
         {serverFilter && (
           <div className="al-server-banner" id="alert-server-filter-banner">
@@ -1438,6 +1529,8 @@ export const AlertCenter: React.FC<AlertCenterProps> = ({
             ) : (
               <div className="al-card-stack">{alerts.map((al) => renderAlertCard(al))}</div>
             )}
+          </>
+        )}
           </>
         )}
       </div>

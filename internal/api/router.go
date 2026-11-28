@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"github.com/icaruszezen/ServerNeedSafe/internal/auth"
 	"github.com/icaruszezen/ServerNeedSafe/internal/mcp"
 	"github.com/icaruszezen/ServerNeedSafe/internal/monitor"
+	"github.com/icaruszezen/ServerNeedSafe/internal/qqbot"
 	"github.com/icaruszezen/ServerNeedSafe/internal/sshmanager"
 	"github.com/icaruszezen/ServerNeedSafe/internal/updater"
 	"github.com/icaruszezen/ServerNeedSafe/internal/vault"
@@ -35,12 +37,14 @@ type Config struct {
 	Monitor                *monitor.Engine
 	AI                     *aiops.Service
 	Vuln                   *vuln.Service
+	QQBot                  *qqbot.Service
 	Updater                *updater.Service
 	Auth                   *auth.Manager
 	StaticFS               fs.FS // Embedded frontend dist FS (optional in pure API unit tests)
 	OnRestart              func(exePath, backupPath string) error
 	DisableAutoUpdateCheck bool
 	DisableAutoVulnSync    bool
+	DisableAutoQQBot       bool
 }
 
 type Server struct {
@@ -67,11 +71,31 @@ func NewServer(cfg Config) *Server {
 		if cfg.AI == nil {
 			cfg.AI = aiops.NewService(cfg.Store, cfg.SSH)
 		}
+		if cfg.QQBot == nil {
+			cfg.QQBot = qqbot.NewService(qqbot.ServiceConfig{
+				Store:           cfg.Store,
+				DisableAutoLoop: cfg.DisableAutoQQBot,
+			})
+		}
+		qqSvc := cfg.QQBot
+		if cfg.Monitor != nil && qqSvc != nil {
+			cfg.Monitor.SetAlertEventHook(func(ctx context.Context, triggered, resolved []vault.MonitorAlert) {
+				qqSvc.NotifyMonitorAlerts(ctx, triggered, resolved)
+			})
+		}
+		if cfg.AI != nil && qqSvc != nil {
+			cfg.AI.SetEventNotifyHooks(qqSvc.NotifyPatrolRecord, qqSvc.NotifyExternalApproval)
+		}
 		if cfg.Vuln == nil {
 			aiSvc := cfg.AI
+			var vulnNotifier func(ctx context.Context, hits []vault.VulnAdvisory) bool
+			if qqSvc != nil {
+				vulnNotifier = qqSvc.NotifyVulnAdvisories
+			}
 			cfg.Vuln = vuln.NewService(vuln.Config{
 				Store:           cfg.Store,
 				AICompleter:     aiSvc.CompleteTextPrompt,
+				EventNotifier:   vulnNotifier,
 				DisableAutoLoop: cfg.DisableAutoVulnSync || cfg.DisableAutoUpdateCheck,
 			})
 		}
@@ -103,6 +127,9 @@ func NewServer(cfg Config) *Server {
 	if s.cfg.Vuln != nil {
 		s.cfg.Vuln.Start()
 	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.Start()
+	}
 	if s.cfg.Updater != nil {
 		s.cfg.Updater.Start()
 	}
@@ -124,6 +151,9 @@ func (s *Server) Close() {
 	}
 	if s.cfg.Vuln != nil {
 		s.cfg.Vuln.Close()
+	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.Close()
 	}
 	if s.mcpLoopback != nil {
 		s.mcpLoopback.Close()
@@ -349,6 +379,17 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/vulns/mark-all-read", s.requireAuth(s.handleMarkAllVulnsRead))
 	s.mux.HandleFunc("POST /api/vulns/{id}/explain", s.requireAuth(s.handleExplainVuln))
 	s.mux.HandleFunc("POST /api/vulns/test-webhook", s.requireAuth(s.handleTestVulnWebhook))
+
+	// 7x24 QQ Open Platform API v2 WebSocket Event Notification Gateway
+	s.mux.HandleFunc("GET /api/notifications/qqbot/overview", s.requireAuth(s.handleGetQQBotOverview))
+	s.mux.HandleFunc("PUT /api/notifications/qqbot/config", s.requireAuth(s.handleUpdateQQBotConfig))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/targets", s.requireAuth(s.handleUpsertQQBotTarget))
+	s.mux.HandleFunc("DELETE /api/notifications/qqbot/targets/{id}", s.requireAuth(s.handleDeleteQQBotTarget))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/bind-code", s.requireAuth(s.handleGenerateQQBotBindCode))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/probe", s.requireAuth(s.handleProbeQQBot))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/reconnect", s.requireAuth(s.handleReconnectQQBot))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/test-push", s.requireAuth(s.handleTestQQBotPush))
+	s.mux.HandleFunc("POST /api/notifications/qqbot/clear-logs", s.requireAuth(s.handleClearQQBotLogs))
 
 	// GitHub Release Auto-Detection, China Mirror Probing & Self-Update
 	s.mux.HandleFunc("GET /api/system/update/status", s.requireAuth(s.handleGetUpdateStatus))

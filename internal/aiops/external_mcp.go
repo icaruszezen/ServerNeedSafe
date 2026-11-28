@@ -110,17 +110,19 @@ func (s *Service) SubmitExternalPatrolReport(ctx context.Context, in ExternalPat
 		shouldNotify = *in.DispatchWebhook
 	}
 	if shouldNotify {
-		if cfg, cErr := s.store.GetPatrolConfigSecret(); cErr == nil && cfg != nil && len(cfg.Webhooks) > 0 {
-			notified := s.dispatchPatrolWebhooks(ctx, cfg.Webhooks, *updated)
-			if notified {
-				updated, _ = s.store.UpdatePatrolRecordAnalysis(recID, vault.PatrolAnalysisUpdate{
-					AnalysisState:     updated.AnalysisState,
-					AISource:          updated.AISource,
-					ExternalClient:    updated.ExternalClient,
-					AIModel:           updated.AIModel,
-					AIWebhookNotified: &notified,
-				}, in.ClientIP)
-			}
+		var webhooks []vault.WebhookChannel
+		if cfg, cErr := s.store.GetPatrolConfigSecret(); cErr == nil && cfg != nil {
+			webhooks = cfg.Webhooks
+		}
+		notified := s.dispatchPatrolWebhooks(ctx, webhooks, *updated)
+		if notified {
+			updated, _ = s.store.UpdatePatrolRecordAnalysis(recID, vault.PatrolAnalysisUpdate{
+				AnalysisState:     updated.AnalysisState,
+				AISource:          updated.AISource,
+				ExternalClient:    updated.ExternalClient,
+				AIModel:           updated.AIModel,
+				AIWebhookNotified: &notified,
+			}, in.ClientIP)
 		}
 	}
 
@@ -308,8 +310,8 @@ func (s *Service) CreateExternalChangePlan(ctx context.Context, in ExternalChang
 		return nil, err
 	}
 
+	notified := false
 	if cfg, cErr := s.store.GetPatrolConfigSecret(); cErr == nil && cfg != nil && cfg.NotifyPendingApprovals && len(cfg.Webhooks) > 0 {
-		notified := false
 		for _, wh := range cfg.Webhooks {
 			if !wh.Enabled || wh.URL == "" {
 				continue
@@ -318,10 +320,16 @@ func (s *Service) CreateExternalChangePlan(ctx context.Context, in ExternalChang
 				notified = true
 			}
 		}
-		if notified {
-			saved.WebhookNotified = true
-			_ = s.store.UpdateExternalApproval(*saved)
-		}
+	}
+	s.mu.Lock()
+	apHook := s.approvalNotifyHook
+	s.mu.Unlock()
+	if apHook != nil && apHook(ctx, *saved) {
+		notified = true
+	}
+	if notified {
+		saved.WebhookNotified = true
+		_ = s.store.UpdateExternalApproval(*saved)
 	}
 
 	s.notifyPersist()

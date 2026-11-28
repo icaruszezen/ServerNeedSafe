@@ -2178,6 +2178,18 @@ pre,
   border: 1px solid var(--danger-border);
 }
 
+.mon-tab-count.teal {
+  background: var(--accent-teal-soft);
+  color: var(--accent-teal);
+  border: 1px solid var(--accent-teal-border);
+}
+
+.mon-tab-count.amber {
+  background: var(--amber-soft);
+  color: var(--amber-text);
+  border: 1px solid var(--amber-border);
+}
+
 .mon-encryption-note {
   display: inline-flex;
   align-items: center;
@@ -7701,6 +7713,528 @@ pre,
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
   .vuln-app-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ==========================================================================
+   QQ Open Platform API v2 WebSocket Event Notification Panel
+   ========================================================================== */
+
+.qqbot-root {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.qqbot-hero-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.qqbot-hero-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.qqbot-hero-identity {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1 1 360px;
+  min-width: 0;
+}
+
+.qqbot-state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 99px;
+  font-size: 12px;
+  font-weight: 640;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+
+.qqbot-state-badge.tone-teal {
+  color: var(--accent-teal);
+  background: var(--accent-teal-soft);
+  border-color: var(--accent-teal-border);
+}
+
+.qqbot-state-badge.tone-amber {
+  color: var(--amber-text);
+  background: var(--amber-soft);
+  border-color: var(--amber-border);
+}
+
+.qqbot-state-badge.tone-danger {
+  color: var(--danger-text);
+  background: var(--danger-soft);
+  border-color: var(--danger-border);
+}
+
+.qqbot-hero-meta {
+  min-width: 0;
+  flex: 1;
+}
+
+.qqbot-hero-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 14.5px;
+}
+
+.qqbot-hero-desc {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.qqbot-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qqbot-error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  word-break: break-word;
+}
+
+.qqbot-probe-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-teal-border);
+  background: var(--accent-teal-soft);
+  font-size: 12.5px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.qqbot-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.qqbot-kpi-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  min-width: 0;
+}
+
+.qqbot-kpi-label {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.qqbot-kpi-val {
+  font-size: 13.5px;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.qqbot-kpi-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.qqbot-two-col {
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.qqbot-right-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.qqbot-config-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.qqbot-inline-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.qqbot-check-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.qqbot-section-block {
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.qqbot-section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qqbot-section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 630;
+  color: var(--text-primary);
+}
+
+.qqbot-sub-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.qqbot-sub-tile {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.qqbot-sub-tile input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.qqbot-sub-tile strong {
+  display: block;
+  font-size: 12.5px;
+  margin-bottom: 2px;
+}
+
+.qqbot-sub-tile span {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.qqbot-intents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qqbot-intent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  cursor: pointer;
+}
+
+.qqbot-intent-row input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.qqbot-intent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.qqbot-intent-code {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.qqbot-intent-row p {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.qqbot-hint-note {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.qqbot-advanced-wrap {
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.qqbot-advanced-toggle {
+  padding-left: 0;
+  justify-content: flex-start;
+}
+
+.qqbot-advanced-body {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+}
+
+.qqbot-form-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.qqbot-bind-code-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-teal-border);
+  background: var(--accent-teal-soft);
+}
+
+.qqbot-bind-code-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.qqbot-bind-code-label {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.qqbot-bind-code-cmd {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--accent-teal);
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: var(--bg-surface);
+  border: 1px solid var(--accent-teal-border);
+}
+
+.qqbot-bind-code-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qqbot-muted-help {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.qqbot-empty-box {
+  padding: 14px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-default);
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.qqbot-target-list,
+.qqbot-discovered-list,
+.qqbot-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.qqbot-target-item,
+.qqbot-discovered-row,
+.qqbot-log-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.qqbot-target-item.disabled {
+  opacity: 0.65;
+}
+
+.qqbot-target-info {
+  min-width: 0;
+  flex: 1 1 200px;
+}
+
+.qqbot-target-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.qqbot-target-id {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.qqbot-target-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qqbot-mini-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.qqbot-add-target-form {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.qqbot-add-target-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qqbot-add-target-row > .input,
+.qqbot-add-target-row > .select {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+
+.qqbot-discovered-meta {
+  margin-top: 4px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.qqbot-log-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.qqbot-log-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.qqbot-log-time {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.qqbot-log-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.qqbot-shortcut-strip {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-teal-border);
+  background: var(--accent-teal-soft);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 1024px) {
+  .qqbot-two-col {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .qqbot-kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

@@ -103,6 +103,9 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.AI != nil {
 		s.cfg.AI.NotifyPatrolConfigUpdated()
 	}
+	if s.cfg.QQBot != nil {
+		s.cfg.QQBot.NotifyConfigUpdated()
+	}
 
 	s.cfg.Auth.ResetAuthFailures()
 	sess, err := s.cfg.Auth.CreateSession(s.cfg.Store.AuthVersion(), clientIP, r.UserAgent())
@@ -178,6 +181,9 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.cfg.AI != nil {
 			s.cfg.AI.NotifyPatrolConfigUpdated()
+		}
+		if s.cfg.QQBot != nil {
+			s.cfg.QQBot.NotifyConfigUpdated()
 		}
 	} else {
 		s.cfg.Store.RecordAuditAsync("auth.login", "web-console", "管理员登录 Web 管理控制台", clientIP, true)
